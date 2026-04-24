@@ -24,20 +24,31 @@ Project was scaffolded with `cyrius init sit`. Do not manually create project st
 
 ## Current State
 
-- **Source**: `src/main.cyr` stub only
-- **Tests**: `src/test.cyr` stub only
-- **Binary**: not yet building meaningful output
+- **Source**: `src/main.cyr` — subcommand dispatch; `sit init` implemented
+- **Tests**: `tests/sit.tcyr` smoke only; integration coverage is shell-level for now
+- **Binary**: `cyrius build src/main.cyr build/sit` produces a working `sit init`
 - **Integration**: no downstream consumers yet; owl will consume sit for git-marker gutter decorations once sit is functional
 
 ## Dependencies
 
-- **Cyrius stdlib** — `string`, `fmt`, `alloc`, `io`, `vec`, `str`, `syscalls`, `assert`, `fs`, `args`, `chrono`, `hashmap`, `process`, `tagged`, `fnptr`
+- **Cyrius stdlib** — `string`, `fmt`, `alloc`, `io`, `vec`, `str`, `syscalls`, `assert`, `fs`, `args`, `chrono`, `hashmap`, `process`, `tagged`, `fnptr`, `thread`, `freelist`, `bigint`, `ct`, `keccak`
 - **sakshi** (2.1.0) — tracing, error handling, structured logging
 - **sankoch** (2.0.1) — LZ4/DEFLATE/zlib/gzip for pack-file compression
 - **sigil** (2.9.1) — hashing and trust verification for object IDs and signed commits
 - **patra** (1.5.5) — B+ tree / WAL-backed object store and index
 
-All four are git-tag pinned in `cyrius.cyml`. No FFI, no C, no libgit2.
+All four are git-tag pinned in `cyrius.cyml`. No FFI, no C, no libgit2 — see [ADR 0001](docs/adr/0001-no-ffi-first-party-only.md).
+
+Cyrius has no transitive dep resolution as of 5.6.16 (fix targeted for 5.7.x), so every crate a dep touches must be declared explicitly. The `thread`/`freelist`/`bigint`/`ct`/`keccak` stdlib entries above exist because patra and sigil reach into them.
+
+## Docs
+
+- [`docs/adr/`](docs/adr/) — architecture decision records. Start here for *why* sit chose X over Y. [0001](docs/adr/0001-no-ffi-first-party-only.md) is the first-party/no-FFI thesis.
+- [`docs/architecture/`](docs/architecture/) — non-obvious constraints and quirks a reader can't derive from the code. **Skim this before writing new code** — e.g. [001](docs/architecture/001-args-stack-buffer-lifetime.md) documents a stdlib `args.cyr` lifetime hazard that silently affects any `argv(n)` usage.
+- [`docs/guides/`](docs/guides/) — task-oriented how-tos. [Getting started](docs/guides/getting-started.md) covers build + first `sit init`.
+- [`docs/examples/`](docs/examples/) — runnable examples; empty until sit's surface area grows past `init`.
+
+New quirks and constraints land in `docs/architecture/` as numbered items. New decisions land in `docs/adr/` using [`template.md`](docs/adr/template.md). Never renumber either series.
 
 ## Rules
 
