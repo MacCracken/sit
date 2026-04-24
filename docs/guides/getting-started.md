@@ -256,6 +256,8 @@ file?.bak
 - `sit checkout [-b] <branch>` — switch branches; `-b` creates the branch first at HEAD
 - `sit tag [<name> [<commit>]]` — list tags, or create a lightweight tag at HEAD (or at a given commit)
 - `sit merge <branch>` — fast-forward when possible; otherwise 3-way merge with line-level diff3. Edits on different regions of the same file auto-merge; truly overlapping edits fall back to `<<<<<<<`/`=======`/`>>>>>>>` markers, save `.sit/MERGE_HEAD`, and wait for you to resolve + `sit add` + `sit commit` (which emits a 2-parent commit). `sit merge --abort` cancels the merge and restores HEAD.
+- `sit reset <path>` — unstage: rewrite the index entry for the path to HEAD's tree hash (or drop it if HEAD doesn't have it). Working tree untouched.
+- `sit reset --hard <ref>` — move the current branch's ref to `<ref>` (branch / tag / commit hex) and restore the working tree to that commit.
 - `sit config [--global] <key> [<value>]` — read/write config entries (`user.name`, `user.email`, etc). Local at `.sit/config`, global at `~/.sitconfig`
 - `sit fsck` — verify that each stored object's content hashes back to its filename
 - `.sitignore` — gitignore-style pattern file (at repo root) filters untracked-file display and `sit add` (override with `-f`)
@@ -263,7 +265,7 @@ file?.bak
 - `sit log` — walk commit history from HEAD with git-style output
 - `sit status` — three-way diff across HEAD tree, staging index, and working directory
 - `sit diff [--staged|HEAD]` — unified diff with `@@` hunk headers (working vs index / index vs HEAD / working vs HEAD)
-- `sit show [<hash>]` — show a single commit's header + parent-diff (defaults to HEAD)
+- `sit show [--stat] [<hash>]` — show a single commit's header + parent-diff (defaults to HEAD); `--stat` emits per-file insertion/deletion counts instead of the full diff
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
 

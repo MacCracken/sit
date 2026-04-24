@@ -2347,6 +2347,91 @@ fn materialize_target(target_hex) {
     return 0;
 }
 
+fn cmd_reset() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+    if (argc() < 3) {
+        eprintln("usage: sit reset <path> | sit reset --hard <ref>");
+        return 1;
+    }
+
+    # --hard <ref>: move current branch ref to <ref>, overwrite working + index.
+    if (streq(argv(2), "--hard") == 1) {
+        if (argc() < 4) {
+            eprintln("usage: sit reset --hard <ref>");
+            return 1;
+        }
+        var target = argv_heap(3);
+        var hex[72];
+        var rr = resolve_hash(target, &hex);
+        if (rr != 1) {
+            syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
+            syscall(SYS_WRITE, STDERR, target, strlen(target));
+            syscall(SYS_WRITE, STDERR, "'\n", 2);
+            return 1;
+        }
+        if (write_head_ref(&hex) != 0) {
+            eprintln("sit: failed to update branch ref");
+            return 1;
+        }
+        materialize_target(&hex);
+        syscall(SYS_WRITE, STDOUT, "HEAD reset --hard to ", 21);
+        syscall(SYS_WRITE, STDOUT, &hex, 12);
+        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        return 0;
+    }
+
+    # sit reset <path>: unstage the path — set its index entry to HEAD's hash,
+    # or remove it from the index if HEAD doesn't have it.
+    var path = argv_heap(2);
+    var path_len = strlen(path);
+
+    var head_entries = read_head_tree_entries();
+    var head_ent = tree_find(head_entries, path);
+
+    var index_entries = parse_index();
+    if (index_entries != 0) {
+        sort_entries(index_entries);
+        index_entries = dedupe_entries(index_entries);
+    }
+
+    var filtered = vec_new();
+    if (index_entries != 0) {
+        var n = vec_len(index_entries);
+        var i = 0;
+        while (i < n) {
+            var e = vec_get(index_entries, i);
+            if (streq(entry_path(e), path) == 0) { vec_push(filtered, e); }
+            i = i + 1;
+        }
+    }
+
+    if (head_ent != 0) {
+        var head_hash_hex = tree_entry_hash(head_ent);
+        var bytes = hex_decode(head_hash_hex, 64);
+        if (bytes != 0) {
+            var new_e = alloc(40);
+            memcpy(new_e, bytes, 32);
+            var pcopy = alloc(path_len + 1);
+            memcpy(pcopy, path, path_len);
+            store8(pcopy + path_len, 0);
+            store64(new_e + 32, pcopy);
+            vec_push(filtered, new_e);
+        }
+    }
+
+    if (rewrite_index(filtered) != 0) {
+        eprintln("sit: failed to update index");
+        return 1;
+    }
+    syscall(SYS_WRITE, STDOUT, "unstaged '", 10);
+    syscall(SYS_WRITE, STDOUT, path, path_len);
+    syscall(SYS_WRITE, STDOUT, "'\n", 2);
+    return 0;
+}
+
 fn cmd_merge() {
     if (file_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -4063,6 +4148,44 @@ fn print_file_diff(path, old_buf, old_len, new_buf, new_len) {
     return 0;
 }
 
+# Count insertion / deletion lines between two buffers and print a diffstat
+# line ` path | +N -M\n`. Writes (ins, del) to out_pair for caller totals.
+fn print_file_stat(path, old_buf, old_len, new_buf, new_len, out_pair) {
+    var a = split_lines(old_buf, old_len);
+    var b = split_lines(new_buf, new_len);
+    var ops = lcs_diff(a, b);
+    if (ops == 0) {
+        store64(out_pair, 0);
+        store64(out_pair + 8, 0);
+        eprintln("sit: diff table exceeds cap; file too large");
+        return 1;
+    }
+    var ins = 0;
+    var del = 0;
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        var kind = load64(op);
+        if (kind == 1) { del = del + 1; }
+        if (kind == 2) { ins = ins + 1; }
+        i = i + 1;
+    }
+    store64(out_pair, ins);
+    store64(out_pair + 8, del);
+    syscall(SYS_WRITE, STDOUT, " ", 1);
+    syscall(SYS_WRITE, STDOUT, path, strlen(path));
+    syscall(SYS_WRITE, STDOUT, " | +", 4);
+    var nbuf[24];
+    var d = write_decimal(&nbuf, ins);
+    syscall(SYS_WRITE, STDOUT, &nbuf, d);
+    syscall(SYS_WRITE, STDOUT, " -", 2);
+    d = write_decimal(&nbuf, del);
+    syscall(SYS_WRITE, STDOUT, &nbuf, d);
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    return 0;
+}
+
 # Read a blob object by hex hash; write (content_ptr, content_len) to out_pair.
 # Returns 0 on success, negative on error.
 fn read_blob_content(hex, out_pair) {
@@ -4350,8 +4473,18 @@ fn cmd_show() {
         return 1;
     }
 
+    var stat_mode = 0;
+    var hash_arg = 0;
+    var ai = 2;
+    while (ai < argc()) {
+        var aa = argv(ai);
+        if (streq(aa, "--stat") == 1) { stat_mode = 1; }
+        else { hash_arg = argv_heap(ai); }
+        ai = ai + 1;
+    }
+
     var hex[72];
-    if (argc() < 3) {
+    if (hash_arg == 0) {
         var head = read_head_ref();
         if (head == 0) {
             eprintln("sit: no commits yet");
@@ -4361,8 +4494,7 @@ fn cmd_show() {
         store8(&hex + 64, 0);
     }
     else {
-        var prefix = argv_heap(2);
-        var rr = resolve_hash(prefix, &hex);
+        var rr = resolve_hash(hash_arg, &hex);
         if (rr == 0 - 2) { eprintln("sit: hash prefix too short (min 4 chars)"); return 1; }
         if (rr == 0 - 1) { eprintln("sit: ambiguous hash prefix"); return 1; }
         if (rr == 0)     { eprintln("sit: no object matches"); return 1; }
@@ -4399,6 +4531,11 @@ fn cmd_show() {
         if (po != 0) { old_entries = po; }
     }
 
+    var tot_files = 0;
+    var tot_ins = 0;
+    var tot_del = 0;
+    var stat_pair[16];
+
     var n = vec_len(new_entries);
     var i = 0;
     while (i < n) {
@@ -4409,7 +4546,15 @@ fn cmd_show() {
         if (old_ent == 0) {
             var np[16];
             if (read_blob_content(new_hash, &np) == 0) {
-                print_file_diff(path, 0, 0, load64(&np), load64(&np + 8));
+                if (stat_mode == 1) {
+                    print_file_stat(path, 0, 0, load64(&np), load64(&np + 8), &stat_pair);
+                    tot_files = tot_files + 1;
+                    tot_ins = tot_ins + load64(&stat_pair);
+                    tot_del = tot_del + load64(&stat_pair + 8);
+                }
+                else {
+                    print_file_diff(path, 0, 0, load64(&np), load64(&np + 8));
+                }
             }
         }
         else {
@@ -4418,9 +4563,20 @@ fn cmd_show() {
                 var np[16];
                 if (read_blob_content(tree_entry_hash(old_ent), &op) == 0) {
                     if (read_blob_content(new_hash, &np) == 0) {
-                        print_file_diff(path,
-                            load64(&op), load64(&op + 8),
-                            load64(&np), load64(&np + 8));
+                        if (stat_mode == 1) {
+                            print_file_stat(path,
+                                load64(&op), load64(&op + 8),
+                                load64(&np), load64(&np + 8),
+                                &stat_pair);
+                            tot_files = tot_files + 1;
+                            tot_ins = tot_ins + load64(&stat_pair);
+                            tot_del = tot_del + load64(&stat_pair + 8);
+                        }
+                        else {
+                            print_file_diff(path,
+                                load64(&op), load64(&op + 8),
+                                load64(&np), load64(&np + 8));
+                        }
                     }
                 }
             }
@@ -4436,10 +4592,37 @@ fn cmd_show() {
         if (tree_find(new_entries, path) == 0) {
             var op[16];
             if (read_blob_content(tree_entry_hash(e), &op) == 0) {
-                print_file_diff(path, load64(&op), load64(&op + 8), 0, 0);
+                if (stat_mode == 1) {
+                    print_file_stat(path, load64(&op), load64(&op + 8), 0, 0, &stat_pair);
+                    tot_files = tot_files + 1;
+                    tot_ins = tot_ins + load64(&stat_pair);
+                    tot_del = tot_del + load64(&stat_pair + 8);
+                }
+                else {
+                    print_file_diff(path, load64(&op), load64(&op + 8), 0, 0);
+                }
             }
         }
         i = i + 1;
+    }
+
+    if (stat_mode == 1) {
+        if (tot_files > 0) {
+            var sbuf[24];
+            var sd = write_decimal(&sbuf, tot_files);
+            syscall(SYS_WRITE, STDOUT, " ", 1);
+            syscall(SYS_WRITE, STDOUT, &sbuf, sd);
+            if (tot_files == 1) { syscall(SYS_WRITE, STDOUT, " file changed, ", 15); }
+            else                { syscall(SYS_WRITE, STDOUT, " files changed, ", 16); }
+            sd = write_decimal(&sbuf, tot_ins);
+            syscall(SYS_WRITE, STDOUT, &sbuf, sd);
+            if (tot_ins == 1) { syscall(SYS_WRITE, STDOUT, " insertion(+), ", 15); }
+            else              { syscall(SYS_WRITE, STDOUT, " insertions(+), ", 16); }
+            sd = write_decimal(&sbuf, tot_del);
+            syscall(SYS_WRITE, STDOUT, &sbuf, sd);
+            if (tot_del == 1) { syscall(SYS_WRITE, STDOUT, " deletion(-)\n", 13); }
+            else              { syscall(SYS_WRITE, STDOUT, " deletions(-)\n", 14); }
+        }
     }
     return 0;
 }
@@ -4455,13 +4638,14 @@ fn print_usage() {
     eprintln("  checkout [-b] <branch>  switch to <branch>, optionally creating it first");
     eprintln("  tag [-d <name>|<name> [<commit>]]  list / create / delete tag (-d deletes)");
     eprintln("  merge <branch>          fast-forward HEAD to <branch> (3-way deferred)");
+    eprintln("  reset <path> | --hard <ref>  unstage a path, or move HEAD to <ref>");
     eprintln("  config [--global] <key> [<value>]  read or write a config value");
     eprintln("  fsck                    verify object integrity (sha-256 vs filename)");
     eprintln("  commit [-m] <message>   record staged changes as a new commit");
     eprintln("  log [--oneline]         show commit history from HEAD");
     eprintln("  status                  show working tree status");
     eprintln("  diff [--staged|HEAD]    show unstaged / staged / working-vs-HEAD diffs");
-    eprintln("  show [<hash>]           show a single commit with its parent diff");
+    eprintln("  show [--stat] [<hash>]  show a single commit (full diff or per-file stat)");
     eprintln("  cat-file <hash>         emit object content to stdout (plumbing)");
     eprintln("  owl-file <hash>         view object through owl (bat-like viewer)");
     return 0;
@@ -4485,6 +4669,7 @@ fn main() {
     if (streq(cmd, "checkout") == 1) { return cmd_checkout(); }
     if (streq(cmd, "tag")      == 1) { return cmd_tag(); }
     if (streq(cmd, "merge")    == 1) { return cmd_merge(); }
+    if (streq(cmd, "reset")    == 1) { return cmd_reset(); }
     if (streq(cmd, "config")   == 1) { return cmd_config(); }
     if (streq(cmd, "fsck")     == 1) { return cmd_fsck(); }
     if (streq(cmd, "commit")   == 1) { return cmd_commit(); }

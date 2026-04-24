@@ -146,6 +146,15 @@
 - Fixes UX gap flagged in v0.2.3: `sit show v0.1` no longer errors with "too short prefix" and instead resolves to the tagged commit.
 - Verified against eight scenarios: `show HEAD`, `show <tag>`, `show <branch>`, `show` on cross-branch tag, `show` on non-current branch, `cat-file <tag>`, short-name-as-tag beats too-short-prefix rule, empty-repo `show HEAD` returns cleanly.
 
+### v0.2.13 — Polish batch 3
+
+- **`sit reset <path>`** — unstage: rewrite the index entry for `<path>` to HEAD's tree hash, or drop the entry entirely if HEAD doesn't have the path. Working tree is untouched. Same index-rewrite primitive (`rewrite_index`) as `sit rm`.
+- **`sit reset --hard <ref>`** — move the current branch's ref to `<ref>` (branch / tag / commit hex) and materialize the target commit's tree into the working directory. Uses the existing `resolve_hash` + `materialize_target` helpers shared with `sit checkout`. Status message: `HEAD reset --hard to <hex12>`.
+- **`sit show --stat`** — per-file diffstat instead of the full unified diff. Prints ` <path> | +<ins> -<del>` for each changed file, followed by a summary line ` N file(s) changed, I insertion(s)(+), D deletion(s)(-)`. Singular/plural noun handling matches git's convention. Re-uses `lcs_diff` to count without the hunk-grouping / context machinery — same algorithm, cheaper output path.
+- **New helper**: `print_file_stat(path, old_buf, old_len, new_buf, new_len, out_pair)` — writes `(ins, del)` into the caller's pair for running totals. Shared primitive for future `sit diff --stat` / `sit log --stat`.
+
+Command count: **17** (init, add, rm, branch, checkout, tag, merge, reset, config, fsck, commit, log, status, diff, show, cat-file, owl-file).
+
 ### v0.2.12 — Polish batch 2
 
 - **`sit log [-n <count>] [<ref>]`** — parse a proper flag+positional arg list. `-n <N>` caps output to N commits; positional ref (branch / tag / hash) replaces the HEAD hardcode as the walk's starting point. Combines with `--oneline`.
