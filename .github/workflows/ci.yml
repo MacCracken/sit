@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,13 +20,14 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep 'cyrius *= *"' cyrius.cyml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')}"
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')}"
           echo "Installing Cyrius $CYRIUS_VERSION"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
           mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
           cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
+          cp "$CYRIUS_DIR/scripts/cyrius" "$HOME/.cyrius/bin/cyrius" 2>/dev/null || true
           cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
           chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
@@ -37,7 +39,60 @@ jobs:
       - name: Build
         run: |
           mkdir -p build
-          cyrius build src/main.cyr build/${{ github.event.repository.name }}
+          cyrius build src/main.cyr build/sit
+          echo "sit: $(wc -c < build/sit) bytes"
+
+      - name: Verify ELF
+        run: xxd -l 4 build/sit | grep -q "7f45 4c46"
 
       - name: Test
-        run: cyrius test src/test.cyr
+        run: cyrius test tests/sit.tcyr
+
+      - name: Smoke — init + add + commit + log
+        run: |
+          export HOME=$GITHUB_WORKSPACE/ci-home
+          mkdir -p "$HOME"
+          demo=$(mktemp -d)
+          cd "$demo"
+          export SIT_AUTHOR_NAME="CI Runner"
+          export SIT_AUTHOR_EMAIL="ci@example.com"
+          "$GITHUB_WORKSPACE/build/sit" init
+          echo "hello, sit!" > greeting.txt
+          "$GITHUB_WORKSPACE/build/sit" add greeting.txt
+          "$GITHUB_WORKSPACE/build/sit" commit -m "smoke commit"
+          "$GITHUB_WORKSPACE/build/sit" log | head -5
+          "$GITHUB_WORKSPACE/build/sit" fsck
+
+      - name: Smoke — signed commit roundtrip
+        run: |
+          export HOME=$GITHUB_WORKSPACE/ci-home
+          demo=$(mktemp -d)
+          cd "$demo"
+          export SIT_AUTHOR_NAME="CI Runner"
+          export SIT_AUTHOR_EMAIL="ci@example.com"
+          "$GITHUB_WORKSPACE/build/sit" key generate
+          "$GITHUB_WORKSPACE/build/sit" init
+          echo "signed" > a.txt
+          "$GITHUB_WORKSPACE/build/sit" add a.txt
+          "$GITHUB_WORKSPACE/build/sit" commit -S -m "signed smoke"
+          "$GITHUB_WORKSPACE/build/sit" verify-commit
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check required files
+        run: |
+          MISSING=0
+          for f in README.md CHANGELOG.md VERSION LICENSE cyrius.cyml; do
+            if [ -f "$f" ]; then echo "  OK: $f"
+            else echo "  MISSING: $f"; MISSING=1; fi
+          done
+          exit $MISSING
+      - name: Verify version consistency
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "VERSION file: $VERSION"
+          grep -q "$VERSION" CHANGELOG.md || { echo "FAIL: version not in CHANGELOG.md"; exit 1; }
+          echo "Version consistent (cyrius.cyml pulls VERSION via \${file:VERSION})"

@@ -20,3 +20,4 @@ Decisions about sit — what we chose, the context, and the consequences we acce
 ## Index
 
 - [0001 — No FFI, first-party only](0001-no-ffi-first-party-only.md) — sit reimplements every layer in Cyrius rather than binding to libgit2/zlib/OpenSSL.
+- [0002 — Signed commits use a `sitsig` header, not `gpgsig`](0002-sitsig-not-gpgsig.md) — why sit signs with raw ed25519 via sigil instead of OpenPGP-armored signatures via GPG.

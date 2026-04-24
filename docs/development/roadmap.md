@@ -1,278 +1,63 @@
 # sit Development Roadmap
 
-> **v0.1.0** — Sovereign version control for Cyrius. Scaffold + `init` + `add` loop working; `sit commit` is the next move.
+> **v0.4.0** — First official release. Local multi-branch VCS with signed commits and local-path wire protocol. Single cut; all pre-release iteration rolls into this tag.
 
-## Completed
+Forward-looking backlog lives below. Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHANGELOG.md`](../../CHANGELOG.md) for the tagged artifact.
 
-### v0.1.0
+## Released
 
-- Initial project scaffold via `cyrius init sit` — stdlib baseline, test/bench/fuzz harnesses, CI workflows.
-- `cyrius.cyml` dep layout following yukti conventions — sakshi 2.1.0, sankoch 2.0.1, sigil 2.9.1, patra 1.5.5 git-tag pinned. Expanded stdlib list to cover transitive reach of the git deps (cyrius 5.6.x has no transitive resolution; 5.7.x targeted).
-- `sit init` — creates git-parity `.sit/{HEAD,objects,refs/heads}` layout; HEAD is `ref: refs/heads/main\n`; idempotent re-init.
-- `sit add <path>` — sigil SHA-256 object IDs, sankoch zlib compression, loose-object storage at `.sit/objects/<hex[0:2]>/<hex[2:64]>`. Framing is `"blob <len>\0<content>"` — hashes are byte-identical to git's SHA-256 object format for the same content. Plaintext staging index at `.sit/index`.
-- Documentation scaffold: `docs/{adr,architecture,guides,examples,development}/`.
-- ADR 0001 — no FFI, first-party only.
-- Arch 001 — `args.cyr` post-return stack memory quirk (Cyrius stdlib).
-- Arch 002 — loose-file objects until patra grows `COL_BYTES` (patra keeps `COL_BLOB` as an alias for the habit crowd).
+### v0.4.0 — first official release
 
-### v0.1.1
+The local VCS loop is complete end-to-end, with ed25519 signing and a local-path fetch/push protocol.
 
-- **`sit cat-file <hash>`** — plumbing read command. Decompresses an object, strips framing, writes content to stdout. Supports 4-char-minimum hash prefixes via `dir_list` scan of `.sit/objects/<xx>/`. Reports ambiguous / no-match / too-short errors with distinct exit messages.
-- **`sit owl-file <hash>`** — decorated viewer. Resolves the object, writes content to `/tmp/sit-owl-<hash[0:12]>`, execs [owl](https://github.com/MacCracken/owl) via `exec_vec` at `/usr/local/bin/owl` → `/usr/bin/owl` → `/opt/owl/bin/owl`. Transparent fallback to raw content when owl is not installed (owl is currently pre-1.0 per its own roadmap).
-- Internal helpers: `object_path()`, `resolve_hash()`, `read_object()`, `find_owl()`, `resolve_and_read()` shared by both read commands.
+**Core object model**
+- `sit init` creates a git-parity `.sit/{HEAD,objects.patra,refs/heads}` layout.
+- Objects are SHA-256-hashed (sigil) and zlib-compressed (sankoch), framed `"<type> <len>\0<content>"` — byte-compatible with git's SHA-256 object format for identical content.
+- Storage is patra-backed: `.sit/objects.patra` (`objects(hash STR, ty INT, content BYTES)`) + `.sit/index.patra` (`entries(path STR, hash_hex STR)`). Legacy plaintext/loose layouts auto-migrate on first access.
+- Trees are recursive with `40000` dir + `100644` file modes, byte-matching git's SHA-256 tree format. `flatten_tree` / `read_head_tree_entries` give flat views for status/diff.
 
-### v0.1.2 — `sit commit`
+**Commands (19)**
+- Write: `init`, `add [-f]`, `rm [--cached]`, `commit [-S] [-m]`, `reset [--hard]`, `merge [--abort]`, `branch [-d]`, `checkout [-b]`, `tag [-d]`, `config [--global|--list|--unset]`, `key generate|show`, `remote add|list|remove`, `fetch`, `push`.
+- Read: `log [--oneline] [-n] [<ref>]`, `status`, `diff [--staged|<commit>|<c1> <c2>]`, `show [--stat] [<hash>]`, `cat-file`, `owl-file`, `fsck`, `verify-commit`.
 
-- **`sit commit [-m] <message>`** — writes a tree object from the staging index plus a commit object, and atomically updates `.sit/refs/heads/main`. Supports both positional (`sit commit "msg"`) and `-m` forms.
-- **Refactor**: `write_blob_object` now delegates to a type-agnostic `write_typed_object(type, type_len, content, content_len)` — same primitive drives blob, tree, and commit writes. Blob hashes unchanged (verified via regression).
-- **Tree format** is git-SHA-256 compatible: `<mode> <name>\0<32 raw hash bytes>` entries, sorted by name. Mode fixed at `100644` for v0.2 (no exec-bit detection). Verified byte-by-byte against `xxd` output.
-- **Commit format** is git-compatible: `tree <hex>\n[parent <hex>\n]author ... committer ... \n<message>\n`. Author/email from `SIT_AUTHOR_NAME` / `SIT_AUTHOR_EMAIL` env, fallback `"sit user" <user@localhost>`. Timestamp via `clock_epoch_secs()`, timezone fixed at `+0000`.
-- **Dedup on stage**: `sit add foo.txt; sit add foo.txt; sit commit` produces a tree with one `foo.txt` entry (last hash wins), not two.
-- **Root-commit marker**: output reads `[main (root-commit) <hash>] <msg>` when no parent exists, `[main <hash>] <msg>` otherwise.
-- Arch 003 — subdirectory paths deferred to v0.3.0 (recursive trees); commit rejects nested paths with a clear error.
+**Signed commits (sigil/ed25519, no GPG)**
+- `sit key generate` → `~/.sit/signing_key` (32B seed hex, 0600) + `signing_key.pub`.
+- `sit commit -S` injects `sitsig <sig-hex> <pub-hex>\n` between `committer` and the message separator. Signed payload is the body *without* the sitsig line (self-consistent like git's `gpgsig`).
+- `sit show` / `sit log` auto-decorate with `Signature: good|BAD (key <hex12>)` via a shared `print_commit_header`.
 
-### v0.1.3 — `sit log`
+**Merge**
+- Fast-forward when possible; otherwise 3-way with line-level diff3. Non-overlapping hunks auto-merge; overlapping edits fall back to conflict markers + `.sit/MERGE_HEAD`. Follow-on `sit commit` emits a 2-parent commit. `sit merge --abort` cancels.
 
-- **`sit log`** — walks `HEAD` → `refs/heads/main` → parent pointers, printing each commit in git-style format (`commit <hex>`, `Author: NAME <EMAIL>`, `Date: <ISO-8601>`, blank line, indented message). Uses `iso8601()` from the chrono stdlib for date rendering.
-- **Commit body parser** — line-based walk extracting `parent <hex>\n` and `author <line>\n`; `parse_author_line` splits the author identity (up to `>`) from the trailing timestamp and timezone. `print_indented_message` handles multi-line messages with git's 4-space indent convention.
-- **Fix**: `read_object` now sizes its decompression buffer from the compressed input (256× upper bound, capped at 16 MB) instead of unconditionally allocating 16 MB. The old code exhausted the bump allocator after ~15 calls — caught when walking a two-commit history segfaulted on the second `read_object`. Dynamic sizing lets `sit log` scale to arbitrarily long histories.
-- Handles empty repo ("no commits yet"), root commit (walk terminates when `parent_hex` stays 0), and multi-line commit messages (each physical line gets indented).
+**Wire protocol (local paths only)**
+- `sit remote add <name> <url>` writes to `.sit/config`; `file://` and bare paths are the only transports in this cut.
+- `sit fetch` walks remote refs, diffs against local object set, copies missing objects naively (no pack bundles).
+- `sit push` is the reverse direction; fast-forward only. Non-ff push rejected.
+- HTTP / SSH transports and pack bundles are explicit v0.5.x work.
 
-### v0.1.4 — `sit status` + tree reader
+**Config + identity**
+- `sit config [--global] <key> [<value>]`, `--list`, `--unset`. Local `.sit/config`, global `~/.sitconfig`.
+- Author chain: `SIT_AUTHOR_NAME` env → local config → global config → `"sit user"` fallback.
 
-- **`sit status`** — three-way diff across HEAD tree, staging index, and working directory. Reports "Staged for commit" (index vs HEAD), "Unstaged changes" (working vs index), and "Untracked files" (in working, absent from both index and HEAD). Emits `nothing to commit, working tree clean` when all three categories are empty.
-- **Tree reader**: `parse_tree(body, body_len)` walks `<mode> <name>\0<32 raw hash bytes>` entries and returns a vec of 24-byte entries holding `(mode_ptr, name_ptr, hash_hex_ptr)`. `read_head_tree_entries()` composes `read_main_ref` → `read_object` → tree-hash extraction → `parse_tree` in one call. Shared with future `sit diff` and (eventually) recursive-tree construction.
-- **Working-dir walker**: `list_working_files()` uses stdlib `dir_list` + `is_dir`, filters dotfiles (including `.sit/`) and directories. Paired with `hash_file_as_blob` — hashes a working-tree file through the same `"blob <len>\0<content>"` framing as `sit add` so index-vs-working comparisons are hash equality, not content comparison.
-- **Dedup at read time**: `cmd_status` sorts + dedupes the index (same helpers as `cmd_commit`) before walking it, so a path that was `sit add`'d twice appears once in status output. Without this the status output double-counted re-staged files.
-- **Deletion detection**: index entry whose path is missing in the working tree shows as `Unstaged changes: deleted: <path>`.
-- Covers nine scenarios: empty repo, untracked-only, staged-new, clean-after-commit, modified-unstaged, re-staged-after-modify, multi-mixed (staged + unstaged + untracked), deleted, outside-repo.
+**Tests**: 31 assertions — sigil SHA-256 known-answers, git-SHA-256 blob framing, hex encode/decode, sankoch zlib roundtrip, patra COL_BYTES small + 16KB overflow, ed25519 sign/verify roundtrip with bit-flip negatives.
 
-### v0.1.5 — `sit diff`
+**Deps**: cyrius 5.6.25, sakshi 2.1.0, sankoch 2.0.1, sigil 2.9.1, patra 1.6.0. Git-tag pinned. No FFI, no C, no libgit2 — see [ADR 0001](../adr/0001-no-ffi-first-party-only.md).
 
-- **`sit diff`** (default) — line-level diff of working tree vs staging index. For each index entry: hash the working file; if hashes differ (or the working file is missing), read both blobs and run an LCS-based diff.
-- **`sit diff --staged`** — index vs HEAD tree. Each index entry compared to HEAD's matching tree entry; entries absent from HEAD show as new-file insertions, entries whose HEAD hash differs from the index hash get a full line diff.
-- **LCS algorithm**: classical DP table, `lines_equal` for cell comparison, backtrace to produce an op-script (`keep` / `delete` / `insert`). Script is reversed before emission so output reads top-to-bottom. Capped at 16M cells (≈128 MB table) — larger files fall through with a clear message.
-- **Output**: `--- a/<path>` / `+++ b/<path>` header followed by the script with ` ` / `-` / `+` prefixes per line. No `@@` hunk headers in v0.2 — all context lines are printed; hunk grouping waits for a later pass.
-- **Primitives**: `split_lines`, `lines_equal`, `lcs_diff`, `print_file_diff`, `read_blob_content` (thin wrapper around `read_object` that returns just the content span). Reusable for future `sit show`, `sit blame`, etc.
-- Eight scenarios verified: clean repo, modified staged file, post-commit working divergence, `--staged` clean, `--staged` new-file adds, working deletion, multi-file mixed, outside-repo.
+## Backlog
 
-### v0.1.6 — Recursive trees
+### v0.5.0 — Network wire protocol
 
-- **`build_tree(entries, prefix_len)`** replaces `build_flat_tree`. Recursive writer that walks sorted index entries, groups consecutive entries sharing the next path segment, emits a subtree for each group, and produces the current level's tree with `40000` entries for directories and `100644` for files. Mode `40000` matches git's wire format (no leading zero for dirs).
-- **No custom sort comparator needed.** Lexical sort of full paths produces correct per-tree git order when walked depth-first: at any tree level, `name/` vs sibling `name.x` sorts identically under both byte-wise comparison of full paths and git's directory-trailing-`/` rule.
-- **`flatten_tree(hex, prefix, out)`** — recursive reader. Walks subtrees transparently; emits one flat entry per file with the full repo-relative path (e.g., `src/main.cyr`) in the `name` slot. `read_head_tree_entries` now composes this. Callers (`tree_find`, status, diff) don't change.
-- **`list_working_walk(prefix, fs_path, out)`** — recursive working-dir walker. Skips dotfiles (catches `.sit`, `.git`, `.env`). Emits full repo-relative paths matching the index/HEAD path convention.
-- **Arch 003 resolved.** `cmd_commit`'s flat-paths rejection is gone; `entries_have_subdirs` deleted; `sit add src/main.cyr && sit commit` works end-to-end.
-- Verified against an 8-test matrix with nested structure (`src/`, `src/lib/`, `docs/`): root tree has correct `100644 README.md / 40000 docs / 40000 src` layout (byte-verified via hexdump), status+diff see nested files correctly, log + commit chain work across subdirectory layouts.
-
-### v0.1.7 — Hunk grouping in `sit diff`
-
-- **`annotate_ops(ops)`** — tags each LCS op with `(old_line, new_line)` 1-indexed line numbers. `keep` advances both, `delete` advances only old, `insert` advances only new.
-- **`group_hunks(annotated, ctx)`** — canonical unified-diff hunk grouper. Buffers up to `ctx` recent keeps as leading context; extends a hunk while keeps-since-last-change stays `<= 2*ctx`; on the `(2*ctx)+1`-th keep, trims trailing keeps to `ctx` and starts the next hunk with the overshoot keep as new leading context. Default `ctx=3` matches git.
-- **`@@ -oldstart,oldlen +newstart,newlen @@`** headers emitted per hunk. `hunk_ranges` computes ranges by walking the hunk once (first-keep-or-delete → `old_start`; first-keep-or-insert → `new_start`; counts derive len). Pure-insertion hunks correctly print `-0,0` (new-file case).
-- Verified against six scenarios: mid-file single change, adjacent changes merged, far-apart changes split, start-of-file (0 leading context), end-of-file (0 trailing context), pure new-file insertion (`@@ -0,0 +1,N @@`).
-
-### v0.1.8 — `sit show`
-
-- **`sit show [<hash>]`** — prints a single commit: log-style header (author, date, indented message) + diff against parent. No-arg defaults to HEAD; accepts any hash prefix ≥ 4 chars via `resolve_hash`.
-- **Refactor**: extracted `parse_commit_body(body, len, out)` (56-byte struct: tree_hex, parent_hex, author identity + ts + tz, msg_start) and `print_commit_header(hex, info, body, len)` from the inline `cmd_log` logic. Both `cmd_log` and `cmd_show` now compose them.
-- **`commit_tree_entries(commit_hex)`** — loads a commit → its tree → flattened entries vec. Used for both "this commit's files" and "parent commit's files" in the diff pass.
-- **Diff pass**: walk new entries (emit new-file diff for paths missing from parent, modified diff for differing hashes) then walk old entries (emit deletion diff for paths missing from new). Each file goes through `print_file_diff` so hunk grouping applies uniformly.
-- Verified against seven scenarios: empty repo, root commit (new-file hunks, `@@ -0,0 +1,N @@`), modification commit (hunk-grouped diff), hash-prefix resolution, multi-file commit (two files, two diffs), bad hash, outside-repo.
-
-### v0.1.9 — `sit rm` + staged deletions
-
-- **`sit rm [--cached] <path>`** — removes `<path>` from the staging index and (unless `--cached`) from the working tree. Errors with `'<path>' is not tracked` if the path is neither in the index nor HEAD's tree.
-- **`rewrite_index(entries)`** — truncates and re-serializes `.sit/index` from a vec of entries. Handles the zero-entries case by writing an empty file. First index-mutating helper; opens the door for future unstage/reset commands.
-- **`cmd_status` HEAD-walk**: files in HEAD but not in the index now render as `Staged for commit: deleted: <path>`. Covers both `sit rm <path>` (working also gone) and `sit rm --cached <path>` (working retained but untracked, HEAD entry triggers the flag).
-- **`cmd_diff --staged` HEAD-walk**: same logic, emits full-file `@@ -1,N +0,0 @@` deletion diffs for index-absent HEAD paths.
-- **`cmd_diff` path corrected**: early-return on empty index moved past the HEAD-deletion pass so `sit diff --staged` works even when every file is rm'd.
-- Verified against six scenarios: rm-untracked error, rm-tracked end-to-end (working + index + status + diff), commit-then-verify-tree-omits-file, `--cached` semantics (status correctly separates Staged-deleted from Untracked since HEAD still contains the on-disk file), rm of an already-manually-deleted file.
-
-### v0.1.10 — `.sitignore`
-
-- **`.sitignore`** at the repo root, read by `load_sitignore()`. Blank lines and `#`-comments are skipped; trailing `/` on a pattern is stripped (directory-only hints not enforced in v1).
-- **`glob_match(pat, name)`** — recursive single-segment glob matcher with `*` (any run) and `?` (exactly one char). Operates on a single segment so `*` never crosses `/`.
-- **`is_ignored(path, patterns)`** — segment-level check: a pattern without `/` matches any segment of the path. `build` ignores `build/`, `src/build/`, and `lib/build/foo.cyr` alike — simple and matches the 80% use case. Anchored (`/build`) and path-patterns (`src/build`) are v2.
-- **`list_working_walk` behavior change**: previously skipped all dotfiles blanket-style. Now only hardcodes `.sit/`; everything else is included unless matched by a pattern. Ignored *directories* aren't descended into (no wasted I/O on `node_modules`/`build`).
-- **`cmd_add`** now rejects ignored paths with `sit: '<path>' matches a .sitignore pattern` — git's behavior, without `-f` override yet.
-- **`.sitignore` is itself trackable** — not auto-ignored; users `sit add .sitignore` normally.
-- Verified against ten scenarios: dotfile visibility without `.sitignore`, `.env`/`build`/`*.log`/`*.tmp` ignore patterns, nested-dir non-recursion, `sit add` rejection, tree omits ignored files on commit, `*` boundary (`*.log` vs `logfile`), `?` single-char semantics, blank/comment lines, empty `.sitignore`.
-
-### v0.1.11 — `sit diff HEAD`
-
-- **`sit diff HEAD`** — working tree vs HEAD tree, skipping the index. Complements the existing `sit diff` (working vs index) and `sit diff --staged` (index vs HEAD): diff HEAD is `diff + diff --staged` combined into one view, answering "what's the total change since my last commit?".
-- Walks HEAD entries: modified files → line diff; missing files → full-deletion diff. Then walks `list_working_files()` (which already respects `.sitignore`): paths not in HEAD → full-addition diff.
-- Pre-req for owl's gutter-marker integration — owl will call this per file to paint changed lines.
-- Verified against six scenarios: clean tree, combined staged+unstaged change (shows both), working-deletion, untracked-file addition, `.sitignore` respected for new files, no-commits-yet repo (HEAD-empty → all working files shown as additions).
-
-### v0.2.0 — HEAD-aware branch resolution
-
-- **`read_head_ref_path()`** — parses `.sit/HEAD` as `ref: refs/heads/<branch>\n`, returns the ref path ("refs/heads/main") or 0 on detached/malformed HEAD.
-- **`read_head_ref()`** + **`write_head_ref(hex)`** — compose the ref path with `.sit/` to read/write the branch's commit hex. Drop-in replacements for the old `read_main_ref` / `write_main_ref` hardcodes.
-- **`current_branch_name()`** — strips `refs/heads/` prefix off the ref path for display. Falls back to `(detached)` for non-branch HEAD.
-- **Everywhere-refactor**: `cmd_commit`, `cmd_log`, `cmd_status`, `cmd_show`, `cmd_diff`, and `read_head_tree_entries` all route through the new helpers. Status's `On branch main\n` and commit's `[main ...]` are now dynamic.
-- Verified against seven scenarios: main-branch regression, manual HEAD retarget to `dev`, commit lands on correct ref (main untouched), log follows active branch, switch back via HEAD edit, new-branch creation by committing with HEAD pointing at a nonexistent ref (creates `refs/heads/<name>` on write), malformed HEAD shows `(detached)` and commit errors out cleanly.
-
-### v0.2.1 — `sit branch` + `sit checkout`
-
-- **`sit branch`** (no args) — lists branches at `.sit/refs/heads/`, alphabetically sorted, current one prefixed with `* `. Uses new `sort_cstrings` helper (insertion-sort over a cstring vec).
-- **`sit branch <name>`** — creates `.sit/refs/heads/<name>` pointing at HEAD's current commit. Errors if branch already exists or if no commits exist yet.
-- **`sit checkout <branch>`** — switches to target branch. Full flow:
-    1. Resolve target ref path + read its commit hex.
-    2. No-op if already on target.
-    3. Dirty check via `is_dirty()` — blocks if index differs from HEAD or working differs from index.
-    4. Collision check — any untracked working file that the target tree contains → error ("would be overwritten").
-    5. Delete files present in current HEAD tree but not in target.
-    6. Write target tree's blob content to working paths, creating parent dirs via `ensure_dirs_for`.
-    7. Rewrite `.sit/index` to exactly match target tree (hex→raw bytes via `hex_decode`).
-    8. Update `.sit/HEAD` via `set_head_ref(target_ref)`.
-- **`is_dirty()`** — factors the dirty detection used by checkout; reuses `parse_index` + `read_head_tree_entries` + `hash_file_as_blob` in the same pattern as `cmd_status`.
-- **`ensure_dirs_for(path)`** — `mkdir -p`-style helper walking the path and `ensure_dir`-ing each prefix at each `/`.
-- **`set_head_ref(ref_path)`** — writes `ref: <ref_path>\n` to `.sit/HEAD`. Used by checkout; probably also by future `sit checkout -b`.
-- Verified against 13 scenarios: empty-branch-list (no commits), list-with-just-main, create-dev, checkout dev (materialize), checkout main (cleanup dev-only files), roundtrip, dirty blocking, clean allows, bad-branch error, dup-branch error, untracked collision, nested-dir create/delete across branches, log-follows-active-branch.
-
-### v0.2.3 — Polish batch: tags, `checkout -b`, `add -f`
-
-- **`sit tag`** — lightweight refs at `.sit/refs/tags/<name>`. `sit tag` lists alphabetically; `sit tag <name>` creates at HEAD; `sit tag <name> <hash-prefix>` creates at a resolved commit via `resolve_hash`. Ensures `.sit/refs/tags/` exists lazily. Duplicate-tag errors cleanly.
-- **`sit checkout -b <branch>`** — create-and-switch convenience. If the target branch doesn't exist, creates it at HEAD before running normal checkout. Errors if the branch already exists (matches git's behavior). Lets us collapse the `sit branch X && sit checkout X` two-step.
-- **`sit add -f <path>`** — force-add an ignored path. Skips the `is_ignored` check when `-f` is present. Non-ignored paths work the same with or without `-f`.
-- Verified against nine scenarios across all three features: empty tag list, tag-at-HEAD, tag-at-hash-prefix, duplicate-tag error, tag-hash-correctness, `checkout -b` creates+switches, `checkout -b` dup error, `add -f` overrides ignore, `add -f` on non-ignored path.
-
-### v0.2.4 — Ref resolution
-
-- **`resolve_ref_name(name, out_buf)`** — new helper. Resolves `HEAD`, `refs/tags/<name>`, and `refs/heads/<name>` in that order (git's precedence minus remotes). On success, writes the 64-char hash into the caller's buffer.
-- **`resolve_hash` chains through `resolve_ref_name`** before falling back to hash-prefix scanning. Net effect: anywhere sit used to accept a hash prefix (`cat-file`, `show`, `tag <name> <commit>`, future `log <rev>`), you can now pass `HEAD`, a tag name, or a branch name interchangeably.
-- Fixes UX gap flagged in v0.2.3: `sit show v0.1` no longer errors with "too short prefix" and instead resolves to the tagged commit.
-- Verified against eight scenarios: `show HEAD`, `show <tag>`, `show <branch>`, `show` on cross-branch tag, `show` on non-current branch, `cat-file <tag>`, short-name-as-tag beats too-short-prefix rule, empty-repo `show HEAD` returns cleanly.
-
-### v0.3.0 — Sigil signed commits
-
-- **`sit key generate`** — writes an ed25519 keypair to `~/.sit/signing_key` (32B seed, hex-encoded, chmod 0600) and `~/.sit/signing_key.pub` (32B pubkey, hex, 0644). Refuses to overwrite an existing private key; entropy sourced from `/dev/urandom` via sigil's `ed25519_generate_keypair`.
-- **`sit key show`** — prints the stored pubkey as 64-char hex. Foundation for future key-list / keyring semantics.
-- **`sit commit -S [-m] <msg>`** — signs the commit body with the `~/.sit/signing_key` seed. Inserts a `sitsig <128-hex-sig> <64-hex-pub>\n` line into the header block between `committer\n` and the blank line. Signed payload is the commit body *without* the sitsig line, so verification is a parse → strip → `ed25519_verify` cycle and the signature is self-consistent (same trick git uses for `gpgsig`). Works for both regular and merge commits.
-- **`sit verify-commit [<hash>]`** — resolves the commit, extracts the sitsig line, verifies against the embedded pubkey. Emits `good signature on <hex12> (key <full-hex>)`, `BAD signature on ...`, or `no signature on ...`. Exit 0 only on verified signatures.
-- **`sit show` / `sit log`** — grow a `Signature: good (key <hex12>)` / `Signature: BAD ...` header line when a commit is signed; silent when unsigned. Driven through the shared `print_commit_header` so every header-rendering path inherits the check.
-- **New helpers**: `signing_home_dir` / `signing_key_path` / `signing_pub_path` / `load_signing_seed` / `load_signing_pubkey` (path + IO), `sign_commit_body` (in-place sitsig injection), `extract_sitsig` (sitsig parser + body stripper), `verify_commit_body` (convenience wrapper returning 1/0/-1).
-- **Refactor**: `build_commit` and `build_merge_commit` now thin-wrap `*_signed` variants that take an optional 32-byte seed argument (0 = unsigned, matching legacy behavior). `cmd_commit` parses a flag vector instead of the old positional form — `-S`, `-m`, and positional message can appear in any order.
-- **Test coverage**: `tests/sit.tcyr` gains `test_ed25519_sign_verify_roundtrip` — fixed-seed keypair, known-message signature, bit-flip negative cases for both message and sig.
-- **Deliberately not GPG-compatible**: sigil uses ed25519 directly; no OpenPGP armor. The `sitsig` header name is chosen to make the difference obvious in `cat-file` output.
-
-Command count: **19** (previous 17 + `key`, `verify-commit`).
-
-### v0.2.13 — Polish batch 3
-
-- **`sit reset <path>`** — unstage: rewrite the index entry for `<path>` to HEAD's tree hash, or drop the entry entirely if HEAD doesn't have the path. Working tree is untouched. Same index-rewrite primitive (`rewrite_index`) as `sit rm`.
-- **`sit reset --hard <ref>`** — move the current branch's ref to `<ref>` (branch / tag / commit hex) and materialize the target commit's tree into the working directory. Uses the existing `resolve_hash` + `materialize_target` helpers shared with `sit checkout`. Status message: `HEAD reset --hard to <hex12>`.
-- **`sit show --stat`** — per-file diffstat instead of the full unified diff. Prints ` <path> | +<ins> -<del>` for each changed file, followed by a summary line ` N file(s) changed, I insertion(s)(+), D deletion(s)(-)`. Singular/plural noun handling matches git's convention. Re-uses `lcs_diff` to count without the hunk-grouping / context machinery — same algorithm, cheaper output path.
-- **New helper**: `print_file_stat(path, old_buf, old_len, new_buf, new_len, out_pair)` — writes `(ins, del)` into the caller's pair for running totals. Shared primitive for future `sit diff --stat` / `sit log --stat`.
-
-Command count: **17** (init, add, rm, branch, checkout, tag, merge, reset, config, fsck, commit, log, status, diff, show, cat-file, owl-file).
-
-### v0.2.12 — Polish batch 2
-
-- **`sit log [-n <count>] [<ref>]`** — parse a proper flag+positional arg list. `-n <N>` caps output to N commits; positional ref (branch / tag / hash) replaces the HEAD hardcode as the walk's starting point. Combines with `--oneline`.
-- **`sit diff <commit>`** — working tree vs an arbitrary commit's tree (generalizes the old `sit diff HEAD` path).
-- **`sit diff <c1> <c2>`** — tree-vs-tree comparison between arbitrary commits. Walks both trees, emits per-path diffs (modified / added-only-in-b / removed-only-in-a).
-- **`sit config --list`** — dumps all non-blank, non-comment lines from the target config file (local or `--global`).
-- **`sit config --unset <key>`** — removes the first matching `key = value` line. Returns non-zero if the key isn't present; preserves other lines including comments.
-- **New helpers**: `config_file_list`, `config_file_unset`. Both use the existing `config_parse_value` predicate for key matching, so tolerant of whitespace around `=`.
-
-### v0.2.11 — Polish batch
-
-- **`sit branch -d <name>`** — delete a branch ref. Errors if the branch doesn't exist or is the current HEAD's branch (no orphaning yourself). Same flow/path as the existing create/list verbs, just in front of the prefix-match path.
-- **`sit tag -d <name>`** — delete a tag ref. No "current tag" concept, so simpler than branch deletion.
-- **`sit log --oneline`** — compact output: `<hex12> <first line of message>\n` per commit. Factored `print_commit_oneline` helper alongside the existing `print_commit_header`. Subject-line extraction stops at the first `\n` after `msg_start`.
-- **`@@ -N +N,M @@` hunk abbreviation** — omit the `,1` when a hunk's count is exactly 1 (git's convention). Applied in `print_hunk_header`; covers new-file inserts (`+1 @@`), single-line mods (both sides), and single-line deletes.
-
-### v0.2.10 — Line-level 3-way merge (diff3-style)
-
-- **`three_way_line_merge(base, ours, theirs)`** — replaces the file-level 3-way for conflicting paths when base/ours/theirs all exist. Runs LCS twice (base vs ours, base vs theirs), extracts hunks, checks for overlap. Non-overlapping hunks → both sides' edits are applied in base line order into a new blob. Overlapping hunks → falls back to the v0.2.9 file-level conflict marker path.
-- **`extract_hunks(ops)`** — groups consecutive non-keep ops from an LCS script into hunks of `(base_start, base_end, replacement_lines)`. Reused across both sides.
-- **`hunks_overlap(h1, h2)`** — true iff base ranges share a line. Adjacent ranges (one ends where the other starts) do NOT overlap; same-position insert-only hunks DO overlap.
-- **`any_hunk_overlap(a, b)`** — O(n·m) scan. Trees are small enough that this is fine.
-- **Integration in `cmd_merge`**: when the file-level algorithm would mark a path as conflicting AND all three sides have content, attempts line-level merge first. Clean merge → `write_blob_object` produces a new blob, hash goes into the merged entries vec as usual. Dirty merge or any-side-missing → conflicts list, MERGE_HEAD flow from v0.2.9.
-- **Result**: two branches editing different parts of the same file (classic "feature touches line 2, main touches line 7") now auto-merge into a single commit with both edits. Previously this was a file-level conflict.
-- Verified against three scenarios: non-overlapping line edits (auto-merge with both), overlapping edits (file-level conflict fallback), post-merge cleanup via `--abort`.
-
-### v0.2.9 — MERGE_HEAD + conflict markers + `sit merge --abort`
-
-- **`.sit/MERGE_HEAD`** — written by `cmd_merge` when a file-level 3-way merge hits conflicts. Contains the target commit's hex. Read by `cmd_commit` on the next commit — if present, the commit is built with two parents (HEAD + MERGE_HEAD) and MERGE_HEAD is unlinked. Closes the "resolved merge commits lose a parent" gap from v0.2.8.
-- **Conflict-marker files in the working tree**: for each conflicting path, sit now writes the file as `<<<<<<< HEAD\n<ours content>\n=======\n<theirs content>\n>>>>>>> <branch>\n`. File-level granularity — both ours and theirs in full. Line-level diff3 is v0.3. User edits to resolve, `sit add`, `sit commit`.
-- **Auto-merged files** (clean paths in a conflicting merge) are materialized to working tree too, so subsequent status only flags the genuinely contested ones.
-- **`sit merge --abort`**: when a merge is in progress, restores the working tree + index to HEAD via `materialize_target`, then unlinks `.sit/MERGE_HEAD`. No-ops with an error message if no merge is in progress.
-- **`sit status` flag**: prints "Merge in progress. Resolve conflicts and commit, or run 'sit merge --abort'." when `MERGE_HEAD` exists.
-- **Commit header mode**: merge-resolving commits now print `[branch (merge) <hex>] <msg>` analogous to `(root-commit)`, so users can see at a glance what kind of commit just landed.
-- Verified against five scenarios: conflict → marker file → MERGE_HEAD set → status hints → resolve + commit produces 2-parent merge commit; abort restores HEAD content and clears MERGE_HEAD.
-
-### v0.2.8 — 3-way merge (file-level)
-
-- `sit merge <branch>` now handles divergent branches via file-level 3-way merge. For each path in the union of `(base, ours, theirs)` trees, picks a single resulting hash based on the standard triad:
-    - `base==ours==theirs` → unchanged
-    - one side unchanged vs base → take the modified side
-    - both sides converged on same hash → take either
-    - both sides modified differently → **conflict**
-- **`find_merge_base(a, b)`** — collects `a`'s ancestors into a vec, walks `b`'s chain, returns first match. Linear since sit commits have ≤2 parents and merge commits don't yet introduce cycles in practice.
-- **`build_merge_commit(tree, p1, p2, msg)`** — mirrors `build_commit` but emits two `parent <hex>\n` lines. Git-compatible format; `cat-file` on a merge commit shows both parents.
-- **`three_way_path_set(base, ours, theirs)`** — union of paths across three flat entry vecs with dedup.
-- **`tree_find_hash(entries, path)`** — convenience returning 0 when absent.
-- **Clean merges auto-commit**: message `Merge branch '<target>'`, `materialize_target` updates working tree + index.
-- **Conflicts**: prints the conflicted paths to stderr, exits 1, leaves HEAD unchanged. No `MERGE_HEAD` tracking yet — user resolves manually, subsequent commit will have HEAD as sole parent (known limitation noted in the error message).
-- Verified: fast-forward regression, non-conflicting 3-way (different files on each branch), conflicting 3-way, post-merge fsck clean (23 objects), merge-commit body has `parent <hex>` × 2 (cat-file verified).
-
-### v0.2.7 — `sit merge` (fast-forward) + cyrius 5.6.25
-
-- **`sit merge <branch>`** — fast-forward merge. Resolves the target via `resolve_hash` (accepts branch names, tag names, or commit prefixes). Four outcomes: `already up to date` (target == HEAD or is ancestor), `fast-forward to <hex>` (HEAD is ancestor of target → move branch ref, materialize target tree), dirty-tree block, or `branches have diverged` when neither is an ancestor.
-- **`is_ancestor(a, d)`** — linear parent-chain walk. Returns 1 if `a` equals `d` or any ancestor of `d`. Relies on sit having no merge commits (each commit has ≤1 parent).
-- **`materialize_target(hex)`** — extracted from `cmd_checkout`. Overwrites working tree + rebuilds index from a given commit's tree. Shared by checkout and fast-forward merge. Doesn't touch HEAD — caller owns the ref update.
-- **`cmd_checkout` now calls `materialize_target`** directly (DRY). ~60 lines of duplicated tree-materialization logic removed from the checkout body.
-- Verified against five scenarios: fast-forward, already-up-to-date, divergent-error, branch-not-found, fsck-clean-after-merge.
-
-- **Toolchain bump to cyrius 5.6.25**. 5.6.22 had a scalar-local clobber bug where i64 locals (ints + pointers) got corrupted across deep call chains (notably any path through `patra_insert_row`). 5.6.23 identified the issue, 5.6.24 shipped the fix in the asm backend, 5.6.25 is a subsequent release we verified. sit builds clean against 5.6.25 with no source-level workarounds — the slot-based pattern we'd prototyped (`var x_slot[8]; store64 / load64`) is not needed in the final code.
-
-### v0.2.6 — Objects migrate to patra (arch 002 fully resolved)
-
-- **`.sit/objects.patra`** — `objects(hash STR, ty INT, content BYTES)` replaces the loose `.sit/objects/<xx>/<yy...>` file tree. Every sit object (blob, tree, commit) is now a row; `content` is the zlib-compressed framed bytes, same on-the-wire shape as the old loose files. `ty` is a small INT (0=blob / 1=tree / 2=commit) kept for future GC / stats filtering even though it's redundant with the framing prefix.
-- **`object_db_open()`** — idempotent `CREATE TABLE` on every call; patra's "table exists" error on second+ call is silently swallowed. Returns the db handle.
-- **`object_db_migrate_from_loose(db)`** — walks `.sit/objects/<xx>/<yy...>`, decompresses each, sniffs type from the framing, `patra_insert_row`s it, `sys_unlink`s the loose file, then `sys_rmdir`s the now-empty 2-char bucket. Triggered at the top of `read_object` / `resolve_hash` / `cmd_fsck` — any code path that might need an object.
-- **`write_typed_object`** rewritten: frame + hash + compress as before, then content-addressed upsert — `SELECT hash FROM objects WHERE hash = '...'` to skip duplicate inserts, otherwise `patra_insert_row`. Same write-once semantics as the old store.
-- **`read_object`** rewritten: `SELECT content FROM objects WHERE hash = '...'`, `patra_result_get_bytes_len` + `patra_result_read_bytes` for the compressed payload, then existing `zlib_decompress` + framing-null scan. Same 24-byte output struct.
-- **`resolve_hash`** prefix path rewritten: `WHERE hash LIKE 'abcd%'`. Count-of-rows drives match/ambiguous/no-match return.
-- **`cmd_fsck`** rewritten: snapshot hashes via `SELECT hash FROM objects`, close the db, then call `read_object` per hash (each does its own open/close). Keeps two simultaneous patra handles off the same file.
-- **CLAUDE.md's thesis met**: sit now uses "patra-backed objects and sigil-hashed refs" top to bottom. No loose files, no plaintext index, no side-channel storage.
-- Perf: re-benchmarked against git on init / add-small / commit-20 — all three stay faster than git (0.40× / 0.83× / 0.49×). Patra open/close per command adds modest overhead; sit's single-static-binary startup advantage still dominates.
-- Verified against seven scenarios: fresh init+add+commit (no loose files produced), nested subdir commits, log+show+cat-file through patra, fsck across 10 objects, branch+checkout roundtrip with materialization, tag + ref resolution via LIKE query, legacy loose-files migration on fsck.
-
-### v0.2.5 — Staging index migrates to patra
-
-- Patra 1.6.0 ships with `COL_BYTES` and its prerequisites (`patra_insert_row`, `patra_result_read_bytes`). sit's first real patra consumer is the staging index.
-- **`.sit/index.patra`** — single-table schema `entries(path STR, hash_hex STR)`. Replaces the plaintext `.sit/index` appended by `file_append_locked` in prior versions.
-- **`index_db_open()`** — opens the patra db and ensures the `entries` table exists (CREATE is idempotent; patra returns a cheap error on second call, which we ignore).
-- **`index_migrate_from_plaintext(db)`** — on first read of any repo that still has the old plaintext `.sit/index`, parse it line-by-line and `patra_insert_row` each entry, then `sys_unlink` the old file. Transparent to the user — first `sit status` after upgrade does the migration.
-- **`parse_index()`** now walks `SELECT path, hash_hex FROM entries`; reallocates rows into the same 40-byte `(hash_bytes, path_ptr)` layout the rest of sit already uses, so no call-site changes outside the parser.
-- **`rewrite_index(entries)`** now `DELETE FROM entries; patra_insert_row(...)` per row. Same external contract — truncate + re-serialize — different backing store.
-- **`index_upsert(hash_hex, path)`** new helper, replaces `cmd_add`'s inline `file_append_locked`. Loads current entries, filters out any row matching the path, appends the new entry, rewrites. Same last-write-wins semantics as the old append-then-dedupe-at-commit dance, but the index now holds at most one row per path at rest.
-- Required toolchain bump: `cyrius = "5.6.22"` (5.6.21 had a sankoch mutex regression that hung `zlib_compress`; 5.6.22 fixes it).
-- Verified against five scenarios: fresh add + commit flow, add + rm workflow, cross-branch checkout round-trip, legacy plaintext auto-migration, clean-tree status.
-
-### v0.2.2 — `sit config` + `sit fsck`
-
-- **`sit config [--global] <key> [<value>]`** — flat `key = value` format, git-compatible priority chain for author identity (`SIT_AUTHOR_NAME` env → `.sit/config` → `~/.sitconfig` → `"sit user"` fallback). Get mode returns the value and exits 0; set mode upserts (replaces the first matching line or appends, preserving comments and blanks).
-- **`config_parse_value`, `config_file_get`, `config_get`, `config_file_set`** helpers — the file walker tolerates arbitrary whitespace around `=`, skips `#`-comments and blanks, preserves surrounding lines on write. `skip_ws(data, pos, stop)` utility for whitespace runs.
-- **`build_commit` author fallback chain updated** — env first (matches git), then config, then the hardcoded fallback.
-- Verified against nine scenarios: missing-key exit 1, set-then-get, set-existing-replaces, commit uses config when env unset, env overrides config, `--global` set/get, local-beats-global, comments+blanks preserved through set, usage error.
-- **`sit fsck`** — walks every `.sit/objects/<xx>/<yy...>`, decompresses, re-hashes via `hash_data` over the framed bytes, compares to the filename. Reports `bad object <hex>` for hash mismatches and `unreadable <hex>` for decompression / read failures. Exit 1 if any bad object found. Emits `checked <n> objects, <m> bad` summary on stdout.
-- Verified against four scenarios: empty repo (0 objects), populated repo (8 objects clean after two commits), corrupted object (GARBAGE overwrite detected as unreadable), missing object file (detected).
-
-## Post-0.1 Backlog
+- **HTTP transport** — sit-native JSON/REST (not git-wire-compatible). Likely shape: `GET /sit/v1/refs`, `GET /sit/v1/object/<hash>`, `POST /sit/v1/refs/<name>`, `POST /sit/v1/object`. Server is a thin patra-to-HTTP translator.
+- **SSH transport** — run `sit-upload-pack` / `sit-receive-pack` over stdin/stdout (same pattern as git).
+- **Pack bundles** — batch object transfer using sankoch delta primitives once patra grows the supporting storage. Reduces per-object network chatter.
+- **Clone / pull** — trivial compositions of fetch + checkout + merge once the transport lands.
 
 ### Longer horizon
 
-- **Pack format** — delta-compressed multi-object storage; depends on `COL_BYTES` and sankoch delta primitives.
-- **Wire protocol** — first-party smart-HTTP / ssh replacement. Not on the AGNOS critical path; revisit once the local VCS loop is solid.
-- **Merge** — 3-way merge with conflict markers. Needs a merge-base finder (walk commit ancestors to find LCA) and per-file three-way text merge.
-- **Signed commits** — sigil-backed signatures on commit objects.
-- **Integration tests in-tree** — promote the shell-level smoke tests from `docs/guides/getting-started.md` into `tests/` with fixtures. Current `tests/sit.tcyr` is stdlib-assert smoke only.
-- **`sit fsck` reachability** — walk commit chain, flag dangling objects (current v0.2.2 only checks integrity, not reachability).
-- **Hunk-grouping polish** — handle the `@@ -N +N,M @@` one-line-count abbreviation.
+- **Nested branch names** — `sit branch feature/foo` and `sit checkout -b feature/foo` currently fail because `.sit/refs/heads/feature/` isn't auto-created. `write_head_ref` / `write_branch_ref` need to `ensure_dir` on the parent path of the target ref file. Affects tag refs symmetrically.
+- **`sit merge -S`** — `cmd_merge` already routes through `build_merge_commit_signed`, but the command doesn't parse a `-S` flag and always passes `seed=0`. Add flag parsing + seed load; symmetric to `cmd_commit -S`.
+- **`sit fsck` reachability** — walk commit chain and flag dangling objects (current implementation checks integrity but not reachability).
 - **Full `.sitignore` semantics** — negation (`!pattern`), double-star (`**`), character classes (`[abc]`), anchored patterns (`/foo`), path patterns (`foo/bar`).
+- **`sit log --graph`** — ASCII DAG for merge history.
+- **Shallow clone** — `--depth N` limits to N commits back from HEAD.
+- **Integration tests in-tree** — promote the shell-level scenarios from `docs/guides/getting-started.md` into `tests/` with fixtures. Current `tests/sit.tcyr` is primitive-assert smoke only.
+- **sandhi migration** — cyrius 5.7.0 ships a first-party `sandhi` stdlib crate; migrate `cyrius.cyml`'s inline `stdlib = [...]` list when the release is out. Transitive dep resolution in the same release should also let us drop the expanded `thread`/`freelist`/`bigint`/`ct`/`keccak` entries.

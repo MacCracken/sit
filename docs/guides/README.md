@@ -4,7 +4,9 @@ How-to material for working on or with sit. Task-oriented. If a reader has a cle
 
 ## Index
 
-- [Getting started](getting-started.md) — build sit from source and run your first `sit init`.
+- [Getting started](getting-started.md) — build sit from source, run your first `sit init`, and walk every shipped command (init/add/commit/log/status/diff/show/merge/branch/checkout/tag/reset/config/fsck/cat-file/owl-file/key/verify-commit).
+
+For an end-to-end *runnable* script covering the same ground in one go, see [`../examples/local-vcs-loop/`](../examples/local-vcs-loop/).
 
 ## What doesn't belong here
 
