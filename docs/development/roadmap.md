@@ -146,6 +146,16 @@
 - Fixes UX gap flagged in v0.2.3: `sit show v0.1` no longer errors with "too short prefix" and instead resolves to the tagged commit.
 - Verified against eight scenarios: `show HEAD`, `show <tag>`, `show <branch>`, `show` on cross-branch tag, `show` on non-current branch, `cat-file <tag>`, short-name-as-tag beats too-short-prefix rule, empty-repo `show HEAD` returns cleanly.
 
+### v0.2.10 — Line-level 3-way merge (diff3-style)
+
+- **`three_way_line_merge(base, ours, theirs)`** — replaces the file-level 3-way for conflicting paths when base/ours/theirs all exist. Runs LCS twice (base vs ours, base vs theirs), extracts hunks, checks for overlap. Non-overlapping hunks → both sides' edits are applied in base line order into a new blob. Overlapping hunks → falls back to the v0.2.9 file-level conflict marker path.
+- **`extract_hunks(ops)`** — groups consecutive non-keep ops from an LCS script into hunks of `(base_start, base_end, replacement_lines)`. Reused across both sides.
+- **`hunks_overlap(h1, h2)`** — true iff base ranges share a line. Adjacent ranges (one ends where the other starts) do NOT overlap; same-position insert-only hunks DO overlap.
+- **`any_hunk_overlap(a, b)`** — O(n·m) scan. Trees are small enough that this is fine.
+- **Integration in `cmd_merge`**: when the file-level algorithm would mark a path as conflicting AND all three sides have content, attempts line-level merge first. Clean merge → `write_blob_object` produces a new blob, hash goes into the merged entries vec as usual. Dirty merge or any-side-missing → conflicts list, MERGE_HEAD flow from v0.2.9.
+- **Result**: two branches editing different parts of the same file (classic "feature touches line 2, main touches line 7") now auto-merge into a single commit with both edits. Previously this was a file-level conflict.
+- Verified against three scenarios: non-overlapping line edits (auto-merge with both), overlapping edits (file-level conflict fallback), post-merge cleanup via `--abort`.
+
 ### v0.2.9 — MERGE_HEAD + conflict markers + `sit merge --abort`
 
 - **`.sit/MERGE_HEAD`** — written by `cmd_merge` when a file-level 3-way merge hits conflicts. Contains the target commit's hex. Read by `cmd_commit` on the next commit — if present, the commit is built with two parents (HEAD + MERGE_HEAD) and MERGE_HEAD is unlinked. Closes the "resolved merge commits lose a parent" gap from v0.2.8.

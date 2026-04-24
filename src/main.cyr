@@ -1683,6 +1683,182 @@ fn set_head_ref(ref_path) {
     return 0;
 }
 
+# Extract hunks from an LCS op-script. A hunk groups consecutive
+# non-keep ops (deletes and/or inserts) and records the base line range
+# it covers along with the replacement lines from the other side.
+#
+# Hunk layout (24 bytes):
+#   [0..8)   base_start (inclusive base line index)
+#   [8..16)  base_end   (exclusive base line index)
+#   [16..24) replacement lines vec (each element is a line-tuple pointer)
+fn extract_hunks(ops) {
+    var hunks = vec_new();
+    var n = vec_len(ops);
+    var i = 0;
+    var base_pos = 0;
+    var in_hunk = 0;
+    var hunk_start = 0;
+    var hunk_inserts = 0;
+
+    while (i < n) {
+        var op = vec_get(ops, i);
+        var kind = load64(op);
+        var line = load64(op + 8);
+
+        if (kind == 0) {
+            # Keep — close any open hunk
+            if (in_hunk == 1) {
+                var h = alloc(24);
+                store64(h, hunk_start);
+                store64(h + 8, base_pos);
+                store64(h + 16, hunk_inserts);
+                vec_push(hunks, h);
+                in_hunk = 0;
+            }
+            base_pos = base_pos + 1;
+        }
+        else {
+            if (in_hunk == 0) {
+                in_hunk = 1;
+                hunk_start = base_pos;
+                hunk_inserts = vec_new();
+            }
+            if (kind == 1) { base_pos = base_pos + 1; }
+            else { vec_push(hunk_inserts, line); }
+        }
+        i = i + 1;
+    }
+
+    if (in_hunk == 1) {
+        var h = alloc(24);
+        store64(h, hunk_start);
+        store64(h + 8, base_pos);
+        store64(h + 16, hunk_inserts);
+        vec_push(hunks, h);
+    }
+    return hunks;
+}
+
+# Two hunks overlap iff their base ranges share at least one line OR both
+# are insert-only hunks (0-length base ranges) at the same base position.
+fn hunks_overlap(h1, h2) {
+    var s1 = load64(h1);
+    var e1 = load64(h1 + 8);
+    var s2 = load64(h2);
+    var e2 = load64(h2 + 8);
+    # Adjacent ranges (e1 == s2 OR e2 == s1) do NOT overlap.
+    if (e1 <= s2) {
+        if (e1 == s2) {
+            if (s1 == e1) { if (s2 == e2) { return 1; } }
+            return 0;
+        }
+        return 0;
+    }
+    if (e2 <= s1) { return 0; }
+    return 1;
+}
+
+# Scan two hunk lists; return 1 if any pair overlaps.
+fn any_hunk_overlap(hunks_a, hunks_b) {
+    var na = vec_len(hunks_a);
+    var nb = vec_len(hunks_b);
+    var i = 0;
+    while (i < na) {
+        var j = 0;
+        while (j < nb) {
+            if (hunks_overlap(vec_get(hunks_a, i), vec_get(hunks_b, j)) == 1) { return 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Append a line-tuple's bytes + "\n" into `buf` starting at `pos`. Returns
+# the new position.
+fn append_line_to_buf(buf, pos, line_tup) {
+    var lp = load64(line_tup);
+    var ll = load64(line_tup + 8);
+    memcpy(buf + pos, lp, ll);
+    store8(buf + pos + ll, 10);
+    return pos + ll + 1;
+}
+
+# Find a hunk in `hunks` whose base_start == b. Returns the hunk or 0.
+fn hunk_starting_at(hunks, b) {
+    var n = vec_len(hunks);
+    var i = 0;
+    while (i < n) {
+        var h = vec_get(hunks, i);
+        if (load64(h) == b) { return h; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Three-way line-level merge. Returns a heap pointer to merged content on
+# clean merge, or 0 on conflict. Writes the merged length into `out_len_ptr`.
+fn three_way_line_merge(base_buf, base_len, ours_buf, ours_len, theirs_buf, theirs_len, out_len_ptr) {
+    var base_lines = split_lines(base_buf, base_len);
+    var ours_lines = split_lines(ours_buf, ours_len);
+    var theirs_lines = split_lines(theirs_buf, theirs_len);
+
+    var ops_bo = lcs_diff(base_lines, ours_lines);
+    var ops_bt = lcs_diff(base_lines, theirs_lines);
+    if (ops_bo == 0) { return 0; }
+    if (ops_bt == 0) { return 0; }
+
+    var ours_hunks = extract_hunks(ops_bo);
+    var theirs_hunks = extract_hunks(ops_bt);
+
+    if (any_hunk_overlap(ours_hunks, theirs_hunks) == 1) { return 0; }
+
+    # Walk base; at each position, apply any starting hunk from either side.
+    var bn = vec_len(base_lines);
+    # Worst-case output size: base + ours_inserts + theirs_inserts + deletions
+    var cap = base_len + ours_len + theirs_len + 64;
+    var out = alloc(cap);
+    var pos = 0;
+
+    var b = 0;
+    while (b <= bn) {
+        var oh = hunk_starting_at(ours_hunks, b);
+        var th = hunk_starting_at(theirs_hunks, b);
+
+        if (oh != 0) {
+            var inserts = load64(oh + 16);
+            var ilen = vec_len(inserts);
+            var k = 0;
+            while (k < ilen) {
+                pos = append_line_to_buf(out, pos, vec_get(inserts, k));
+                k = k + 1;
+            }
+            b = load64(oh + 8);
+        }
+        else {
+            if (th != 0) {
+                var inserts = load64(th + 16);
+                var ilen = vec_len(inserts);
+                var k = 0;
+                while (k < ilen) {
+                    pos = append_line_to_buf(out, pos, vec_get(inserts, k));
+                    k = k + 1;
+                }
+                b = load64(th + 8);
+            }
+            else {
+                if (b < bn) {
+                    pos = append_line_to_buf(out, pos, vec_get(base_lines, b));
+                }
+                b = b + 1;
+            }
+        }
+    }
+
+    store64(out_len_ptr, pos);
+    return out;
+}
+
 # Write `.sit/MERGE_HEAD` pointing at the other-parent commit for an
 # in-progress merge. Next `sit commit` will read this and emit a 2-parent
 # commit, then unlink it.
@@ -2143,6 +2319,38 @@ fn cmd_merge() {
                 }
                 else {
                     result_h = theirs_h;
+                }
+            }
+        }
+
+        # Try line-level diff3 before declaring a file-level conflict.
+        # Applies when base/ours/theirs all exist AND hunks don't overlap.
+        if (needs_conflict == 1) {
+            if (base_h != 0) {
+                if (ours_h != 0) {
+                    if (theirs_h != 0) {
+                        var bp[16]; var op[16]; var tp[16];
+                        if (read_blob_content(base_h, &bp) == 0) {
+                            if (read_blob_content(ours_h, &op) == 0) {
+                                if (read_blob_content(theirs_h, &tp) == 0) {
+                                    var merged_len[8];
+                                    var merged_buf = three_way_line_merge(
+                                        load64(&bp), load64(&bp + 8),
+                                        load64(&op), load64(&op + 8),
+                                        load64(&tp), load64(&tp + 8),
+                                        &merged_len);
+                                    if (merged_buf != 0) {
+                                        # Line-level merge succeeded — write as a new blob
+                                        var new_hex = write_blob_object(merged_buf, load64(&merged_len));
+                                        if (new_hex != 0) {
+                                            result_h = new_hex;
+                                            needs_conflict = 0;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
