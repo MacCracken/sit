@@ -1,11 +1,86 @@
-# sit test suite
-# Stdlib auto-included via cyrius.toml
+# sit — test suite
+# Exercises the dep primitives sit's correctness rests on: sigil SHA-256,
+# sankoch zlib roundtrip, hex encode/decode, and git-SHA-256-framed blob
+# hashing. Stdlib + deps are auto-included via cyrius.cyml.
+
+fn test_sigil_hash_known_answer() {
+    test_group("sigil SHA-256 known answers");
+
+    # sha256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    var empty_hex = hash_data("", 0);
+    assert_streq(empty_hex,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "sha256 of empty string");
+
+    # sha256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+    var abc_hex = hash_data("abc", 3);
+    assert_streq(abc_hex,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "sha256 of 'abc'");
+    return 0;
+}
+
+fn test_blob_framing_git_compatible() {
+    test_group("git-SHA-256 blob framing");
+
+    # sit's blob format: "blob <len>\0<content>". Same as git-SHA-256.
+    # Expected: sha256(b"blob 12\0hello, sit!\n")
+    #         = 37f70a18b0d27d5dd912f6080063bf6fe10820814bccc4bcd13c67ce97c2a96c
+    var framed = alloc(32);
+    memcpy(framed, "blob 12", 7);
+    store8(framed + 7, 0);
+    memcpy(framed + 8, "hello, sit!\n", 12);
+    var hex = hash_data(framed, 20);
+    assert_streq(hex,
+        "37f70a18b0d27d5dd912f6080063bf6fe10820814bccc4bcd13c67ce97c2a96c",
+        "blob('hello, sit!\\n') matches git SHA-256");
+    return 0;
+}
+
+fn test_hex_roundtrip() {
+    test_group("hex encode / decode");
+
+    var src[4];
+    store8(&src, 0xDE);
+    store8(&src + 1, 0xAD);
+    store8(&src + 2, 0xBE);
+    store8(&src + 3, 0xEF);
+    var hex = hex_encode(&src, 4);
+    assert_streq(hex, "deadbeef", "encode 0xDEADBEEF");
+
+    var bytes = hex_decode("deadbeef", 8);
+    assert(bytes != 0, "decode returned non-null");
+    assert_eq(load8(bytes) & 0xFF, 0xDE, "byte 0");
+    assert_eq(load8(bytes + 1) & 0xFF, 0xAD, "byte 1");
+    assert_eq(load8(bytes + 2) & 0xFF, 0xBE, "byte 2");
+    assert_eq(load8(bytes + 3) & 0xFF, 0xEF, "byte 3");
+    return 0;
+}
+
+fn test_sankoch_zlib_roundtrip() {
+    test_group("sankoch zlib roundtrip");
+
+    var src = "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.";
+    var src_len = strlen(src);
+
+    var compressed = alloc(256);
+    var clen = zlib_compress(src, src_len, compressed, 256);
+    assert_gt(clen, 0, "compress returned positive length");
+    assert_lt(clen, src_len, "compressed is smaller than source");
+
+    var decompressed = alloc(256);
+    var dlen = zlib_decompress(compressed, clen, decompressed, 256);
+    assert_eq(dlen, src_len, "decompressed length matches source");
+    assert_eq(memeq(decompressed, src, src_len), 1, "decompressed bytes match source");
+    return 0;
+}
 
 fn main() {
     alloc_init();
-    test_group("smoke");
-    assert(1, "true is true");
-    assert_eq(1 + 1, 2, "math works");
+    test_sigil_hash_known_answer();
+    test_blob_framing_git_compatible();
+    test_hex_roundtrip();
+    test_sankoch_zlib_roundtrip();
     return assert_summary();
 }
 

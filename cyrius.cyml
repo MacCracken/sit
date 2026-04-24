@@ -39,6 +39,7 @@ stdlib = [
     "bigint",
     "ct",
     "keccak",
+    "bench",
 ]
 
 [deps.sakshi]

@@ -59,8 +59,62 @@ fn object_path(buf, hex) {
     return 78;
 }
 
-# Resolve a hex hash prefix (4-64 chars) to a full 64-char hash.
-# Writes null-terminated hash into out_buf (65 bytes) and returns:
+# Try to resolve `name` as a ref: HEAD, refs/tags/<name>, or refs/heads/<name>
+# in that order. On success, writes the 64-char hash into out_buf and returns 1.
+# Returns 0 if no ref matches.
+fn resolve_ref_name(name, out_buf) {
+    if (streq(name, "HEAD") == 1) {
+        var h = read_head_ref();
+        if (h == 0) { return 0; }
+        memcpy(out_buf, h, 64);
+        store8(out_buf + 64, 0);
+        return 1;
+    }
+
+    var name_len = strlen(name);
+
+    var tag_path = alloc(15 + name_len + 1);
+    memcpy(tag_path, ".sit/refs/tags/", 15);
+    memcpy(tag_path + 15, name, name_len);
+    store8(tag_path + 15 + name_len, 0);
+    if (file_exists(tag_path) == 1) {
+        var tfd = file_open(tag_path, 0, 0);
+        if (tfd >= 0) {
+            var tbuf = alloc(80);
+            var tn = file_read(tfd, tbuf, 80);
+            file_close(tfd);
+            if (tn >= 64) {
+                memcpy(out_buf, tbuf, 64);
+                store8(out_buf + 64, 0);
+                return 1;
+            }
+        }
+    }
+
+    var head_path = alloc(16 + name_len + 1);
+    memcpy(head_path, ".sit/refs/heads/", 16);
+    memcpy(head_path + 16, name, name_len);
+    store8(head_path + 16 + name_len, 0);
+    if (file_exists(head_path) == 1) {
+        var hfd = file_open(head_path, 0, 0);
+        if (hfd >= 0) {
+            var hbuf = alloc(80);
+            var hn = file_read(hfd, hbuf, 80);
+            file_close(hfd);
+            if (hn >= 64) {
+                memcpy(out_buf, hbuf, 64);
+                store8(out_buf + 64, 0);
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+# Resolve a reference: either a symbolic name (HEAD, tag, branch) or a hex hash
+# (full 64 chars or a prefix of 4+). Writes null-terminated hash into out_buf
+# (65 bytes) and returns:
 #    1  exact match
 #    0  no match
 #   -1  ambiguous
@@ -72,6 +126,10 @@ fn resolve_hash(prefix, out_buf) {
         store8(out_buf + 64, 0);
         return 1;
     }
+
+    # Try as a ref name first (HEAD, tags, branches)
+    if (resolve_ref_name(prefix, out_buf) == 1) { return 1; }
+
     if (plen < 4) { return 0 - 2; }
 
     var dir = alloc(32);

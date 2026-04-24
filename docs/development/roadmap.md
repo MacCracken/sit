@@ -139,6 +139,13 @@
 - **`sit add -f <path>`** — force-add an ignored path. Skips the `is_ignored` check when `-f` is present. Non-ignored paths work the same with or without `-f`.
 - Verified against nine scenarios across all three features: empty tag list, tag-at-HEAD, tag-at-hash-prefix, duplicate-tag error, tag-hash-correctness, `checkout -b` creates+switches, `checkout -b` dup error, `add -f` overrides ignore, `add -f` on non-ignored path.
 
+### v0.2.4 — Ref resolution
+
+- **`resolve_ref_name(name, out_buf)`** — new helper. Resolves `HEAD`, `refs/tags/<name>`, and `refs/heads/<name>` in that order (git's precedence minus remotes). On success, writes the 64-char hash into the caller's buffer.
+- **`resolve_hash` chains through `resolve_ref_name`** before falling back to hash-prefix scanning. Net effect: anywhere sit used to accept a hash prefix (`cat-file`, `show`, `tag <name> <commit>`, future `log <rev>`), you can now pass `HEAD`, a tag name, or a branch name interchangeably.
+- Fixes UX gap flagged in v0.2.3: `sit show v0.1` no longer errors with "too short prefix" and instead resolves to the tagged commit.
+- Verified against eight scenarios: `show HEAD`, `show <tag>`, `show <branch>`, `show` on cross-branch tag, `show` on non-current branch, `cat-file <tag>`, short-name-as-tag beats too-short-prefix rule, empty-repo `show HEAD` returns cleanly.
+
 ### v0.2.2 — `sit config` + `sit fsck`
 
 - **`sit config [--global] <key> [<value>]`** — flat `key = value` format, git-compatible priority chain for author identity (`SIT_AUTHOR_NAME` env → `.sit/config` → `~/.sitconfig` → `"sit user"` fallback). Get mode returns the value and exits 0; set mode upserts (replaces the first matching line or appends, preserving comments and blanks).
@@ -162,4 +169,3 @@
 - **`sit fsck` reachability** — walk commit chain, flag dangling objects (current v0.2.2 only checks integrity, not reachability).
 - **Hunk-grouping polish** — handle the `@@ -N +N,M @@` one-line-count abbreviation.
 - **Full `.sitignore` semantics** — negation (`!pattern`), double-star (`**`), character classes (`[abc]`), anchored patterns (`/foo`), path patterns (`foo/bar`).
-- **Tag resolution in `cat-file` / `log` / `show`** — `resolve_hash` currently doesn't consult `refs/tags/`, so `sit show v1.0` won't work. Small addition once we decide on ref-name vs hash-prefix disambiguation.

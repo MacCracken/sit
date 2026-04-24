@@ -270,7 +270,6 @@ file?.bak
 
 - Remote / push / pull / fetch / wire protocol
 - Merge, rebase
-- Tag resolution in `sit show`/`sit log` (tag refs exist but `sit show v1.0` won't find them yet)
 - Full gitignore semantics (no negation / `**` / char-classes yet)
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).

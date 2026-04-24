@@ -1,13 +1,122 @@
-# sit benchmarks
-# Stdlib auto-included via cyrius.toml
+# sit — benchmark harness
+# Measures throughput of the primitives sit's hot paths depend on: sigil
+# SHA-256 and sankoch zlib compress/decompress. Results go to stdout in
+# ns/op, ops/s, and MB/s where meaningful.
 
-fn bench_noop() { return 0; }
+fn fill_pseudo_random(buf, len) {
+    var i = 0;
+    while (i < len) {
+        store8(buf + i, (i * 2654435769 + i / 7) & 0xFF);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn bench_sigil_sha256(size, iters) {
+    var name_prefix = "sha256-";
+    var nb = alloc(32);
+    memcpy(nb, name_prefix, 7);
+    var digits = write_decimal(nb + 7, size);
+    memcpy(nb + 7 + digits, "B", 1);
+    store8(nb + 7 + digits + 1, 0);
+
+    var buf = alloc(size);
+    fill_pseudo_random(buf, size);
+
+    var b = bench_new(nb);
+    bench_batch_start(b);
+    var i = 0;
+    while (i < iters) {
+        hash_data(buf, size);
+        i = i + 1;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    return 0;
+}
+
+fn bench_sankoch_compress(size, iters) {
+    var nb = alloc(32);
+    memcpy(nb, "zlib-compress-", 14);
+    var digits = write_decimal(nb + 14, size);
+    memcpy(nb + 14 + digits, "B", 1);
+    store8(nb + 14 + digits + 1, 0);
+
+    var src = alloc(size);
+    fill_pseudo_random(src, size);
+    var out_cap = size + 128;
+    var dst = alloc(out_cap);
+
+    var b = bench_new(nb);
+    bench_batch_start(b);
+    var i = 0;
+    while (i < iters) {
+        zlib_compress(src, size, dst, out_cap);
+        i = i + 1;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    return 0;
+}
+
+fn bench_sankoch_decompress(size, iters) {
+    var nb = alloc(32);
+    memcpy(nb, "zlib-decompress-", 16);
+    var digits = write_decimal(nb + 16, size);
+    memcpy(nb + 16 + digits, "B", 1);
+    store8(nb + 16 + digits + 1, 0);
+
+    var src = alloc(size);
+    fill_pseudo_random(src, size);
+    var out_cap = size + 128;
+    var compressed = alloc(out_cap);
+    var clen = zlib_compress(src, size, compressed, out_cap);
+
+    var decompressed = alloc(size + 128);
+    var b = bench_new(nb);
+    bench_batch_start(b);
+    var i = 0;
+    while (i < iters) {
+        zlib_decompress(compressed, clen, decompressed, size + 128);
+        i = i + 1;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    return 0;
+}
 
 fn main() {
     alloc_init();
-    bench("noop", &bench_noop, 1000000);
+
+    # SHA-256 at multiple sizes (pseudo-random to defeat cache-friendly zero-page paths)
+    bench_sigil_sha256(64, 10000);
+    bench_sigil_sha256(1024, 5000);
+    bench_sigil_sha256(65536, 500);
+
+    # zlib compress and decompress
+    bench_sankoch_compress(1024, 2000);
+    bench_sankoch_compress(65536, 200);
+    bench_sankoch_decompress(1024, 5000);
+    bench_sankoch_decompress(65536, 500);
+
     return 0;
 }
 
 var r = main();
 syscall(60, r);
+
+# write_decimal helper (lifted from src/main.cyr so tests don't include it)
+fn write_decimal(buf, n) {
+    if (n == 0) { store8(buf, 48); return 1; }
+    var digits = 0;
+    var m = n;
+    while (m > 0) { digits = digits + 1; m = m / 10; }
+    m = n;
+    var i = digits - 1;
+    while (m > 0) {
+        store8(buf + i, 48 + m % 10);
+        i = i - 1;
+        m = m / 10;
+    }
+    return digits;
+}
