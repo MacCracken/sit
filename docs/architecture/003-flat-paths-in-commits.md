@@ -1,7 +1,7 @@
 # 003 — `sit commit` currently requires flat paths
 
-**Status**: active constraint, tracked for v0.3.0.
-**Related**: roadmap "Recursive tree structure" backlog item.
+**Status**: **Resolved in v0.1.6** — recursive trees now work. Kept here for historical context; see roadmap entry v0.1.6 for what landed.
+**Related**: roadmap v0.1.6 ("Recursive trees").
 
 ## The issue
 

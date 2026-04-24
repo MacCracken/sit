@@ -56,12 +56,22 @@
 - **Primitives**: `split_lines`, `lines_equal`, `lcs_diff`, `print_file_diff`, `read_blob_content` (thin wrapper around `read_object` that returns just the content span). Reusable for future `sit show`, `sit blame`, etc.
 - Eight scenarios verified: clean repo, modified staged file, post-commit working divergence, `--staged` clean, `--staged` new-file adds, working deletion, multi-file mixed, outside-repo.
 
+### v0.1.6 — Recursive trees
+
+- **`build_tree(entries, prefix_len)`** replaces `build_flat_tree`. Recursive writer that walks sorted index entries, groups consecutive entries sharing the next path segment, emits a subtree for each group, and produces the current level's tree with `40000` entries for directories and `100644` for files. Mode `40000` matches git's wire format (no leading zero for dirs).
+- **No custom sort comparator needed.** Lexical sort of full paths produces correct per-tree git order when walked depth-first: at any tree level, `name/` vs sibling `name.x` sorts identically under both byte-wise comparison of full paths and git's directory-trailing-`/` rule.
+- **`flatten_tree(hex, prefix, out)`** — recursive reader. Walks subtrees transparently; emits one flat entry per file with the full repo-relative path (e.g., `src/main.cyr`) in the `name` slot. `read_head_tree_entries` now composes this. Callers (`tree_find`, status, diff) don't change.
+- **`list_working_walk(prefix, fs_path, out)`** — recursive working-dir walker. Skips dotfiles (catches `.sit`, `.git`, `.env`). Emits full repo-relative paths matching the index/HEAD path convention.
+- **Arch 003 resolved.** `cmd_commit`'s flat-paths rejection is gone; `entries_have_subdirs` deleted; `sit add src/main.cyr && sit commit` works end-to-end.
+- Verified against an 8-test matrix with nested structure (`src/`, `src/lib/`, `docs/`): root tree has correct `100644 README.md / 40000 docs / 40000 src` layout (byte-verified via hexdump), status+diff see nested files correctly, log + commit chain work across subdirectory layouts.
+
 ## Post-0.1 Backlog
 
 ### Priority — the v0.2.0 loop
 
-- **Recursive trees** (arch 003) — lift the flat-path restriction on `sit commit`. Path segmentation + per-directory subtree construction + git's directory-sort rule (`<name>/` vs `<name>`). Tree *reader* (v0.1.4) already in place; only the writer needs to go recursive.
 - **Hunk grouping for `sit diff`** — collapse stretches of context between changes into 3-line windows, emit `@@ -a,b +c,d @@` headers. Straightforward follow-on to the v0.1.5 LCS script.
+- **`sit show <commit>`** — combines `cat-file` + diff-against-parent for a single commit. All primitives already in place.
+- **HEAD-aware branch selection** — `sit commit` / `sit log` / `sit status` currently hardcode `refs/heads/main`. Needs HEAD parsing (`ref: refs/heads/<branch>`).
 
 ### Working-tree visibility
 

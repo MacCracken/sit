@@ -129,7 +129,7 @@ sit cat-file 8cf1dc9 | xxd
 # 100644 greeting.txt\0<32 raw hash bytes>100644 notes.md\0<32 raw hash bytes>...
 ```
 
-**Current limitation**: staged paths must be flat (no subdirectories). `sit add src/main.cyr` works, but `sit commit` will error out with a pointer to [arch 003](../architecture/003-flat-paths-in-commits.md). Recursive trees land in v0.3.0.
+Subdirectories work end-to-end — `sit add src/main.cyr && sit add docs/intro.md && sit commit -m "..."` produces a proper recursive tree structure (root tree → `src/` subtree → `main.cyr` blob, etc). Trees use mode `40000` for directories and `100644` for files, matching git's SHA-256 tree format byte-for-byte.
 
 ## View history
 
@@ -229,7 +229,8 @@ Algorithm is classical LCS (longest common subsequence) — DP table capped at 1
 ## What doesn't yet
 
 - Hunk grouping in `sit diff` (`@@ -a,b +c,d @@`)
-- Recursive trees (subdirectories) — see [arch 003](../architecture/003-flat-paths-in-commits.md)
+- `sit show <commit>` — commit-at-a-glance with parent diff
 - HEAD-aware branch selection — `sit commit` / `sit log` / `sit status` always use `refs/heads/main`
+- Branch create/switch / `sit checkout`
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).
