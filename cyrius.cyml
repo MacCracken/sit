@@ -1,0 +1,22 @@
+[package]
+name = "sit"
+version = "${file:VERSION}"
+description = "Sovereign version control — a Cyrius-native git replacement"
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/sit"
+language = "cyrius"
+cyrius = "5.6.16"
+
+[build]
+entry = "src/main.cyr"
+test = "src/test.cyr"
+output = "sit"
+
+# Stdlib baseline only for now. As sit grows, first-party deps land here:
+#   sankoch — LZ4/DEFLATE/zlib/gzip (git's pack-file compression layer)
+#   sigil   — hashing + trust verification (git's SHA layer)
+#   patra   — B+ tree / WAL object store (git's .git/objects layer)
+# No libgit2, no C, no FFI. Each layer benchmarked against its C incumbent.
+[deps]
+stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert"]
+---

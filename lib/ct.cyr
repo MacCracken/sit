@@ -1,0 +1,22 @@
+# ct.cyr — constant-time primitives for crypto code
+# Usage: include "lib/ct.cyr"
+#
+# These helpers avoid data-dependent branches in codegen. They are the
+# preferred replacement for hand-rolled mask-and-xor at secret-dependent
+# decision points (sigil's `ge_cmov`, `_ge_table_select`, canonical-S
+# reject path, etc.).
+#
+# Contract: the compiled output must contain no conditional branch that
+# depends on the `cond` argument. Each helper uses the widely-used
+# mask-xor pattern:
+#   mask = 0 - cond     ; 0 if cond == 0, all-1s if cond == 1
+#   r    = a ^ (mask & (a ^ b))
+# which reduces to `a` when cond == 0 and `b` when cond == 1 with only
+# arithmetic + bitwise ops.
+
+# Branchless select: returns `a` if cond == 0, `b` if cond == 1.
+# Undefined for cond outside {0, 1}.
+fn ct_select(cond, a, b) {
+    var mask = 0 - cond;
+    return a ^ (mask & (a ^ b));
+}
