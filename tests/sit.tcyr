@@ -182,6 +182,45 @@ fn test_patra_col_bytes_overflow() {
     return 0;
 }
 
+fn test_ed25519_sign_verify_roundtrip() {
+    test_group("sigil ed25519 sign/verify roundtrip");
+
+    # Generate a keypair from a fixed seed — deterministic.
+    var seed[32];
+    var i = 0;
+    while (i < 32) { store8(&seed + i, i); i = i + 1; }
+
+    var sk[64];
+    var pk[32];
+    ed25519_keypair(&seed, &sk, &pk);
+
+    var msg = "sit commit body — author, committer, tree, parent";
+    var msg_len = strlen(msg);
+
+    var sig[64];
+    ed25519_sign(&sk, msg, msg_len, &sig);
+
+    var ok = ed25519_verify(&pk, msg, msg_len, &sig);
+    assert_eq(ok, 1, "verify accepts untampered message");
+
+    # Flip one bit of the message — verify must reject.
+    var tampered = alloc(msg_len + 1);
+    memcpy(tampered, msg, msg_len);
+    store8(tampered + 10, load8(tampered + 10) ^ 1);
+    store8(tampered + msg_len, 0);
+    var bad = ed25519_verify(&pk, tampered, msg_len, &sig);
+    assert_eq(bad, 0, "verify rejects tampered message");
+
+    # Flip one bit of the signature — verify must reject.
+    var sig2[64];
+    memcpy(&sig2, &sig, 64);
+    store8(&sig2 + 5, load8(&sig2 + 5) ^ 1);
+    var bad2 = ed25519_verify(&pk, msg, msg_len, &sig2);
+    assert_eq(bad2, 0, "verify rejects tampered signature");
+
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -190,6 +229,7 @@ fn main() {
     test_sankoch_zlib_roundtrip();
     test_patra_col_bytes_small();
     test_patra_col_bytes_overflow();
+    test_ed25519_sign_verify_roundtrip();
     return assert_summary();
 }
 

@@ -131,6 +131,45 @@ sit cat-file 8cf1dc9 | xxd
 
 Subdirectories work end-to-end — `sit add src/main.cyr && sit add docs/intro.md && sit commit -m "..."` produces a proper recursive tree structure (root tree → `src/` subtree → `main.cyr` blob, etc). Trees use mode `40000` for directories and `100644` for files, matching git's SHA-256 tree format byte-for-byte.
 
+## Sign commits
+
+Sit uses sigil's ed25519 directly — no GPG, no OpenPGP armor, no agent. Generate a keypair once per machine:
+
+```sh
+/path/to/sit/build/sit key generate
+# generated ed25519 key ce8fc220b848
+#   private: /home/you/.sit/signing_key (0600)
+#   public:  /home/you/.sit/signing_key.pub
+```
+
+The seed lives at `~/.sit/signing_key` (hex-encoded, chmod 0600). Treat it the same as an SSH private key.
+
+Sign a commit with `-S`:
+
+```sh
+/path/to/sit/build/sit commit -S -m "signed initial"
+# [main (root-commit) 15a772e936d9] signed initial
+```
+
+Verify it:
+
+```sh
+sit verify-commit 15a772e936d9
+# good signature on 15a772e936d9 (key ce8fc220b848698b45379f4825dcaca1eb1ef7105948e22408c57b521848b102)
+```
+
+And `sit show` / `sit log` pick up the signature automatically:
+
+```sh
+sit show
+# commit 15a772e936d9179bc0f69f0fb2496abb79132e1da18e5f2369c2f6eb58ce941a
+# Signature: good (key ce8fc220b848)
+# Author: Your Name <you@example.com>
+# ...
+```
+
+The signature is a `sitsig <128-hex-sig> <64-hex-pubkey>` line spliced into the commit header between `committer` and the blank separator. `cat-file` shows it verbatim; the signed payload is the commit body *without* the sitsig line, matching git's self-consistent `gpgsig` convention.
+
 ## View history
 
 ```sh
@@ -266,6 +305,9 @@ file?.bak
 - `sit status` — three-way diff across HEAD tree, staging index, and working directory
 - `sit diff [--staged|HEAD]` — unified diff with `@@` hunk headers (working vs index / index vs HEAD / working vs HEAD)
 - `sit show [--stat] [<hash>]` — show a single commit's header + parent-diff (defaults to HEAD); `--stat` emits per-file insertion/deletion counts instead of the full diff
+- `sit key generate` / `sit key show` — create / inspect the local ed25519 signing key at `~/.sit/signing_key`
+- `sit commit -S` — sign the commit body (inserts a `sitsig <sig> <pubkey>` header line)
+- `sit verify-commit [<hash>]` — check a commit's signature; defaults to HEAD
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
 

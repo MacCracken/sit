@@ -24,7 +24,8 @@ Project was scaffolded with `cyrius init sit`. Do not manually create project st
 
 ## Current State
 
-- **Source**: `src/main.cyr` — subcommand dispatch; `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `reset`, `commit`, `config`, `fsck`, `log`, `status`, `diff`, `show` (`--stat`), `cat-file`, `owl-file` implemented (17 commands)
+- **Source**: `src/main.cyr` — subcommand dispatch; `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `reset`, `commit` (`-S` signs), `config`, `fsck`, `key`, `verify-commit`, `log`, `status`, `diff`, `show` (`--stat`), `cat-file`, `owl-file` implemented (19 commands)
+- **Signing**: ed25519 via sigil. `sit key generate` writes `~/.sit/signing_key` (32B seed hex, 0600) + `.pub` (32B pubkey hex, 0644). `sit commit -S` inserts a `sitsig <sig-hex> <pub-hex>\n` line into the commit header between `committer` and the blank separator. Signed payload is the commit body *without* the sitsig line — self-consistent like git's `gpgsig`. `sit show`/`sit log` print `Signature: good|BAD (key <hex12>)` via `print_commit_header`; `sit verify-commit [<hash>]` is the explicit check (exit 0 only on good sigs). No GPG, no OpenPGP armor
 - **Tests**: `tests/sit.tcyr` smoke only; integration coverage is shell-level for now
 - **Binary**: `cyrius build src/main.cyr build/sit`
 - **Object store**: `.sit/objects.patra` with schema `objects(hash STR, ty INT, content BYTES)`. `write_typed_object` does content-addressed upsert; `read_object` queries + decompresses. `resolve_hash` prefix-match uses `WHERE hash LIKE 'abcd%'`. SHA-256 via sigil, zlib via sankoch; framing `"<type> <len>\0<content>"` is byte-compatible with git's SHA-256 object format. Legacy `.sit/objects/<xx>/<yy...>` loose files auto-migrate on first access

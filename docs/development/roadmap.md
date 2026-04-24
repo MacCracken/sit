@@ -146,6 +146,20 @@
 - Fixes UX gap flagged in v0.2.3: `sit show v0.1` no longer errors with "too short prefix" and instead resolves to the tagged commit.
 - Verified against eight scenarios: `show HEAD`, `show <tag>`, `show <branch>`, `show` on cross-branch tag, `show` on non-current branch, `cat-file <tag>`, short-name-as-tag beats too-short-prefix rule, empty-repo `show HEAD` returns cleanly.
 
+### v0.3.0 — Sigil signed commits
+
+- **`sit key generate`** — writes an ed25519 keypair to `~/.sit/signing_key` (32B seed, hex-encoded, chmod 0600) and `~/.sit/signing_key.pub` (32B pubkey, hex, 0644). Refuses to overwrite an existing private key; entropy sourced from `/dev/urandom` via sigil's `ed25519_generate_keypair`.
+- **`sit key show`** — prints the stored pubkey as 64-char hex. Foundation for future key-list / keyring semantics.
+- **`sit commit -S [-m] <msg>`** — signs the commit body with the `~/.sit/signing_key` seed. Inserts a `sitsig <128-hex-sig> <64-hex-pub>\n` line into the header block between `committer\n` and the blank line. Signed payload is the commit body *without* the sitsig line, so verification is a parse → strip → `ed25519_verify` cycle and the signature is self-consistent (same trick git uses for `gpgsig`). Works for both regular and merge commits.
+- **`sit verify-commit [<hash>]`** — resolves the commit, extracts the sitsig line, verifies against the embedded pubkey. Emits `good signature on <hex12> (key <full-hex>)`, `BAD signature on ...`, or `no signature on ...`. Exit 0 only on verified signatures.
+- **`sit show` / `sit log`** — grow a `Signature: good (key <hex12>)` / `Signature: BAD ...` header line when a commit is signed; silent when unsigned. Driven through the shared `print_commit_header` so every header-rendering path inherits the check.
+- **New helpers**: `signing_home_dir` / `signing_key_path` / `signing_pub_path` / `load_signing_seed` / `load_signing_pubkey` (path + IO), `sign_commit_body` (in-place sitsig injection), `extract_sitsig` (sitsig parser + body stripper), `verify_commit_body` (convenience wrapper returning 1/0/-1).
+- **Refactor**: `build_commit` and `build_merge_commit` now thin-wrap `*_signed` variants that take an optional 32-byte seed argument (0 = unsigned, matching legacy behavior). `cmd_commit` parses a flag vector instead of the old positional form — `-S`, `-m`, and positional message can appear in any order.
+- **Test coverage**: `tests/sit.tcyr` gains `test_ed25519_sign_verify_roundtrip` — fixed-seed keypair, known-message signature, bit-flip negative cases for both message and sig.
+- **Deliberately not GPG-compatible**: sigil uses ed25519 directly; no OpenPGP armor. The `sitsig` header name is chosen to make the difference obvious in `cat-file` output.
+
+Command count: **19** (previous 17 + `key`, `verify-commit`).
+
 ### v0.2.13 — Polish batch 3
 
 - **`sit reset <path>`** — unstage: rewrite the index entry for `<path>` to HEAD's tree hash, or drop the entry entirely if HEAD doesn't have the path. Working tree is untouched. Same index-rewrite primitive (`rewrite_index`) as `sit rm`.
