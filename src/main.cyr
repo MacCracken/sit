@@ -1683,6 +1683,159 @@ fn set_head_ref(ref_path) {
     return 0;
 }
 
+# Find the lowest common ancestor of two commits. Walks a's ancestry into a
+# set, then walks b's and returns the first hit. Returns 0 if no common
+# ancestor exists (disjoint histories).
+fn find_merge_base(a_hex, b_hex) {
+    var ancestors = vec_new();
+    var current = a_hex;
+    while (current != 0) {
+        var copy = alloc(65);
+        memcpy(copy, current, 64);
+        store8(copy + 64, 0);
+        vec_push(ancestors, copy);
+
+        var obj[24];
+        if (read_object(current, &obj) != 0) { current = 0; }
+        else {
+            var buf = load64(&obj);
+            var blen = load64(&obj + 8);
+            var coff = load64(&obj + 16);
+            var info[56];
+            if (parse_commit_body(buf + coff, blen - coff, &info) != 0) { current = 0; }
+            else { current = load64(&info + 8); }
+        }
+    }
+
+    current = b_hex;
+    while (current != 0) {
+        var n = vec_len(ancestors);
+        var i = 0;
+        while (i < n) {
+            if (streq(vec_get(ancestors, i), current) == 1) { return vec_get(ancestors, i); }
+            i = i + 1;
+        }
+        var obj[24];
+        if (read_object(current, &obj) != 0) { return 0; }
+        var buf = load64(&obj);
+        var blen = load64(&obj + 8);
+        var coff = load64(&obj + 16);
+        var info[56];
+        if (parse_commit_body(buf + coff, blen - coff, &info) != 0) { return 0; }
+        current = load64(&info + 8);
+    }
+    return 0;
+}
+
+# Build + write a 2-parent merge commit. Mirrors build_commit but emits two
+# `parent <hex>\n` header lines. Returns the new commit's hex hash.
+fn build_merge_commit(tree_hex, p1_hex, p2_hex, message) {
+    var name = getenv("SIT_AUTHOR_NAME");
+    if (name == 0) { name = config_get("user.name"); }
+    if (name == 0) { name = "sit user"; }
+    var email = getenv("SIT_AUTHOR_EMAIL");
+    if (email == 0) { email = config_get("user.email"); }
+    if (email == 0) { email = "user@localhost"; }
+    var ts = clock_epoch_secs();
+
+    var name_len = strlen(name);
+    var email_len = strlen(email);
+    var msg_len = strlen(message);
+
+    var cap = 512 + msg_len + name_len * 2 + email_len * 2 + 160;
+    var body = alloc(cap);
+    var pos = 0;
+
+    memcpy(body + pos, "tree ", 5); pos = pos + 5;
+    memcpy(body + pos, tree_hex, 64); pos = pos + 64;
+    store8(body + pos, 10); pos = pos + 1;
+
+    memcpy(body + pos, "parent ", 7); pos = pos + 7;
+    memcpy(body + pos, p1_hex, 64); pos = pos + 64;
+    store8(body + pos, 10); pos = pos + 1;
+
+    memcpy(body + pos, "parent ", 7); pos = pos + 7;
+    memcpy(body + pos, p2_hex, 64); pos = pos + 64;
+    store8(body + pos, 10); pos = pos + 1;
+
+    memcpy(body + pos, "author ", 7); pos = pos + 7;
+    memcpy(body + pos, name, name_len); pos = pos + name_len;
+    memcpy(body + pos, " <", 2); pos = pos + 2;
+    memcpy(body + pos, email, email_len); pos = pos + email_len;
+    memcpy(body + pos, "> ", 2); pos = pos + 2;
+    var digits = write_decimal(body + pos, ts); pos = pos + digits;
+    memcpy(body + pos, " +0000\n", 7); pos = pos + 7;
+
+    memcpy(body + pos, "committer ", 10); pos = pos + 10;
+    memcpy(body + pos, name, name_len); pos = pos + name_len;
+    memcpy(body + pos, " <", 2); pos = pos + 2;
+    memcpy(body + pos, email, email_len); pos = pos + email_len;
+    memcpy(body + pos, "> ", 2); pos = pos + 2;
+    digits = write_decimal(body + pos, ts); pos = pos + digits;
+    memcpy(body + pos, " +0000\n", 7); pos = pos + 7;
+
+    store8(body + pos, 10); pos = pos + 1;
+    memcpy(body + pos, message, msg_len); pos = pos + msg_len;
+    if (msg_len == 0) { store8(body + pos, 10); pos = pos + 1; }
+    else {
+        if (load8(message + msg_len - 1) != 10) {
+            store8(body + pos, 10); pos = pos + 1;
+        }
+    }
+
+    return write_typed_object("commit", 6, body, pos);
+}
+
+# Find a tree entry's hash_hex for a given path, or 0 if absent.
+fn tree_find_hash(entries, path) {
+    if (entries == 0) { return 0; }
+    var e = tree_find(entries, path);
+    if (e == 0) { return 0; }
+    return tree_entry_hash(e);
+}
+
+# Union of paths across three flattened tree entry vecs. Returns a vec of
+# heap-copied path cstrings, each unique.
+fn three_way_path_set(base, ours, theirs) {
+    var paths = vec_new();
+    var sources_cnt = 3;
+    var sources[24];
+    store64(&sources + 0, base);
+    store64(&sources + 8, ours);
+    store64(&sources + 16, theirs);
+
+    var si = 0;
+    while (si < sources_cnt) {
+        var entries = load64(&sources + si * 8);
+        if (entries != 0) {
+            var n = vec_len(entries);
+            var i = 0;
+            while (i < n) {
+                var e = vec_get(entries, i);
+                var p = tree_entry_name(e);
+                var plen = strlen(p);
+                # Dedup against existing paths
+                var found = 0;
+                var j = 0;
+                var m = vec_len(paths);
+                while (j < m) {
+                    if (streq(vec_get(paths, j), p) == 1) { found = 1; j = m; }
+                    else { j = j + 1; }
+                }
+                if (found == 0) {
+                    var copy = alloc(plen + 1);
+                    memcpy(copy, p, plen);
+                    store8(copy + plen, 0);
+                    vec_push(paths, copy);
+                }
+                i = i + 1;
+            }
+        }
+        si = si + 1;
+    }
+    return paths;
+}
+
 # Walk descendant's parent chain; return 1 if ancestor_hex is descendant
 # or any of its ancestors. Linear — sit has no merge commits yet.
 fn is_ancestor(ancestor_hex, descendant_hex) {
@@ -1821,9 +1974,162 @@ fn cmd_merge() {
         return 0;
     }
 
-    eprintln("sit: branches have diverged");
-    eprintln("sit:   non-fast-forward merge (3-way) is not yet implemented");
-    return 1;
+    # Divergent → 3-way merge (file-level)
+    if (is_dirty() == 1) {
+        eprintln("sit: working tree has uncommitted changes");
+        eprintln("sit:   commit or revert before merging");
+        return 1;
+    }
+
+    var base_hex = find_merge_base(head_hex, &target_hex);
+    if (base_hex == 0) {
+        eprintln("sit: no common ancestor between current branch and target");
+        return 1;
+    }
+
+    var base_entries = commit_tree_entries(base_hex);
+    var ours_entries = commit_tree_entries(head_hex);
+    var theirs_entries = commit_tree_entries(&target_hex);
+    if (ours_entries == 0) { ours_entries = vec_new(); }
+    if (theirs_entries == 0) { theirs_entries = vec_new(); }
+    if (base_entries == 0) { base_entries = vec_new(); }
+
+    var paths = three_way_path_set(base_entries, ours_entries, theirs_entries);
+    var merged = vec_new();
+    var conflicts = vec_new();
+
+    var pn = vec_len(paths);
+    var pi = 0;
+    while (pi < pn) {
+        var p = vec_get(paths, pi);
+        var base_h = tree_find_hash(base_entries, p);
+        var ours_h = tree_find_hash(ours_entries, p);
+        var theirs_h = tree_find_hash(theirs_entries, p);
+
+        # Result hash: 0 means "not in merged tree"
+        var result_h = 0;
+        var needs_conflict = 0;
+
+        if (ours_h != 0) {
+            if (theirs_h != 0) {
+                if (streq(ours_h, theirs_h) == 1) {
+                    result_h = ours_h;
+                }
+                else {
+                    if (base_h != 0) {
+                        if (streq(base_h, ours_h) == 1)   { result_h = theirs_h; }
+                        else {
+                            if (streq(base_h, theirs_h) == 1) { result_h = ours_h; }
+                            else { needs_conflict = 1; }
+                        }
+                    }
+                    else { needs_conflict = 1; }
+                }
+            }
+            else {
+                # theirs absent
+                if (base_h != 0) {
+                    if (streq(base_h, ours_h) == 1) { result_h = 0; }  # deleted by theirs
+                    else { needs_conflict = 1; }  # ours modified, theirs deleted
+                }
+                else {
+                    # Added only by ours
+                    result_h = ours_h;
+                }
+            }
+        }
+        else {
+            # ours absent
+            if (theirs_h != 0) {
+                if (base_h != 0) {
+                    if (streq(base_h, theirs_h) == 1) { result_h = 0; }  # deleted by ours
+                    else { needs_conflict = 1; }  # theirs modified, ours deleted
+                }
+                else {
+                    result_h = theirs_h;
+                }
+            }
+        }
+
+        if (needs_conflict == 1) {
+            var pc = alloc(strlen(p) + 1);
+            memcpy(pc, p, strlen(p));
+            store8(pc + strlen(p), 0);
+            vec_push(conflicts, pc);
+        }
+        else {
+            if (result_h != 0) {
+                var bytes = hex_decode(result_h, 64);
+                if (bytes != 0) {
+                    var entry = alloc(40);
+                    memcpy(entry, bytes, 32);
+                    var pc = alloc(strlen(p) + 1);
+                    memcpy(pc, p, strlen(p));
+                    store8(pc + strlen(p), 0);
+                    store64(entry + 32, pc);
+                    vec_push(merged, entry);
+                }
+            }
+        }
+        pi = pi + 1;
+    }
+
+    if (vec_len(conflicts) > 0) {
+        syscall(SYS_WRITE, STDERR, "sit: merge conflict in ", 23);
+        var buf[24];
+        var digits = write_decimal(&buf, vec_len(conflicts));
+        syscall(SYS_WRITE, STDERR, &buf, digits);
+        syscall(SYS_WRITE, STDERR, " file(s):\n", 10);
+        var ci = 0;
+        while (ci < vec_len(conflicts)) {
+            syscall(SYS_WRITE, STDERR, "  ", 2);
+            var cp = vec_get(conflicts, ci);
+            syscall(SYS_WRITE, STDERR, cp, strlen(cp));
+            syscall(SYS_WRITE, STDERR, "\n", 1);
+            ci = ci + 1;
+        }
+        eprintln("sit: resolve manually and run 'sit add' + 'sit commit'");
+        eprintln("sit: (note: resulting commit will have only HEAD as parent — MERGE_HEAD tracking is a later feature)");
+        return 1;
+    }
+
+    # Clean merge — sort entries, build tree, create 2-parent commit
+    sort_entries(merged);
+    var tree_hex = build_tree(merged, 0);
+    if (tree_hex == 0) {
+        eprintln("sit: failed to write merged tree");
+        return 1;
+    }
+
+    var msg_cap = 64 + tnlen + 32;
+    var msg = alloc(msg_cap);
+    memcpy(msg, "Merge branch '", 14);
+    memcpy(msg + 14, target_name, tnlen);
+    memcpy(msg + 14 + tnlen, "'", 1);
+    store8(msg + 14 + tnlen + 1, 0);
+
+    var head_copy = alloc(65);
+    memcpy(head_copy, head_hex, 64);
+    store8(head_copy + 64, 0);
+
+    var merge_hex = build_merge_commit(tree_hex, head_copy, &target_hex, msg);
+    if (merge_hex == 0) {
+        eprintln("sit: failed to write merge commit");
+        return 1;
+    }
+
+    if (write_head_ref(merge_hex) != 0) {
+        eprintln("sit: failed to update branch ref");
+        return 1;
+    }
+    materialize_target(merge_hex);
+
+    syscall(SYS_WRITE, STDOUT, "merge ", 6);
+    syscall(SYS_WRITE, STDOUT, merge_hex, 12);
+    syscall(SYS_WRITE, STDOUT, ": Merge branch '", 16);
+    syscall(SYS_WRITE, STDOUT, target_name, tnlen);
+    syscall(SYS_WRITE, STDOUT, "'\n", 2);
+    return 0;
 }
 
 fn cmd_checkout() {

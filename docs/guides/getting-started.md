@@ -255,7 +255,7 @@ file?.bak
 - `sit branch [<name>]` — list branches, or create one at HEAD
 - `sit checkout [-b] <branch>` — switch branches; `-b` creates the branch first at HEAD
 - `sit tag [<name> [<commit>]]` — list tags, or create a lightweight tag at HEAD (or at a given commit)
-- `sit merge <branch>` — fast-forward HEAD to `<branch>`; errors on divergent branches (3-way merge not yet implemented)
+- `sit merge <branch>` — fast-forward when possible; otherwise file-level 3-way merge. Clean merges auto-commit with two parents; conflicts are reported per-file and require manual resolution.
 - `sit config [--global] <key> [<value>]` — read/write config entries (`user.name`, `user.email`, etc). Local at `.sit/config`, global at `~/.sitconfig`
 - `sit fsck` — verify that each stored object's content hashes back to its filename
 - `.sitignore` — gitignore-style pattern file (at repo root) filters untracked-file display and `sit add` (override with `-f`)

@@ -146,6 +146,21 @@
 - Fixes UX gap flagged in v0.2.3: `sit show v0.1` no longer errors with "too short prefix" and instead resolves to the tagged commit.
 - Verified against eight scenarios: `show HEAD`, `show <tag>`, `show <branch>`, `show` on cross-branch tag, `show` on non-current branch, `cat-file <tag>`, short-name-as-tag beats too-short-prefix rule, empty-repo `show HEAD` returns cleanly.
 
+### v0.2.8 — 3-way merge (file-level)
+
+- `sit merge <branch>` now handles divergent branches via file-level 3-way merge. For each path in the union of `(base, ours, theirs)` trees, picks a single resulting hash based on the standard triad:
+    - `base==ours==theirs` → unchanged
+    - one side unchanged vs base → take the modified side
+    - both sides converged on same hash → take either
+    - both sides modified differently → **conflict**
+- **`find_merge_base(a, b)`** — collects `a`'s ancestors into a vec, walks `b`'s chain, returns first match. Linear since sit commits have ≤2 parents and merge commits don't yet introduce cycles in practice.
+- **`build_merge_commit(tree, p1, p2, msg)`** — mirrors `build_commit` but emits two `parent <hex>\n` lines. Git-compatible format; `cat-file` on a merge commit shows both parents.
+- **`three_way_path_set(base, ours, theirs)`** — union of paths across three flat entry vecs with dedup.
+- **`tree_find_hash(entries, path)`** — convenience returning 0 when absent.
+- **Clean merges auto-commit**: message `Merge branch '<target>'`, `materialize_target` updates working tree + index.
+- **Conflicts**: prints the conflicted paths to stderr, exits 1, leaves HEAD unchanged. No `MERGE_HEAD` tracking yet — user resolves manually, subsequent commit will have HEAD as sole parent (known limitation noted in the error message).
+- Verified: fast-forward regression, non-conflicting 3-way (different files on each branch), conflicting 3-way, post-merge fsck clean (23 objects), merge-commit body has `parent <hex>` × 2 (cat-file verified).
+
 ### v0.2.7 — `sit merge` (fast-forward) + cyrius 5.6.25
 
 - **`sit merge <branch>`** — fast-forward merge. Resolves the target via `resolve_hash` (accepts branch names, tag names, or commit prefixes). Four outcomes: `already up to date` (target == HEAD or is ancestor), `fast-forward to <hex>` (HEAD is ancestor of target → move branch ref, materialize target tree), dirty-tree block, or `branches have diverged` when neither is an ancestor.
