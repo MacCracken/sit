@@ -31,15 +31,13 @@ Project was scaffolded with `cyrius init sit`. Do not manually create project st
 
 ## Dependencies
 
-- **Cyrius stdlib** — `string`, `fmt`, `alloc`, `io`, `vec`, `str`, `syscalls`, `assert` (scaffold defaults)
+- **Cyrius stdlib** — `string`, `fmt`, `alloc`, `io`, `vec`, `str`, `syscalls`, `assert`, `fs`, `args`, `chrono`, `hashmap`, `process`, `tagged`, `fnptr`
+- **sakshi** (2.1.0) — tracing, error handling, structured logging
+- **sankoch** (2.0.1) — LZ4/DEFLATE/zlib/gzip for pack-file compression
+- **sigil** (2.9.1) — hashing and trust verification for object IDs and signed commits
+- **patra** (1.5.5) — B+ tree / WAL-backed object store and index
 
-Future deps (add when the corresponding layer lands):
-
-- **sankoch** — LZ4/DEFLATE/zlib/gzip for pack-file compression
-- **sigil** — hashing and trust verification for object IDs and signed commits
-- **patra** — B+ tree / WAL-backed object store and index
-
-No FFI. No C. No libgit2.
+All four are git-tag pinned in `cyrius.cyml`. No FFI, no C, no libgit2.
 
 ## Rules
 

@@ -12,11 +12,47 @@ entry = "src/main.cyr"
 test = "src/test.cyr"
 output = "sit"
 
-# Stdlib baseline only for now. As sit grows, first-party deps land here:
+# No libgit2, no C, no FFI. Each layer is first-party Cyrius, benchmarked
+# against its C incumbent.
 #   sankoch — LZ4/DEFLATE/zlib/gzip (git's pack-file compression layer)
 #   sigil   — hashing + trust verification (git's SHA layer)
 #   patra   — B+ tree / WAL object store (git's .git/objects layer)
-# No libgit2, no C, no FFI. Each layer benchmarked against its C incumbent.
 [deps]
-stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert"]
----
+stdlib = [
+    "string",
+    "fmt",
+    "alloc",
+    "io",
+    "vec",
+    "str",
+    "syscalls",
+    "assert",
+    "fs",
+    "args",
+    "chrono",
+    "hashmap",
+    "process",
+    "tagged",
+    "fnptr",
+]
+
+[deps.sakshi]
+git = "https://github.com/MacCracken/sakshi.git"
+tag = "2.1.0"
+modules = ["dist/sakshi.cyr"]
+
+[deps.sankoch]
+git = "https://github.com/MacCracken/sankoch.git"
+tag = "2.0.1"
+modules = ["dist/sankoch.cyr"]
+
+[deps.sigil]
+git = "https://github.com/MacCracken/sigil.git"
+tag = "2.9.1"
+modules = ["dist/sigil.cyr"]
+
+[deps.patra]
+git = "https://github.com/MacCracken/patra.git"
+tag = "1.5.5"
+modules = ["dist/patra.cyr"]
+
