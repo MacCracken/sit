@@ -24,11 +24,13 @@ Project was scaffolded with `cyrius init sit`. Do not manually create project st
 
 ## Current State
 
-- **Source**: `src/main.cyr` — subcommand dispatch; `init`, `add`, `cat-file`, `owl-file` implemented
+- **Source**: `src/main.cyr` — subcommand dispatch; `init`, `add`, `commit`, `cat-file`, `owl-file` implemented
 - **Tests**: `tests/sit.tcyr` smoke only; integration coverage is shell-level for now
 - **Binary**: `cyrius build src/main.cyr build/sit`
-- **Objects**: SHA-256 hashed via sigil, zlib-compressed via sankoch, stored loose at `.sit/objects/<hex[0:2]>/<hex[2:64]>`. Framing is `"blob <len>\0<content>"` — byte-compatible with git's SHA-256 object format
-- **Staging index**: plaintext `<hex>\t<path>\n` lines at `.sit/index` (placeholder — migrates to patra once the index grows mutation semantics; see [arch 002](docs/architecture/002-loose-objects-until-patra-blobs.md))
+- **Object writer**: single type-agnostic `write_typed_object(type, len, content, content_len)` drives blob, tree, and commit writes. SHA-256 via sigil, zlib via sankoch, loose storage at `.sit/objects/<hex[0:2]>/<hex[2:64]>`. Framing `"<type> <len>\0<content>"` is byte-compatible with git's SHA-256 object format for all three object types
+- **Trees**: flat only in v0.2 — entries are `<mode> <name>\0<32 raw hash bytes>` sorted by name, mode fixed at `100644`. Recursive trees (subdirectories) deferred to v0.3; see [arch 003](docs/architecture/003-flat-paths-in-commits.md)
+- **Commits**: git-parity body format; author/email from `SIT_AUTHOR_NAME` / `SIT_AUTHOR_EMAIL` env (fallback placeholder), timestamp via `clock_epoch_secs()`, tz fixed `+0000`. `.sit/refs/heads/main` updated atomically. Parent pointer linked from the previous ref value
+- **Staging index**: plaintext `<hex>\t<path>\n` lines at `.sit/index` (placeholder — migrates to patra once the index grows mutation semantics; see [arch 002](docs/architecture/002-loose-objects-until-patra-blobs.md)). Dedup happens at commit time (last hash per path wins)
 - **Read commands**: `cat-file` (plumbing, raw bytes) and `owl-file` (decorated via [owl](https://github.com/MacCracken/owl); falls back to raw when owl isn't on PATH — owl is pre-1.0)
 - **Integration**: owl consumes sit for git-marker gutter decorations once both land; owl is the downstream
 

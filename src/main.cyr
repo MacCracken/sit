@@ -189,21 +189,18 @@ fn cmd_init() {
     return 0;
 }
 
-# Build "blob <len>\0" header at buf. Returns header length.
-fn write_blob_header(buf, content_len) {
-    memcpy(buf, "blob ", 5);
-    var digits = write_decimal(buf + 5, content_len);
-    store8(buf + 5 + digits, 0);
-    return 5 + digits + 1;
-}
-
-# Hash, compress, and write a blob object. Returns the sigil hex hash
-# (64-char null-terminated C-string) on success, or 0 on failure.
-fn write_blob_object(content, content_len) {
+# Frame ("<type> <len>\0<content>"), hash with sigil, compress with sankoch,
+# and write the resulting object to .sit/objects/<xx>/<yy...>.
+# Returns the 64-char hex hash (null-terminated) or 0 on failure.
+fn write_typed_object(type_str, type_len, content, content_len) {
     var hdr_max = 32;
     var full_cap = hdr_max + content_len;
     var full = alloc(full_cap);
-    var hdr_len = write_blob_header(full, content_len);
+    memcpy(full, type_str, type_len);
+    store8(full + type_len, 32);
+    var digits = write_decimal(full + type_len + 1, content_len);
+    store8(full + type_len + 1 + digits, 0);
+    var hdr_len = type_len + 1 + digits + 1;
     memcpy(full + hdr_len, content, content_len);
     var full_len = hdr_len + content_len;
 
@@ -226,6 +223,10 @@ fn write_blob_object(content, content_len) {
     object_path(obj, hex);
     if (file_write_all(obj, compressed, clen) < 0) { return 0; }
     return hex;
+}
+
+fn write_blob_object(content, content_len) {
+    return write_typed_object("blob", 4, content, content_len);
 }
 
 fn cmd_add() {
@@ -383,14 +384,344 @@ fn cmd_owl_file() {
     return rc;
 }
 
+# Staging entry layout (40 bytes):
+#   0..32:  raw hash bytes (SHA-256, decoded from the hex in .sit/index)
+#   32..40: path ptr (heap, null-terminated)
+fn entry_hash(e) { return e; }
+fn entry_path(e) { return load64(e + 32); }
+
+# Parse .sit/index into a vec of entries. Returns 0 on missing/empty/corrupt.
+fn parse_index() {
+    if (file_exists(".sit/index") != 1) { return 0; }
+
+    var fd = file_open(".sit/index", 0, 0);
+    if (fd < 0) { return 0; }
+    var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
+    syscall(SYS_LSEEK, fd, 0, SEEK_SET);
+    if (size <= 0) { file_close(fd); return 0; }
+
+    var data = alloc(size);
+    var total = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        var n = file_read(fd, data + total, size - total);
+        if (n <= 0) { rgo = 0; }
+        else { total = total + n; if (total >= size) { rgo = 0; } }
+    }
+    file_close(fd);
+
+    var entries = vec_new();
+    var pos = 0;
+    while (pos < size) {
+        if (pos + 65 > size) { return 0; }
+        if (load8(data + pos + 64) != 9) { return 0; }
+
+        var nl = pos + 65;
+        while (nl < size) {
+            if (load8(data + nl) == 10) { break; }
+            nl = nl + 1;
+        }
+        if (nl >= size) { return 0; }
+
+        var plen = nl - pos - 65;
+        var hash_bytes = hex_decode(data + pos, 64);
+        if (hash_bytes == 0) { return 0; }
+
+        var path = alloc(plen + 1);
+        memcpy(path, data + pos + 65, plen);
+        store8(path + plen, 0);
+
+        var entry = alloc(40);
+        memcpy(entry, hash_bytes, 32);
+        store64(entry + 32, path);
+        vec_push(entries, entry);
+
+        pos = nl + 1;
+    }
+
+    if (vec_len(entries) == 0) { return 0; }
+    return entries;
+}
+
+fn entries_have_subdirs(entries) {
+    var n = vec_len(entries);
+    var i = 0;
+    while (i < n) {
+        var path = entry_path(vec_get(entries, i));
+        var plen = strlen(path);
+        var j = 0;
+        while (j < plen) {
+            if (load8(path + j) == 47) { return 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Byte-wise compare two null-terminated C strings. Returns -1/0/+1.
+fn strcmp_cstr(a, b) {
+    var i = 0;
+    var done = 0;
+    var result = 0;
+    while (done == 0) {
+        var ca = load8(a + i);
+        var cb = load8(b + i);
+        if (ca != cb) {
+            if (ca < cb) { result = 0 - 1; }
+            else { result = 1; }
+            done = 1;
+        }
+        else {
+            if (ca == 0) { done = 1; }
+            else { i = i + 1; }
+        }
+    }
+    return result;
+}
+
+# Insertion-sort entries vec by path name (ascending). In place.
+fn sort_entries(entries) {
+    var n = vec_len(entries);
+    var i = 1;
+    while (i < n) {
+        var cur = vec_get(entries, i);
+        var cur_path = entry_path(cur);
+        var j = i - 1;
+        var placed = 0;
+        while (placed == 0) {
+            if (j < 0) { placed = 1; }
+            else {
+                var prev = vec_get(entries, j);
+                if (strcmp_cstr(cur_path, entry_path(prev)) >= 0) { placed = 1; }
+                else {
+                    vec_set(entries, j + 1, prev);
+                    j = j - 1;
+                }
+            }
+        }
+        vec_set(entries, j + 1, cur);
+        i = i + 1;
+    }
+    return entries;
+}
+
+# After sorting, keep only the last entry for each path (staged-twice wins).
+fn dedupe_entries(entries) {
+    var n = vec_len(entries);
+    var out = vec_new();
+    var i = 0;
+    while (i < n) {
+        var cur = vec_get(entries, i);
+        var is_last = 1;
+        if (i + 1 < n) {
+            var nxt = vec_get(entries, i + 1);
+            if (strcmp_cstr(entry_path(cur), entry_path(nxt)) == 0) { is_last = 0; }
+        }
+        if (is_last == 1) { vec_push(out, cur); }
+        i = i + 1;
+    }
+    return out;
+}
+
+# Build a flat tree: for each entry, "100644 <name>\0<32 raw hash bytes>".
+# Returns tree hash hex, or 0 on failure.
+fn build_flat_tree(entries) {
+    var n = vec_len(entries);
+    var total_size = 0;
+    var i = 0;
+    while (i < n) {
+        var path = entry_path(vec_get(entries, i));
+        total_size = total_size + 7 + strlen(path) + 1 + 32;
+        i = i + 1;
+    }
+
+    var body = alloc(total_size);
+    var pos = 0;
+    i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        var path = entry_path(e);
+        var plen = strlen(path);
+        memcpy(body + pos, "100644 ", 7);
+        pos = pos + 7;
+        memcpy(body + pos, path, plen);
+        pos = pos + plen;
+        store8(body + pos, 0);
+        pos = pos + 1;
+        memcpy(body + pos, entry_hash(e), 32);
+        pos = pos + 32;
+        i = i + 1;
+    }
+
+    return write_typed_object("tree", 4, body, total_size);
+}
+
+# Read .sit/refs/heads/main. Returns 64-char null-terminated hex ptr, or 0.
+fn read_main_ref() {
+    if (file_exists(".sit/refs/heads/main") != 1) { return 0; }
+    var fd = file_open(".sit/refs/heads/main", 0, 0);
+    if (fd < 0) { return 0; }
+    var buf = alloc(80);
+    var n = file_read(fd, buf, 80);
+    file_close(fd);
+    if (n < 64) { return 0; }
+    store8(buf + 64, 0);
+    return buf;
+}
+
+fn write_main_ref(hex) {
+    var out = alloc(66);
+    memcpy(out, hex, 64);
+    store8(out + 64, 10);
+    store8(out + 65, 0);
+    if (file_write_all(".sit/refs/heads/main", out, 65) < 0) { return 0 - 1; }
+    return 0;
+}
+
+# Build and write a commit object. Returns hex hash or 0.
+fn build_commit(tree_hex, parent_hex, message) {
+    var name = getenv("SIT_AUTHOR_NAME");
+    if (name == 0) { name = "sit user"; }
+    var email = getenv("SIT_AUTHOR_EMAIL");
+    if (email == 0) { email = "user@localhost"; }
+    var ts = clock_epoch_secs();
+
+    var name_len = strlen(name);
+    var email_len = strlen(email);
+    var msg_len = strlen(message);
+
+    var cap = 512 + msg_len + name_len * 2 + email_len * 2;
+    if (parent_hex != 0) { cap = cap + 80; }
+    var body = alloc(cap);
+    var pos = 0;
+
+    memcpy(body + pos, "tree ", 5); pos = pos + 5;
+    memcpy(body + pos, tree_hex, 64); pos = pos + 64;
+    store8(body + pos, 10); pos = pos + 1;
+
+    if (parent_hex != 0) {
+        memcpy(body + pos, "parent ", 7); pos = pos + 7;
+        memcpy(body + pos, parent_hex, 64); pos = pos + 64;
+        store8(body + pos, 10); pos = pos + 1;
+    }
+
+    memcpy(body + pos, "author ", 7); pos = pos + 7;
+    memcpy(body + pos, name, name_len); pos = pos + name_len;
+    memcpy(body + pos, " <", 2); pos = pos + 2;
+    memcpy(body + pos, email, email_len); pos = pos + email_len;
+    memcpy(body + pos, "> ", 2); pos = pos + 2;
+    var digits = write_decimal(body + pos, ts); pos = pos + digits;
+    memcpy(body + pos, " +0000\n", 7); pos = pos + 7;
+
+    memcpy(body + pos, "committer ", 10); pos = pos + 10;
+    memcpy(body + pos, name, name_len); pos = pos + name_len;
+    memcpy(body + pos, " <", 2); pos = pos + 2;
+    memcpy(body + pos, email, email_len); pos = pos + email_len;
+    memcpy(body + pos, "> ", 2); pos = pos + 2;
+    digits = write_decimal(body + pos, ts); pos = pos + digits;
+    memcpy(body + pos, " +0000\n", 7); pos = pos + 7;
+
+    store8(body + pos, 10); pos = pos + 1;
+    memcpy(body + pos, message, msg_len); pos = pos + msg_len;
+    if (msg_len == 0) { store8(body + pos, 10); pos = pos + 1; }
+    else {
+        if (load8(message + msg_len - 1) != 10) {
+            store8(body + pos, 10); pos = pos + 1;
+        }
+    }
+
+    return write_typed_object("commit", 6, body, pos);
+}
+
+fn cmd_commit() {
+    var ac = argc();
+    if (ac < 3) {
+        eprintln("usage: sit commit [-m] <message>");
+        return 1;
+    }
+
+    # Parse message — support both `sit commit "msg"` and `sit commit -m "msg"`.
+    var message = 0;
+    var second = argv(2);
+    if (strlen(second) == 2) {
+        if (load8(second) == 45) {
+            if (load8(second + 1) == 109) {
+                if (ac < 4) {
+                    eprintln("sit: -m requires a message argument");
+                    return 1;
+                }
+                message = argv_heap(3);
+            }
+        }
+    }
+    if (message == 0) { message = argv_heap(2); }
+
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var entries = parse_index();
+    if (entries == 0) {
+        eprintln("sit: nothing to commit (empty or missing index)");
+        return 1;
+    }
+
+    if (entries_have_subdirs(entries) == 1) {
+        eprintln("sit: subdirectory paths not yet supported");
+        eprintln("sit:   see docs/architecture/003 for status");
+        return 1;
+    }
+
+    sort_entries(entries);
+    entries = dedupe_entries(entries);
+
+    var tree_hex = build_flat_tree(entries);
+    if (tree_hex == 0) {
+        eprintln("sit: failed to write tree object");
+        return 1;
+    }
+
+    var parent_hex = read_main_ref();
+
+    var commit_hex = build_commit(tree_hex, parent_hex, message);
+    if (commit_hex == 0) {
+        eprintln("sit: failed to write commit object");
+        return 1;
+    }
+
+    if (write_main_ref(commit_hex) != 0) {
+        eprintln("sit: failed to update refs/heads/main");
+        return 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "[main ", 6);
+    if (parent_hex == 0) {
+        syscall(SYS_WRITE, STDOUT, "(root-commit) ", 14);
+    }
+    syscall(SYS_WRITE, STDOUT, commit_hex, 12);
+    syscall(SYS_WRITE, STDOUT, "] ", 2);
+    var msg_len = strlen(message);
+    syscall(SYS_WRITE, STDOUT, message, msg_len);
+    if (msg_len > 0) {
+        if (load8(message + msg_len - 1) != 10) {
+            syscall(SYS_WRITE, STDOUT, "\n", 1);
+        }
+    }
+    else { syscall(SYS_WRITE, STDOUT, "\n", 1); }
+    return 0;
+}
+
 fn print_usage() {
     eprintln("usage: sit <command> [<args>]");
     eprintln("");
     eprintln("commands:");
-    eprintln("  init               create an empty sit repository");
-    eprintln("  add <path>         hash and store a file as a blob object");
-    eprintln("  cat-file <hash>    emit object content to stdout (plumbing)");
-    eprintln("  owl-file <hash>    view object through owl (bat-like viewer)");
+    eprintln("  init                    create an empty sit repository");
+    eprintln("  add <path>              hash and store a file as a blob object");
+    eprintln("  commit [-m] <message>   record staged changes as a new commit");
+    eprintln("  cat-file <hash>         emit object content to stdout (plumbing)");
+    eprintln("  owl-file <hash>         view object through owl (bat-like viewer)");
     return 0;
 }
 
@@ -407,6 +738,7 @@ fn main() {
 
     if (streq(cmd, "init")     == 1) { return cmd_init(); }
     if (streq(cmd, "add")      == 1) { return cmd_add(); }
+    if (streq(cmd, "commit")   == 1) { return cmd_commit(); }
     if (streq(cmd, "cat-file") == 1) { return cmd_cat_file(); }
     if (streq(cmd, "owl-file") == 1) { return cmd_owl_file(); }
 

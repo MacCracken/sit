@@ -102,16 +102,47 @@ Runs the content through [owl](https://github.com/MacCracken/owl) — bat-like f
 
 If owl isn't installed (it's currently pre-1.0), `owl-file` prints a notice and falls back to emitting raw content — so the command is usable today, and transparently upgrades to decorated output once owl ships.
 
+## Commit
+
+```sh
+export SIT_AUTHOR_NAME="Your Name"
+export SIT_AUTHOR_EMAIL="you@example.com"
+/path/to/sit/build/sit commit -m "initial commit"
+# [main (root-commit) 9836957df923] initial commit
+```
+
+The first commit on a branch prints `(root-commit)` in the header. Subsequent commits link to their parent via the commit object's `parent <hex>\n` line. If `SIT_AUTHOR_NAME` / `SIT_AUTHOR_EMAIL` are unset, sit uses the placeholder `"sit user" <user@localhost>`.
+
+Both `sit commit "msg"` (positional) and `sit commit -m "msg"` work.
+
+Inspect the commit and its tree:
+
+```sh
+sit cat-file 9836957df923
+# tree 8cf1dc97124fcbe8ec037c213cbb5440b03b7f4377a7aecc7bb3bae59f3d16da
+# author Your Name <you@example.com> 1776999445 +0000
+# committer Your Name <you@example.com> 1776999445 +0000
+#
+# initial commit
+
+sit cat-file 8cf1dc9 | xxd
+# 100644 greeting.txt\0<32 raw hash bytes>100644 notes.md\0<32 raw hash bytes>...
+```
+
+**Current limitation**: staged paths must be flat (no subdirectories). `sit add src/main.cyr` works, but `sit commit` will error out with a pointer to [arch 003](../architecture/003-flat-paths-in-commits.md). Recursive trees land in v0.3.0.
+
 ## What works today
 
 - `sit init` — create empty repository
 - `sit add <path>` — hash, compress, and store a file as a blob object; append to staging index
+- `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
 
 ## What doesn't yet
 
-- `sit commit` — tree + commit object creation
-- `sit status`, `sit log`, `sit diff`, everything else
+- `sit status`, `sit log`, `sit diff`
+- Recursive trees (subdirectories) — see [arch 003](../architecture/003-flat-paths-in-commits.md)
+- HEAD-aware branch selection — `sit commit` always writes to `refs/heads/main`
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).
