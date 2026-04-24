@@ -158,19 +158,51 @@ Walks the commit chain starting from `HEAD` (currently hardcoded to `refs/heads/
 
 Empty repo prints `sit: no commits yet` to stderr and exits 0 — not an error.
 
+## Check status
+
+```sh
+/path/to/sit/build/sit status
+# On branch main
+#
+# Staged for commit:
+#   modified:  readme.txt
+#   new file:  third.txt
+#
+# Unstaged changes:
+#   modified:  third.txt
+#
+# Untracked files:
+#   new.txt
+```
+
+Compares three views:
+
+1. **HEAD tree** — what was last committed (the tree object pointed to by `refs/heads/main`).
+2. **Staging index** — what `sit add` has recorded as "about to commit".
+3. **Working directory** — what's actually on disk right now.
+
+Categories:
+
+- **Staged for commit** — files in the index whose hash differs from HEAD's tree (or aren't in HEAD at all).
+- **Unstaged changes** — index entry where the file on disk has changed since `sit add`, or the file has been deleted.
+- **Untracked files** — files on disk that are neither staged nor committed.
+
+Empty repo with no files prints `nothing to commit, working tree clean`.
+
 ## What works today
 
 - `sit init` — create empty repository
 - `sit add <path>` — hash, compress, and store a file as a blob object; append to staging index
 - `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
 - `sit log` — walk commit history from HEAD with git-style output
+- `sit status` — three-way diff across HEAD tree, staging index, and working directory
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
 
 ## What doesn't yet
 
-- `sit status`, `sit diff`
+- `sit diff` — line-level comparison between blobs / working / index
 - Recursive trees (subdirectories) — see [arch 003](../architecture/003-flat-paths-in-commits.md)
-- HEAD-aware branch selection — `sit commit` / `sit log` always use `refs/heads/main`
+- HEAD-aware branch selection — `sit commit` / `sit log` / `sit status` always use `refs/heads/main`
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).

@@ -885,6 +885,299 @@ fn cmd_log() {
     return 0;
 }
 
+# Hash arbitrary content with "blob <len>\0" framing without writing.
+# Returns 64-char null-terminated hex C-string (matches `sit add`'s hash).
+fn hash_blob_of_content(content, content_len) {
+    var full_cap = 32 + content_len;
+    var full = alloc(full_cap);
+    memcpy(full, "blob ", 5);
+    var digits = write_decimal(full + 5, content_len);
+    store8(full + 5 + digits, 0);
+    var hdr_len = 5 + digits + 1;
+    memcpy(full + hdr_len, content, content_len);
+    return hash_data(full, hdr_len + content_len);
+}
+
+# Read a regular file into a heap buffer. Stores (buf_ptr, len) to out_pair.
+# Returns 0 on success, negative on error.
+fn read_file_heap(path, out_pair) {
+    var fd = file_open(path, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
+    syscall(SYS_LSEEK, fd, 0, SEEK_SET);
+    if (size < 0) { file_close(fd); return 0 - 2; }
+    var buf = alloc(size + 1);
+    if (buf == 0) { file_close(fd); return 0 - 3; }
+    var total = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        var n = file_read(fd, buf + total, size - total);
+        if (n <= 0) { rgo = 0; }
+        else { total = total + n; if (total >= size) { rgo = 0; } }
+    }
+    file_close(fd);
+    store64(out_pair, buf);
+    store64(out_pair + 8, total);
+    return 0;
+}
+
+fn hash_file_as_blob(path) {
+    var pair[16];
+    if (read_file_heap(path, &pair) != 0) { return 0; }
+    return hash_blob_of_content(load64(&pair), load64(&pair + 8));
+}
+
+# Tree entry layout (24 bytes):
+#   0..8:   mode ptr (heap cstring, e.g. "100644")
+#   8..16:  name ptr (heap cstring)
+#   16..24: hash_hex ptr (heap cstring, 64 chars + null)
+fn tree_entry_mode(e) { return load64(e); }
+fn tree_entry_name(e) { return load64(e + 8); }
+fn tree_entry_hash(e) { return load64(e + 16); }
+
+# Parse tree object body. Returns vec of entries.
+fn parse_tree(body, body_len) {
+    var entries = vec_new();
+    var pos = 0;
+    while (pos < body_len) {
+        var sp = pos;
+        while (sp < body_len) {
+            if (load8(body + sp) == 32) { break; }
+            sp = sp + 1;
+        }
+        if (sp >= body_len) { pos = body_len; }
+        else {
+            var mode_len = sp - pos;
+            var mode = alloc(mode_len + 1);
+            memcpy(mode, body + pos, mode_len);
+            store8(mode + mode_len, 0);
+
+            var nu = sp + 1;
+            while (nu < body_len) {
+                if (load8(body + nu) == 0) { break; }
+                nu = nu + 1;
+            }
+            if (nu >= body_len) { pos = body_len; }
+            else {
+                var name_len = nu - sp - 1;
+                var name = alloc(name_len + 1);
+                memcpy(name, body + sp + 1, name_len);
+                store8(name + name_len, 0);
+
+                if (nu + 1 + 32 > body_len) { pos = body_len; }
+                else {
+                    var hash_hex = hex_encode(body + nu + 1, 32);
+                    var e = alloc(24);
+                    store64(e, mode);
+                    store64(e + 8, name);
+                    store64(e + 16, hash_hex);
+                    vec_push(entries, e);
+                    pos = nu + 1 + 32;
+                }
+            }
+        }
+    }
+    return entries;
+}
+
+# Read HEAD → commit → tree object, parse into entries. Returns 0 if no HEAD commit.
+fn read_head_tree_entries() {
+    var head_commit = read_main_ref();
+    if (head_commit == 0) { return 0; }
+
+    var obj[24];
+    if (read_object(head_commit, &obj) != 0) { return 0; }
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    var body = buf + coff;
+    var body_len = blen - coff;
+
+    if (body_len < 70) { return 0; }
+    if (memeq(body, "tree ", 5) == 0) { return 0; }
+    var tree_hex = alloc(65);
+    memcpy(tree_hex, body + 5, 64);
+    store8(tree_hex + 64, 0);
+
+    var tobj[24];
+    if (read_object(tree_hex, &tobj) != 0) { return 0; }
+    var tbuf = load64(&tobj);
+    var tblen = load64(&tobj + 8);
+    var tcoff = load64(&tobj + 16);
+    return parse_tree(tbuf + tcoff, tblen - tcoff);
+}
+
+fn tree_find(entries, name) {
+    if (entries == 0) { return 0; }
+    var n = vec_len(entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        if (streq(tree_entry_name(e), name) == 1) { return e; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn index_find(entries, path) {
+    if (entries == 0) { return 0; }
+    var n = vec_len(entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        if (streq(entry_path(e), path) == 1) { return e; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# List regular files in the working directory (flat). Skips dotfiles (including
+# `.sit/`) and any entry that `is_dir` reports as a directory.
+fn list_working_files() {
+    var raw = dir_list(str_from("."));
+    var files = vec_new();
+    var n = vec_len(raw);
+    var i = 0;
+    while (i < n) {
+        var s = vec_get(raw, i);
+        var sdata = str_data(s);
+        if (load8(sdata) != 46) {
+            var slen = str_len(s);
+            var name = alloc(slen + 1);
+            memcpy(name, sdata, slen);
+            store8(name + slen, 0);
+            if (is_dir(str_from(name)) == 0) {
+                vec_push(files, name);
+            }
+        }
+        i = i + 1;
+    }
+    return files;
+}
+
+# A "status item" is a 16-byte (label_ptr, path_ptr) pair.
+fn push_status_item(vec, label, path) {
+    var item = alloc(16);
+    store64(item, label);
+    store64(item + 8, path);
+    vec_push(vec, item);
+    return 0;
+}
+
+fn print_labeled_section(title, title_len, items) {
+    if (vec_len(items) == 0) { return 0; }
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    syscall(SYS_WRITE, STDOUT, title, title_len);
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    var si = 0;
+    while (si < vec_len(items)) {
+        var it = vec_get(items, si);
+        var lab = load64(it);
+        var pth = load64(it + 8);
+        syscall(SYS_WRITE, STDOUT, "  ", 2);
+        syscall(SYS_WRITE, STDOUT, lab, strlen(lab));
+        syscall(SYS_WRITE, STDOUT, pth, strlen(pth));
+        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        si = si + 1;
+    }
+    return 1;
+}
+
+fn print_name_section(title, title_len, names) {
+    if (vec_len(names) == 0) { return 0; }
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    syscall(SYS_WRITE, STDOUT, title, title_len);
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    var si = 0;
+    while (si < vec_len(names)) {
+        var nm = vec_get(names, si);
+        syscall(SYS_WRITE, STDOUT, "  ", 2);
+        syscall(SYS_WRITE, STDOUT, nm, strlen(nm));
+        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        si = si + 1;
+    }
+    return 1;
+}
+
+fn cmd_status() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var head_entries = read_head_tree_entries();
+    var index_entries = parse_index();
+    if (index_entries != 0) {
+        sort_entries(index_entries);
+        index_entries = dedupe_entries(index_entries);
+    }
+    var working = list_working_files();
+
+    var staged = vec_new();
+    var unstaged = vec_new();
+    var untracked = vec_new();
+
+    if (index_entries != 0) {
+        var ni = vec_len(index_entries);
+        var ii = 0;
+        while (ii < ni) {
+            var e = vec_get(index_entries, ii);
+            var path = entry_path(e);
+            var idx_hash_hex = hex_encode(entry_hash(e), 32);
+
+            var head_ent = tree_find(head_entries, path);
+            var label = 0;
+            if (head_ent == 0) { label = "new file:  "; }
+            else {
+                if (streq(tree_entry_hash(head_ent), idx_hash_hex) == 0) {
+                    label = "modified:  ";
+                }
+            }
+            if (label != 0) { push_status_item(staged, label, path); }
+
+            if (file_exists(path) == 1) {
+                var working_hex = hash_file_as_blob(path);
+                if (working_hex != 0) {
+                    if (streq(working_hex, idx_hash_hex) == 0) {
+                        push_status_item(unstaged, "modified:  ", path);
+                    }
+                }
+            }
+            else {
+                push_status_item(unstaged, "deleted:   ", path);
+            }
+            ii = ii + 1;
+        }
+    }
+
+    var nw = vec_len(working);
+    var wi = 0;
+    while (wi < nw) {
+        var name = vec_get(working, wi);
+        if (index_find(index_entries, name) == 0) {
+            if (tree_find(head_entries, name) == 0) {
+                vec_push(untracked, name);
+            }
+        }
+        wi = wi + 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "On branch main\n", 15);
+    if (read_main_ref() == 0) {
+        syscall(SYS_WRITE, STDOUT, "No commits yet\n", 15);
+    }
+
+    var any = 0;
+    if (print_labeled_section("Staged for commit:", 18, staged) == 1)   { any = 1; }
+    if (print_labeled_section("Unstaged changes:", 17, unstaged) == 1)   { any = 1; }
+    if (print_name_section("Untracked files:", 16, untracked) == 1)      { any = 1; }
+
+    if (any == 0) {
+        syscall(SYS_WRITE, STDOUT, "\nnothing to commit, working tree clean\n", 39);
+    }
+    return 0;
+}
+
 fn print_usage() {
     eprintln("usage: sit <command> [<args>]");
     eprintln("");
@@ -893,6 +1186,7 @@ fn print_usage() {
     eprintln("  add <path>              hash and store a file as a blob object");
     eprintln("  commit [-m] <message>   record staged changes as a new commit");
     eprintln("  log                     show commit history from HEAD");
+    eprintln("  status                  show working tree status");
     eprintln("  cat-file <hash>         emit object content to stdout (plumbing)");
     eprintln("  owl-file <hash>         view object through owl (bat-like viewer)");
     return 0;
@@ -913,6 +1207,7 @@ fn main() {
     if (streq(cmd, "add")      == 1) { return cmd_add(); }
     if (streq(cmd, "commit")   == 1) { return cmd_commit(); }
     if (streq(cmd, "log")      == 1) { return cmd_log(); }
+    if (streq(cmd, "status")   == 1) { return cmd_status(); }
     if (streq(cmd, "cat-file") == 1) { return cmd_cat_file(); }
     if (streq(cmd, "owl-file") == 1) { return cmd_owl_file(); }
 

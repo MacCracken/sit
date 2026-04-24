@@ -38,13 +38,21 @@
 - **Fix**: `read_object` now sizes its decompression buffer from the compressed input (256× upper bound, capped at 16 MB) instead of unconditionally allocating 16 MB. The old code exhausted the bump allocator after ~15 calls — caught when walking a two-commit history segfaulted on the second `read_object`. Dynamic sizing lets `sit log` scale to arbitrarily long histories.
 - Handles empty repo ("no commits yet"), root commit (walk terminates when `parent_hex` stays 0), and multi-line commit messages (each physical line gets indented).
 
+### v0.1.4 — `sit status` + tree reader
+
+- **`sit status`** — three-way diff across HEAD tree, staging index, and working directory. Reports "Staged for commit" (index vs HEAD), "Unstaged changes" (working vs index), and "Untracked files" (in working, absent from both index and HEAD). Emits `nothing to commit, working tree clean` when all three categories are empty.
+- **Tree reader**: `parse_tree(body, body_len)` walks `<mode> <name>\0<32 raw hash bytes>` entries and returns a vec of 24-byte entries holding `(mode_ptr, name_ptr, hash_hex_ptr)`. `read_head_tree_entries()` composes `read_main_ref` → `read_object` → tree-hash extraction → `parse_tree` in one call. Shared with future `sit diff` and (eventually) recursive-tree construction.
+- **Working-dir walker**: `list_working_files()` uses stdlib `dir_list` + `is_dir`, filters dotfiles (including `.sit/`) and directories. Paired with `hash_file_as_blob` — hashes a working-tree file through the same `"blob <len>\0<content>"` framing as `sit add` so index-vs-working comparisons are hash equality, not content comparison.
+- **Dedup at read time**: `cmd_status` sorts + dedupes the index (same helpers as `cmd_commit`) before walking it, so a path that was `sit add`'d twice appears once in status output. Without this the status output double-counted re-staged files.
+- **Deletion detection**: index entry whose path is missing in the working tree shows as `Unstaged changes: deleted: <path>`.
+- Covers nine scenarios: empty repo, untracked-only, staged-new, clean-after-commit, modified-unstaged, re-staged-after-modify, multi-mixed (staged + unstaged + untracked), deleted, outside-repo.
+
 ## Post-0.1 Backlog
 
 ### Priority — the v0.2.0 loop
 
-- **`sit status`** — diff working tree vs staging index vs HEAD tree. Needs a tree reader (walk tree objects, yield `(path, mode, hash)` tuples).
-- **`sit diff`** — sankoch-backed text diff between two blobs / working tree / index.
-- **Recursive trees** (arch 003) — lift the flat-path restriction on `sit commit`. Path segmentation + per-directory subtree construction + git's directory-sort rule (`<name>/` vs `<name>`). Often paired with the tree reader from `sit status`.
+- **`sit diff`** — sankoch-backed text diff between two blobs / working tree / index. Needs a line-diff algorithm (Myers or similar).
+- **Recursive trees** (arch 003) — lift the flat-path restriction on `sit commit`. Path segmentation + per-directory subtree construction + git's directory-sort rule (`<name>/` vs `<name>`). Tree *reader* (v0.1.4) already in place; only the writer needs to go recursive.
 
 ### Working-tree visibility
 
