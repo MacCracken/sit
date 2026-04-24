@@ -8,10 +8,11 @@ The name is from *smriti* (स्मृति — "that which is remembered"). T
 
 ## Status
 
-- **Version**: 0.1.0 (scaffolded — not yet functional)
+- **Version**: 0.1.6 — local single-branch VCS is functional
 - **Language**: Cyrius (toolchain pinned in `cyrius.cyml`)
+- **Commands**: `init`, `add`, `commit`, `log`, `status`, `diff`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md)
 
-This is an exploratory, post-boot project. Not on the AGNOS critical path.
+Objects are SHA-256-hashed (via [sigil](https://github.com/MacCracken/sigil)) and zlib-compressed (via [sankoch](https://github.com/MacCracken/sankoch)); trees are recursive and byte-compatible with git's SHA-256 object format. Still exploratory, post-boot — not on the AGNOS critical path.
 
 ## Architecture
 
