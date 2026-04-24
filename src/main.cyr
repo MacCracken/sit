@@ -1,10 +1,81 @@
 # sit — main entry point
-# Stdlib auto-included via cyrius.toml
+# Stdlib auto-included via cyrius.cyml
+
+fn eprintln(s) {
+    var len = strlen(s);
+    syscall(SYS_WRITE, STDERR, s, len);
+    syscall(SYS_WRITE, STDERR, "\n", 1);
+    return 0;
+}
+
+# mkdir(path, 0o755), tolerating EEXIST (-17).
+fn ensure_dir(path) {
+    var r = sys_mkdir(path, 0x1ED);
+    if (r == 0) { return 0; }
+    if (r == 0 - 17) { return 0; }
+    return r;
+}
+
+fn cmd_init() {
+    var reinit = file_exists(".sit/HEAD");
+
+    if (ensure_dir(".sit") != 0) {
+        eprintln("sit: failed to create .sit");
+        return 1;
+    }
+    if (ensure_dir(".sit/objects") != 0) {
+        eprintln("sit: failed to create .sit/objects");
+        return 1;
+    }
+    if (ensure_dir(".sit/refs") != 0) {
+        eprintln("sit: failed to create .sit/refs");
+        return 1;
+    }
+    if (ensure_dir(".sit/refs/heads") != 0) {
+        eprintln("sit: failed to create .sit/refs/heads");
+        return 1;
+    }
+
+    var head = "ref: refs/heads/main\n";
+    if (file_write_all(".sit/HEAD", head, 21) < 0) {
+        eprintln("sit: failed to write .sit/HEAD");
+        return 1;
+    }
+
+    if (reinit == 1) {
+        println("reinitialized existing sit repository in .sit/");
+    } else {
+        println("initialized empty sit repository in .sit/");
+    }
+    return 0;
+}
+
+fn print_usage() {
+    eprintln("usage: sit <command> [<args>]");
+    eprintln("");
+    eprintln("commands:");
+    eprintln("  init    create an empty sit repository");
+    return 0;
+}
 
 fn main() {
     alloc_init();
-    println("hello from sit");
-    return 0;
+    args_init();
+
+    if (argc() < 2) {
+        print_usage();
+        return 1;
+    }
+
+    var cmd = argv(1);
+
+    if (streq(cmd, "init") == 1) {
+        return cmd_init();
+    }
+
+    eprintln("sit: unknown command");
+    print_usage();
+    return 1;
 }
 
 var r = main();

@@ -34,6 +34,11 @@ stdlib = [
     "process",
     "tagged",
     "fnptr",
+    "thread",
+    "freelist",
+    "bigint",
+    "ct",
+    "keccak",
 ]
 
 [deps.sakshi]
