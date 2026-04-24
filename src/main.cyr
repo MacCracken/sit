@@ -822,6 +822,322 @@ fn build_commit(tree_hex, parent_hex, message) {
     return write_typed_object("commit", 6, body, pos);
 }
 
+fn sort_cstrings(vec) {
+    var n = vec_len(vec);
+    var i = 1;
+    while (i < n) {
+        var cur = vec_get(vec, i);
+        var j = i - 1;
+        var placed = 0;
+        while (placed == 0) {
+            if (j < 0) { placed = 1; }
+            else {
+                var prev = vec_get(vec, j);
+                if (strcmp_cstr(cur, prev) >= 0) { placed = 1; }
+                else {
+                    vec_set(vec, j + 1, prev);
+                    j = j - 1;
+                }
+            }
+        }
+        vec_set(vec, j + 1, cur);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn cmd_branch() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    if (argc() < 3) {
+        if (file_exists(".sit/refs/heads") != 1) { return 0; }
+        var raw = dir_list(str_from(".sit/refs/heads"));
+        var names = vec_new();
+        var n = vec_len(raw);
+        var i = 0;
+        while (i < n) {
+            var s = vec_get(raw, i);
+            var slen = str_len(s);
+            var nm = alloc(slen + 1);
+            memcpy(nm, str_data(s), slen);
+            store8(nm + slen, 0);
+            vec_push(names, nm);
+            i = i + 1;
+        }
+        sort_cstrings(names);
+        var curr = current_branch_name();
+        i = 0;
+        var m = vec_len(names);
+        while (i < m) {
+            var nm = vec_get(names, i);
+            var is_current = 0;
+            if (curr != 0) {
+                if (streq(nm, curr) == 1) { is_current = 1; }
+            }
+            if (is_current == 1) { syscall(SYS_WRITE, STDOUT, "* ", 2); }
+            else                 { syscall(SYS_WRITE, STDOUT, "  ", 2); }
+            syscall(SYS_WRITE, STDOUT, nm, strlen(nm));
+            syscall(SYS_WRITE, STDOUT, "\n", 1);
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    var name = argv_heap(2);
+    var nlen = strlen(name);
+    var path = alloc(16 + nlen + 1);
+    memcpy(path, ".sit/refs/heads/", 16);
+    memcpy(path + 16, name, nlen);
+    store8(path + 16 + nlen, 0);
+
+    if (file_exists(path) == 1) {
+        syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
+        syscall(SYS_WRITE, STDERR, name, nlen);
+        syscall(SYS_WRITE, STDERR, "' already exists\n", 17);
+        return 1;
+    }
+
+    var head_hex = read_head_ref();
+    if (head_hex == 0) {
+        eprintln("sit: cannot create a branch with no commits");
+        return 1;
+    }
+
+    var buf = alloc(66);
+    memcpy(buf, head_hex, 64);
+    store8(buf + 64, 10);
+    store8(buf + 65, 0);
+    if (file_write_all(path, buf, 65) < 0) {
+        eprintln("sit: failed to write branch ref");
+        return 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "created branch '", 16);
+    syscall(SYS_WRITE, STDOUT, name, nlen);
+    syscall(SYS_WRITE, STDOUT, "'\n", 2);
+    return 0;
+}
+
+# True if there are any staged or unstaged changes vs HEAD. Untracked files
+# are not considered dirty (they don't block checkout unless they collide).
+fn is_dirty() {
+    var index_entries = parse_index();
+    if (index_entries != 0) {
+        sort_entries(index_entries);
+        index_entries = dedupe_entries(index_entries);
+    }
+    var head_entries = read_head_tree_entries();
+
+    if (index_entries != 0) {
+        var n = vec_len(index_entries);
+        var i = 0;
+        while (i < n) {
+            var e = vec_get(index_entries, i);
+            var path = entry_path(e);
+            var idx_hex = hex_encode(entry_hash(e), 32);
+            var head_ent = tree_find(head_entries, path);
+            if (head_ent == 0) { return 1; }
+            if (streq(tree_entry_hash(head_ent), idx_hex) == 0) { return 1; }
+            if (file_exists(path) == 1) {
+                var wh = hash_file_as_blob(path);
+                if (wh != 0) {
+                    if (streq(wh, idx_hex) == 0) { return 1; }
+                }
+            }
+            else { return 1; }
+            i = i + 1;
+        }
+    }
+
+    if (head_entries != 0) {
+        var hn = vec_len(head_entries);
+        var hi = 0;
+        while (hi < hn) {
+            var he = vec_get(head_entries, hi);
+            if (index_find(index_entries, tree_entry_name(he)) == 0) { return 1; }
+            hi = hi + 1;
+        }
+    }
+    return 0;
+}
+
+# Ensure all parent directories of `path` exist. For "src/lib/foo.cyr",
+# creates "src" and "src/lib".
+fn ensure_dirs_for(path) {
+    var len = strlen(path);
+    var i = 0;
+    while (i < len) {
+        if (load8(path + i) == 47) {
+            var dir = alloc(i + 1);
+            memcpy(dir, path, i);
+            store8(dir + i, 0);
+            ensure_dir(dir);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Write "ref: <ref_path>\n" to .sit/HEAD. Returns 0 on success.
+fn set_head_ref(ref_path) {
+    var rlen = strlen(ref_path);
+    var total = 5 + rlen + 1;
+    var buf = alloc(total + 1);
+    memcpy(buf, "ref: ", 5);
+    memcpy(buf + 5, ref_path, rlen);
+    store8(buf + 5 + rlen, 10);
+    store8(buf + total, 0);
+    if (file_write_all(".sit/HEAD", buf, total) < 0) { return 0 - 1; }
+    return 0;
+}
+
+fn cmd_checkout() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+    if (argc() < 3) {
+        eprintln("usage: sit checkout <branch>");
+        return 1;
+    }
+
+    var target = argv_heap(2);
+    var tlen = strlen(target);
+
+    var target_ref_len = 11 + tlen;
+    var target_ref = alloc(target_ref_len + 1);
+    memcpy(target_ref, "refs/heads/", 11);
+    memcpy(target_ref + 11, target, tlen);
+    store8(target_ref + target_ref_len, 0);
+
+    var target_path = alloc(5 + target_ref_len + 1);
+    memcpy(target_path, ".sit/", 5);
+    memcpy(target_path + 5, target_ref, target_ref_len);
+    store8(target_path + 5 + target_ref_len, 0);
+
+    if (file_exists(target_path) != 1) {
+        syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
+        syscall(SYS_WRITE, STDERR, target, tlen);
+        syscall(SYS_WRITE, STDERR, "' not found\n", 12);
+        return 1;
+    }
+
+    var curr = current_branch_name();
+    if (curr != 0) {
+        if (streq(curr, target) == 1) {
+            syscall(SYS_WRITE, STDOUT, "already on '", 12);
+            syscall(SYS_WRITE, STDOUT, target, tlen);
+            syscall(SYS_WRITE, STDOUT, "'\n", 2);
+            return 0;
+        }
+    }
+
+    if (is_dirty() == 1) {
+        eprintln("sit: working tree has uncommitted changes");
+        eprintln("sit:   commit or revert before switching branches");
+        return 1;
+    }
+
+    var target_fd = file_open(target_path, 0, 0);
+    if (target_fd < 0) {
+        eprintln("sit: cannot read target branch ref");
+        return 1;
+    }
+    var target_hex = alloc(80);
+    var n = file_read(target_fd, target_hex, 80);
+    file_close(target_fd);
+    if (n < 64) {
+        eprintln("sit: target ref is invalid");
+        return 1;
+    }
+    store8(target_hex + 64, 0);
+
+    var target_entries = commit_tree_entries(target_hex);
+    if (target_entries == 0) { target_entries = vec_new(); }
+
+    var curr_entries = read_head_tree_entries();
+    if (curr_entries == 0) { curr_entries = vec_new(); }
+
+    # Collision check: untracked files on disk that would be overwritten
+    var working = list_working_files();
+    var wn = vec_len(working);
+    var wi = 0;
+    while (wi < wn) {
+        var wpath = vec_get(working, wi);
+        if (tree_find(curr_entries, wpath) == 0) {
+            if (tree_find(target_entries, wpath) != 0) {
+                syscall(SYS_WRITE, STDERR, "sit: untracked file '", 21);
+                syscall(SYS_WRITE, STDERR, wpath, strlen(wpath));
+                syscall(SYS_WRITE, STDERR, "' would be overwritten\n", 23);
+                return 1;
+            }
+        }
+        wi = wi + 1;
+    }
+
+    # Delete files in current tree not in target
+    var cn = vec_len(curr_entries);
+    var ci = 0;
+    while (ci < cn) {
+        var ce = vec_get(curr_entries, ci);
+        var cpath = tree_entry_name(ce);
+        if (tree_find(target_entries, cpath) == 0) {
+            if (file_exists(cpath) == 1) { sys_unlink(cpath); }
+        }
+        ci = ci + 1;
+    }
+
+    # Write target tree files
+    var tn = vec_len(target_entries);
+    var ti = 0;
+    while (ti < tn) {
+        var te = vec_get(target_entries, ti);
+        var tpath = tree_entry_name(te);
+        var thex = tree_entry_hash(te);
+        ensure_dirs_for(tpath);
+        var tp[16];
+        if (read_blob_content(thex, &tp) == 0) {
+            file_write_all(tpath, load64(&tp), load64(&tp + 8));
+        }
+        ti = ti + 1;
+    }
+
+    # Rebuild index from target tree
+    var new_index = vec_new();
+    ti = 0;
+    while (ti < tn) {
+        var te = vec_get(target_entries, ti);
+        var tpath = tree_entry_name(te);
+        var thex = tree_entry_hash(te);
+        var bytes = hex_decode(thex, 64);
+        if (bytes != 0) {
+            var entry = alloc(40);
+            memcpy(entry, bytes, 32);
+            var plen = strlen(tpath);
+            var pcopy = alloc(plen + 1);
+            memcpy(pcopy, tpath, plen);
+            store8(pcopy + plen, 0);
+            store64(entry + 32, pcopy);
+            vec_push(new_index, entry);
+        }
+        ti = ti + 1;
+    }
+    rewrite_index(new_index);
+
+    if (set_head_ref(target_ref) != 0) {
+        eprintln("sit: failed to update HEAD");
+        return 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "switched to branch '", 20);
+    syscall(SYS_WRITE, STDOUT, target, tlen);
+    syscall(SYS_WRITE, STDOUT, "'\n", 2);
+    return 0;
+}
+
 fn cmd_rm() {
     if (argc() < 3) {
         eprintln("usage: sit rm [--cached] <path>");
@@ -2305,6 +2621,8 @@ fn print_usage() {
     eprintln("  init                    create an empty sit repository");
     eprintln("  add <path>              hash and store a file as a blob object");
     eprintln("  rm [--cached] <path>    remove a tracked file from working tree and index");
+    eprintln("  branch [<name>]         list branches, or create one at HEAD");
+    eprintln("  checkout <branch>       switch to <branch>, updating working tree + index");
     eprintln("  commit [-m] <message>   record staged changes as a new commit");
     eprintln("  log                     show commit history from HEAD");
     eprintln("  status                  show working tree status");
@@ -2329,6 +2647,8 @@ fn main() {
     if (streq(cmd, "init")     == 1) { return cmd_init(); }
     if (streq(cmd, "add")      == 1) { return cmd_add(); }
     if (streq(cmd, "rm")       == 1) { return cmd_rm(); }
+    if (streq(cmd, "branch")   == 1) { return cmd_branch(); }
+    if (streq(cmd, "checkout") == 1) { return cmd_checkout(); }
     if (streq(cmd, "commit")   == 1) { return cmd_commit(); }
     if (streq(cmd, "log")      == 1) { return cmd_log(); }
     if (streq(cmd, "status")   == 1) { return cmd_status(); }

@@ -114,11 +114,25 @@
 - **Everywhere-refactor**: `cmd_commit`, `cmd_log`, `cmd_status`, `cmd_show`, `cmd_diff`, and `read_head_tree_entries` all route through the new helpers. Status's `On branch main\n` and commit's `[main ...]` are now dynamic.
 - Verified against seven scenarios: main-branch regression, manual HEAD retarget to `dev`, commit lands on correct ref (main untouched), log follows active branch, switch back via HEAD edit, new-branch creation by committing with HEAD pointing at a nonexistent ref (creates `refs/heads/<name>` on write), malformed HEAD shows `(detached)` and commit errors out cleanly.
 
+### v0.2.1 — `sit branch` + `sit checkout`
+
+- **`sit branch`** (no args) — lists branches at `.sit/refs/heads/`, alphabetically sorted, current one prefixed with `* `. Uses new `sort_cstrings` helper (insertion-sort over a cstring vec).
+- **`sit branch <name>`** — creates `.sit/refs/heads/<name>` pointing at HEAD's current commit. Errors if branch already exists or if no commits exist yet.
+- **`sit checkout <branch>`** — switches to target branch. Full flow:
+    1. Resolve target ref path + read its commit hex.
+    2. No-op if already on target.
+    3. Dirty check via `is_dirty()` — blocks if index differs from HEAD or working differs from index.
+    4. Collision check — any untracked working file that the target tree contains → error ("would be overwritten").
+    5. Delete files present in current HEAD tree but not in target.
+    6. Write target tree's blob content to working paths, creating parent dirs via `ensure_dirs_for`.
+    7. Rewrite `.sit/index` to exactly match target tree (hex→raw bytes via `hex_decode`).
+    8. Update `.sit/HEAD` via `set_head_ref(target_ref)`.
+- **`is_dirty()`** — factors the dirty detection used by checkout; reuses `parse_index` + `read_head_tree_entries` + `hash_file_as_blob` in the same pattern as `cmd_status`.
+- **`ensure_dirs_for(path)`** — `mkdir -p`-style helper walking the path and `ensure_dir`-ing each prefix at each `/`.
+- **`set_head_ref(ref_path)`** — writes `ref: <ref_path>\n` to `.sit/HEAD`. Used by checkout; probably also by future `sit checkout -b`.
+- Verified against 13 scenarios: empty-branch-list (no commits), list-with-just-main, create-dev, checkout dev (materialize), checkout main (cleanup dev-only files), roundtrip, dirty blocking, clean allows, bad-branch error, dup-branch error, untracked collision, nested-dir create/delete across branches, log-follows-active-branch.
+
 ## Post-0.1 Backlog
-
-### v0.2 — Branches
-
-- **v0.2.1 — `sit branch [<name>]` + `sit checkout <name>`.** First multi-ref feature. `sit branch` creates `.sit/refs/heads/<name>` pointing at HEAD's current commit; `sit checkout` updates HEAD, materializes the target's tree into the working directory, and rewrites the index to match.
 
 ### Longer horizon
 

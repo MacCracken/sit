@@ -252,6 +252,8 @@ file?.bak
 - `sit init` — create empty repository
 - `sit add <path>` — hash, compress, and store a file as a blob object; append to staging index
 - `sit rm [--cached] <path>` — remove a tracked file from working tree + index (or just the index with `--cached`)
+- `sit branch [<name>]` — list branches, or create one at HEAD
+- `sit checkout <branch>` — switch branches: materializes the target tree into the working directory, rewrites the index, updates HEAD
 - `.sitignore` — gitignore-style pattern file (at repo root) filters untracked-file display and `sit add`
 - `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
 - `sit log` — walk commit history from HEAD with git-style output
@@ -263,7 +265,9 @@ file?.bak
 
 ## What doesn't yet
 
-- HEAD-aware branch selection — `sit commit` / `sit log` / `sit status` always use `refs/heads/main`
-- Branch create/switch / `sit checkout`
+- `sit config` (author identity is env-var-only)
+- Remote / push / pull / fetch / wire protocol
+- `sit fsck`, merge, rebase, tags
+- `sit checkout -b <name>` convenience (use `sit branch <name>` then `sit checkout <name>`)
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).
