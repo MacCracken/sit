@@ -1683,6 +1683,89 @@ fn set_head_ref(ref_path) {
     return 0;
 }
 
+# Write `.sit/MERGE_HEAD` pointing at the other-parent commit for an
+# in-progress merge. Next `sit commit` will read this and emit a 2-parent
+# commit, then unlink it.
+fn write_merge_head(hex) {
+    var buf = alloc(66);
+    memcpy(buf, hex, 64);
+    store8(buf + 64, 10);
+    store8(buf + 65, 0);
+    if (file_write_all(".sit/MERGE_HEAD", buf, 65) < 0) { return 0 - 1; }
+    return 0;
+}
+
+# Read `.sit/MERGE_HEAD` if it exists. Returns heap-allocated 64-char hex
+# cstring, or 0 if no merge is in progress.
+fn read_merge_head() {
+    if (file_exists(".sit/MERGE_HEAD") != 1) { return 0; }
+    var fd = file_open(".sit/MERGE_HEAD", 0, 0);
+    if (fd < 0) { return 0; }
+    var buf = alloc(80);
+    var n = file_read(fd, buf, 80);
+    file_close(fd);
+    if (n < 64) { return 0; }
+    store8(buf + 64, 0);
+    return buf;
+}
+
+# Write a file with git-style conflict markers for ours/theirs. The markers
+# wrap full-file content (we're file-level 3-way, not line-level yet).
+#   <<<<<<< HEAD
+#   <ours content>
+#   =======
+#   <theirs content>
+#   >>>>>>> <branch_name>
+fn write_conflict_file(path, ours_hex, theirs_hex, branch_name) {
+    var op[16];
+    var tp[16];
+    var ours_content = 0;
+    var ours_len = 0;
+    var theirs_content = 0;
+    var theirs_len = 0;
+    if (ours_hex != 0) {
+        if (read_blob_content(ours_hex, &op) == 0) {
+            ours_content = load64(&op);
+            ours_len = load64(&op + 8);
+        }
+    }
+    if (theirs_hex != 0) {
+        if (read_blob_content(theirs_hex, &tp) == 0) {
+            theirs_content = load64(&tp);
+            theirs_len = load64(&tp + 8);
+        }
+    }
+
+    var bn_len = strlen(branch_name);
+    var cap = 64 + ours_len + theirs_len + bn_len;
+    var out = alloc(cap);
+    var pos = 0;
+
+    memcpy(out + pos, "<<<<<<< HEAD\n", 13); pos = pos + 13;
+    if (ours_len > 0) {
+        memcpy(out + pos, ours_content, ours_len);
+        pos = pos + ours_len;
+        if (load8(ours_content + ours_len - 1) != 10) {
+            store8(out + pos, 10); pos = pos + 1;
+        }
+    }
+    memcpy(out + pos, "=======\n", 8); pos = pos + 8;
+    if (theirs_len > 0) {
+        memcpy(out + pos, theirs_content, theirs_len);
+        pos = pos + theirs_len;
+        if (load8(theirs_content + theirs_len - 1) != 10) {
+            store8(out + pos, 10); pos = pos + 1;
+        }
+    }
+    memcpy(out + pos, ">>>>>>> ", 8); pos = pos + 8;
+    memcpy(out + pos, branch_name, bn_len); pos = pos + bn_len;
+    store8(out + pos, 10); pos = pos + 1;
+
+    ensure_dirs_for(path);
+    if (file_write_all(path, out, pos) < 0) { return 0 - 1; }
+    return 0;
+}
+
 # Find the lowest common ancestor of two commits. Walks a's ancestry into a
 # set, then walks b's and returns the first hit. Returns 0 if no common
 # ancestor exists (disjoint histories).
@@ -1923,8 +2006,21 @@ fn cmd_merge() {
         return 1;
     }
     if (argc() < 3) {
-        eprintln("usage: sit merge <branch>");
+        eprintln("usage: sit merge <branch> | sit merge --abort");
         return 1;
+    }
+
+    # --abort: restore working tree to HEAD, clear MERGE_HEAD.
+    if (streq(argv(2), "--abort") == 1) {
+        if (file_exists(".sit/MERGE_HEAD") != 1) {
+            eprintln("sit: no merge in progress");
+            return 1;
+        }
+        var head = read_head_ref();
+        if (head != 0) { materialize_target(head); }
+        sys_unlink(".sit/MERGE_HEAD");
+        syscall(SYS_WRITE, STDOUT, "merge aborted\n", 14);
+        return 0;
     }
 
     var target_name = argv_heap(2);
@@ -2075,21 +2171,51 @@ fn cmd_merge() {
     }
 
     if (vec_len(conflicts) > 0) {
+        # Write auto-merged files to working tree so clean paths don't appear
+        # conflicted in subsequent sit status.
+        var mi = 0;
+        var mn = vec_len(merged);
+        while (mi < mn) {
+            var me = vec_get(merged, mi);
+            var mpath = load64(me + 32);
+            var bytes32 = me;
+            var mhex = hex_encode(bytes32, 32);
+            ensure_dirs_for(mpath);
+            var mp[16];
+            if (read_blob_content(mhex, &mp) == 0) {
+                file_write_all(mpath, load64(&mp), load64(&mp + 8));
+            }
+            mi = mi + 1;
+        }
+
+        # Write conflict-marker files for each conflicting path.
+        var ci = 0;
+        while (ci < vec_len(conflicts)) {
+            var cp = vec_get(conflicts, ci);
+            var ours_h = tree_find_hash(ours_entries, cp);
+            var theirs_h = tree_find_hash(theirs_entries, cp);
+            write_conflict_file(cp, ours_h, theirs_h, target_name);
+            ci = ci + 1;
+        }
+
+        # Track MERGE_HEAD so the next sit commit produces a 2-parent commit.
+        write_merge_head(&target_hex);
+
         syscall(SYS_WRITE, STDERR, "sit: merge conflict in ", 23);
         var buf[24];
         var digits = write_decimal(&buf, vec_len(conflicts));
         syscall(SYS_WRITE, STDERR, &buf, digits);
         syscall(SYS_WRITE, STDERR, " file(s):\n", 10);
-        var ci = 0;
+        ci = 0;
         while (ci < vec_len(conflicts)) {
             syscall(SYS_WRITE, STDERR, "  ", 2);
-            var cp = vec_get(conflicts, ci);
-            syscall(SYS_WRITE, STDERR, cp, strlen(cp));
+            var cp2 = vec_get(conflicts, ci);
+            syscall(SYS_WRITE, STDERR, cp2, strlen(cp2));
             syscall(SYS_WRITE, STDERR, "\n", 1);
             ci = ci + 1;
         }
-        eprintln("sit: resolve manually and run 'sit add' + 'sit commit'");
-        eprintln("sit: (note: resulting commit will have only HEAD as parent — MERGE_HEAD tracking is a later feature)");
+        eprintln("sit: edit the marked files, 'sit add' them, then 'sit commit'");
+        eprintln("sit:   'sit merge --abort' to cancel and restore the working tree");
         return 1;
     }
 
@@ -2387,8 +2513,17 @@ fn cmd_commit() {
     }
 
     var parent_hex = read_head_ref();
+    var merge_parent = read_merge_head();
 
-    var commit_hex = build_commit(tree_hex, parent_hex, message);
+    var commit_hex = 0;
+    if (merge_parent != 0) {
+        # Resolving an in-progress merge — 2-parent commit, then clear MERGE_HEAD.
+        commit_hex = build_merge_commit(tree_hex, parent_hex, merge_parent, message);
+        if (commit_hex != 0) { sys_unlink(".sit/MERGE_HEAD"); }
+    }
+    else {
+        commit_hex = build_commit(tree_hex, parent_hex, message);
+    }
     if (commit_hex == 0) {
         eprintln("sit: failed to write commit object");
         return 1;
@@ -2404,8 +2539,13 @@ fn cmd_commit() {
     if (branch != 0) { syscall(SYS_WRITE, STDOUT, branch, strlen(branch)); }
     else             { syscall(SYS_WRITE, STDOUT, "detached", 8); }
     syscall(SYS_WRITE, STDOUT, " ", 1);
-    if (parent_hex == 0) {
-        syscall(SYS_WRITE, STDOUT, "(root-commit) ", 14);
+    if (merge_parent != 0) {
+        syscall(SYS_WRITE, STDOUT, "(merge) ", 8);
+    }
+    else {
+        if (parent_hex == 0) {
+            syscall(SYS_WRITE, STDOUT, "(root-commit) ", 14);
+        }
     }
     syscall(SYS_WRITE, STDOUT, commit_hex, 12);
     syscall(SYS_WRITE, STDOUT, "] ", 2);
@@ -3111,6 +3251,10 @@ fn cmd_status() {
     syscall(SYS_WRITE, STDOUT, "\n", 1);
     if (read_head_ref() == 0) {
         syscall(SYS_WRITE, STDOUT, "No commits yet\n", 15);
+    }
+    if (read_merge_head() != 0) {
+        var msg = "Merge in progress. Resolve conflicts and commit, or run 'sit merge --abort'.\n";
+        syscall(SYS_WRITE, STDOUT, msg, strlen(msg));
     }
 
     var any = 0;

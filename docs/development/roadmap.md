@@ -146,6 +146,16 @@
 - Fixes UX gap flagged in v0.2.3: `sit show v0.1` no longer errors with "too short prefix" and instead resolves to the tagged commit.
 - Verified against eight scenarios: `show HEAD`, `show <tag>`, `show <branch>`, `show` on cross-branch tag, `show` on non-current branch, `cat-file <tag>`, short-name-as-tag beats too-short-prefix rule, empty-repo `show HEAD` returns cleanly.
 
+### v0.2.9 — MERGE_HEAD + conflict markers + `sit merge --abort`
+
+- **`.sit/MERGE_HEAD`** — written by `cmd_merge` when a file-level 3-way merge hits conflicts. Contains the target commit's hex. Read by `cmd_commit` on the next commit — if present, the commit is built with two parents (HEAD + MERGE_HEAD) and MERGE_HEAD is unlinked. Closes the "resolved merge commits lose a parent" gap from v0.2.8.
+- **Conflict-marker files in the working tree**: for each conflicting path, sit now writes the file as `<<<<<<< HEAD\n<ours content>\n=======\n<theirs content>\n>>>>>>> <branch>\n`. File-level granularity — both ours and theirs in full. Line-level diff3 is v0.3. User edits to resolve, `sit add`, `sit commit`.
+- **Auto-merged files** (clean paths in a conflicting merge) are materialized to working tree too, so subsequent status only flags the genuinely contested ones.
+- **`sit merge --abort`**: when a merge is in progress, restores the working tree + index to HEAD via `materialize_target`, then unlinks `.sit/MERGE_HEAD`. No-ops with an error message if no merge is in progress.
+- **`sit status` flag**: prints "Merge in progress. Resolve conflicts and commit, or run 'sit merge --abort'." when `MERGE_HEAD` exists.
+- **Commit header mode**: merge-resolving commits now print `[branch (merge) <hex>] <msg>` analogous to `(root-commit)`, so users can see at a glance what kind of commit just landed.
+- Verified against five scenarios: conflict → marker file → MERGE_HEAD set → status hints → resolve + commit produces 2-parent merge commit; abort restores HEAD content and clears MERGE_HEAD.
+
 ### v0.2.8 — 3-way merge (file-level)
 
 - `sit merge <branch>` now handles divergent branches via file-level 3-way merge. For each path in the union of `(base, ours, theirs)` trees, picks a single resulting hash based on the standard triad:
