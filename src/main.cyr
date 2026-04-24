@@ -1371,6 +1371,85 @@ fn cmd_fsck() {
     return 0;
 }
 
+# Print every non-blank, non-comment line of a config file to stdout.
+fn config_file_list(path) {
+    if (file_exists(path) != 1) { return 0; }
+    var pair[16];
+    if (read_file_heap(path, &pair) != 0) { return 0; }
+    var data = load64(&pair);
+    var len = load64(&pair + 8);
+    var pos = 0;
+    while (pos < len) {
+        var le = pos;
+        var finding = 1;
+        while (finding == 1) {
+            if (le >= len) { finding = 0; }
+            else {
+                if (load8(data + le) == 10) { finding = 0; }
+                else { le = le + 1; }
+            }
+        }
+        var stop = le;
+        if (stop > pos) {
+            if (load8(data + stop - 1) == 13) { stop = stop - 1; }
+        }
+        var start = skip_ws(data, pos, stop);
+        if (start < stop) {
+            if (load8(data + start) != 35) {
+                syscall(SYS_WRITE, STDOUT, data + pos, le - pos);
+                if (le < len) { syscall(SYS_WRITE, STDOUT, "\n", 1); }
+            }
+        }
+        pos = le + 1;
+    }
+    return 0;
+}
+
+# Remove the first line matching `key = value` from a config file.
+# Returns 0 on success, -1 on I/O failure, -2 if the key wasn't present.
+fn config_file_unset(path, key) {
+    var key_len = strlen(key);
+    if (file_exists(path) != 1) { return 0 - 2; }
+    var pair[16];
+    if (read_file_heap(path, &pair) != 0) { return 0 - 1; }
+    var data = load64(&pair);
+    var len = load64(&pair + 8);
+
+    var out = alloc(len + 1);
+    var out_pos = 0;
+    var removed = 0;
+    var pos = 0;
+    while (pos < len) {
+        var le = pos;
+        var finding = 1;
+        while (finding == 1) {
+            if (le >= len) { finding = 0; }
+            else {
+                if (load8(data + le) == 10) { finding = 0; }
+                else { le = le + 1; }
+            }
+        }
+        var stop = le;
+        if (stop > pos) {
+            if (load8(data + stop - 1) == 13) { stop = stop - 1; }
+        }
+        var v = config_parse_value(data, pos, stop, key, key_len);
+        if (v != 0) {
+            removed = 1;
+        }
+        else {
+            var copy_len = le - pos;
+            if (le < len) { copy_len = copy_len + 1; }
+            memcpy(out + out_pos, data + pos, copy_len);
+            out_pos = out_pos + copy_len;
+        }
+        pos = le + 1;
+    }
+    if (removed == 0) { return 0 - 2; }
+    if (file_write_all(path, out, out_pos) < 0) { return 0 - 1; }
+    return 0;
+}
+
 fn cmd_config() {
     var global = 0;
     var arg_base = 2;
@@ -1380,12 +1459,6 @@ fn cmd_config() {
             arg_base = 3;
         }
     }
-
-    if (argc() < arg_base + 1) {
-        eprintln("usage: sit config [--global] <key> [<value>]");
-        return 1;
-    }
-    var key = argv_heap(arg_base);
 
     var path = 0;
     if (global == 1) {
@@ -1408,6 +1481,41 @@ fn cmd_config() {
         path = ".sit/config";
     }
 
+    if (argc() < arg_base + 1) {
+        eprintln("usage: sit config [--global] [--list | --unset <key> | <key> [<value>]]");
+        return 1;
+    }
+
+    # --list: dump all entries (or nothing if file missing)
+    if (streq(argv(arg_base), "--list") == 1) {
+        config_file_list(path);
+        return 0;
+    }
+
+    # --unset <key>: remove key
+    if (streq(argv(arg_base), "--unset") == 1) {
+        if (argc() < arg_base + 2) {
+            eprintln("sit: --unset requires a key");
+            return 1;
+        }
+        var ukey = argv_heap(arg_base + 1);
+        var r = config_file_unset(path, ukey);
+        if (r == 0 - 2) {
+            syscall(SYS_WRITE, STDERR, "sit: '", 6);
+            syscall(SYS_WRITE, STDERR, ukey, strlen(ukey));
+            syscall(SYS_WRITE, STDERR, "' not set in ", 13);
+            syscall(SYS_WRITE, STDERR, path, strlen(path));
+            syscall(SYS_WRITE, STDERR, "\n", 1);
+            return 1;
+        }
+        if (r < 0) {
+            eprintln("sit: failed to write config");
+            return 1;
+        }
+        return 0;
+    }
+
+    var key = argv_heap(arg_base);
     if (argc() < arg_base + 2) {
         var val = 0;
         if (global == 1) { val = config_file_get(path, key); }
@@ -3027,19 +3135,64 @@ fn cmd_log() {
         return 1;
     }
 
+    # argv scan: --oneline, -n <count>, and an optional positional <ref>.
     var oneline = 0;
-    if (argc() >= 3) {
-        if (streq(argv(2), "--oneline") == 1) { oneline = 1; }
+    var limit = 0 - 1;
+    var start_ref = 0;
+    var ai = 2;
+    while (ai < argc()) {
+        var a = argv(ai);
+        if (streq(a, "--oneline") == 1) { oneline = 1; ai = ai + 1; }
+        else {
+            if (streq(a, "-n") == 1) {
+                if (ai + 1 >= argc()) {
+                    eprintln("sit: -n requires a number");
+                    return 1;
+                }
+                limit = atoi(argv(ai + 1));
+                ai = ai + 2;
+            }
+            else {
+                if (start_ref != 0) {
+                    eprintln("usage: sit log [--oneline] [-n <count>] [<ref>]");
+                    return 1;
+                }
+                start_ref = argv_heap(ai);
+                ai = ai + 1;
+            }
+        }
     }
 
-    var current_hex = read_head_ref();
+    var current_hex = 0;
+    if (start_ref != 0) {
+        var resolved[72];
+        var rr = resolve_hash(start_ref, &resolved);
+        if (rr != 1) {
+            syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
+            syscall(SYS_WRITE, STDERR, start_ref, strlen(start_ref));
+            syscall(SYS_WRITE, STDERR, "'\n", 2);
+            return 1;
+        }
+        current_hex = alloc(65);
+        memcpy(current_hex, &resolved, 64);
+        store8(current_hex + 64, 0);
+    }
+    else {
+        current_hex = read_head_ref();
+    }
     if (current_hex == 0) {
         eprintln("sit: no commits yet");
         return 0;
     }
 
     var first = 1;
+    var shown = 0;
     while (current_hex != 0) {
+        if (limit >= 0) {
+            if (shown >= limit) { current_hex = 0; }
+        }
+        if (current_hex == 0) { return 0; }
+
         var obj[24];
         if (read_object(current_hex, &obj) != 0) {
             eprintln("sit: cannot read commit object");
@@ -3066,6 +3219,7 @@ fn cmd_log() {
             print_commit_header(current_hex, &info, body, body_len);
         }
 
+        shown = shown + 1;
         current_hex = load64(&info + 8);
     }
     return 0;
@@ -3928,16 +4082,109 @@ fn cmd_diff() {
         return 1;
     }
 
+    # Scan args: --staged flag, optional 1-2 positional refs.
     var staged = 0;
-    var want_head = 0;
-    if (argc() >= 3) {
-        var a2 = argv(2);
-        if (streq(a2, "--staged") == 1) { staged = 1; }
-        if (streq(a2, "HEAD") == 1) { want_head = 1; }
+    var ref_a = 0;
+    var ref_b = 0;
+    var ai = 2;
+    while (ai < argc()) {
+        var a = argv(ai);
+        if (streq(a, "--staged") == 1) { staged = 1; ai = ai + 1; }
+        else {
+            if (ref_a == 0) { ref_a = argv_heap(ai); ai = ai + 1; }
+            else {
+                if (ref_b == 0) { ref_b = argv_heap(ai); ai = ai + 1; }
+                else {
+                    eprintln("usage: sit diff [--staged] [<commit> [<commit>]]");
+                    return 1;
+                }
+            }
+        }
     }
 
-    if (want_head == 1) {
-        var head_entries = read_head_tree_entries();
+    # Resolve any refs to commit trees.
+    var tree_a_entries = 0;
+    var tree_b_entries = 0;
+    if (ref_a != 0) {
+        var r[72];
+        if (resolve_hash(ref_a, &r) != 1) {
+            syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
+            syscall(SYS_WRITE, STDERR, ref_a, strlen(ref_a));
+            syscall(SYS_WRITE, STDERR, "'\n", 2);
+            return 1;
+        }
+        var ref_a_hex = alloc(65);
+        memcpy(ref_a_hex, &r, 64);
+        store8(ref_a_hex + 64, 0);
+        tree_a_entries = commit_tree_entries(ref_a_hex);
+        if (tree_a_entries == 0) { tree_a_entries = vec_new(); }
+    }
+    if (ref_b != 0) {
+        var r[72];
+        if (resolve_hash(ref_b, &r) != 1) {
+            syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
+            syscall(SYS_WRITE, STDERR, ref_b, strlen(ref_b));
+            syscall(SYS_WRITE, STDERR, "'\n", 2);
+            return 1;
+        }
+        var ref_b_hex = alloc(65);
+        memcpy(ref_b_hex, &r, 64);
+        store8(ref_b_hex + 64, 0);
+        tree_b_entries = commit_tree_entries(ref_b_hex);
+        if (tree_b_entries == 0) { tree_b_entries = vec_new(); }
+    }
+
+    # Mode: tree-vs-tree (two refs given).
+    if (tree_b_entries != 0) {
+        var an = vec_len(tree_a_entries);
+        var bn = vec_len(tree_b_entries);
+        # For each path in A: if B has it with different hash, diff; if B lacks it, full delete.
+        var i = 0;
+        while (i < an) {
+            var ae = vec_get(tree_a_entries, i);
+            var apath = tree_entry_name(ae);
+            var ahex = tree_entry_hash(ae);
+            var be = tree_find(tree_b_entries, apath);
+            if (be == 0) {
+                var ap[16];
+                if (read_blob_content(ahex, &ap) == 0) {
+                    print_file_diff(apath, load64(&ap), load64(&ap + 8), 0, 0);
+                }
+            }
+            else {
+                if (streq(tree_entry_hash(be), ahex) == 0) {
+                    var ap[16];
+                    var bp[16];
+                    if (read_blob_content(ahex, &ap) == 0) {
+                        if (read_blob_content(tree_entry_hash(be), &bp) == 0) {
+                            print_file_diff(apath,
+                                load64(&ap), load64(&ap + 8),
+                                load64(&bp), load64(&bp + 8));
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        # Then: any path in B not in A → full addition.
+        i = 0;
+        while (i < bn) {
+            var be = vec_get(tree_b_entries, i);
+            var bpath = tree_entry_name(be);
+            if (tree_find(tree_a_entries, bpath) == 0) {
+                var bp[16];
+                if (read_blob_content(tree_entry_hash(be), &bp) == 0) {
+                    print_file_diff(bpath, 0, 0, load64(&bp), load64(&bp + 8));
+                }
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    # Mode: working-vs-ref (one ref given).
+    if (tree_a_entries != 0) {
+        var head_entries = tree_a_entries;
         var working_files = list_working_files();
 
         if (head_entries != 0) {

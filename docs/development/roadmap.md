@@ -146,6 +146,15 @@
 - Fixes UX gap flagged in v0.2.3: `sit show v0.1` no longer errors with "too short prefix" and instead resolves to the tagged commit.
 - Verified against eight scenarios: `show HEAD`, `show <tag>`, `show <branch>`, `show` on cross-branch tag, `show` on non-current branch, `cat-file <tag>`, short-name-as-tag beats too-short-prefix rule, empty-repo `show HEAD` returns cleanly.
 
+### v0.2.12 — Polish batch 2
+
+- **`sit log [-n <count>] [<ref>]`** — parse a proper flag+positional arg list. `-n <N>` caps output to N commits; positional ref (branch / tag / hash) replaces the HEAD hardcode as the walk's starting point. Combines with `--oneline`.
+- **`sit diff <commit>`** — working tree vs an arbitrary commit's tree (generalizes the old `sit diff HEAD` path).
+- **`sit diff <c1> <c2>`** — tree-vs-tree comparison between arbitrary commits. Walks both trees, emits per-path diffs (modified / added-only-in-b / removed-only-in-a).
+- **`sit config --list`** — dumps all non-blank, non-comment lines from the target config file (local or `--global`).
+- **`sit config --unset <key>`** — removes the first matching `key = value` line. Returns non-zero if the key isn't present; preserves other lines including comments.
+- **New helpers**: `config_file_list`, `config_file_unset`. Both use the existing `config_parse_value` predicate for key matching, so tolerant of whitespace around `=`.
+
 ### v0.2.11 — Polish batch
 
 - **`sit branch -d <name>`** — delete a branch ref. Errors if the branch doesn't exist or is the current HEAD's branch (no orphaning yourself). Same flow/path as the existing create/list verbs, just in front of the prefix-match path.
