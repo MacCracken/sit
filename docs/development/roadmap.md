@@ -83,6 +83,7 @@ Cyrius composes sources via `include "path/to/file.cyr"` (see stdlib `hashmap.cy
 
 ### Longer horizon
 
+- **Reject push to checked-out branch** — git's `receive.denyCurrentBranch = refuse` default. Today `sit push` silently advances the remote's ref while leaving its working tree stale; surprising when the remote is someone's active repo. Check whether the remote's HEAD resolves to the branch being pushed and refuse by default; opt-in escape via a config knob later.
 - **`sit fsck` reachability** — walk commit chain and flag dangling objects (current implementation checks integrity but not reachability).
 - **Full `.sitignore` semantics** — negation (`!pattern`), double-star (`**`), character classes (`[abc]`), anchored patterns (`/foo`), path patterns (`foo/bar`).
 - **`sit log --graph`** — ASCII DAG for merge history.

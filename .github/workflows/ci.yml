@@ -77,24 +77,38 @@ jobs:
           "$GITHUB_WORKSPACE/build/sit" commit -S -m "signed smoke"
           "$GITHUB_WORKSPACE/build/sit" verify-commit
 
-      - name: Smoke — wire protocol (clone, pull, push)
+      - name: Smoke — wire protocol (clone, push, pull)
         run: |
           export HOME=$GITHUB_WORKSPACE/ci-home
           export SIT_AUTHOR_NAME="CI Runner"
           export SIT_AUTHOR_EMAIL="ci@example.com"
           ORIG=$(mktemp -d)
           (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" init && echo hello > a && "$GITHUB_WORKSPACE/build/sit" add a && "$GITHUB_WORKSPACE/build/sit" commit -m "origin-root")
+
+          # 1) clone picks up origin's single commit
           CLONE=$(mktemp -d)/repo
           "$GITHUB_WORKSPACE/build/sit" clone "$ORIG" "$CLONE"
           cd "$CLONE"
           test "$(cat a)" = "hello" || { echo "clone content wrong"; exit 1; }
+
+          # 2) commit locally, push to origin — check via log, not working tree
+          #    (push updates origin's refs + objects, not its working dir — same as git push to a non-bare remote)
           echo world > b
           "$GITHUB_WORKSPACE/build/sit" add b
           "$GITHUB_WORKSPACE/build/sit" commit -m "clone-add-b"
+          CLONE_TIP=$("$GITHUB_WORKSPACE/build/sit" log | awk '/^commit /{print $2; exit}')
           "$GITHUB_WORKSPACE/build/sit" push origin main
-          # Verify origin received the push
+
           cd "$ORIG"
-          test -f b && grep -q world b && echo "wire smoke ok" || { echo "push content missing"; exit 1; }
+          test "$(cat .sit/refs/heads/main | tr -d '\n')" = "$CLONE_TIP" || { echo "origin ref not updated"; exit 1; }
+          "$GITHUB_WORKSPACE/build/sit" log | grep -q "$CLONE_TIP" || { echo "origin log missing new commit"; exit 1; }
+
+          # 3) pull into a second clone demonstrates the full round trip
+          SECOND=$(mktemp -d)/second
+          "$GITHUB_WORKSPACE/build/sit" clone "$ORIG" "$SECOND"
+          cd "$SECOND"
+          test "$(cat b)" = "world" || { echo "second clone didn't pick up the pushed commit"; exit 1; }
+          echo "wire smoke ok"
 
   docs:
     name: Documentation
