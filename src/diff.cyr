@@ -1,0 +1,1060 @@
+# diff.cyr — unified diff, LCS, hunk grouping, status, show.
+#
+# Classical LCS on split_lines tables (capped at 16M cells), git-style hunk
+# grouping with 3-line context, unified-diff emitter, diffstat variant, and
+# cmd_diff / cmd_show / cmd_status which all consume the same primitives.
+# Also home to is_dirty and the working-tree walker used by status + add.
+
+fn is_dirty() {
+    var index_entries = parse_index();
+    if (index_entries != 0) {
+        sort_entries(index_entries);
+        index_entries = dedupe_entries(index_entries);
+    }
+    var head_entries = read_head_tree_entries();
+
+    if (index_entries != 0) {
+        var n = vec_len(index_entries);
+        var i = 0;
+        while (i < n) {
+            var e = vec_get(index_entries, i);
+            var path = entry_path(e);
+            var idx_hex = hex_encode(entry_hash(e), 32);
+            var head_ent = tree_find(head_entries, path);
+            if (head_ent == 0) { return 1; }
+            if (streq(tree_entry_hash(head_ent), idx_hex) == 0) { return 1; }
+            if (file_exists(path) == 1) {
+                var wh = hash_file_as_blob(path);
+                if (wh != 0) {
+                    if (streq(wh, idx_hex) == 0) { return 1; }
+                }
+            }
+            else { return 1; }
+            i = i + 1;
+        }
+    }
+
+    if (head_entries != 0) {
+        var hn = vec_len(head_entries);
+        var hi = 0;
+        while (hi < hn) {
+            var he = vec_get(head_entries, hi);
+            if (index_find(index_entries, tree_entry_name(he)) == 0) { return 1; }
+            hi = hi + 1;
+        }
+    }
+    return 0;
+}
+
+# Ensure all parent directories of `path` exist. For "src/lib/foo.cyr",
+# creates "src" and "src/lib".
+# Write "ref: <ref_path>\n" to .sit/HEAD. Returns 0 on success.
+fn list_working_walk(prefix, fs_path, out, patterns) {
+    var raw = dir_list(str_from(fs_path));
+    var n = vec_len(raw);
+    var fs_path_len = strlen(fs_path);
+    var prefix_len = strlen(prefix);
+    var i = 0;
+    while (i < n) {
+        var s = vec_get(raw, i);
+        var sdata = str_data(s);
+        var slen = str_len(s);
+
+        var skip = 0;
+        if (slen == 4) {
+            if (memeq(sdata, ".sit", 4) == 1) { skip = 1; }
+        }
+
+        if (skip == 0) {
+            var rel_path_len = prefix_len + slen;
+            var rel_path = alloc(rel_path_len + 1);
+            memcpy(rel_path, prefix, prefix_len);
+            memcpy(rel_path + prefix_len, sdata, slen);
+            store8(rel_path + rel_path_len, 0);
+            if (is_ignored(rel_path, patterns) == 1) { skip = 1; }
+        }
+
+        if (skip == 0) {
+            var child_fs = alloc(fs_path_len + 1 + slen + 1);
+            memcpy(child_fs, fs_path, fs_path_len);
+            store8(child_fs + fs_path_len, 47);
+            memcpy(child_fs + fs_path_len + 1, sdata, slen);
+            store8(child_fs + fs_path_len + 1 + slen, 0);
+
+            if (is_dir(str_from(child_fs)) == 1) {
+                var new_prefix = alloc(prefix_len + slen + 2);
+                memcpy(new_prefix, prefix, prefix_len);
+                memcpy(new_prefix + prefix_len, sdata, slen);
+                store8(new_prefix + prefix_len + slen, 47);
+                store8(new_prefix + prefix_len + slen + 1, 0);
+                list_working_walk(new_prefix, child_fs, out, patterns);
+            }
+            else {
+                var full_len = prefix_len + slen;
+                var full = alloc(full_len + 1);
+                memcpy(full, prefix, prefix_len);
+                memcpy(full + prefix_len, sdata, slen);
+                store8(full + full_len, 0);
+                vec_push(out, full);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn list_working_files() {
+    var files = vec_new();
+    var patterns = load_sitignore();
+    list_working_walk("", ".", files, patterns);
+    return files;
+}
+
+# A "status item" is a 16-byte (label_ptr, path_ptr) pair.
+fn push_status_item(vec, label, path) {
+    var item = alloc(16);
+    store64(item, label);
+    store64(item + 8, path);
+    vec_push(vec, item);
+    return 0;
+}
+
+fn print_labeled_section(title, title_len, items) {
+    if (vec_len(items) == 0) { return 0; }
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    syscall(SYS_WRITE, STDOUT, title, title_len);
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    var si = 0;
+    while (si < vec_len(items)) {
+        var it = vec_get(items, si);
+        var lab = load64(it);
+        var pth = load64(it + 8);
+        syscall(SYS_WRITE, STDOUT, "  ", 2);
+        syscall(SYS_WRITE, STDOUT, lab, strlen(lab));
+        syscall(SYS_WRITE, STDOUT, pth, strlen(pth));
+        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        si = si + 1;
+    }
+    return 1;
+}
+
+fn print_name_section(title, title_len, names) {
+    if (vec_len(names) == 0) { return 0; }
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    syscall(SYS_WRITE, STDOUT, title, title_len);
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    var si = 0;
+    while (si < vec_len(names)) {
+        var nm = vec_get(names, si);
+        syscall(SYS_WRITE, STDOUT, "  ", 2);
+        syscall(SYS_WRITE, STDOUT, nm, strlen(nm));
+        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        si = si + 1;
+    }
+    return 1;
+}
+
+fn cmd_status() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var head_entries = read_head_tree_entries();
+    var index_entries = parse_index();
+    if (index_entries != 0) {
+        sort_entries(index_entries);
+        index_entries = dedupe_entries(index_entries);
+    }
+    var working = list_working_files();
+
+    var staged = vec_new();
+    var unstaged = vec_new();
+    var untracked = vec_new();
+
+    if (index_entries != 0) {
+        var ni = vec_len(index_entries);
+        var ii = 0;
+        while (ii < ni) {
+            var e = vec_get(index_entries, ii);
+            var path = entry_path(e);
+            var idx_hash_hex = hex_encode(entry_hash(e), 32);
+
+            var head_ent = tree_find(head_entries, path);
+            var label = 0;
+            if (head_ent == 0) { label = "new file:  "; }
+            else {
+                if (streq(tree_entry_hash(head_ent), idx_hash_hex) == 0) {
+                    label = "modified:  ";
+                }
+            }
+            if (label != 0) { push_status_item(staged, label, path); }
+
+            if (file_exists(path) == 1) {
+                var working_hex = hash_file_as_blob(path);
+                if (working_hex != 0) {
+                    if (streq(working_hex, idx_hash_hex) == 0) {
+                        push_status_item(unstaged, "modified:  ", path);
+                    }
+                }
+            }
+            else {
+                push_status_item(unstaged, "deleted:   ", path);
+            }
+            ii = ii + 1;
+        }
+    }
+
+    var nw = vec_len(working);
+    var wi = 0;
+    while (wi < nw) {
+        var name = vec_get(working, wi);
+        if (index_find(index_entries, name) == 0) {
+            if (tree_find(head_entries, name) == 0) {
+                vec_push(untracked, name);
+            }
+        }
+        wi = wi + 1;
+    }
+
+    if (head_entries != 0) {
+        var hn = vec_len(head_entries);
+        var hi = 0;
+        while (hi < hn) {
+            var he = vec_get(head_entries, hi);
+            var hpath = tree_entry_name(he);
+            if (index_find(index_entries, hpath) == 0) {
+                push_status_item(staged, "deleted:   ", hpath);
+            }
+            hi = hi + 1;
+        }
+    }
+
+    var branch = current_branch_name();
+    syscall(SYS_WRITE, STDOUT, "On branch ", 10);
+    if (branch != 0) { syscall(SYS_WRITE, STDOUT, branch, strlen(branch)); }
+    else             { syscall(SYS_WRITE, STDOUT, "(detached)", 10); }
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    if (read_head_ref() == 0) {
+        syscall(SYS_WRITE, STDOUT, "No commits yet\n", 15);
+    }
+    if (read_merge_head() != 0) {
+        var msg = "Merge in progress. Resolve conflicts and commit, or run 'sit merge --abort'.\n";
+        syscall(SYS_WRITE, STDOUT, msg, strlen(msg));
+    }
+
+    var any = 0;
+    if (print_labeled_section("Staged for commit:", 18, staged) == 1)   { any = 1; }
+    if (print_labeled_section("Unstaged changes:", 17, unstaged) == 1)   { any = 1; }
+    if (print_name_section("Untracked files:", 16, untracked) == 1)      { any = 1; }
+
+    if (any == 0) {
+        syscall(SYS_WRITE, STDOUT, "\nnothing to commit, working tree clean\n", 39);
+    }
+    return 0;
+}
+
+# ---- diff ------------------------------------------------------------------
+# Line layout (16 bytes): { ptr_into_data, len } — \n excluded.
+fn line_ptr(l) { return load64(l); }
+fn line_len(l) { return load64(l + 8); }
+
+fn split_lines(data, len) {
+    var lines = vec_new();
+    var pos = 0;
+    while (pos < len) {
+        var start = pos;
+        while (pos < len) {
+            if (load8(data + pos) == 10) { break; }
+            pos = pos + 1;
+        }
+        var line = alloc(16);
+        store64(line, data + start);
+        store64(line + 8, pos - start);
+        vec_push(lines, line);
+        if (pos < len) { pos = pos + 1; }
+    }
+    return lines;
+}
+
+fn lines_equal(a, b) {
+    var alen = line_len(a);
+    var blen = line_len(b);
+    if (alen != blen) { return 0; }
+    return memeq(line_ptr(a), line_ptr(b), alen);
+}
+
+# LCS-based diff. Returns a vec of op-tuples (16 bytes):
+#   op kind: 0 = keep, 1 = delete, 2 = insert
+#   line ptr: points at one of the input line tuples
+# Returns 0 if the DP table would be too large (caller must handle).
+fn lcs_diff(a, b) {
+    var n1 = vec_len(a);
+    var n2 = vec_len(b);
+    var stride = n2 + 1;
+    var cells = (n1 + 1) * stride;
+    if (cells > 16 * 1024 * 1024) { return 0; }
+    var T = alloc(cells * 8);
+    if (T == 0) { return 0; }
+
+    var i = 1;
+    while (i <= n1) {
+        var j = 1;
+        while (j <= n2) {
+            var aline = vec_get(a, i - 1);
+            var bline = vec_get(b, j - 1);
+            var cellval = 0;
+            if (lines_equal(aline, bline) == 1) {
+                cellval = load64(T + ((i - 1) * stride + (j - 1)) * 8) + 1;
+            }
+            else {
+                var up = load64(T + ((i - 1) * stride + j) * 8);
+                var left = load64(T + (i * stride + (j - 1)) * 8);
+                if (up >= left) { cellval = up; }
+                else { cellval = left; }
+            }
+            store64(T + (i * stride + j) * 8, cellval);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var script = vec_new();
+    i = n1;
+    var j = n2;
+    while (i > 0) {
+        if (j > 0) {
+            if (lines_equal(vec_get(a, i - 1), vec_get(b, j - 1)) == 1) {
+                var op = alloc(16);
+                store64(op, 0);
+                store64(op + 8, vec_get(a, i - 1));
+                vec_push(script, op);
+                i = i - 1;
+                j = j - 1;
+            }
+            else {
+                var up = load64(T + ((i - 1) * stride + j) * 8);
+                var left = load64(T + (i * stride + (j - 1)) * 8);
+                if (left >= up) {
+                    var op = alloc(16);
+                    store64(op, 2);
+                    store64(op + 8, vec_get(b, j - 1));
+                    vec_push(script, op);
+                    j = j - 1;
+                }
+                else {
+                    var op = alloc(16);
+                    store64(op, 1);
+                    store64(op + 8, vec_get(a, i - 1));
+                    vec_push(script, op);
+                    i = i - 1;
+                }
+            }
+        }
+        else {
+            var op = alloc(16);
+            store64(op, 1);
+            store64(op + 8, vec_get(a, i - 1));
+            vec_push(script, op);
+            i = i - 1;
+        }
+    }
+    while (j > 0) {
+        var op = alloc(16);
+        store64(op, 2);
+        store64(op + 8, vec_get(b, j - 1));
+        vec_push(script, op);
+        j = j - 1;
+    }
+
+    var reversed = vec_new();
+    var k = vec_len(script) - 1;
+    while (k >= 0) {
+        vec_push(reversed, vec_get(script, k));
+        k = k - 1;
+    }
+    return reversed;
+}
+
+# Annotated op layout (32 bytes):
+#   0..8:   kind (0=keep, 1=del, 2=ins)
+#   8..16:  line ptr
+#   16..24: old_line (1-indexed; 0 if op has no presence in old)
+#   24..32: new_line (1-indexed; 0 if op has no presence in new)
+fn ann_kind(a) { return load64(a); }
+fn ann_line(a) { return load64(a + 8); }
+fn ann_old(a)  { return load64(a + 16); }
+fn ann_new(a)  { return load64(a + 24); }
+
+fn annotate_ops(ops) {
+    var out = vec_new();
+    var old_line = 0;
+    var new_line = 0;
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        var kind = load64(op);
+        var line = load64(op + 8);
+        var a = alloc(32);
+        store64(a, kind);
+        store64(a + 8, line);
+        if (kind == 0) {
+            old_line = old_line + 1;
+            new_line = new_line + 1;
+            store64(a + 16, old_line);
+            store64(a + 24, new_line);
+        }
+        else {
+            if (kind == 1) {
+                old_line = old_line + 1;
+                store64(a + 16, old_line);
+                store64(a + 24, 0);
+            }
+            else {
+                new_line = new_line + 1;
+                store64(a + 16, 0);
+                store64(a + 24, new_line);
+            }
+        }
+        vec_push(out, a);
+        i = i + 1;
+    }
+    return out;
+}
+
+# Group annotated ops into hunks. Each hunk is a vec of ops.
+# Algorithm: keep up to N leading-context keeps before the first change of a
+# hunk; extend the hunk as long as consecutive keep-runs stay within 2N; when
+# we see a (2N+1)-th keep since the last change, trim the hunk's trailing
+# keeps to N and close it. The overshoot keep becomes the first of the next
+# hunk's leading-context buffer.
+fn group_hunks(annotated, ctx) {
+    var hunks = vec_new();
+    var pending = vec_new();
+    var hunk = 0;
+    var since_change = 0;
+
+    var n = vec_len(annotated);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(annotated, i);
+        var kind = ann_kind(op);
+
+        if (kind == 0) {
+            if (hunk == 0) {
+                vec_push(pending, op);
+                if (vec_len(pending) > ctx) { vec_remove(pending, 0); }
+            }
+            else {
+                since_change = since_change + 1;
+                if (since_change <= 2 * ctx) { vec_push(hunk, op); }
+                else {
+                    # Close hunk: trim trailing keeps to exactly ctx.
+                    var k = 0;
+                    while (k < ctx) { vec_pop(hunk); k = k + 1; }
+                    vec_push(hunks, hunk);
+                    hunk = 0;
+                    pending = vec_new();
+                    vec_push(pending, op);
+                    since_change = 0;
+                }
+            }
+        }
+        else {
+            if (hunk == 0) {
+                hunk = vec_new();
+                var pi = 0;
+                var pn = vec_len(pending);
+                while (pi < pn) {
+                    vec_push(hunk, vec_get(pending, pi));
+                    pi = pi + 1;
+                }
+                pending = vec_new();
+            }
+            vec_push(hunk, op);
+            since_change = 0;
+        }
+        i = i + 1;
+    }
+
+    if (hunk != 0) {
+        var trim = since_change - ctx;
+        if (trim > 0) {
+            var k = 0;
+            while (k < trim) { vec_pop(hunk); k = k + 1; }
+        }
+        vec_push(hunks, hunk);
+    }
+    return hunks;
+}
+
+# Compute hunk header ranges. Writes to out (32 bytes):
+#   0..8:   old_start, 8..16: old_len, 16..24: new_start, 24..32: new_len
+fn hunk_ranges(hunk, out) {
+    var old_start = 0;
+    var new_start = 0;
+    var old_len = 0;
+    var new_len = 0;
+    var n = vec_len(hunk);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(hunk, i);
+        var kind = ann_kind(op);
+        if (kind != 2) {
+            if (old_start == 0) { old_start = ann_old(op); }
+            old_len = old_len + 1;
+        }
+        if (kind != 1) {
+            if (new_start == 0) { new_start = ann_new(op); }
+            new_len = new_len + 1;
+        }
+        i = i + 1;
+    }
+    store64(out, old_start);
+    store64(out + 8, old_len);
+    store64(out + 16, new_start);
+    store64(out + 24, new_len);
+    return 0;
+}
+
+fn write_unsigned(n) {
+    var buf[24];
+    var digits = write_decimal(&buf, n);
+    syscall(SYS_WRITE, STDOUT, &buf, digits);
+    return 0;
+}
+
+fn print_hunk_header(hunk) {
+    var r[32];
+    hunk_ranges(hunk, &r);
+    var old_len = load64(&r + 8);
+    var new_len = load64(&r + 24);
+    syscall(SYS_WRITE, STDOUT, "@@ -", 4);
+    write_unsigned(load64(&r));
+    # Git convention: omit ",1" when the count is 1.
+    if (old_len != 1) {
+        syscall(SYS_WRITE, STDOUT, ",", 1);
+        write_unsigned(old_len);
+    }
+    syscall(SYS_WRITE, STDOUT, " +", 2);
+    write_unsigned(load64(&r + 16));
+    if (new_len != 1) {
+        syscall(SYS_WRITE, STDOUT, ",", 1);
+        write_unsigned(new_len);
+    }
+    syscall(SYS_WRITE, STDOUT, " @@\n", 4);
+    return 0;
+}
+
+fn print_file_diff(path, old_buf, old_len, new_buf, new_len) {
+    syscall(SYS_WRITE, STDOUT, "--- a/", 6);
+    syscall(SYS_WRITE, STDOUT, path, strlen(path));
+    syscall(SYS_WRITE, STDOUT, "\n+++ b/", 7);
+    syscall(SYS_WRITE, STDOUT, path, strlen(path));
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+
+    var a = split_lines(old_buf, old_len);
+    var b = split_lines(new_buf, new_len);
+    var ops = lcs_diff(a, b);
+    if (ops == 0) {
+        eprintln("sit: diff table exceeds cap; file too large");
+        return 1;
+    }
+
+    var annotated = annotate_ops(ops);
+    var hunks = group_hunks(annotated, 3);
+
+    var h = 0;
+    var hn = vec_len(hunks);
+    while (h < hn) {
+        var hunk = vec_get(hunks, h);
+        print_hunk_header(hunk);
+
+        var ni = 0;
+        var nn = vec_len(hunk);
+        while (ni < nn) {
+            var op = vec_get(hunk, ni);
+            var kind = ann_kind(op);
+            var l = ann_line(op);
+            if (kind == 0) { syscall(SYS_WRITE, STDOUT, " ", 1); }
+            if (kind == 1) { syscall(SYS_WRITE, STDOUT, "-", 1); }
+            if (kind == 2) { syscall(SYS_WRITE, STDOUT, "+", 1); }
+            syscall(SYS_WRITE, STDOUT, line_ptr(l), line_len(l));
+            syscall(SYS_WRITE, STDOUT, "\n", 1);
+            ni = ni + 1;
+        }
+        h = h + 1;
+    }
+    return 0;
+}
+
+# Count insertion / deletion lines between two buffers and print a diffstat
+# line ` path | +N -M\n`. Writes (ins, del) to out_pair for caller totals.
+fn print_file_stat(path, old_buf, old_len, new_buf, new_len, out_pair) {
+    var a = split_lines(old_buf, old_len);
+    var b = split_lines(new_buf, new_len);
+    var ops = lcs_diff(a, b);
+    if (ops == 0) {
+        store64(out_pair, 0);
+        store64(out_pair + 8, 0);
+        eprintln("sit: diff table exceeds cap; file too large");
+        return 1;
+    }
+    var ins = 0;
+    var del = 0;
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        var kind = load64(op);
+        if (kind == 1) { del = del + 1; }
+        if (kind == 2) { ins = ins + 1; }
+        i = i + 1;
+    }
+    store64(out_pair, ins);
+    store64(out_pair + 8, del);
+    syscall(SYS_WRITE, STDOUT, " ", 1);
+    syscall(SYS_WRITE, STDOUT, path, strlen(path));
+    syscall(SYS_WRITE, STDOUT, " | +", 4);
+    var nbuf[24];
+    var d = write_decimal(&nbuf, ins);
+    syscall(SYS_WRITE, STDOUT, &nbuf, d);
+    syscall(SYS_WRITE, STDOUT, " -", 2);
+    d = write_decimal(&nbuf, del);
+    syscall(SYS_WRITE, STDOUT, &nbuf, d);
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    return 0;
+}
+
+# Read a blob object by hex hash; write (content_ptr, content_len) to out_pair.
+# Returns 0 on success, negative on error.
+fn read_blob_content(hex, out_pair) {
+    var obj[24];
+    if (read_object(hex, &obj) != 0) { return 0 - 1; }
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    store64(out_pair, buf + coff);
+    store64(out_pair + 8, blen - coff);
+    return 0;
+}
+
+fn cmd_diff() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    # Scan args: --staged flag, optional 1-2 positional refs.
+    var staged = 0;
+    var ref_a = 0;
+    var ref_b = 0;
+    var ai = 2;
+    while (ai < argc()) {
+        var a = argv(ai);
+        if (streq(a, "--staged") == 1) { staged = 1; ai = ai + 1; }
+        else {
+            if (ref_a == 0) { ref_a = argv_heap(ai); ai = ai + 1; }
+            else {
+                if (ref_b == 0) { ref_b = argv_heap(ai); ai = ai + 1; }
+                else {
+                    eprintln("usage: sit diff [--staged] [<commit> [<commit>]]");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    # Resolve any refs to commit trees.
+    var tree_a_entries = 0;
+    var tree_b_entries = 0;
+    if (ref_a != 0) {
+        var r[72];
+        if (resolve_hash(ref_a, &r) != 1) {
+            syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
+            syscall(SYS_WRITE, STDERR, ref_a, strlen(ref_a));
+            syscall(SYS_WRITE, STDERR, "'\n", 2);
+            return 1;
+        }
+        var ref_a_hex = alloc(65);
+        memcpy(ref_a_hex, &r, 64);
+        store8(ref_a_hex + 64, 0);
+        tree_a_entries = commit_tree_entries(ref_a_hex);
+        if (tree_a_entries == 0) { tree_a_entries = vec_new(); }
+    }
+    if (ref_b != 0) {
+        var r[72];
+        if (resolve_hash(ref_b, &r) != 1) {
+            syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
+            syscall(SYS_WRITE, STDERR, ref_b, strlen(ref_b));
+            syscall(SYS_WRITE, STDERR, "'\n", 2);
+            return 1;
+        }
+        var ref_b_hex = alloc(65);
+        memcpy(ref_b_hex, &r, 64);
+        store8(ref_b_hex + 64, 0);
+        tree_b_entries = commit_tree_entries(ref_b_hex);
+        if (tree_b_entries == 0) { tree_b_entries = vec_new(); }
+    }
+
+    # Mode: tree-vs-tree (two refs given).
+    if (tree_b_entries != 0) {
+        var an = vec_len(tree_a_entries);
+        var bn = vec_len(tree_b_entries);
+        # For each path in A: if B has it with different hash, diff; if B lacks it, full delete.
+        var i = 0;
+        while (i < an) {
+            var ae = vec_get(tree_a_entries, i);
+            var apath = tree_entry_name(ae);
+            var ahex = tree_entry_hash(ae);
+            var be = tree_find(tree_b_entries, apath);
+            if (be == 0) {
+                var ap[16];
+                if (read_blob_content(ahex, &ap) == 0) {
+                    print_file_diff(apath, load64(&ap), load64(&ap + 8), 0, 0);
+                }
+            }
+            else {
+                if (streq(tree_entry_hash(be), ahex) == 0) {
+                    var ap[16];
+                    var bp[16];
+                    if (read_blob_content(ahex, &ap) == 0) {
+                        if (read_blob_content(tree_entry_hash(be), &bp) == 0) {
+                            print_file_diff(apath,
+                                load64(&ap), load64(&ap + 8),
+                                load64(&bp), load64(&bp + 8));
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        # Then: any path in B not in A → full addition.
+        i = 0;
+        while (i < bn) {
+            var be = vec_get(tree_b_entries, i);
+            var bpath = tree_entry_name(be);
+            if (tree_find(tree_a_entries, bpath) == 0) {
+                var bp[16];
+                if (read_blob_content(tree_entry_hash(be), &bp) == 0) {
+                    print_file_diff(bpath, 0, 0, load64(&bp), load64(&bp + 8));
+                }
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    # Mode: working-vs-ref (one ref given).
+    if (tree_a_entries != 0) {
+        var head_entries = tree_a_entries;
+        var working_files = list_working_files();
+
+        if (head_entries != 0) {
+            var hn = vec_len(head_entries);
+            var hi = 0;
+            while (hi < hn) {
+                var he = vec_get(head_entries, hi);
+                var path = tree_entry_name(he);
+                var head_hex = tree_entry_hash(he);
+
+                if (file_exists(path) == 1) {
+                    var working_hex = hash_file_as_blob(path);
+                    if (working_hex != 0) {
+                        if (streq(head_hex, working_hex) == 0) {
+                            var hp[16];
+                            var wp[16];
+                            if (read_blob_content(head_hex, &hp) == 0) {
+                                if (read_file_heap(path, &wp) == 0) {
+                                    print_file_diff(path,
+                                        load64(&hp), load64(&hp + 8),
+                                        load64(&wp), load64(&wp + 8));
+                                }
+                            }
+                        }
+                    }
+                }
+                else {
+                    var hp[16];
+                    if (read_blob_content(head_hex, &hp) == 0) {
+                        print_file_diff(path, load64(&hp), load64(&hp + 8), 0, 0);
+                    }
+                }
+                hi = hi + 1;
+            }
+        }
+
+        var wn = vec_len(working_files);
+        var wi = 0;
+        while (wi < wn) {
+            var wpath = vec_get(working_files, wi);
+            if (tree_find(head_entries, wpath) == 0) {
+                var wp[16];
+                if (read_file_heap(wpath, &wp) == 0) {
+                    print_file_diff(wpath, 0, 0, load64(&wp), load64(&wp + 8));
+                }
+            }
+            wi = wi + 1;
+        }
+        return 0;
+    }
+
+    var index_entries = parse_index();
+    if (index_entries != 0) {
+        sort_entries(index_entries);
+        index_entries = dedupe_entries(index_entries);
+    }
+
+    var head_entries = 0;
+    if (staged == 1) { head_entries = read_head_tree_entries(); }
+
+    # Under --staged, emit full-file deletion diffs for HEAD paths absent from index.
+    if (staged == 1) {
+        if (head_entries != 0) {
+            var hn = vec_len(head_entries);
+            var hi = 0;
+            while (hi < hn) {
+                var he = vec_get(head_entries, hi);
+                var hpath = tree_entry_name(he);
+                if (index_find(index_entries, hpath) == 0) {
+                    var op[16];
+                    if (read_blob_content(tree_entry_hash(he), &op) == 0) {
+                        print_file_diff(hpath, load64(&op), load64(&op + 8), 0, 0);
+                    }
+                }
+                hi = hi + 1;
+            }
+        }
+    }
+
+    if (index_entries == 0) { return 0; }
+
+    var n = vec_len(index_entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(index_entries, i);
+        var path = entry_path(e);
+        var idx_hash_hex = hex_encode(entry_hash(e), 32);
+
+        if (staged == 1) {
+            var head_ent = tree_find(head_entries, path);
+            if (head_ent == 0) {
+                var ip[16];
+                if (read_blob_content(idx_hash_hex, &ip) == 0) {
+                    print_file_diff(path, 0, 0, load64(&ip), load64(&ip + 8));
+                }
+            }
+            else {
+                if (streq(tree_entry_hash(head_ent), idx_hash_hex) == 0) {
+                    var hp[16];
+                    var ip[16];
+                    if (read_blob_content(tree_entry_hash(head_ent), &hp) == 0) {
+                        if (read_blob_content(idx_hash_hex, &ip) == 0) {
+                            print_file_diff(path,
+                                load64(&hp), load64(&hp + 8),
+                                load64(&ip), load64(&ip + 8));
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            if (file_exists(path) == 1) {
+                var working_hex = hash_file_as_blob(path);
+                if (working_hex != 0) {
+                    if (streq(working_hex, idx_hash_hex) == 0) {
+                        var ip[16];
+                        var wp[16];
+                        if (read_blob_content(idx_hash_hex, &ip) == 0) {
+                            if (read_file_heap(path, &wp) == 0) {
+                                print_file_diff(path,
+                                    load64(&ip), load64(&ip + 8),
+                                    load64(&wp), load64(&wp + 8));
+                            }
+                        }
+                    }
+                }
+            }
+            else {
+                var ip[16];
+                if (read_blob_content(idx_hash_hex, &ip) == 0) {
+                    print_file_diff(path, load64(&ip), load64(&ip + 8), 0, 0);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Load a commit's tree and return its flattened entries. Returns 0 on error.
+fn cmd_show() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var stat_mode = 0;
+    var hash_arg = 0;
+    var ai = 2;
+    while (ai < argc()) {
+        var aa = argv(ai);
+        if (streq(aa, "--stat") == 1) { stat_mode = 1; }
+        else { hash_arg = argv_heap(ai); }
+        ai = ai + 1;
+    }
+
+    var hex[72];
+    if (hash_arg == 0) {
+        var head = read_head_ref();
+        if (head == 0) {
+            eprintln("sit: no commits yet");
+            return 0;
+        }
+        memcpy(&hex, head, 64);
+        store8(&hex + 64, 0);
+    }
+    else {
+        var rr = resolve_hash(hash_arg, &hex);
+        if (rr == 0 - 2) { eprintln("sit: hash prefix too short (min 4 chars)"); return 1; }
+        if (rr == 0 - 1) { eprintln("sit: ambiguous hash prefix"); return 1; }
+        if (rr == 0)     { eprintln("sit: no object matches"); return 1; }
+    }
+
+    var obj[24];
+    if (read_object(&hex, &obj) != 0) {
+        eprintln("sit: cannot read object");
+        return 1;
+    }
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    var body = buf + coff;
+    var body_len = blen - coff;
+
+    var info[56];
+    if (parse_commit_body(body, body_len, &info) != 0) {
+        eprintln("sit: object is not a commit");
+        return 1;
+    }
+
+    print_commit_header(&hex, &info, body, body_len);
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+
+    var tree_hex = load64(&info);
+    var new_entries = vec_new();
+    if (tree_hex != 0) { flatten_tree(tree_hex, "", new_entries); }
+
+    var parent_hex = load64(&info + 8);
+    var old_entries = vec_new();
+    if (parent_hex != 0) {
+        var po = commit_tree_entries(parent_hex);
+        if (po != 0) { old_entries = po; }
+    }
+
+    var tot_files = 0;
+    var tot_ins = 0;
+    var tot_del = 0;
+    var stat_pair[16];
+
+    var n = vec_len(new_entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(new_entries, i);
+        var path = tree_entry_name(e);
+        var new_hash = tree_entry_hash(e);
+        var old_ent = tree_find(old_entries, path);
+        if (old_ent == 0) {
+            var np[16];
+            if (read_blob_content(new_hash, &np) == 0) {
+                if (stat_mode == 1) {
+                    print_file_stat(path, 0, 0, load64(&np), load64(&np + 8), &stat_pair);
+                    tot_files = tot_files + 1;
+                    tot_ins = tot_ins + load64(&stat_pair);
+                    tot_del = tot_del + load64(&stat_pair + 8);
+                }
+                else {
+                    print_file_diff(path, 0, 0, load64(&np), load64(&np + 8));
+                }
+            }
+        }
+        else {
+            if (streq(tree_entry_hash(old_ent), new_hash) == 0) {
+                var op[16];
+                var np[16];
+                if (read_blob_content(tree_entry_hash(old_ent), &op) == 0) {
+                    if (read_blob_content(new_hash, &np) == 0) {
+                        if (stat_mode == 1) {
+                            print_file_stat(path,
+                                load64(&op), load64(&op + 8),
+                                load64(&np), load64(&np + 8),
+                                &stat_pair);
+                            tot_files = tot_files + 1;
+                            tot_ins = tot_ins + load64(&stat_pair);
+                            tot_del = tot_del + load64(&stat_pair + 8);
+                        }
+                        else {
+                            print_file_diff(path,
+                                load64(&op), load64(&op + 8),
+                                load64(&np), load64(&np + 8));
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    var on = vec_len(old_entries);
+    i = 0;
+    while (i < on) {
+        var e = vec_get(old_entries, i);
+        var path = tree_entry_name(e);
+        if (tree_find(new_entries, path) == 0) {
+            var op[16];
+            if (read_blob_content(tree_entry_hash(e), &op) == 0) {
+                if (stat_mode == 1) {
+                    print_file_stat(path, load64(&op), load64(&op + 8), 0, 0, &stat_pair);
+                    tot_files = tot_files + 1;
+                    tot_ins = tot_ins + load64(&stat_pair);
+                    tot_del = tot_del + load64(&stat_pair + 8);
+                }
+                else {
+                    print_file_diff(path, load64(&op), load64(&op + 8), 0, 0);
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    if (stat_mode == 1) {
+        if (tot_files > 0) {
+            var sbuf[24];
+            var sd = write_decimal(&sbuf, tot_files);
+            syscall(SYS_WRITE, STDOUT, " ", 1);
+            syscall(SYS_WRITE, STDOUT, &sbuf, sd);
+            if (tot_files == 1) { syscall(SYS_WRITE, STDOUT, " file changed, ", 15); }
+            else                { syscall(SYS_WRITE, STDOUT, " files changed, ", 16); }
+            sd = write_decimal(&sbuf, tot_ins);
+            syscall(SYS_WRITE, STDOUT, &sbuf, sd);
+            if (tot_ins == 1) { syscall(SYS_WRITE, STDOUT, " insertion(+), ", 15); }
+            else              { syscall(SYS_WRITE, STDOUT, " insertions(+), ", 16); }
+            sd = write_decimal(&sbuf, tot_del);
+            syscall(SYS_WRITE, STDOUT, &sbuf, sd);
+            if (tot_del == 1) { syscall(SYS_WRITE, STDOUT, " deletion(-)\n", 13); }
+            else              { syscall(SYS_WRITE, STDOUT, " deletions(-)\n", 14); }
+        }
+    }
+    return 0;
+}
+
+# =====================================================================
+# Wire protocol — local-path transport (v0.5.0)
+#
+# A remote is another sit working-tree directory (the one containing `.sit/`).
+# We open its patra object DB directly and walk refs by filesystem path.
+# No pack bundles, no network. HTTP and SSH transports are v0.5.x work.
+# =====================================================================
+
+# Look up `remote.<name>.url` in the local config. Returns heap cstring or 0.

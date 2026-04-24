@@ -1,0 +1,488 @@
+# object_db.cyr — patra object store, compression / framing, read commands.
+#
+# Content-addressed via sigil SHA-256 over the git-SHA-256-compatible framing
+# "<type> <len>\0<content>". Zlib compression via sankoch. Objects live in
+# .sit/objects.patra (`objects(hash STR, ty INT, content BYTES)`). Legacy
+# loose-file layout auto-migrates on first access. Read verbs: cat-file,
+# owl-file, fsck. Also the blob-hash primitives used by add + status.
+
+fn object_path(buf, hex) {
+    memcpy(buf, ".sit/objects/", 13);
+    store8(buf + 13, load8(hex));
+    store8(buf + 14, load8(hex + 1));
+    store8(buf + 15, 47);
+    memcpy(buf + 16, hex + 2, 62);
+    store8(buf + 78, 0);
+    return 78;
+}
+
+# Try to resolve `name` as a ref: HEAD, refs/tags/<name>, or refs/heads/<name>
+# in that order. On success, writes the 64-char hash into out_buf and returns 1.
+# Returns 0 if no ref matches.
+fn resolve_hash(prefix, out_buf) {
+    var plen = strlen(prefix);
+    if (plen == 64) {
+        memcpy(out_buf, prefix, 64);
+        store8(out_buf + 64, 0);
+        return 1;
+    }
+
+    # Try as a ref name first (HEAD, tags, branches)
+    if (resolve_ref_name(prefix, out_buf) == 1) { return 1; }
+
+    if (plen < 4) { return 0 - 2; }
+
+    var db = object_db_open();
+    if (db == 0) { return 0; }
+    object_db_migrate_from_loose(db);
+
+    var sql = alloc(64 + plen);
+    memcpy(sql, "SELECT hash FROM objects WHERE hash LIKE '", 42);
+    memcpy(sql + 42, prefix, plen);
+    memcpy(sql + 42 + plen, "%'", 2);
+    store8(sql + 42 + plen + 2, 0);
+
+    var rs = patra_query(db, sql);
+    if (rs == 0) { patra_close(db); return 0; }
+    var count = patra_result_count(rs);
+    if (count == 0) {
+        patra_result_free(rs);
+        patra_close(db);
+        return 0;
+    }
+    if (count > 1) {
+        patra_result_free(rs);
+        patra_close(db);
+        return 0 - 1;
+    }
+
+    var hash_str = patra_result_get_str(rs, 0, 0);
+    memcpy(out_buf, hash_str, 64);
+    store8(out_buf + 64, 0);
+    patra_result_free(rs);
+    patra_close(db);
+    return 1;
+}
+
+# Read and decompress an object by full 64-char hex hash.
+# On success, writes to out (24 bytes):
+#   out[0..8)    decompressed buffer ptr
+#   out[8..16)   decompressed length (framing + content)
+#   out[16..24)  content offset (first byte past framing \0)
+# Returns 0 on success, negative on error.
+fn read_object(hex, out) {
+    var db = object_db_open();
+    if (db == 0) { return 0 - 1; }
+    object_db_migrate_from_loose(db);
+
+    var sql = alloc(128);
+    memcpy(sql, "SELECT content FROM objects WHERE hash = '", 42);
+    memcpy(sql + 42, hex, 64);
+    memcpy(sql + 42 + 64, "'", 1);
+    store8(sql + 42 + 64 + 1, 0);
+
+    var rs = patra_query(db, sql);
+    if (rs == 0) { patra_close(db); return 0 - 2; }
+    if (patra_result_count(rs) == 0) {
+        patra_result_free(rs);
+        patra_close(db);
+        return 0 - 3;
+    }
+
+    var blen = patra_result_get_bytes_len(rs, 0, 0);
+    if (blen <= 0) {
+        patra_result_free(rs);
+        patra_close(db);
+        return 0 - 4;
+    }
+
+    var compressed = alloc(blen);
+    if (patra_result_read_bytes(db, rs, 0, 0, compressed) != 0) {
+        patra_result_free(rs);
+        patra_close(db);
+        return 0 - 5;
+    }
+    patra_result_free(rs);
+    patra_close(db);
+
+    var dec_cap = blen * 256;
+    if (dec_cap < 4096) { dec_cap = 4096; }
+    if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
+    var decompressed = alloc(dec_cap);
+    if (decompressed == 0) { return 0 - 6; }
+    var dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
+    if (dlen <= 0) { return 0 - 7; }
+
+    var nul = 0;
+    while (nul < dlen) {
+        if (load8(decompressed + nul) == 0) { break; }
+        nul = nul + 1;
+    }
+    if (nul >= dlen) { return 0 - 8; }
+
+    store64(out, decompressed);
+    store64(out + 8, dlen);
+    store64(out + 16, nul + 1);
+    return 0;
+}
+
+fn write_typed_object(type_str, type_len, content, content_len) {
+    var hdr_max = 32;
+    var full_cap = hdr_max + content_len;
+    var full = alloc(full_cap);
+    memcpy(full, type_str, type_len);
+    store8(full + type_len, 32);
+    var digits = write_decimal(full + type_len + 1, content_len);
+    store8(full + type_len + 1 + digits, 0);
+    var hdr_len = type_len + 1 + digits + 1;
+    memcpy(full + hdr_len, content, content_len);
+    var full_len = hdr_len + content_len;
+
+    var hex = hash_data(full, full_len);
+
+    var out_cap = full_len + 64 + full_len / 10;
+    if (out_cap < 128) { out_cap = 128; }
+    var compressed = alloc(out_cap);
+    var clen = zlib_compress(full, full_len, compressed, out_cap);
+    if (clen <= 0) { return 0; }
+
+    var db = object_db_open();
+    if (db == 0) { return 0; }
+
+    # Content-addressed — skip if hash already present.
+    var check_sql = alloc(128);
+    memcpy(check_sql, "SELECT hash FROM objects WHERE hash = '", 39);
+    memcpy(check_sql + 39, hex, 64);
+    memcpy(check_sql + 39 + 64, "'", 1);
+    store8(check_sql + 39 + 64 + 1, 0);
+    var rs = patra_query(db, check_sql);
+    var exists = 0;
+    if (rs != 0) {
+        if (patra_result_count(rs) > 0) { exists = 1; }
+        patra_result_free(rs);
+    }
+
+    if (exists == 0) {
+        var type_code = type_code_of(type_str, type_len);
+        var types[24];
+        store64(&types + 0, 1);
+        store64(&types + 8, 0);
+        store64(&types + 16, 2);
+        var ivals[24];
+        store64(&ivals + 8, type_code);
+        var sptrs[24];
+        store64(&sptrs + 0, hex);
+        var slens[24];
+        store64(&slens + 0, 64);
+        var bptrs[24];
+        store64(&bptrs + 16, compressed);
+        var blens[24];
+        store64(&blens + 16, clen);
+        patra_insert_row(db, "objects", 7, 3,
+            &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+    }
+
+    patra_close(db);
+    return hex;
+}
+
+fn write_blob_object(content, content_len) {
+    return write_typed_object("blob", 4, content, content_len);
+}
+
+fn resolve_and_read(obj_out, hex_out) {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var prefix = argv_heap(2);
+    var rr = resolve_hash(prefix, hex_out);
+    if (rr == 0 - 2) { eprintln("sit: hash prefix too short (min 4 chars)"); return 1; }
+    if (rr == 0 - 1) { eprintln("sit: ambiguous hash prefix"); return 1; }
+    if (rr == 0)     { eprintln("sit: no object matches"); return 1; }
+
+    var er = read_object(hex_out, obj_out);
+    if (er != 0) {
+        eprintln("sit: cannot read object (corrupt or missing)");
+        return 1;
+    }
+    return 0;
+}
+
+fn cmd_cat_file() {
+    if (argc() < 3) {
+        eprintln("usage: sit cat-file <hash>");
+        return 1;
+    }
+
+    var hex[72];
+    var obj[24];
+    var r = resolve_and_read(&obj, &hex);
+    if (r != 0) { return r; }
+
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    syscall(SYS_WRITE, STDOUT, buf + coff, blen - coff);
+    return 0;
+}
+
+# Locate the owl binary on common system paths.
+# Returns a C-string path or 0 if not found.
+fn find_owl() {
+    if (file_exists("/usr/local/bin/owl") == 1) { return "/usr/local/bin/owl"; }
+    if (file_exists("/usr/bin/owl") == 1)       { return "/usr/bin/owl"; }
+    if (file_exists("/opt/owl/bin/owl") == 1)   { return "/opt/owl/bin/owl"; }
+    return 0;
+}
+
+fn cmd_owl_file() {
+    if (argc() < 3) {
+        eprintln("usage: sit owl-file <hash>");
+        return 1;
+    }
+
+    var hex[72];
+    var obj[24];
+    var r = resolve_and_read(&obj, &hex);
+    if (r != 0) { return r; }
+
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    var content = buf + coff;
+    var content_len = blen - coff;
+
+    # Write content to /tmp/sit-owl-<hex[0:12]> for owl to read
+    var tmppath[64];
+    memcpy(&tmppath, "/tmp/sit-owl-", 13);
+    memcpy(&tmppath + 13, &hex, 12);
+    store8(&tmppath + 25, 0);
+
+    if (file_write_all(&tmppath, content, content_len) < 0) {
+        eprintln("sit: cannot write tempfile");
+        return 1;
+    }
+
+    var owl = find_owl();
+    if (owl == 0) {
+        eprintln("sit: owl not installed — emitting raw content");
+        eprintln("sit:   (owl is pre-1.0; https://github.com/MacCracken/owl)");
+        syscall(SYS_WRITE, STDOUT, content, content_len);
+        sys_unlink(&tmppath);
+        return 0;
+    }
+
+    var args = vec_new();
+    vec_push(args, owl);
+    vec_push(args, &tmppath);
+    var rc = exec_vec(args);
+    sys_unlink(&tmppath);
+    return rc;
+}
+
+# Type codes stored in the objects.type INT column.
+fn type_code_of(type_str, type_len) {
+    if (type_len == 4) {
+        if (memeq(type_str, "blob", 4) == 1) { return 0; }
+        if (memeq(type_str, "tree", 4) == 1) { return 1; }
+    }
+    if (type_len == 6) {
+        if (memeq(type_str, "commit", 6) == 1) { return 2; }
+    }
+    return 0 - 1;
+}
+
+# Open (or create) the patra-backed object store. Returns db handle, or 0.
+fn object_db_open() {
+    patra_init();
+    var db = patra_open(".sit/objects.patra");
+    if (db == 0) { return 0; }
+    patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
+    return db;
+}
+
+# Migrate legacy loose-file objects (under .sit/objects/<xx>/<yy...>) into
+# the patra table. No-op if no legacy files present. Deletes loose files
+# + empty 2-char directories as they're migrated.
+fn object_db_migrate_from_loose(db) {
+    if (file_exists(".sit/objects") != 1) { return 0; }
+
+    var dirs = dir_list(str_from(".sit/objects"));
+    var dn = vec_len(dirs);
+    var di = 0;
+    while (di < dn) {
+        var s = vec_get(dirs, di);
+        var sdata = str_data(s);
+        var slen = str_len(s);
+
+        if (slen == 2) {
+            var sub_path = alloc(16);
+            memcpy(sub_path, ".sit/objects/", 13);
+            memcpy(sub_path + 13, sdata, 2);
+            store8(sub_path + 15, 0);
+
+            var files = dir_list(str_from(sub_path));
+            var fn_ct = vec_len(files);
+            var fi = 0;
+            while (fi < fn_ct) {
+                var f = vec_get(files, fi);
+                var fdata = str_data(f);
+                var flen = str_len(f);
+
+                if (flen == 62) {
+                    var hex = alloc(65);
+                    memcpy(hex, sdata, 2);
+                    memcpy(hex + 2, fdata, 62);
+                    store8(hex + 64, 0);
+
+                    var loose_path = alloc(96);
+                    object_path(loose_path, hex);
+                    var pair[16];
+                    if (read_file_heap(loose_path, &pair) == 0) {
+                        var compressed = load64(&pair);
+                        var clen = load64(&pair + 8);
+
+                        # Sniff type from decompressed header for the INT column
+                        var dec_cap = clen * 256;
+                        if (dec_cap < 4096) { dec_cap = 4096; }
+                        if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
+                        var decompressed = alloc(dec_cap);
+                        var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+                        var type_code = 0;
+                        if (dlen > 5) {
+                            if (memeq(decompressed, "blob ", 5) == 1) { type_code = 0; }
+                            else {
+                                if (memeq(decompressed, "tree ", 5) == 1) { type_code = 1; }
+                                else {
+                                    if (dlen > 7) {
+                                        if (memeq(decompressed, "commit ", 7) == 1) { type_code = 2; }
+                                    }
+                                }
+                            }
+                        }
+
+                        var types[24];
+                        store64(&types + 0, 1);
+                        store64(&types + 8, 0);
+                        store64(&types + 16, 2);
+                        var ivals[24];
+                        store64(&ivals + 8, type_code);
+                        var sptrs[24];
+                        store64(&sptrs + 0, hex);
+                        var slens[24];
+                        store64(&slens + 0, 64);
+                        var bptrs[24];
+                        store64(&bptrs + 16, compressed);
+                        var blens[24];
+                        store64(&blens + 16, clen);
+                        patra_insert_row(db, "objects", 7, 3,
+                            &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+
+                        sys_unlink(loose_path);
+                    }
+                }
+                fi = fi + 1;
+            }
+            sys_rmdir(sub_path);
+        }
+        di = di + 1;
+    }
+    return 0;
+}
+
+# Open (or create) the patra-backed staging index. Returns db handle, or 0.
+fn cmd_fsck() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var db = object_db_open();
+    if (db == 0) {
+        syscall(SYS_WRITE, STDOUT, "checked 0 objects, 0 bad\n", 25);
+        return 0;
+    }
+    object_db_migrate_from_loose(db);
+
+    # Snapshot the hash list first, then close the db so read_object can open
+    # its own handle without contention.
+    var rs = patra_query(db, "SELECT hash FROM objects");
+    var total = 0;
+    var bad = 0;
+    var hashes = vec_new();
+    if (rs != 0) {
+        var count = patra_result_count(rs);
+        var i = 0;
+        while (i < count) {
+            var s = patra_result_get_str(rs, i, 0);
+            var copy = alloc(65);
+            memcpy(copy, s, 64);
+            store8(copy + 64, 0);
+            vec_push(hashes, copy);
+            i = i + 1;
+        }
+        patra_result_free(rs);
+    }
+    patra_close(db);
+
+    var hn = vec_len(hashes);
+    var hi = 0;
+    while (hi < hn) {
+        var hex = vec_get(hashes, hi);
+        var obj[24];
+        if (read_object(hex, &obj) == 0) {
+            var buf = load64(&obj);
+            var blen = load64(&obj + 8);
+            var actual = hash_data(buf, blen);
+            if (streq(hex, actual) == 0) {
+                syscall(SYS_WRITE, STDERR, "bad object ", 11);
+                syscall(SYS_WRITE, STDERR, hex, 64);
+                syscall(SYS_WRITE, STDERR, "\n", 1);
+                bad = bad + 1;
+            }
+            total = total + 1;
+        }
+        else {
+            syscall(SYS_WRITE, STDERR, "unreadable ", 11);
+            syscall(SYS_WRITE, STDERR, hex, 64);
+            syscall(SYS_WRITE, STDERR, "\n", 1);
+            bad = bad + 1;
+        }
+        hi = hi + 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "checked ", 8);
+    write_unsigned(total);
+    syscall(SYS_WRITE, STDOUT, " objects, ", 10);
+    write_unsigned(bad);
+    syscall(SYS_WRITE, STDOUT, " bad\n", 5);
+
+    if (bad > 0) { return 1; }
+    return 0;
+}
+
+fn hash_blob_of_content(content, content_len) {
+    var full_cap = 32 + content_len;
+    var full = alloc(full_cap);
+    memcpy(full, "blob ", 5);
+    var digits = write_decimal(full + 5, content_len);
+    store8(full + 5 + digits, 0);
+    var hdr_len = 5 + digits + 1;
+    memcpy(full + hdr_len, content, content_len);
+    return hash_data(full, hdr_len + content_len);
+}
+
+# Read a regular file into a heap buffer. Stores (buf_ptr, len) to out_pair.
+# Returns 0 on success, negative on error.
+fn hash_file_as_blob(path) {
+    var pair[16];
+    if (read_file_heap(path, &pair) != 0) { return 0; }
+    return hash_blob_of_content(load64(&pair), load64(&pair + 8));
+}
+
+# Tree entry layout (24 bytes):
+#   0..8:   mode ptr (heap cstring, e.g. "100644")
+#   8..16:  name ptr (heap cstring)
+#   16..24: hash_hex ptr (heap cstring, 64 chars + null)

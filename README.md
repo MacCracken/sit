@@ -8,7 +8,7 @@ The name is from *smriti* (स्मृति — "that which is remembered"). T
 
 ## Status
 
-- **Version**: 0.5.0 — wire protocol (local-path transport). Remotes, fetch, pull, push, clone across bare-path remotes. Network transports (HTTP, SSH) are v0.6.x work.
+- **Version**: 0.5.1 — file-split refactor. `src/main.cyr` broken into 11 topical modules; no feature changes. Wire protocol (local-path transport) shipped in 0.5.0.
 - **Language**: Cyrius (toolchain pinned in `cyrius.cyml` under `[package].cyrius`)
 - **Commands** (24): `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `reset`, `commit`, `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md)
 

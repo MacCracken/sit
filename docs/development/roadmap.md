@@ -1,10 +1,17 @@
 # sit Development Roadmap
 
-> **v0.5.0** — Wire protocol (local-path transport). Remotes, fetch, push across bare-path remotes. Network transports are v0.6.x work.
+> **v0.5.1** — File-split refactor. `src/main.cyr` (5700 lines) broken into 11 topical modules chained through `src/lib.cyr`. No feature changes.
 
-Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHANGELOG.md`](../../CHANGELOG.md) for the tagged artifact.
+Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHANGELOG.md`](../../CHANGELOG.md) for the tagged artifacts.
 
 ## Released
+
+### v0.5.1 — file-split refactor
+
+- `src/main.cyr` shrank from 5096 → 112 lines (purely `print_usage` + `main()` + dispatch + trailer).
+- 11 topical modules under `src/`: `util`, `config`, `object_db`, `index`, `refs`, `tree`, `diff`, `commit`, `merge`, `sign`, `wire`. Chained via `src/lib.cyr`.
+- No function renames, no feature changes, no bug fixes beyond what the split surfaced. Mechanical relocation only.
+- Follows the yukti / patra include-chain pattern; `cyrius.cyml [build].entry` stays on `src/main.cyr`, stdlib continues auto-including via `[deps].stdlib`.
 
 ### v0.5.0 — wire protocol (local-path transport)
 
@@ -56,24 +63,6 @@ The local VCS loop is complete end-to-end, with ed25519 signing and a local-path
 **Deps**: cyrius 5.6.25, sakshi 2.1.0, sankoch 2.0.1, sigil 2.9.1, patra 1.6.0. Git-tag pinned. No FFI, no C, no libgit2 — see [ADR 0001](../adr/0001-no-ffi-first-party-only.md).
 
 ## Backlog
-
-### v0.5.1 — File-split refactor
-
-`src/main.cyr` is ~5700 lines in one flat file. That's been fine for bootstrap but needs to be broken up before v0.6.x network work adds another ~1000 lines. No features, no bug fixes beyond what the split itself surfaces.
-
-Candidate module layout (read the code before committing to it):
-
-- `src/object_db.cyr` — `object_db_open`, `write_typed_object`, `read_object`, loose-file migrator, `db_*` parameterized variants
-- `src/index.cyr` — `parse_index`, `rewrite_index`, `index_upsert`, plaintext migrator
-- `src/commit.cyr` — `build_commit*`, `build_merge_commit*`, `parse_commit_body`, `print_commit_header`
-- `src/refs.cyr` — `read_head_ref`, `write_head_ref`, `resolve_ref_name`, `resolve_hash`, `ensure_parent_dirs`
-- `src/tree.cyr` — `build_tree`, `parse_tree`, `flatten_tree`, entry accessors
-- `src/diff.cyr` — `lcs_diff`, `split_lines`, `annotate_ops`, hunk grouping, `print_file_diff` / `print_file_stat`
-- `src/sign.cyr` — key paths, `sign_commit_body`, `extract_sitsig`, `verify_commit_body`, `cmd_key`, `cmd_verify_commit`
-- `src/wire.cyr` — remote config, `walk_reachable_*`, `copy_objects`, `cmd_remote/fetch/pull/push/clone`
-- `src/main.cyr` — `print_usage`, dispatch, and the `main()` wrapper only
-
-Cyrius composes sources via `include "path/to/file.cyr"` (see stdlib `hashmap.cyr` for the pattern); `cyrius.cyml [build].entry` stays pointed at `src/main.cyr`. No new ADR needed — this is a mechanical file split, not an architectural decision.
 
 ### v0.6.0 — Network wire protocol
 

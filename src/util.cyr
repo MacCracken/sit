@@ -1,0 +1,172 @@
+# util.cyr — universal helpers.
+#
+# Everything here is consumed by two or more domain modules. Keep this file
+# free of sit-specific domain knowledge — no refs, no objects, no patra.
+
+var SEEK_SET = 0;
+var SEEK_END = 2;
+
+fn eprintln(s) {
+    var len = strlen(s);
+    syscall(SYS_WRITE, STDERR, s, len);
+    syscall(SYS_WRITE, STDERR, "\n", 1);
+    return 0;
+}
+
+# mkdir(path, 0o755), tolerating EEXIST (-17).
+fn ensure_dir(path) {
+    var r = sys_mkdir(path, 0x1ED);
+    if (r == 0) { return 0; }
+    if (r == 0 - 17) { return 0; }
+    return r;
+}
+
+# Walk `path`, mkdir every '/'-delimited directory prefix. Used by ref writers
+# so `.sit/refs/heads/feature/foo` creates `.sit/refs/heads/feature/` on demand.
+fn ensure_parent_dirs(path) {
+    var len = strlen(path);
+    var i = 0;
+    while (i < len) {
+        if (load8(path + i) == 47) {
+            if (i > 0) {
+                var segment = alloc(i + 1);
+                memcpy(segment, path, i);
+                store8(segment + i, 0);
+                ensure_dir(segment);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Like ensure_parent_dirs but also mkdirs the root-relative prefix for an
+# absolute-looking path. Used by the merge conflict writer.
+fn ensure_dirs_for(path) {
+    var len = strlen(path);
+    var i = 0;
+    while (i < len) {
+        if (load8(path + i) == 47) {
+            var dir = alloc(i + 1);
+            memcpy(dir, path, i);
+            store8(dir + i, 0);
+            ensure_dir(dir);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Write decimal representation of n into buf. Returns digit count.
+fn write_decimal(buf, n) {
+    if (n == 0) { store8(buf, 48); return 1; }
+    var digits = 0;
+    var m = n;
+    while (m > 0) { digits = digits + 1; m = m / 10; }
+    m = n;
+    var i = digits - 1;
+    while (m > 0) {
+        store8(buf + i, 48 + m % 10);
+        i = i - 1;
+        m = m / 10;
+    }
+    return digits;
+}
+
+# Copy argv(n) into a heap-owned, null-terminated string. See
+# docs/architecture/001 — argv pointers alias post-return stack memory,
+# so we must copy before doing anything stack-heavy.
+fn argv_heap(n) {
+    var raw = argv(n);
+    var len = strlen(raw);
+    var s = alloc(len + 1);
+    memcpy(s, raw, len);
+    store8(s + len, 0);
+    return s;
+}
+
+# Advance past any run of spaces or tabs in [pos, stop).
+fn skip_ws(data, pos, stop) {
+    var i = pos;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (i >= stop) { scanning = 0; }
+        else {
+            var c = load8(data + i);
+            if (c == 32) { i = i + 1; }
+            else {
+                if (c == 9) { i = i + 1; }
+                else { scanning = 0; }
+            }
+        }
+    }
+    return i;
+}
+
+fn strcmp_cstr(a, b) {
+    var i = 0;
+    var done = 0;
+    var result = 0;
+    while (done == 0) {
+        var ca = load8(a + i);
+        var cb = load8(b + i);
+        if (ca != cb) {
+            if (ca < cb) { result = 0 - 1; }
+            else { result = 1; }
+            done = 1;
+        }
+        else {
+            if (ca == 0) { done = 1; }
+            else { i = i + 1; }
+        }
+    }
+    return result;
+}
+
+# Insertion-sort a vec of cstrings in place (ascending).
+fn sort_cstrings(vec) {
+    var n = vec_len(vec);
+    var i = 1;
+    while (i < n) {
+        var cur = vec_get(vec, i);
+        var j = i - 1;
+        var placed = 0;
+        while (placed == 0) {
+            if (j < 0) { placed = 1; }
+            else {
+                var prev = vec_get(vec, j);
+                if (strcmp_cstr(cur, prev) >= 0) { placed = 1; }
+                else {
+                    vec_set(vec, j + 1, prev);
+                    j = j - 1;
+                }
+            }
+        }
+        vec_set(vec, j + 1, cur);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Read an entire file into a heap buffer. Writes (ptr, len) to out_pair.
+# Returns 0 on success, negative on failure.
+fn read_file_heap(path, out_pair) {
+    var fd = file_open(path, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
+    syscall(SYS_LSEEK, fd, 0, SEEK_SET);
+    if (size < 0) { file_close(fd); return 0 - 2; }
+    var buf = alloc(size + 1);
+    if (buf == 0) { file_close(fd); return 0 - 3; }
+    var total = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        var n = file_read(fd, buf + total, size - total);
+        if (n <= 0) { rgo = 0; }
+        else { total = total + n; if (total >= size) { rgo = 0; } }
+    }
+    file_close(fd);
+    store64(out_pair, buf);
+    store64(out_pair + 8, total);
+    return 0;
+}

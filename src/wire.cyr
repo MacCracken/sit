@@ -1,0 +1,749 @@
+# wire.cyr — local-path wire protocol.
+#
+# Remote config helpers (remote.<name>.url), db_* parameterized object readers
+# so the same reachability walker runs against local or remote patra stores,
+# BFS reachability, object copy loop, fast-forward check, and all five wire
+# commands: remote, fetch, pull, push, clone.
+
+fn remote_url(name) {
+    var nlen = strlen(name);
+    var key = alloc(nlen + 12);
+    memcpy(key, "remote.", 7);
+    memcpy(key + 7, name, nlen);
+    memcpy(key + 7 + nlen, ".url", 4);
+    store8(key + 7 + nlen + 4, 0);
+    return config_get(key);
+}
+
+# Strip a `file://` scheme prefix if present; otherwise return a heap copy.
+fn remote_normalize(url) {
+    var ulen = strlen(url);
+    var start = 0;
+    if (ulen > 7) {
+        if (memeq(url, "file://", 7) == 1) { start = 7; }
+    }
+    var out_len = ulen - start;
+    var out = alloc(out_len + 1);
+    memcpy(out, url + start, out_len);
+    store8(out + out_len, 0);
+    return out;
+}
+
+# Join repo_path + "/.sit/objects.patra" → heap cstring.
+fn remote_objects_path(repo_path) {
+    var rl = strlen(repo_path);
+    var p = alloc(rl + 24);
+    memcpy(p, repo_path, rl);
+    memcpy(p + rl, "/.sit/objects.patra", 19);
+    store8(p + rl + 19, 0);
+    return p;
+}
+
+# Open (or create) a patra objects DB at `<repo_path>/.sit/objects.patra`.
+fn remote_objects_open(repo_path) {
+    patra_init();
+    var p = remote_objects_path(repo_path);
+    var db = patra_open(p);
+    if (db == 0) { return 0; }
+    patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
+    return db;
+}
+
+# Return 1 if `hex` exists in the given opened object DB, else 0.
+fn db_object_has(db, hex) {
+    var sql = alloc(128);
+    memcpy(sql, "SELECT hash FROM objects WHERE hash = '", 39);
+    memcpy(sql + 39, hex, 64);
+    memcpy(sql + 39 + 64, "'", 1);
+    store8(sql + 39 + 64 + 1, 0);
+    var rs = patra_query(db, sql);
+    if (rs == 0) { return 0; }
+    var cnt = patra_result_count(rs);
+    patra_result_free(rs);
+    if (cnt > 0) { return 1; }
+    return 0;
+}
+
+# Read compressed bytes + type code from an opened db by hex.
+# Layout at out: 0..8 = compressed_ptr, 8..16 = clen, 16..24 = ty.
+fn db_object_read_raw(db, hex, out) {
+    var sql = alloc(128);
+    memcpy(sql, "SELECT content, ty FROM objects WHERE hash = '", 46);
+    memcpy(sql + 46, hex, 64);
+    memcpy(sql + 46 + 64, "'", 1);
+    store8(sql + 46 + 64 + 1, 0);
+    var rs = patra_query(db, sql);
+    if (rs == 0) { return 0 - 1; }
+    if (patra_result_count(rs) == 0) { patra_result_free(rs); return 0 - 2; }
+    var blen = patra_result_get_bytes_len(rs, 0, 0);
+    if (blen <= 0) { patra_result_free(rs); return 0 - 3; }
+    var compressed = alloc(blen);
+    if (patra_result_read_bytes(db, rs, 0, 0, compressed) != 0) {
+        patra_result_free(rs);
+        return 0 - 4;
+    }
+    var ty = patra_result_get_int(rs, 0, 1);
+    patra_result_free(rs);
+    store64(out, compressed);
+    store64(out + 8, blen);
+    store64(out + 16, ty);
+    return 0;
+}
+
+# Read + decompress from an opened db. Same out-layout as read_object.
+fn db_object_read_decompressed(db, hex, out) {
+    var raw[24];
+    if (db_object_read_raw(db, hex, &raw) != 0) { return 0 - 1; }
+    var compressed = load64(&raw);
+    var clen = load64(&raw + 8);
+    var dec_cap = clen * 256;
+    if (dec_cap < 4096) { dec_cap = 4096; }
+    if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
+    var decompressed = alloc(dec_cap);
+    if (decompressed == 0) { return 0 - 2; }
+    var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+    if (dlen <= 0) { return 0 - 3; }
+    var nul = 0;
+    while (nul < dlen) {
+        if (load8(decompressed + nul) == 0) { break; }
+        nul = nul + 1;
+    }
+    if (nul >= dlen) { return 0 - 4; }
+    store64(out, decompressed);
+    store64(out + 8, dlen);
+    store64(out + 16, nul + 1);
+    return 0;
+}
+
+# Insert a pre-compressed object (hex key, type code, zlib bytes) into db.
+fn db_object_insert_raw(db, hex, type_code, compressed, clen) {
+    if (db_object_has(db, hex) == 1) { return 0; }
+    var types[24];
+    store64(&types +  0, 1);
+    store64(&types +  8, 0);
+    store64(&types + 16, 2);
+    var ivals[24];
+    store64(&ivals + 8, type_code);
+    var sptrs[24];
+    store64(&sptrs + 0, hex);
+    var slens[24];
+    store64(&slens + 0, 64);
+    var bptrs[24];
+    store64(&bptrs + 16, compressed);
+    var blens[24];
+    store64(&blens + 16, clen);
+    return patra_insert_row(db, "objects", 7, 3,
+        &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+}
+
+# Walk every object reachable from `root_commit_hex` in `src_db` and append
+# each object's hex hash to `out`. Uses `seen` (map_new) for dedup.
+fn walk_reachable_tree(src_db, tree_hex, out, seen) {
+    if (map_has(seen, tree_hex) == 1) { return 0; }
+    map_set(seen, tree_hex, 1);
+    var hex_copy = alloc(65);
+    memcpy(hex_copy, tree_hex, 64);
+    store8(hex_copy + 64, 0);
+    vec_push(out, hex_copy);
+
+    var obj[24];
+    if (db_object_read_decompressed(src_db, tree_hex, &obj) != 0) { return 0; }
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    var entries = parse_tree(buf + coff, blen - coff);
+    var n = vec_len(entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        var mode = tree_entry_mode(e);
+        var hash = tree_entry_hash(e);
+        if (streq(mode, "40000") == 1) {
+            walk_reachable_tree(src_db, hash, out, seen);
+        }
+        else {
+            if (map_has(seen, hash) == 0) {
+                map_set(seen, hash, 1);
+                var bcopy = alloc(65);
+                memcpy(bcopy, hash, 64);
+                store8(bcopy + 64, 0);
+                vec_push(out, bcopy);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn walk_reachable_from_commit(src_db, root_hex, out, seen) {
+    var queue = vec_new();
+    var hex_copy = alloc(65);
+    memcpy(hex_copy, root_hex, 64);
+    store8(hex_copy + 64, 0);
+    vec_push(queue, hex_copy);
+    while (vec_len(queue) > 0) {
+        var cur = vec_get(queue, vec_len(queue) - 1);
+        vec_pop(queue);
+        if (map_has(seen, cur) == 1) { }
+        else {
+            map_set(seen, cur, 1);
+            vec_push(out, cur);
+
+            var obj[24];
+            if (db_object_read_decompressed(src_db, cur, &obj) == 0) {
+                var buf = load64(&obj);
+                var blen = load64(&obj + 8);
+                var coff = load64(&obj + 16);
+                var body = buf + coff;
+                var body_len = blen - coff;
+                var info[56];
+                if (parse_commit_body(body, body_len, &info) == 0) {
+                    var tree_hex = load64(&info);
+                    if (tree_hex != 0) { walk_reachable_tree(src_db, tree_hex, out, seen); }
+                    var parent_hex = load64(&info + 8);
+                    if (parent_hex != 0) { vec_push(queue, parent_hex); }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# Copy every hex in `hashes` that isn't already present in `dst_db` from
+# `src_db`. Returns the count of objects newly written.
+fn copy_objects(src_db, dst_db, hashes) {
+    var n = vec_len(hashes);
+    var i = 0;
+    var copied = 0;
+    while (i < n) {
+        var hex = vec_get(hashes, i);
+        if (db_object_has(dst_db, hex) == 0) {
+            var raw[24];
+            if (db_object_read_raw(src_db, hex, &raw) == 0) {
+                var compressed = load64(&raw);
+                var clen = load64(&raw + 8);
+                var ty = load64(&raw + 16);
+                if (db_object_insert_raw(dst_db, hex, ty, compressed, clen) == 0) {
+                    copied = copied + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return copied;
+}
+
+# Read a ref file at `<repo_path>/.sit/refs/heads/<branch>` — 64 hex chars.
+# Returns heap 65-byte cstring on success, 0 on missing/malformed.
+fn read_remote_ref(repo_path, branch) {
+    var rl = strlen(repo_path);
+    var bl = strlen(branch);
+    var p = alloc(rl + bl + 32);
+    memcpy(p, repo_path, rl);
+    memcpy(p + rl, "/.sit/refs/heads/", 17);
+    memcpy(p + rl + 17, branch, bl);
+    store8(p + rl + 17 + bl, 0);
+    if (file_exists(p) != 1) { return 0; }
+    var buf = alloc(128);
+    var n = file_read_all(p, buf, 128);
+    if (n < 64) { return 0; }
+    var out = alloc(65);
+    memcpy(out, buf, 64);
+    store8(out + 64, 0);
+    return out;
+}
+
+# Write `hex\n` (65 bytes) to `<repo_path>/.sit/refs/heads/<branch>`.
+fn write_remote_ref(repo_path, branch, hex) {
+    var rl = strlen(repo_path);
+    var bl = strlen(branch);
+    var p = alloc(rl + bl + 32);
+    memcpy(p, repo_path, rl);
+    memcpy(p + rl, "/.sit/refs/heads/", 17);
+    memcpy(p + rl + 17, branch, bl);
+    store8(p + rl + 17 + bl, 0);
+    var buf = alloc(66);
+    memcpy(buf, hex, 64);
+    store8(buf + 64, 10);
+    return file_write_all(p, buf, 65);
+}
+
+# Write 65-byte hex to `.sit/refs/remotes/<remote>/<branch>`.
+fn write_remote_tracking(remote, branch, hex) {
+    var dir = alloc(128);
+    memcpy(dir, ".sit/refs/remotes", 17);
+    store8(dir + 17, 0);
+    ensure_dir(dir);
+    var rl = strlen(remote);
+    memcpy(dir + 17, "/", 1);
+    memcpy(dir + 18, remote, rl);
+    store8(dir + 18 + rl, 0);
+    ensure_dir(dir);
+    var bl = strlen(branch);
+    var p = alloc(32 + rl + bl);
+    memcpy(p, ".sit/refs/remotes/", 18);
+    memcpy(p + 18, remote, rl);
+    memcpy(p + 18 + rl, "/", 1);
+    memcpy(p + 18 + rl + 1, branch, bl);
+    store8(p + 18 + rl + 1 + bl, 0);
+    var buf = alloc(66);
+    memcpy(buf, hex, 64);
+    store8(buf + 64, 10);
+    return file_write_all(p, buf, 65);
+}
+
+# Return 1 if `ancestor_hex` is reachable from `desc_hex` (ff check).
+fn is_ancestor_in_db(db, ancestor_hex, desc_hex) {
+    if (streq(ancestor_hex, desc_hex) == 1) { return 1; }
+    var queue = vec_new();
+    var seen = map_new();
+    var start = alloc(65);
+    memcpy(start, desc_hex, 64);
+    store8(start + 64, 0);
+    vec_push(queue, start);
+    while (vec_len(queue) > 0) {
+        var cur = vec_get(queue, vec_len(queue) - 1);
+        vec_pop(queue);
+        if (map_has(seen, cur) == 1) { }
+        else {
+            map_set(seen, cur, 1);
+            if (streq(cur, ancestor_hex) == 1) { return 1; }
+            var obj[24];
+            if (db_object_read_decompressed(db, cur, &obj) == 0) {
+                var buf = load64(&obj);
+                var blen = load64(&obj + 8);
+                var coff = load64(&obj + 16);
+                var info[56];
+                if (parse_commit_body(buf + coff, blen - coff, &info) == 0) {
+                    var p = load64(&info + 8);
+                    if (p != 0) { vec_push(queue, p); }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+fn cmd_remote_add() {
+    if (argc() < 5) {
+        eprintln("usage: sit remote add <name> <url>");
+        return 1;
+    }
+    var name = argv_heap(3);
+    var url = argv_heap(4);
+    var nlen = strlen(name);
+    var key = alloc(nlen + 12);
+    memcpy(key, "remote.", 7);
+    memcpy(key + 7, name, nlen);
+    memcpy(key + 7 + nlen, ".url", 4);
+    store8(key + 7 + nlen + 4, 0);
+    if (config_file_set(".sit/config", key, url) != 0) {
+        eprintln("sit: failed to write .sit/config");
+        return 1;
+    }
+    return 0;
+}
+
+fn cmd_remote_list() {
+    if (file_exists(".sit/config") != 1) { return 0; }
+    var pair[16];
+    if (read_file_heap(".sit/config", &pair) != 0) { return 0; }
+    var data = load64(&pair);
+    var len = load64(&pair + 8);
+    var pos = 0;
+    while (pos < len) {
+        var le = pos;
+        while (le < len) {
+            if (load8(data + le) == 10) { break; }
+            le = le + 1;
+        }
+        var stop = le;
+        if (stop > pos) {
+            if (load8(data + stop - 1) == 13) { stop = stop - 1; }
+        }
+        var start = skip_ws(data, pos, stop);
+        # Match lines shaped "remote.<name>.url = <url>"
+        if (stop - start > 8) {
+            if (memeq(data + start, "remote.", 7) == 1) {
+                # find closing ".url"
+                var dot = start + 7;
+                while (dot < stop) {
+                    if (load8(data + dot) == 46) { break; }
+                    dot = dot + 1;
+                }
+                if (dot < stop) {
+                    if (dot + 4 <= stop) {
+                        if (memeq(data + dot, ".url", 4) == 1) {
+                            syscall(SYS_WRITE, STDOUT, data + start + 7, dot - (start + 7));
+                            syscall(SYS_WRITE, STDOUT, "\t", 1);
+                            # skip past " = "
+                            var eq = dot + 4;
+                            while (eq < stop) {
+                                if (load8(data + eq) == 61) { eq = eq + 1; break; }
+                                eq = eq + 1;
+                            }
+                            eq = skip_ws(data, eq, stop);
+                            syscall(SYS_WRITE, STDOUT, data + eq, stop - eq);
+                            syscall(SYS_WRITE, STDOUT, "\n", 1);
+                        }
+                    }
+                }
+            }
+        }
+        pos = le + 1;
+    }
+    return 0;
+}
+
+fn cmd_remote_remove() {
+    if (argc() < 4) {
+        eprintln("usage: sit remote remove <name>");
+        return 1;
+    }
+    var name = argv_heap(3);
+    var nlen = strlen(name);
+    var key = alloc(nlen + 12);
+    memcpy(key, "remote.", 7);
+    memcpy(key + 7, name, nlen);
+    memcpy(key + 7 + nlen, ".url", 4);
+    store8(key + 7 + nlen + 4, 0);
+    var r = config_file_unset(".sit/config", key);
+    if (r == 0 - 2) {
+        eprintln("sit: no such remote");
+        return 1;
+    }
+    if (r != 0) {
+        eprintln("sit: failed to update .sit/config");
+        return 1;
+    }
+    return 0;
+}
+
+fn cmd_remote() {
+    if (argc() < 3) { return cmd_remote_list(); }
+    var sub = argv(2);
+    if (streq(sub, "add")    == 1) { return cmd_remote_add(); }
+    if (streq(sub, "list")   == 1) { return cmd_remote_list(); }
+    if (streq(sub, "remove") == 1) { return cmd_remote_remove(); }
+    eprintln("sit: unknown remote subcommand (add | list | remove)");
+    return 1;
+}
+
+# Copy reachable objects + write remote-tracking ref. Returns the 65-byte
+# fetched tip hex on success, or 0 on failure (with an eprintln already emitted).
+# Shared between cmd_fetch, cmd_pull, and cmd_clone.
+fn do_fetch(name, branch) {
+    var url = remote_url(name);
+    if (url == 0) {
+        eprintln("sit: no such remote");
+        return 0;
+    }
+    var repo_path = remote_normalize(url);
+
+    var remote_tip = read_remote_ref(repo_path, branch);
+    if (remote_tip == 0) {
+        eprintln("sit: remote has no such branch");
+        return 0;
+    }
+
+    var src_db = remote_objects_open(repo_path);
+    if (src_db == 0) {
+        eprintln("sit: cannot open remote object db");
+        return 0;
+    }
+    var dst_db = object_db_open();
+    if (dst_db == 0) {
+        patra_close(src_db);
+        eprintln("sit: cannot open local object db");
+        return 0;
+    }
+    object_db_migrate_from_loose(dst_db);
+
+    var seen = map_new();
+    var hashes = vec_new();
+    walk_reachable_from_commit(src_db, remote_tip, hashes, seen);
+    var copied = copy_objects(src_db, dst_db, hashes);
+
+    patra_close(src_db);
+    patra_close(dst_db);
+
+    write_remote_tracking(name, branch, remote_tip);
+
+    syscall(SYS_WRITE, STDOUT, "fetched ", 8);
+    syscall(SYS_WRITE, STDOUT, name, strlen(name));
+    syscall(SYS_WRITE, STDOUT, "/", 1);
+    syscall(SYS_WRITE, STDOUT, branch, strlen(branch));
+    syscall(SYS_WRITE, STDOUT, " at ", 4);
+    syscall(SYS_WRITE, STDOUT, remote_tip, 12);
+    var nbuf[24];
+    var d = write_decimal(&nbuf, copied);
+    syscall(SYS_WRITE, STDOUT, " (", 2);
+    syscall(SYS_WRITE, STDOUT, &nbuf, d);
+    syscall(SYS_WRITE, STDOUT, " new objects)\n", 14);
+    return remote_tip;
+}
+
+fn cmd_fetch() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository");
+        return 1;
+    }
+    if (argc() < 3) {
+        eprintln("usage: sit fetch <remote> [<branch>]");
+        return 1;
+    }
+    var name = argv_heap(2);
+    var branch = "main";
+    if (argc() >= 4) { branch = argv_heap(3); }
+    if (do_fetch(name, branch) == 0) { return 1; }
+    return 0;
+}
+
+# Pull = fetch + fast-forward merge. Non-ff divergence tells the user to run
+# `sit merge` manually rather than attempting an automatic 3-way here — keeps
+# the semantics narrow and predictable.
+fn cmd_pull() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository");
+        return 1;
+    }
+    if (argc() < 3) {
+        eprintln("usage: sit pull <remote> [<branch>]");
+        return 1;
+    }
+    var name = argv_heap(2);
+    var branch = "main";
+    if (argc() >= 4) { branch = argv_heap(3); }
+
+    var tip = do_fetch(name, branch);
+    if (tip == 0) { return 1; }
+
+    var head_hex = read_head_ref();
+    if (head_hex == 0) {
+        # No local commits yet — adopt the fetched tip as HEAD, materialize.
+        if (write_head_ref(tip) != 0) {
+            eprintln("sit: failed to update HEAD");
+            return 1;
+        }
+        materialize_target(tip);
+        syscall(SYS_WRITE, STDOUT, "initialized from ", 17);
+        syscall(SYS_WRITE, STDOUT, name, strlen(name));
+        syscall(SYS_WRITE, STDOUT, "/", 1);
+        syscall(SYS_WRITE, STDOUT, branch, strlen(branch));
+        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        return 0;
+    }
+
+    if (streq(tip, head_hex) == 1) {
+        syscall(SYS_WRITE, STDOUT, "already up to date\n", 19);
+        return 0;
+    }
+    if (is_ancestor(tip, head_hex) == 1) {
+        syscall(SYS_WRITE, STDOUT, "already up to date\n", 19);
+        return 0;
+    }
+    if (is_ancestor(head_hex, tip) == 1) {
+        if (is_dirty() == 1) {
+            eprintln("sit: working tree has uncommitted changes; commit or revert before pulling");
+            return 1;
+        }
+        if (write_head_ref(tip) != 0) {
+            eprintln("sit: failed to update HEAD");
+            return 1;
+        }
+        materialize_target(tip);
+        syscall(SYS_WRITE, STDOUT, "fast-forward to ", 16);
+        syscall(SYS_WRITE, STDOUT, tip, 12);
+        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        return 0;
+    }
+    eprintln("sit: local and remote have diverged");
+    syscall(SYS_WRITE, STDERR, "sit:   run 'sit merge ", 22);
+    syscall(SYS_WRITE, STDERR, name, strlen(name));
+    syscall(SYS_WRITE, STDERR, "/", 1);
+    syscall(SYS_WRITE, STDERR, branch, strlen(branch));
+    syscall(SYS_WRITE, STDERR, "' to resolve\n", 13);
+    return 1;
+}
+
+# Clone = mkdir + chdir + init + remote-add + fetch + HEAD ref + materialize.
+# Target directory defaults to the last '/'-delimited segment of the URL.
+fn cmd_clone() {
+    if (argc() < 3) {
+        eprintln("usage: sit clone <url> [<dir>]");
+        return 1;
+    }
+    var url = argv_heap(2);
+
+    var target = 0;
+    if (argc() >= 4) { target = argv_heap(3); }
+    else {
+        # Derive target from URL: strip trailing slash, take last segment, drop file:// prefix.
+        var src = remote_normalize(url);
+        var slen = strlen(src);
+        while (slen > 0) {
+            if (load8(src + slen - 1) != 47) { break; }
+            slen = slen - 1;
+        }
+        var tail = slen;
+        while (tail > 0) {
+            if (load8(src + tail - 1) == 47) { break; }
+            tail = tail - 1;
+        }
+        var tlen = slen - tail;
+        if (tlen == 0) {
+            eprintln("sit: cannot derive target dir from url (pass one explicitly)");
+            return 1;
+        }
+        target = alloc(tlen + 1);
+        memcpy(target, src + tail, tlen);
+        store8(target + tlen, 0);
+    }
+
+    if (ensure_dir(target) != 0) {
+        eprintln("sit: cannot create target directory");
+        return 1;
+    }
+    # Reject non-empty target to avoid clobbering. dir_list returns entries including
+    # '.' / '..' in some stdlib variants; count anything else as populated.
+    var listing = dir_list(str_from(target));
+    var ln = vec_len(listing);
+    var li = 0;
+    var real_entries = 0;
+    while (li < ln) {
+        var s = vec_get(listing, li);
+        var sd = str_data(s);
+        var slen2 = str_len(s);
+        var is_dot = 0;
+        if (slen2 == 1) { if (load8(sd) == 46) { is_dot = 1; } }
+        if (slen2 == 2) {
+            if (load8(sd) == 46) {
+                if (load8(sd + 1) == 46) { is_dot = 1; }
+            }
+        }
+        if (is_dot == 0) { real_entries = real_entries + 1; }
+        li = li + 1;
+    }
+    if (real_entries > 0) {
+        eprintln("sit: target directory is not empty");
+        return 1;
+    }
+
+    if (syscall(SYS_CHDIR, target) != 0) {
+        eprintln("sit: cannot chdir into target");
+        return 1;
+    }
+
+    # Inline init — same shape as cmd_init.
+    ensure_dir(".sit");
+    ensure_dir(".sit/objects");
+    ensure_dir(".sit/refs");
+    ensure_dir(".sit/refs/heads");
+    var head = "ref: refs/heads/main\n";
+    if (file_write_all(".sit/HEAD", head, 21) < 0) {
+        eprintln("sit: failed to write .sit/HEAD");
+        return 1;
+    }
+
+    # Register origin, fetch, set local main to the fetched tip, materialize.
+    if (config_file_set(".sit/config", "remote.origin.url", url) != 0) {
+        eprintln("sit: failed to write .sit/config");
+        return 1;
+    }
+
+    var tip = do_fetch("origin", "main");
+    if (tip == 0) { return 1; }
+
+    if (write_head_ref(tip) != 0) {
+        eprintln("sit: failed to update HEAD");
+        return 1;
+    }
+    materialize_target(tip);
+
+    syscall(SYS_WRITE, STDOUT, "cloned ", 7);
+    syscall(SYS_WRITE, STDOUT, url, strlen(url));
+    syscall(SYS_WRITE, STDOUT, " into ", 6);
+    syscall(SYS_WRITE, STDOUT, target, strlen(target));
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    return 0;
+}
+
+fn cmd_push() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository");
+        return 1;
+    }
+    if (argc() < 3) {
+        eprintln("usage: sit push <remote> [<branch>]");
+        return 1;
+    }
+    var name = argv_heap(2);
+    var branch = current_branch_name();
+    if (argc() >= 4) { branch = argv_heap(3); }
+    if (branch == 0) { branch = "main"; }
+
+    var url = remote_url(name);
+    if (url == 0) {
+        eprintln("sit: no such remote");
+        return 1;
+    }
+    var repo_path = remote_normalize(url);
+
+    var local_tip = read_head_ref();
+    if (local_tip == 0) {
+        eprintln("sit: no commits to push");
+        return 1;
+    }
+
+    var src_db = object_db_open();
+    if (src_db == 0) {
+        eprintln("sit: cannot open local object db");
+        return 1;
+    }
+    object_db_migrate_from_loose(src_db);
+
+    var dst_db = remote_objects_open(repo_path);
+    if (dst_db == 0) {
+        patra_close(src_db);
+        eprintln("sit: cannot open remote object db");
+        return 1;
+    }
+
+    var remote_tip = read_remote_ref(repo_path, branch);
+    if (remote_tip != 0) {
+        # Fast-forward check: remote_tip must be an ancestor of local_tip.
+        if (is_ancestor_in_db(src_db, remote_tip, local_tip) == 0) {
+            patra_close(src_db);
+            patra_close(dst_db);
+            eprintln("sit: non-fast-forward push rejected (remote has diverged)");
+            return 1;
+        }
+    }
+
+    var seen = map_new();
+    var hashes = vec_new();
+    walk_reachable_from_commit(src_db, local_tip, hashes, seen);
+    var copied = copy_objects(src_db, dst_db, hashes);
+
+    patra_close(src_db);
+    patra_close(dst_db);
+
+    if (write_remote_ref(repo_path, branch, local_tip) < 0) {
+        eprintln("sit: failed to update remote ref");
+        return 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "pushed ", 7);
+    syscall(SYS_WRITE, STDOUT, branch, strlen(branch));
+    syscall(SYS_WRITE, STDOUT, " -> ", 4);
+    syscall(SYS_WRITE, STDOUT, name, strlen(name));
+    syscall(SYS_WRITE, STDOUT, " at ", 4);
+    syscall(SYS_WRITE, STDOUT, local_tip, 12);
+    var nbuf[24];
+    var d = write_decimal(&nbuf, copied);
+    syscall(SYS_WRITE, STDOUT, " (", 2);
+    syscall(SYS_WRITE, STDOUT, &nbuf, d);
+    syscall(SYS_WRITE, STDOUT, " new objects)\n", 14);
+    return 0;
+}
+

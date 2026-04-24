@@ -1,0 +1,594 @@
+# index.cyr — staging index + .sitignore + cmd_add / cmd_rm / cmd_reset.
+#
+# Patra-backed index at .sit/index.patra. Pattern-based ignore with segment
+# matching and * / ? globs (no **, no negation, no char classes).
+
+fn cmd_add() {
+    if (argc() < 3) {
+        eprintln("usage: sit add [-f] <path>");
+        return 1;
+    }
+
+    var forced = 0;
+    var arg_idx = 2;
+    if (streq(argv(2), "-f") == 1) {
+        forced = 1;
+        arg_idx = 3;
+        if (argc() < 4) {
+            eprintln("usage: sit add -f <path>");
+            return 1;
+        }
+    }
+    var path = argv_heap(arg_idx);
+    var path_len = strlen(path);
+
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    if (forced == 0) {
+        var patterns = load_sitignore();
+        if (is_ignored(path, patterns) == 1) {
+            syscall(SYS_WRITE, STDERR, "sit: '", 6);
+            syscall(SYS_WRITE, STDERR, path, path_len);
+            syscall(SYS_WRITE, STDERR, "' matches a .sitignore pattern (use -f to override)\n", 52);
+            return 1;
+        }
+    }
+
+    var fd = file_open(path, 0, 0);
+    if (fd < 0) {
+        syscall(SYS_WRITE, STDERR, "sit: cannot open '", 18);
+        syscall(SYS_WRITE, STDERR, path, path_len);
+        syscall(SYS_WRITE, STDERR, "'\n", 2);
+        return 1;
+    }
+    var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
+    syscall(SYS_LSEEK, fd, 0, SEEK_SET);
+    if (size < 0) {
+        file_close(fd);
+        eprintln("sit: cannot stat file");
+        return 1;
+    }
+
+    var content = alloc(size);
+    var total = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        var r = file_read(fd, content + total, size - total);
+        if (r <= 0) { rgo = 0; }
+        else { total = total + r; if (total >= size) { rgo = 0; } }
+    }
+    file_close(fd);
+
+    var hex = write_blob_object(content, total);
+    if (hex == 0) {
+        eprintln("sit: failed to write object");
+        return 1;
+    }
+
+    if (index_upsert(hex, path) != 0) {
+        eprintln("sit: failed to update index");
+        return 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "added ", 6);
+    syscall(SYS_WRITE, STDOUT, hex, 12);
+    syscall(SYS_WRITE, STDOUT, " ", 1);
+    syscall(SYS_WRITE, STDOUT, path, path_len);
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    return 0;
+}
+
+# Common setup for read-side commands: parse prefix, resolve to full hash,
+# read+decompress. On success: writes 24-byte struct to obj_out, returns 0.
+# On error: emits message to stderr and returns non-zero for main to return.
+fn index_db_open() {
+    patra_init();
+    var db = patra_open(".sit/index.patra");
+    if (db == 0) { return 0; }
+    # Idempotent — second call returns "already exists", which we ignore.
+    patra_exec(db, "CREATE TABLE entries (path STR, hash_hex STR)");
+    return db;
+}
+
+# Migrate legacy plaintext .sit/index (v0.1 format) into the patra table.
+# No-op if the plaintext file is absent. Deletes it on successful migration.
+fn index_migrate_from_plaintext(db) {
+    if (file_exists(".sit/index") != 1) { return 0; }
+    var pair[16];
+    if (read_file_heap(".sit/index", &pair) != 0) { return 0; }
+    var data = load64(&pair);
+    var len = load64(&pair + 8);
+
+    var pos = 0;
+    while (pos < len) {
+        if (pos + 65 > len) { pos = len; }
+        else {
+            if (load8(data + pos + 64) != 9) { pos = len; }
+            else {
+                var nl = pos + 65;
+                while (nl < len) {
+                    if (load8(data + nl) == 10) { break; }
+                    nl = nl + 1;
+                }
+                var plen = nl - pos - 65;
+
+                var hash_copy = alloc(65);
+                memcpy(hash_copy, data + pos, 64);
+                store8(hash_copy + 64, 0);
+                var path_copy = alloc(plen + 1);
+                memcpy(path_copy, data + pos + 65, plen);
+                store8(path_copy + plen, 0);
+
+                var types[16];
+                store64(&types + 0, 1);
+                store64(&types + 8, 1);
+                var ivals[16];
+                var sptrs[16];
+                store64(&sptrs + 0, path_copy);
+                store64(&sptrs + 8, hash_copy);
+                var slens[16];
+                store64(&slens + 0, plen);
+                store64(&slens + 8, 64);
+                var bptrs[16];
+                var blens[16];
+                patra_insert_row(db, "entries", 7, 2,
+                    &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+
+                pos = nl + 1;
+            }
+        }
+    }
+    sys_unlink(".sit/index");
+    return 0;
+}
+
+# Rewrite the staging index to exactly the given entries. DELETE + insert all.
+fn rewrite_index(entries) {
+    var db = index_db_open();
+    if (db == 0) { return 0 - 1; }
+    patra_exec(db, "DELETE FROM entries");
+
+    var n = vec_len(entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        var path = entry_path(e);
+        var hash_hex = hex_encode(entry_hash(e), 32);
+
+        var types[16];
+        store64(&types + 0, 1);
+        store64(&types + 8, 1);
+        var ivals[16];
+        var sptrs[16];
+        store64(&sptrs + 0, path);
+        store64(&sptrs + 8, hash_hex);
+        var slens[16];
+        store64(&slens + 0, strlen(path));
+        store64(&slens + 8, 64);
+        var bptrs[16];
+        var blens[16];
+        patra_insert_row(db, "entries", 7, 2,
+            &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+        i = i + 1;
+    }
+    patra_close(db);
+    return 0;
+}
+
+# Upsert a single (hash, path) entry — replaces any existing row for that path.
+# Used by `sit add` to stage a file.
+fn index_upsert(hash_hex, path) {
+    var existing = parse_index();
+    var filtered = vec_new();
+    if (existing != 0) {
+        var n = vec_len(existing);
+        var i = 0;
+        while (i < n) {
+            var e = vec_get(existing, i);
+            if (streq(entry_path(e), path) == 0) { vec_push(filtered, e); }
+            i = i + 1;
+        }
+    }
+
+    var bytes = hex_decode(hash_hex, 64);
+    if (bytes == 0) { return 0 - 1; }
+    var new_e = alloc(40);
+    memcpy(new_e, bytes, 32);
+    var plen = strlen(path);
+    var path_copy = alloc(plen + 1);
+    memcpy(path_copy, path, plen);
+    store8(path_copy + plen, 0);
+    store64(new_e + 32, path_copy);
+    vec_push(filtered, new_e);
+
+    return rewrite_index(filtered);
+}
+
+# Staging entry layout (40 bytes):
+#   0..32:  raw hash bytes (SHA-256, decoded from the hex in .sit/index)
+#   32..40: path ptr (heap, null-terminated)
+fn entry_hash(e) { return e; }
+fn entry_path(e) { return load64(e + 32); }
+
+# Load staging index from .sit/index.patra. Returns vec of entries or 0.
+# Auto-migrates plaintext .sit/index from v0.1 layout if present.
+fn parse_index() {
+    # Nothing to load if neither file exists
+    if (file_exists(".sit/index.patra") != 1) {
+        if (file_exists(".sit/index") != 1) { return 0; }
+    }
+
+    var db = index_db_open();
+    if (db == 0) { return 0; }
+    index_migrate_from_plaintext(db);
+
+    var rs = patra_query(db, "SELECT path, hash_hex FROM entries");
+    if (rs == 0) { patra_close(db); return 0; }
+
+    var count = patra_result_count(rs);
+    if (count == 0) {
+        patra_result_free(rs);
+        patra_close(db);
+        return 0;
+    }
+
+    var entries = vec_new();
+    var i = 0;
+    while (i < count) {
+        var path_str = patra_result_get_str(rs, i, 0);
+        var hash_str = patra_result_get_str(rs, i, 1);
+
+        var bytes = hex_decode(hash_str, 64);
+        if (bytes != 0) {
+            var entry = alloc(40);
+            memcpy(entry, bytes, 32);
+            var plen = strlen(path_str);
+            var p = alloc(plen + 1);
+            memcpy(p, path_str, plen);
+            store8(p + plen, 0);
+            store64(entry + 32, p);
+            vec_push(entries, entry);
+        }
+        i = i + 1;
+    }
+
+    patra_result_free(rs);
+    patra_close(db);
+    if (vec_len(entries) == 0) { return 0; }
+    return entries;
+}
+
+# Byte-wise compare two null-terminated C strings. Returns -1/0/+1.
+# Insertion-sort entries vec by path name (ascending). In place.
+fn sort_entries(entries) {
+    var n = vec_len(entries);
+    var i = 1;
+    while (i < n) {
+        var cur = vec_get(entries, i);
+        var cur_path = entry_path(cur);
+        var j = i - 1;
+        var placed = 0;
+        while (placed == 0) {
+            if (j < 0) { placed = 1; }
+            else {
+                var prev = vec_get(entries, j);
+                if (strcmp_cstr(cur_path, entry_path(prev)) >= 0) { placed = 1; }
+                else {
+                    vec_set(entries, j + 1, prev);
+                    j = j - 1;
+                }
+            }
+        }
+        vec_set(entries, j + 1, cur);
+        i = i + 1;
+    }
+    return entries;
+}
+
+# After sorting, keep only the last entry for each path (staged-twice wins).
+fn dedupe_entries(entries) {
+    var n = vec_len(entries);
+    var out = vec_new();
+    var i = 0;
+    while (i < n) {
+        var cur = vec_get(entries, i);
+        var is_last = 1;
+        if (i + 1 < n) {
+            var nxt = vec_get(entries, i + 1);
+            if (strcmp_cstr(entry_path(cur), entry_path(nxt)) == 0) { is_last = 0; }
+        }
+        if (is_last == 1) { vec_push(out, cur); }
+        i = i + 1;
+    }
+    return out;
+}
+
+# Internal tree-level entry (24 bytes):
+#   0..8:   mode ptr ("100644" for files, "40000" for dirs)
+#   8..16:  name ptr (heap, null-term; leaf name only)
+#   16..24: hash bytes ptr (heap, 32 raw bytes)
+fn cmd_reset() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+    if (argc() < 3) {
+        eprintln("usage: sit reset <path> | sit reset --hard <ref>");
+        return 1;
+    }
+
+    # --hard <ref>: move current branch ref to <ref>, overwrite working + index.
+    if (streq(argv(2), "--hard") == 1) {
+        if (argc() < 4) {
+            eprintln("usage: sit reset --hard <ref>");
+            return 1;
+        }
+        var target = argv_heap(3);
+        var hex[72];
+        var rr = resolve_hash(target, &hex);
+        if (rr != 1) {
+            syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
+            syscall(SYS_WRITE, STDERR, target, strlen(target));
+            syscall(SYS_WRITE, STDERR, "'\n", 2);
+            return 1;
+        }
+        if (write_head_ref(&hex) != 0) {
+            eprintln("sit: failed to update branch ref");
+            return 1;
+        }
+        materialize_target(&hex);
+        syscall(SYS_WRITE, STDOUT, "HEAD reset --hard to ", 21);
+        syscall(SYS_WRITE, STDOUT, &hex, 12);
+        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        return 0;
+    }
+
+    # sit reset <path>: unstage the path — set its index entry to HEAD's hash,
+    # or remove it from the index if HEAD doesn't have it.
+    var path = argv_heap(2);
+    var path_len = strlen(path);
+
+    var head_entries = read_head_tree_entries();
+    var head_ent = tree_find(head_entries, path);
+
+    var index_entries = parse_index();
+    if (index_entries != 0) {
+        sort_entries(index_entries);
+        index_entries = dedupe_entries(index_entries);
+    }
+
+    var filtered = vec_new();
+    if (index_entries != 0) {
+        var n = vec_len(index_entries);
+        var i = 0;
+        while (i < n) {
+            var e = vec_get(index_entries, i);
+            if (streq(entry_path(e), path) == 0) { vec_push(filtered, e); }
+            i = i + 1;
+        }
+    }
+
+    if (head_ent != 0) {
+        var head_hash_hex = tree_entry_hash(head_ent);
+        var bytes = hex_decode(head_hash_hex, 64);
+        if (bytes != 0) {
+            var new_e = alloc(40);
+            memcpy(new_e, bytes, 32);
+            var pcopy = alloc(path_len + 1);
+            memcpy(pcopy, path, path_len);
+            store8(pcopy + path_len, 0);
+            store64(new_e + 32, pcopy);
+            vec_push(filtered, new_e);
+        }
+    }
+
+    if (rewrite_index(filtered) != 0) {
+        eprintln("sit: failed to update index");
+        return 1;
+    }
+    syscall(SYS_WRITE, STDOUT, "unstaged '", 10);
+    syscall(SYS_WRITE, STDOUT, path, path_len);
+    syscall(SYS_WRITE, STDOUT, "'\n", 2);
+    return 0;
+}
+
+fn cmd_rm() {
+    if (argc() < 3) {
+        eprintln("usage: sit rm [--cached] <path>");
+        return 1;
+    }
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var cached = 0;
+    var arg_idx = 2;
+    if (streq(argv(2), "--cached") == 1) {
+        cached = 1;
+        arg_idx = 3;
+        if (argc() < 4) {
+            eprintln("usage: sit rm --cached <path>");
+            return 1;
+        }
+    }
+    var path = argv_heap(arg_idx);
+    var path_len = strlen(path);
+
+    var index_entries = parse_index();
+    if (index_entries != 0) {
+        sort_entries(index_entries);
+        index_entries = dedupe_entries(index_entries);
+    }
+
+    var head_entries = read_head_tree_entries();
+
+    var in_index = 0;
+    if (index_entries != 0) {
+        if (index_find(index_entries, path) != 0) { in_index = 1; }
+    }
+    var in_head = 0;
+    if (tree_find(head_entries, path) != 0) { in_head = 1; }
+
+    if (in_index == 0) {
+        if (in_head == 0) {
+            syscall(SYS_WRITE, STDERR, "sit: '", 6);
+            syscall(SYS_WRITE, STDERR, path, path_len);
+            syscall(SYS_WRITE, STDERR, "' is not tracked\n", 17);
+            return 1;
+        }
+    }
+
+    if (index_entries != 0) {
+        var filtered = vec_new();
+        var n = vec_len(index_entries);
+        var i = 0;
+        while (i < n) {
+            var e = vec_get(index_entries, i);
+            if (streq(entry_path(e), path) == 0) { vec_push(filtered, e); }
+            i = i + 1;
+        }
+        if (rewrite_index(filtered) != 0) {
+            eprintln("sit: failed to rewrite index");
+            return 1;
+        }
+    }
+
+    if (cached == 0) {
+        if (file_exists(path) == 1) {
+            if (sys_unlink(path) != 0) {
+                syscall(SYS_WRITE, STDERR, "sit: failed to remove '", 23);
+                syscall(SYS_WRITE, STDERR, path, path_len);
+                syscall(SYS_WRITE, STDERR, "'\n", 2);
+                return 1;
+            }
+        }
+    }
+
+    syscall(SYS_WRITE, STDOUT, "rm '", 4);
+    syscall(SYS_WRITE, STDOUT, path, path_len);
+    syscall(SYS_WRITE, STDOUT, "'\n", 2);
+    return 0;
+}
+
+fn index_find(entries, path) {
+    if (entries == 0) { return 0; }
+    var n = vec_len(entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        if (streq(entry_path(e), path) == 1) { return e; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Glob match (single segment, no '/' crossing). Supports `*` (any run) and
+# `?` (single char). Recursive — pattern segments are short, no depth issue.
+fn glob_match(pat, pat_len, name, name_len) {
+    if (pat_len == 0) {
+        if (name_len == 0) { return 1; }
+        return 0;
+    }
+    var pc = load8(pat);
+    if (pc == 42) {
+        if (glob_match(pat + 1, pat_len - 1, name, name_len) == 1) { return 1; }
+        if (name_len == 0) { return 0; }
+        return glob_match(pat, pat_len, name + 1, name_len - 1);
+    }
+    if (name_len == 0) { return 0; }
+    if (pc == 63) {
+        return glob_match(pat + 1, pat_len - 1, name + 1, name_len - 1);
+    }
+    if (pc != load8(name)) { return 0; }
+    return glob_match(pat + 1, pat_len - 1, name + 1, name_len - 1);
+}
+
+# True if `path` is matched by any pattern. Each pattern is tested against
+# every path segment — a pattern like `build` matches `build/`, `src/build/`,
+# or `lib/build/foo.cyr`. First-match wins.
+fn is_ignored(path, patterns) {
+    if (patterns == 0) { return 0; }
+    var path_len = strlen(path);
+    var n = vec_len(patterns);
+    var i = 0;
+    while (i < n) {
+        var pat = vec_get(patterns, i);
+        var pat_len = strlen(pat);
+
+        var seg_start = 0;
+        var j = 0;
+        while (j <= path_len) {
+            var is_boundary = 0;
+            if (j == path_len) { is_boundary = 1; }
+            else { if (load8(path + j) == 47) { is_boundary = 1; } }
+            if (is_boundary == 1) {
+                var seg_len = j - seg_start;
+                if (seg_len > 0) {
+                    if (glob_match(pat, pat_len, path + seg_start, seg_len) == 1) {
+                        return 1;
+                    }
+                }
+                seg_start = j + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Read `.sitignore` into a vec of pattern cstrings. Blank lines and lines
+# starting with `#` are skipped. Trailing `/` on a pattern is stripped
+# (directory-only hints aren't enforced yet).
+fn load_sitignore() {
+    if (file_exists(".sitignore") != 1) { return 0; }
+    var pair[16];
+    if (read_file_heap(".sitignore", &pair) != 0) { return 0; }
+    var data = load64(&pair);
+    var len = load64(&pair + 8);
+
+    var patterns = vec_new();
+    var pos = 0;
+    while (pos < len) {
+        var line_end = pos;
+        while (line_end < len) {
+            if (load8(data + line_end) == 10) { break; }
+            line_end = line_end + 1;
+        }
+
+        var line_start = pos;
+        var line_stop = line_end;
+        if (line_stop > line_start) {
+            if (load8(data + line_stop - 1) == 13) { line_stop = line_stop - 1; }
+        }
+
+        var keep = 1;
+        if (line_stop == line_start) { keep = 0; }
+        else {
+            if (load8(data + line_start) == 35) { keep = 0; }
+        }
+
+        if (keep == 1) {
+            var p_len = line_stop - line_start;
+            if (p_len > 0) {
+                if (load8(data + line_start + p_len - 1) == 47) { p_len = p_len - 1; }
+            }
+            if (p_len > 0) {
+                var pat = alloc(p_len + 1);
+                memcpy(pat, data + line_start, p_len);
+                store8(pat + p_len, 0);
+                vec_push(patterns, pat);
+            }
+        }
+        pos = line_end + 1;
+    }
+    return patterns;
+}
+
+# Recursive working-dir walker. Entries are pushed as full repo-relative
+# paths ("src/main.cyr"). Hardcoded skip: `.sit/`. Everything else is
+# included unless it matches a `.sitignore` pattern.

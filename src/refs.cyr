@@ -1,0 +1,550 @@
+# refs.cyr — HEAD / branch / tag / resolution.
+#
+# Refs live at .sit/HEAD (symbolic), .sit/refs/heads/<name>, .sit/refs/tags/<name>,
+# and .sit/refs/remotes/<remote>/<name>. ensure_parent_dirs (util.cyr) is called
+# by every write path so nested names like feature/foo work.
+
+fn resolve_ref_name(name, out_buf) {
+    if (streq(name, "HEAD") == 1) {
+        var h = read_head_ref();
+        if (h == 0) { return 0; }
+        memcpy(out_buf, h, 64);
+        store8(out_buf + 64, 0);
+        return 1;
+    }
+
+    var name_len = strlen(name);
+
+    var tag_path = alloc(15 + name_len + 1);
+    memcpy(tag_path, ".sit/refs/tags/", 15);
+    memcpy(tag_path + 15, name, name_len);
+    store8(tag_path + 15 + name_len, 0);
+    if (file_exists(tag_path) == 1) {
+        var tfd = file_open(tag_path, 0, 0);
+        if (tfd >= 0) {
+            var tbuf = alloc(80);
+            var tn = file_read(tfd, tbuf, 80);
+            file_close(tfd);
+            if (tn >= 64) {
+                memcpy(out_buf, tbuf, 64);
+                store8(out_buf + 64, 0);
+                return 1;
+            }
+        }
+    }
+
+    var head_path = alloc(16 + name_len + 1);
+    memcpy(head_path, ".sit/refs/heads/", 16);
+    memcpy(head_path + 16, name, name_len);
+    store8(head_path + 16 + name_len, 0);
+    if (file_exists(head_path) == 1) {
+        var hfd = file_open(head_path, 0, 0);
+        if (hfd >= 0) {
+            var hbuf = alloc(80);
+            var hn = file_read(hfd, hbuf, 80);
+            file_close(hfd);
+            if (hn >= 64) {
+                memcpy(out_buf, hbuf, 64);
+                store8(out_buf + 64, 0);
+                return 1;
+            }
+        }
+    }
+
+    # Remote-tracking ref (e.g. "origin/main" → .sit/refs/remotes/origin/main)
+    var rem_path = alloc(18 + name_len + 1);
+    memcpy(rem_path, ".sit/refs/remotes/", 18);
+    memcpy(rem_path + 18, name, name_len);
+    store8(rem_path + 18 + name_len, 0);
+    if (file_exists(rem_path) == 1) {
+        var rfd = file_open(rem_path, 0, 0);
+        if (rfd >= 0) {
+            var rbuf = alloc(80);
+            var rn = file_read(rfd, rbuf, 80);
+            file_close(rfd);
+            if (rn >= 64) {
+                memcpy(out_buf, rbuf, 64);
+                store8(out_buf + 64, 0);
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+# Resolve a reference: either a symbolic name (HEAD, tag, branch) or a hex hash
+# (full 64 chars or a prefix of 4+). Writes null-terminated hash into out_buf
+# (65 bytes) and returns:
+#    1  exact match
+#    0  no match
+#   -1  ambiguous
+#   -2  prefix too short
+fn read_head_ref_path() {
+    var pair[16];
+    if (read_file_heap(".sit/HEAD", &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+
+    if (len < 5) { return 0; }
+    if (memeq(buf, "ref: ", 5) == 0) { return 0; }
+
+    var stop = 5;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (stop >= len) { scanning = 0; }
+        else {
+            var c = load8(buf + stop);
+            if (c == 10) { scanning = 0; }
+            else {
+                if (c == 13) { scanning = 0; }
+                else { stop = stop + 1; }
+            }
+        }
+    }
+
+    var ref_len = stop - 5;
+    if (ref_len == 0) { return 0; }
+
+    var ref = alloc(ref_len + 1);
+    memcpy(ref, buf + 5, ref_len);
+    store8(ref + ref_len, 0);
+    return ref;
+}
+
+# Read the ref file pointed at by HEAD. Returns 64-char hex or 0.
+fn read_head_ref() {
+    var ref_path = read_head_ref_path();
+    if (ref_path == 0) { return 0; }
+    var ref_len = strlen(ref_path);
+    var full = alloc(5 + ref_len + 1);
+    memcpy(full, ".sit/", 5);
+    memcpy(full + 5, ref_path, ref_len);
+    store8(full + 5 + ref_len, 0);
+
+    if (file_exists(full) != 1) { return 0; }
+    var fd = file_open(full, 0, 0);
+    if (fd < 0) { return 0; }
+    var buf = alloc(80);
+    var n = file_read(fd, buf, 80);
+    file_close(fd);
+    if (n < 64) { return 0; }
+    store8(buf + 64, 0);
+    return buf;
+}
+
+# Write the given 64-char hex to the ref file HEAD points at.
+fn write_head_ref(hex) {
+    var ref_path = read_head_ref_path();
+    if (ref_path == 0) { return 0 - 1; }
+    var ref_len = strlen(ref_path);
+    var full = alloc(5 + ref_len + 1);
+    memcpy(full, ".sit/", 5);
+    memcpy(full + 5, ref_path, ref_len);
+    store8(full + 5 + ref_len, 0);
+    ensure_parent_dirs(full);
+
+    var out = alloc(66);
+    memcpy(out, hex, 64);
+    store8(out + 64, 10);
+    store8(out + 65, 0);
+    if (file_write_all(full, out, 65) < 0) { return 0 - 1; }
+    return 0;
+}
+
+# Extract the branch name from HEAD (e.g. "main" from "refs/heads/main").
+# Returns heap cstring or 0 if HEAD isn't a branch ref.
+fn current_branch_name() {
+    var ref_path = read_head_ref_path();
+    if (ref_path == 0) { return 0; }
+    var ref_len = strlen(ref_path);
+    if (ref_len <= 11) { return ref_path; }
+    if (memeq(ref_path, "refs/heads/", 11) == 0) { return ref_path; }
+    var name_len = ref_len - 11;
+    var name = alloc(name_len + 1);
+    memcpy(name, ref_path + 11, name_len);
+    store8(name + name_len, 0);
+    return name;
+}
+
+# Build and write a commit object. Returns hex hash or 0.
+fn set_head_ref(ref_path) {
+    var rlen = strlen(ref_path);
+    var total = 5 + rlen + 1;
+    var buf = alloc(total + 1);
+    memcpy(buf, "ref: ", 5);
+    memcpy(buf + 5, ref_path, rlen);
+    store8(buf + 5 + rlen, 10);
+    store8(buf + total, 0);
+    if (file_write_all(".sit/HEAD", buf, total) < 0) { return 0 - 1; }
+    return 0;
+}
+
+# Extract hunks from an LCS op-script. A hunk groups consecutive
+# non-keep ops (deletes and/or inserts) and records the base line range
+# it covers along with the replacement lines from the other side.
+#
+# Hunk layout (24 bytes):
+#   [0..8)   base_start (inclusive base line index)
+#   [8..16)  base_end   (exclusive base line index)
+#   [16..24) replacement lines vec (each element is a line-tuple pointer)
+fn cmd_tag() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    if (argc() < 3) {
+        if (file_exists(".sit/refs/tags") != 1) { return 0; }
+        var raw = dir_list(str_from(".sit/refs/tags"));
+        var names = vec_new();
+        var n = vec_len(raw);
+        var i = 0;
+        while (i < n) {
+            var s = vec_get(raw, i);
+            var slen = str_len(s);
+            var nm = alloc(slen + 1);
+            memcpy(nm, str_data(s), slen);
+            store8(nm + slen, 0);
+            vec_push(names, nm);
+            i = i + 1;
+        }
+        sort_cstrings(names);
+        var m = vec_len(names);
+        i = 0;
+        while (i < m) {
+            var nm = vec_get(names, i);
+            syscall(SYS_WRITE, STDOUT, nm, strlen(nm));
+            syscall(SYS_WRITE, STDOUT, "\n", 1);
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    # Deletion: sit tag -d <name>
+    if (streq(argv(2), "-d") == 1) {
+        if (argc() < 4) {
+            eprintln("usage: sit tag -d <name>");
+            return 1;
+        }
+        var dname = argv_heap(3);
+        var dnlen = strlen(dname);
+        var dpath = alloc(15 + dnlen + 1);
+        memcpy(dpath, ".sit/refs/tags/", 15);
+        memcpy(dpath + 15, dname, dnlen);
+        store8(dpath + 15 + dnlen, 0);
+        if (file_exists(dpath) != 1) {
+            syscall(SYS_WRITE, STDERR, "sit: tag '", 10);
+            syscall(SYS_WRITE, STDERR, dname, dnlen);
+            syscall(SYS_WRITE, STDERR, "' not found\n", 12);
+            return 1;
+        }
+        if (sys_unlink(dpath) != 0) {
+            eprintln("sit: failed to remove tag ref");
+            return 1;
+        }
+        syscall(SYS_WRITE, STDOUT, "deleted tag '", 13);
+        syscall(SYS_WRITE, STDOUT, dname, dnlen);
+        syscall(SYS_WRITE, STDOUT, "'\n", 2);
+        return 0;
+    }
+
+    var name = argv_heap(2);
+    var nlen = strlen(name);
+    var path = alloc(15 + nlen + 1);
+    memcpy(path, ".sit/refs/tags/", 15);
+    memcpy(path + 15, name, nlen);
+    store8(path + 15 + nlen, 0);
+
+    if (file_exists(path) == 1) {
+        syscall(SYS_WRITE, STDERR, "sit: tag '", 10);
+        syscall(SYS_WRITE, STDERR, name, nlen);
+        syscall(SYS_WRITE, STDERR, "' already exists\n", 17);
+        return 1;
+    }
+
+    var target_hex = 0;
+    if (argc() >= 4) {
+        var prefix = argv_heap(3);
+        var hex[72];
+        var rr = resolve_hash(prefix, &hex);
+        if (rr != 1) {
+            eprintln("sit: cannot resolve target commit");
+            return 1;
+        }
+        target_hex = alloc(65);
+        memcpy(target_hex, &hex, 64);
+        store8(target_hex + 64, 0);
+    }
+    else {
+        target_hex = read_head_ref();
+        if (target_hex == 0) {
+            eprintln("sit: cannot tag with no commits");
+            return 1;
+        }
+    }
+
+    ensure_dir(".sit/refs/tags");
+    ensure_parent_dirs(path);
+
+    var buf = alloc(66);
+    memcpy(buf, target_hex, 64);
+    store8(buf + 64, 10);
+    store8(buf + 65, 0);
+    if (file_write_all(path, buf, 65) < 0) {
+        eprintln("sit: failed to write tag ref");
+        return 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "created tag '", 13);
+    syscall(SYS_WRITE, STDOUT, name, nlen);
+    syscall(SYS_WRITE, STDOUT, "'\n", 2);
+    return 0;
+}
+
+fn cmd_branch() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    if (argc() < 3) {
+        if (file_exists(".sit/refs/heads") != 1) { return 0; }
+        var raw = dir_list(str_from(".sit/refs/heads"));
+        var names = vec_new();
+        var n = vec_len(raw);
+        var i = 0;
+        while (i < n) {
+            var s = vec_get(raw, i);
+            var slen = str_len(s);
+            var nm = alloc(slen + 1);
+            memcpy(nm, str_data(s), slen);
+            store8(nm + slen, 0);
+            vec_push(names, nm);
+            i = i + 1;
+        }
+        sort_cstrings(names);
+        var curr = current_branch_name();
+        i = 0;
+        var m = vec_len(names);
+        while (i < m) {
+            var nm = vec_get(names, i);
+            var is_current = 0;
+            if (curr != 0) {
+                if (streq(nm, curr) == 1) { is_current = 1; }
+            }
+            if (is_current == 1) { syscall(SYS_WRITE, STDOUT, "* ", 2); }
+            else                 { syscall(SYS_WRITE, STDOUT, "  ", 2); }
+            syscall(SYS_WRITE, STDOUT, nm, strlen(nm));
+            syscall(SYS_WRITE, STDOUT, "\n", 1);
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    # Deletion: sit branch -d <name>
+    if (streq(argv(2), "-d") == 1) {
+        if (argc() < 4) {
+            eprintln("usage: sit branch -d <name>");
+            return 1;
+        }
+        var dname = argv_heap(3);
+        var dnlen = strlen(dname);
+        var dpath = alloc(16 + dnlen + 1);
+        memcpy(dpath, ".sit/refs/heads/", 16);
+        memcpy(dpath + 16, dname, dnlen);
+        store8(dpath + 16 + dnlen, 0);
+        if (file_exists(dpath) != 1) {
+            syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
+            syscall(SYS_WRITE, STDERR, dname, dnlen);
+            syscall(SYS_WRITE, STDERR, "' not found\n", 12);
+            return 1;
+        }
+        var curr_br = current_branch_name();
+        if (curr_br != 0) {
+            if (streq(curr_br, dname) == 1) {
+                eprintln("sit: cannot delete the currently checked-out branch");
+                return 1;
+            }
+        }
+        if (sys_unlink(dpath) != 0) {
+            eprintln("sit: failed to remove branch ref");
+            return 1;
+        }
+        syscall(SYS_WRITE, STDOUT, "deleted branch '", 16);
+        syscall(SYS_WRITE, STDOUT, dname, dnlen);
+        syscall(SYS_WRITE, STDOUT, "'\n", 2);
+        return 0;
+    }
+
+    var name = argv_heap(2);
+    var nlen = strlen(name);
+    var path = alloc(16 + nlen + 1);
+    memcpy(path, ".sit/refs/heads/", 16);
+    memcpy(path + 16, name, nlen);
+    store8(path + 16 + nlen, 0);
+
+    if (file_exists(path) == 1) {
+        syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
+        syscall(SYS_WRITE, STDERR, name, nlen);
+        syscall(SYS_WRITE, STDERR, "' already exists\n", 17);
+        return 1;
+    }
+
+    var head_hex = read_head_ref();
+    if (head_hex == 0) {
+        eprintln("sit: cannot create a branch with no commits");
+        return 1;
+    }
+
+    ensure_parent_dirs(path);
+    var buf = alloc(66);
+    memcpy(buf, head_hex, 64);
+    store8(buf + 64, 10);
+    store8(buf + 65, 0);
+    if (file_write_all(path, buf, 65) < 0) {
+        eprintln("sit: failed to write branch ref");
+        return 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "created branch '", 16);
+    syscall(SYS_WRITE, STDOUT, name, nlen);
+    syscall(SYS_WRITE, STDOUT, "'\n", 2);
+    return 0;
+}
+
+# True if there are any staged or unstaged changes vs HEAD. Untracked files
+# are not considered dirty (they don't block checkout unless they collide).
+fn cmd_checkout() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+    if (argc() < 3) {
+        eprintln("usage: sit checkout [-b] <branch>");
+        return 1;
+    }
+
+    var create = 0;
+    var arg_idx = 2;
+    if (streq(argv(2), "-b") == 1) {
+        create = 1;
+        arg_idx = 3;
+        if (argc() < 4) {
+            eprintln("usage: sit checkout -b <branch>");
+            return 1;
+        }
+    }
+    var target = argv_heap(arg_idx);
+    var tlen = strlen(target);
+
+    if (create == 1) {
+        var new_branch = alloc(16 + tlen + 1);
+        memcpy(new_branch, ".sit/refs/heads/", 16);
+        memcpy(new_branch + 16, target, tlen);
+        store8(new_branch + 16 + tlen, 0);
+        if (file_exists(new_branch) == 1) {
+            syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
+            syscall(SYS_WRITE, STDERR, target, tlen);
+            syscall(SYS_WRITE, STDERR, "' already exists\n", 17);
+            return 1;
+        }
+        var head_hex = read_head_ref();
+        if (head_hex == 0) {
+            eprintln("sit: cannot create a branch with no commits");
+            return 1;
+        }
+        ensure_parent_dirs(new_branch);
+        var buf = alloc(66);
+        memcpy(buf, head_hex, 64);
+        store8(buf + 64, 10);
+        store8(buf + 65, 0);
+        if (file_write_all(new_branch, buf, 65) < 0) {
+            eprintln("sit: failed to write branch ref");
+            return 1;
+        }
+    }
+
+    var target_ref_len = 11 + tlen;
+    var target_ref = alloc(target_ref_len + 1);
+    memcpy(target_ref, "refs/heads/", 11);
+    memcpy(target_ref + 11, target, tlen);
+    store8(target_ref + target_ref_len, 0);
+
+    var target_path = alloc(5 + target_ref_len + 1);
+    memcpy(target_path, ".sit/", 5);
+    memcpy(target_path + 5, target_ref, target_ref_len);
+    store8(target_path + 5 + target_ref_len, 0);
+
+    if (file_exists(target_path) != 1) {
+        syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
+        syscall(SYS_WRITE, STDERR, target, tlen);
+        syscall(SYS_WRITE, STDERR, "' not found\n", 12);
+        return 1;
+    }
+
+    var curr = current_branch_name();
+    if (curr != 0) {
+        if (streq(curr, target) == 1) {
+            syscall(SYS_WRITE, STDOUT, "already on '", 12);
+            syscall(SYS_WRITE, STDOUT, target, tlen);
+            syscall(SYS_WRITE, STDOUT, "'\n", 2);
+            return 0;
+        }
+    }
+
+    if (is_dirty() == 1) {
+        eprintln("sit: working tree has uncommitted changes");
+        eprintln("sit:   commit or revert before switching branches");
+        return 1;
+    }
+
+    var target_fd = file_open(target_path, 0, 0);
+    if (target_fd < 0) {
+        eprintln("sit: cannot read target branch ref");
+        return 1;
+    }
+    var target_hex = alloc(80);
+    var n = file_read(target_fd, target_hex, 80);
+    file_close(target_fd);
+    if (n < 64) {
+        eprintln("sit: target ref is invalid");
+        return 1;
+    }
+    store8(target_hex + 64, 0);
+
+    var target_entries = commit_tree_entries(target_hex);
+    if (target_entries == 0) { target_entries = vec_new(); }
+    var curr_entries = read_head_tree_entries();
+    if (curr_entries == 0) { curr_entries = vec_new(); }
+
+    # Collision check: untracked files on disk that would be overwritten
+    var working = list_working_files();
+    var wn = vec_len(working);
+    var wi = 0;
+    while (wi < wn) {
+        var wpath = vec_get(working, wi);
+        if (tree_find(curr_entries, wpath) == 0) {
+            if (tree_find(target_entries, wpath) != 0) {
+                syscall(SYS_WRITE, STDERR, "sit: untracked file '", 21);
+                syscall(SYS_WRITE, STDERR, wpath, strlen(wpath));
+                syscall(SYS_WRITE, STDERR, "' would be overwritten\n", 23);
+                return 1;
+            }
+        }
+        wi = wi + 1;
+    }
+
+    materialize_target(target_hex);
+
+    if (set_head_ref(target_ref) != 0) {
+        eprintln("sit: failed to update HEAD");
+        return 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "switched to branch '", 20);
+    syscall(SYS_WRITE, STDOUT, target, tlen);
+    syscall(SYS_WRITE, STDOUT, "'\n", 2);
+    return 0;
+}
+

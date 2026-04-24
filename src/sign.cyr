@@ -1,0 +1,310 @@
+# sign.cyr — ed25519 signing over commit bodies.
+#
+# Key material lives at ~/.sit/signing_key (32B seed hex, chmod 0600) plus
+# ~/.sit/signing_key.pub (32B pubkey hex). Signed commits splice a single
+# `sitsig <sig-hex> <pub-hex>\n` header line between `committer` and the
+# blank separator — the signed payload is the body WITHOUT that line, so
+# verification is self-consistent. See ADR 0002.
+
+# Path helpers for ~/.sit/ signing keys. Return heap cstrings or 0 if HOME unset.
+fn signing_home_dir() {
+    var home = getenv("HOME");
+    if (home == 0) { return 0; }
+    var hlen = strlen(home);
+    var p = alloc(hlen + 6);
+    memcpy(p, home, hlen);
+    memcpy(p + hlen, "/.sit", 5);
+    store8(p + hlen + 5, 0);
+    return p;
+}
+fn signing_key_path() {
+    var home = getenv("HOME");
+    if (home == 0) { return 0; }
+    var hlen = strlen(home);
+    var p = alloc(hlen + 18);
+    memcpy(p, home, hlen);
+    memcpy(p + hlen, "/.sit/signing_key", 17);
+    store8(p + hlen + 17, 0);
+    return p;
+}
+fn signing_pub_path() {
+    var home = getenv("HOME");
+    if (home == 0) { return 0; }
+    var hlen = strlen(home);
+    var p = alloc(hlen + 22);
+    memcpy(p, home, hlen);
+    memcpy(p + hlen, "/.sit/signing_key.pub", 21);
+    store8(p + hlen + 21, 0);
+    return p;
+}
+
+# Load 32B seed from ~/.sit/signing_key (hex-encoded, 64 chars). Returns
+# heap ptr on success, 0 if missing or malformed.
+fn load_signing_seed() {
+    var p = signing_key_path();
+    if (p == 0) { return 0; }
+    if (file_exists(p) != 1) { return 0; }
+    var buf = alloc(80);
+    var n = file_read_all(p, buf, 80);
+    if (n < 64) { return 0; }
+    return hex_decode(buf, 64);
+}
+
+# Load 32B pubkey from ~/.sit/signing_key.pub (hex-encoded, 64 chars).
+fn load_signing_pubkey() {
+    var p = signing_pub_path();
+    if (p == 0) { return 0; }
+    if (file_exists(p) != 1) { return 0; }
+    var buf = alloc(80);
+    var n = file_read_all(p, buf, 80);
+    if (n < 64) { return 0; }
+    return hex_decode(buf, 64);
+}
+
+# Sign `body` (the full unsigned commit body) with the 32-byte seed,
+# returning a new heap buffer that splices a `sitsig <sig-hex> <pub-hex>\n`
+# line in after the last header (just before the blank line separating
+# headers from message). Writes the new length to *out_len.
+#
+# Layout in the returned buffer:
+#   <headers up through committer\n>
+#   sitsig <128 hex sig> <64 hex pub>\n
+#   \n
+#   <message>
+#
+# The signed payload is the input `body` verbatim (i.e. without the sitsig
+# line) — so verification just re-parses, strips the sitsig line, and calls
+# ed25519_verify against what's left.
+fn sign_commit_body(body, body_len, seed, out_len) {
+    # Find blank line "\n\n" separating headers from message. We know it
+    # exists because build_commit always writes one.
+    var split = 0;
+    var i = 0;
+    while (i + 1 < body_len) {
+        if (load8(body + i) == 10) {
+            if (load8(body + i + 1) == 10) { split = i + 1; i = body_len; }
+            else { i = i + 1; }
+        }
+        else { i = i + 1; }
+    }
+    if (split == 0) { return 0; }
+
+    var sk[64];
+    var pk[32];
+    ed25519_keypair(seed, &sk, &pk);
+    var sig[64];
+    ed25519_sign(&sk, body, body_len, &sig);
+    var sig_hex = hex_encode(&sig, 64);
+    var pk_hex = hex_encode(&pk, 32);
+
+    # "sitsig " (7) + 128 sig + " " (1) + 64 pub + "\n" (1) = 201
+    var sitsig_len = 201;
+    var new_len = body_len + sitsig_len;
+    var out = alloc(new_len + 1);
+    memcpy(out, body, split);
+    var pos = split;
+    memcpy(out + pos, "sitsig ", 7); pos = pos + 7;
+    memcpy(out + pos, sig_hex, 128); pos = pos + 128;
+    store8(out + pos, 32); pos = pos + 1;
+    memcpy(out + pos, pk_hex, 64); pos = pos + 64;
+    store8(out + pos, 10); pos = pos + 1;
+    memcpy(out + pos, body + split, body_len - split);
+    pos = pos + (body_len - split);
+    store64(out_len, pos);
+    return out;
+}
+
+# Scan `body` for a `sitsig <sig-hex> <pub-hex>\n` line in the header block.
+# On match: decodes sig (64B) into out_sig, pub (32B) into out_pub, and builds
+# a stripped-body heap buffer (with that line removed) at *out_stripped_ptr
+# with length written to *out_stripped_len. Returns 1 on match, 0 otherwise.
+fn extract_sitsig(body, body_len, out_sig, out_pub, out_stripped_ptr, out_stripped_len) {
+    var pos = 0;
+    var in_headers = 1;
+    while (pos < body_len) {
+        if (in_headers == 0) { pos = body_len; }
+        else {
+            var nl = pos;
+            while (nl < body_len) {
+                if (load8(body + nl) == 10) { break; }
+                nl = nl + 1;
+            }
+            var line_len = nl - pos;
+            if (line_len == 0) { in_headers = 0; }
+            else {
+                if (line_len == 200) {
+                    if (memeq(body + pos, "sitsig ", 7) == 1) {
+                        if (load8(body + pos + 135) == 32) {
+                            var sig_bytes = hex_decode(body + pos + 7, 128);
+                            var pub_bytes = hex_decode(body + pos + 136, 64);
+                            if (sig_bytes != 0) {
+                                if (pub_bytes != 0) {
+                                    memcpy(out_sig, sig_bytes, 64);
+                                    memcpy(out_pub, pub_bytes, 32);
+                                    var stripped_len = body_len - 201;
+                                    var out = alloc(stripped_len + 1);
+                                    memcpy(out, body, pos);
+                                    memcpy(out + pos, body + nl + 1, body_len - (nl + 1));
+                                    store8(out + stripped_len, 0);
+                                    store64(out_stripped_ptr, out);
+                                    store64(out_stripped_len, stripped_len);
+                                    return 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                pos = nl + 1;
+            }
+            if (in_headers == 1) { pos = nl + 1; }
+        }
+    }
+    return 0;
+}
+
+# Verify a commit body that may contain a sitsig line. Returns:
+#   1 = sitsig present and signature valid
+#   0 = sitsig present but signature invalid
+#  -1 = no sitsig present
+# When 1 or 0 are returned, out_pub (32B buffer) is filled.
+fn verify_commit_body(body, body_len, out_pk) {
+    var sig[64];
+    var pk[32];
+    var stripped_ptr_slot[8];
+    var stripped_len_slot[8];
+    store64(&stripped_ptr_slot, 0);
+    store64(&stripped_len_slot, 0);
+    var r = extract_sitsig(body, body_len, &sig, &pk, &stripped_ptr_slot, &stripped_len_slot);
+    if (r == 0) { return 0 - 1; }
+    memcpy(out_pk, &pk, 32);
+    var stripped = load64(&stripped_ptr_slot);
+    var slen = load64(&stripped_len_slot);
+    return ed25519_verify(&pk, stripped, slen, &sig);
+}
+
+fn cmd_key_generate() {
+    var dir = signing_home_dir();
+    if (dir == 0) { eprintln("sit: HOME not set"); return 1; }
+    if (ensure_dir(dir) != 0) {
+        eprintln("sit: cannot create ~/.sit/");
+        return 1;
+    }
+    var priv_path = signing_key_path();
+    var pub_path = signing_pub_path();
+    if (file_exists(priv_path) == 1) {
+        eprintln("sit: signing key already exists (delete ~/.sit/signing_key to regenerate)");
+        return 1;
+    }
+
+    var sk[64];
+    var pk[32];
+    var gen = ed25519_generate_keypair(&sk, &pk);
+    if (gen != 1) {
+        eprintln("sit: entropy error generating key");
+        return 1;
+    }
+    # sk layout is seed||pk; store only the 32-byte seed (hex).
+    var seed_hex = hex_encode(&sk, 32);
+    var fd = sys_open(priv_path, O_WRONLY | O_CREAT | O_TRUNC, 0x180);
+    if (fd < 0) { eprintln("sit: cannot write signing key"); return 1; }
+    syscall(SYS_WRITE, fd, seed_hex, 64);
+    syscall(SYS_WRITE, fd, "\n", 1);
+    sys_close(fd);
+
+    var pub_hex = hex_encode(&pk, 32);
+    var pub_out = alloc(66);
+    memcpy(pub_out, pub_hex, 64);
+    store8(pub_out + 64, 10);
+    if (file_write_all(pub_path, pub_out, 65) < 0) {
+        eprintln("sit: cannot write public key");
+        return 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "generated ed25519 key ", 22);
+    syscall(SYS_WRITE, STDOUT, pub_hex, 12);
+    syscall(SYS_WRITE, STDOUT, "\n  private: ", 12);
+    syscall(SYS_WRITE, STDOUT, priv_path, strlen(priv_path));
+    syscall(SYS_WRITE, STDOUT, " (0600)\n  public:  ", 19);
+    syscall(SYS_WRITE, STDOUT, pub_path, strlen(pub_path));
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    return 0;
+}
+
+fn cmd_key_show() {
+    var pk = load_signing_pubkey();
+    if (pk == 0) {
+        eprintln("sit: no signing key (run 'sit key generate')");
+        return 1;
+    }
+    var hex = hex_encode(pk, 32);
+    syscall(SYS_WRITE, STDOUT, hex, 64);
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    return 0;
+}
+
+fn cmd_key() {
+    if (argc() < 3) {
+        eprintln("usage: sit key generate | sit key show");
+        return 1;
+    }
+    var sub = argv(2);
+    if (streq(sub, "generate") == 1) { return cmd_key_generate(); }
+    if (streq(sub, "show")     == 1) { return cmd_key_show(); }
+    eprintln("sit: unknown key subcommand");
+    return 1;
+}
+
+fn cmd_verify_commit() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+    var hex[72];
+    if (argc() < 3) {
+        var head = read_head_ref();
+        if (head == 0) { eprintln("sit: no commits yet"); return 1; }
+        memcpy(&hex, head, 64);
+        store8(&hex + 64, 0);
+    }
+    else {
+        var prefix = argv_heap(2);
+        var rr = resolve_hash(prefix, &hex);
+        if (rr == 0 - 2) { eprintln("sit: hash prefix too short (min 4 chars)"); return 1; }
+        if (rr == 0 - 1) { eprintln("sit: ambiguous hash prefix"); return 1; }
+        if (rr == 0)     { eprintln("sit: no object matches"); return 1; }
+    }
+    var obj[24];
+    if (read_object(&hex, &obj) != 0) {
+        eprintln("sit: cannot read object");
+        return 1;
+    }
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    var body = buf + coff;
+    var body_len = blen - coff;
+
+    var pk[32];
+    var vr = verify_commit_body(body, body_len, &pk);
+    if (vr == 0 - 1) {
+        syscall(SYS_WRITE, STDOUT, "no signature on ", 16);
+        syscall(SYS_WRITE, STDOUT, &hex, 12);
+        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        return 1;
+    }
+    var pk_hex = hex_encode(&pk, 32);
+    if (vr == 1) {
+        syscall(SYS_WRITE, STDOUT, "good signature on ", 18);
+        syscall(SYS_WRITE, STDOUT, &hex, 12);
+        syscall(SYS_WRITE, STDOUT, " (key ", 6);
+        syscall(SYS_WRITE, STDOUT, pk_hex, 64);
+        syscall(SYS_WRITE, STDOUT, ")\n", 2);
+        return 0;
+    }
+    syscall(SYS_WRITE, STDOUT, "BAD signature on ", 17);
+    syscall(SYS_WRITE, STDOUT, &hex, 12);
+    syscall(SYS_WRITE, STDOUT, " (key ", 6);
+    syscall(SYS_WRITE, STDOUT, pk_hex, 64);
+    syscall(SYS_WRITE, STDOUT, ")\n", 2);
+    return 1;
+}

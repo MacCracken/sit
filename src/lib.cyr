@@ -1,0 +1,18 @@
+# lib.cyr — sit domain-module include chain.
+#
+# Stdlib is auto-included via cyrius.cyml [deps].stdlib, so this file only
+# chains sit-local modules. Cyrius does two-pass compilation so include
+# order doesn't affect function resolution — order here is just logical
+# grouping (primitives first, then storage, refs, objects, commands).
+
+include "src/util.cyr"
+include "src/config.cyr"
+include "src/object_db.cyr"
+include "src/index.cyr"
+include "src/refs.cyr"
+include "src/tree.cyr"
+include "src/diff.cyr"
+include "src/commit.cyr"
+include "src/merge.cyr"
+include "src/sign.cyr"
+include "src/wire.cyr"

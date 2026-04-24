@@ -1,0 +1,310 @@
+# tree.cyr — sit tree objects.
+#
+# Top-level tree layout for subdirectory grouping (`tlvl_*`), git-SHA-256-compatible
+# tree entry parse / build / flatten, and tree_find lookups. Trees encode
+# directories as `40000 <name>\0<32B hash>` entries and files as `100644 ...`.
+
+fn tlvl_mode(e) { return load64(e); }
+fn tlvl_name(e) { return load64(e + 8); }
+fn tlvl_bytes(e) { return load64(e + 16); }
+
+# Recursive tree writer.
+# `entries` is a slice of the sorted+deduped staging index; all entries passed
+# at a given call share the same prefix of length `prefix_len` (empty at root).
+# Lexical sort of full paths produces correct per-tree git order when walked
+# depth-first — no separate sort step needed at the level.
+# Returns tree hex hash, or 0 on failure.
+fn build_tree(entries, prefix_len) {
+    var level = vec_new();
+    var n = vec_len(entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        var full_path = entry_path(e);
+        var rest = full_path + prefix_len;
+        var rest_len = strlen(full_path) - prefix_len;
+
+        var slash = 0;
+        var found = 0;
+        while (slash < rest_len) {
+            if (load8(rest + slash) == 47) { found = 1; break; }
+            slash = slash + 1;
+        }
+
+        if (found == 0) {
+            var name = alloc(rest_len + 1);
+            memcpy(name, rest, rest_len);
+            store8(name + rest_len, 0);
+
+            var le = alloc(24);
+            store64(le, "100644");
+            store64(le + 8, name);
+            store64(le + 16, entry_hash(e));
+            vec_push(level, le);
+            i = i + 1;
+        }
+        else {
+            var subdir_name = alloc(slash + 1);
+            memcpy(subdir_name, rest, slash);
+            store8(subdir_name + slash, 0);
+
+            var sub_prefix_len = prefix_len + slash + 1;
+            var sub_entries = vec_new();
+
+            var collecting = 1;
+            while (collecting == 1) {
+                if (i >= n) { collecting = 0; }
+                else {
+                    var ee = vec_get(entries, i);
+                    var ee_path = entry_path(ee);
+                    var ee_len = strlen(ee_path);
+                    var ok = 1;
+                    if (ee_len <= prefix_len + slash) { ok = 0; }
+                    else {
+                        var m = 0;
+                        while (m < slash) {
+                            if (load8(ee_path + prefix_len + m) != load8(rest + m)) { ok = 0; }
+                            m = m + 1;
+                        }
+                        if (ok == 1) {
+                            if (load8(ee_path + prefix_len + slash) != 47) { ok = 0; }
+                        }
+                    }
+                    if (ok == 0) { collecting = 0; }
+                    else {
+                        vec_push(sub_entries, ee);
+                        i = i + 1;
+                    }
+                }
+            }
+
+            var sub_hex = build_tree(sub_entries, sub_prefix_len);
+            if (sub_hex == 0) { return 0; }
+            var sub_bytes = hex_decode(sub_hex, 64);
+            if (sub_bytes == 0) { return 0; }
+
+            var le = alloc(24);
+            store64(le, "40000");
+            store64(le + 8, subdir_name);
+            store64(le + 16, sub_bytes);
+            vec_push(level, le);
+        }
+    }
+
+    var body_size = 0;
+    var k = 0;
+    var nl = vec_len(level);
+    while (k < nl) {
+        var le = vec_get(level, k);
+        body_size = body_size + strlen(tlvl_mode(le)) + 1 + strlen(tlvl_name(le)) + 1 + 32;
+        k = k + 1;
+    }
+
+    var body = alloc(body_size);
+    var pos = 0;
+    k = 0;
+    while (k < nl) {
+        var le = vec_get(level, k);
+        var mode = tlvl_mode(le);
+        var name = tlvl_name(le);
+        var mlen = strlen(mode);
+        var nlen = strlen(name);
+        memcpy(body + pos, mode, mlen); pos = pos + mlen;
+        store8(body + pos, 32); pos = pos + 1;
+        memcpy(body + pos, name, nlen); pos = pos + nlen;
+        store8(body + pos, 0); pos = pos + 1;
+        memcpy(body + pos, tlvl_bytes(le), 32); pos = pos + 32;
+        k = k + 1;
+    }
+
+    return write_typed_object("tree", 4, body, body_size);
+}
+
+# Parse .sit/HEAD. If symbolic (`ref: refs/heads/<branch>\n`), returns the
+# ref path (heap cstring, e.g. "refs/heads/main"). Returns 0 on missing HEAD,
+# detached (raw hex), or malformed content.
+fn tree_entry_mode(e) { return load64(e); }
+fn tree_entry_name(e) { return load64(e + 8); }
+fn tree_entry_hash(e) { return load64(e + 16); }
+
+# Parse tree object body. Returns vec of entries.
+fn parse_tree(body, body_len) {
+    var entries = vec_new();
+    var pos = 0;
+    while (pos < body_len) {
+        var sp = pos;
+        while (sp < body_len) {
+            if (load8(body + sp) == 32) { break; }
+            sp = sp + 1;
+        }
+        if (sp >= body_len) { pos = body_len; }
+        else {
+            var mode_len = sp - pos;
+            var mode = alloc(mode_len + 1);
+            memcpy(mode, body + pos, mode_len);
+            store8(mode + mode_len, 0);
+
+            var nu = sp + 1;
+            while (nu < body_len) {
+                if (load8(body + nu) == 0) { break; }
+                nu = nu + 1;
+            }
+            if (nu >= body_len) { pos = body_len; }
+            else {
+                var name_len = nu - sp - 1;
+                var name = alloc(name_len + 1);
+                memcpy(name, body + sp + 1, name_len);
+                store8(name + name_len, 0);
+
+                if (nu + 1 + 32 > body_len) { pos = body_len; }
+                else {
+                    var hash_hex = hex_encode(body + nu + 1, 32);
+                    var e = alloc(24);
+                    store64(e, mode);
+                    store64(e + 8, name);
+                    store64(e + 16, hash_hex);
+                    vec_push(entries, e);
+                    pos = nu + 1 + 32;
+                }
+            }
+        }
+    }
+    return entries;
+}
+
+# Recursively walk a tree, pushing one entry per file to `out` with the full
+# path (e.g., "src/main.cyr") stored in the `name` slot. Subtree entries are
+# traversed, not emitted. Returned entries can be searched by `tree_find`
+# against full paths because it only uses the name/hash slots.
+fn flatten_tree(tree_hex, prefix, out) {
+    var obj[24];
+    if (read_object(tree_hex, &obj) != 0) { return 0 - 1; }
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+
+    var entries = parse_tree(buf + coff, blen - coff);
+    var n = vec_len(entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        var mode = tree_entry_mode(e);
+        var name = tree_entry_name(e);
+        var hash_hex = tree_entry_hash(e);
+
+        var prefix_len = strlen(prefix);
+        var name_len = strlen(name);
+
+        if (streq(mode, "40000") == 1) {
+            var sub_prefix = alloc(prefix_len + name_len + 2);
+            memcpy(sub_prefix, prefix, prefix_len);
+            memcpy(sub_prefix + prefix_len, name, name_len);
+            store8(sub_prefix + prefix_len + name_len, 47);
+            store8(sub_prefix + prefix_len + name_len + 1, 0);
+            flatten_tree(hash_hex, sub_prefix, out);
+        }
+        else {
+            var full_path = alloc(prefix_len + name_len + 1);
+            memcpy(full_path, prefix, prefix_len);
+            memcpy(full_path + prefix_len, name, name_len);
+            store8(full_path + prefix_len + name_len, 0);
+
+            var flat = alloc(24);
+            store64(flat, mode);
+            store64(flat + 8, full_path);
+            store64(flat + 16, hash_hex);
+            vec_push(out, flat);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Read HEAD → commit → tree, recursively flatten into full-path entries.
+# Returns vec or 0 if there's no HEAD commit yet.
+fn read_head_tree_entries() {
+    var head_commit = read_head_ref();
+    if (head_commit == 0) { return 0; }
+
+    var obj[24];
+    if (read_object(head_commit, &obj) != 0) { return 0; }
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    var body = buf + coff;
+    var body_len = blen - coff;
+
+    if (body_len < 70) { return 0; }
+    if (memeq(body, "tree ", 5) == 0) { return 0; }
+    var tree_hex = alloc(65);
+    memcpy(tree_hex, body + 5, 64);
+    store8(tree_hex + 64, 0);
+
+    var out = vec_new();
+    flatten_tree(tree_hex, "", out);
+    return out;
+}
+
+fn tree_find(entries, name) {
+    if (entries == 0) { return 0; }
+    var n = vec_len(entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        if (streq(tree_entry_name(e), name) == 1) { return e; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn tree_find_hash(entries, path) {
+    if (entries == 0) { return 0; }
+    var e = tree_find(entries, path);
+    if (e == 0) { return 0; }
+    return tree_entry_hash(e);
+}
+
+# Union of paths across three flattened tree entry vecs. Returns a vec of
+# heap-copied path cstrings, each unique.
+fn three_way_path_set(base, ours, theirs) {
+    var paths = vec_new();
+    var sources_cnt = 3;
+    var sources[24];
+    store64(&sources + 0, base);
+    store64(&sources + 8, ours);
+    store64(&sources + 16, theirs);
+
+    var si = 0;
+    while (si < sources_cnt) {
+        var entries = load64(&sources + si * 8);
+        if (entries != 0) {
+            var n = vec_len(entries);
+            var i = 0;
+            while (i < n) {
+                var e = vec_get(entries, i);
+                var p = tree_entry_name(e);
+                var plen = strlen(p);
+                # Dedup against existing paths
+                var found = 0;
+                var j = 0;
+                var m = vec_len(paths);
+                while (j < m) {
+                    if (streq(vec_get(paths, j), p) == 1) { found = 1; j = m; }
+                    else { j = j + 1; }
+                }
+                if (found == 0) {
+                    var copy = alloc(plen + 1);
+                    memcpy(copy, p, plen);
+                    store8(copy + plen, 0);
+                    vec_push(paths, copy);
+                }
+                i = i + 1;
+            }
+        }
+        si = si + 1;
+    }
+    return paths;
+}
+
+# Walk descendant's parent chain; return 1 if ancestor_hex is descendant
+# or any of its ancestors. Linear — sit has no merge commits yet.
