@@ -678,10 +678,53 @@ fn build_tree(entries, prefix_len) {
     return write_typed_object("tree", 4, body, body_size);
 }
 
-# Read .sit/refs/heads/main. Returns 64-char null-terminated hex ptr, or 0.
-fn read_main_ref() {
-    if (file_exists(".sit/refs/heads/main") != 1) { return 0; }
-    var fd = file_open(".sit/refs/heads/main", 0, 0);
+# Parse .sit/HEAD. If symbolic (`ref: refs/heads/<branch>\n`), returns the
+# ref path (heap cstring, e.g. "refs/heads/main"). Returns 0 on missing HEAD,
+# detached (raw hex), or malformed content.
+fn read_head_ref_path() {
+    var pair[16];
+    if (read_file_heap(".sit/HEAD", &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+
+    if (len < 5) { return 0; }
+    if (memeq(buf, "ref: ", 5) == 0) { return 0; }
+
+    var stop = 5;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (stop >= len) { scanning = 0; }
+        else {
+            var c = load8(buf + stop);
+            if (c == 10) { scanning = 0; }
+            else {
+                if (c == 13) { scanning = 0; }
+                else { stop = stop + 1; }
+            }
+        }
+    }
+
+    var ref_len = stop - 5;
+    if (ref_len == 0) { return 0; }
+
+    var ref = alloc(ref_len + 1);
+    memcpy(ref, buf + 5, ref_len);
+    store8(ref + ref_len, 0);
+    return ref;
+}
+
+# Read the ref file pointed at by HEAD. Returns 64-char hex or 0.
+fn read_head_ref() {
+    var ref_path = read_head_ref_path();
+    if (ref_path == 0) { return 0; }
+    var ref_len = strlen(ref_path);
+    var full = alloc(5 + ref_len + 1);
+    memcpy(full, ".sit/", 5);
+    memcpy(full + 5, ref_path, ref_len);
+    store8(full + 5 + ref_len, 0);
+
+    if (file_exists(full) != 1) { return 0; }
+    var fd = file_open(full, 0, 0);
     if (fd < 0) { return 0; }
     var buf = alloc(80);
     var n = file_read(fd, buf, 80);
@@ -691,13 +734,37 @@ fn read_main_ref() {
     return buf;
 }
 
-fn write_main_ref(hex) {
+# Write the given 64-char hex to the ref file HEAD points at.
+fn write_head_ref(hex) {
+    var ref_path = read_head_ref_path();
+    if (ref_path == 0) { return 0 - 1; }
+    var ref_len = strlen(ref_path);
+    var full = alloc(5 + ref_len + 1);
+    memcpy(full, ".sit/", 5);
+    memcpy(full + 5, ref_path, ref_len);
+    store8(full + 5 + ref_len, 0);
+
     var out = alloc(66);
     memcpy(out, hex, 64);
     store8(out + 64, 10);
     store8(out + 65, 0);
-    if (file_write_all(".sit/refs/heads/main", out, 65) < 0) { return 0 - 1; }
+    if (file_write_all(full, out, 65) < 0) { return 0 - 1; }
     return 0;
+}
+
+# Extract the branch name from HEAD (e.g. "main" from "refs/heads/main").
+# Returns heap cstring or 0 if HEAD isn't a branch ref.
+fn current_branch_name() {
+    var ref_path = read_head_ref_path();
+    if (ref_path == 0) { return 0; }
+    var ref_len = strlen(ref_path);
+    if (ref_len <= 11) { return ref_path; }
+    if (memeq(ref_path, "refs/heads/", 11) == 0) { return ref_path; }
+    var name_len = ref_len - 11;
+    var name = alloc(name_len + 1);
+    memcpy(name, ref_path + 11, name_len);
+    store8(name + name_len, 0);
+    return name;
 }
 
 # Build and write a commit object. Returns hex hash or 0.
@@ -877,7 +944,7 @@ fn cmd_commit() {
         return 1;
     }
 
-    var parent_hex = read_main_ref();
+    var parent_hex = read_head_ref();
 
     var commit_hex = build_commit(tree_hex, parent_hex, message);
     if (commit_hex == 0) {
@@ -885,12 +952,16 @@ fn cmd_commit() {
         return 1;
     }
 
-    if (write_main_ref(commit_hex) != 0) {
-        eprintln("sit: failed to update refs/heads/main");
+    if (write_head_ref(commit_hex) != 0) {
+        eprintln("sit: failed to update HEAD's ref");
         return 1;
     }
 
-    syscall(SYS_WRITE, STDOUT, "[main ", 6);
+    var branch = current_branch_name();
+    syscall(SYS_WRITE, STDOUT, "[", 1);
+    if (branch != 0) { syscall(SYS_WRITE, STDOUT, branch, strlen(branch)); }
+    else             { syscall(SYS_WRITE, STDOUT, "detached", 8); }
+    syscall(SYS_WRITE, STDOUT, " ", 1);
     if (parent_hex == 0) {
         syscall(SYS_WRITE, STDOUT, "(root-commit) ", 14);
     }
@@ -1078,7 +1149,7 @@ fn cmd_log() {
         return 1;
     }
 
-    var current_hex = read_main_ref();
+    var current_hex = read_head_ref();
     if (current_hex == 0) {
         eprintln("sit: no commits yet");
         return 0;
@@ -1258,7 +1329,7 @@ fn flatten_tree(tree_hex, prefix, out) {
 # Read HEAD → commit → tree, recursively flatten into full-path entries.
 # Returns vec or 0 if there's no HEAD commit yet.
 fn read_head_tree_entries() {
-    var head_commit = read_main_ref();
+    var head_commit = read_head_ref();
     if (head_commit == 0) { return 0; }
 
     var obj[24];
@@ -1591,8 +1662,12 @@ fn cmd_status() {
         }
     }
 
-    syscall(SYS_WRITE, STDOUT, "On branch main\n", 15);
-    if (read_main_ref() == 0) {
+    var branch = current_branch_name();
+    syscall(SYS_WRITE, STDOUT, "On branch ", 10);
+    if (branch != 0) { syscall(SYS_WRITE, STDOUT, branch, strlen(branch)); }
+    else             { syscall(SYS_WRITE, STDOUT, "(detached)", 10); }
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    if (read_head_ref() == 0) {
         syscall(SYS_WRITE, STDOUT, "No commits yet\n", 15);
     }
 
@@ -2131,7 +2206,7 @@ fn cmd_show() {
 
     var hex[72];
     if (argc() < 3) {
-        var head = read_main_ref();
+        var head = read_head_ref();
         if (head == 0) {
             eprintln("sit: no commits yet");
             return 0;

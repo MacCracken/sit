@@ -106,12 +106,19 @@
 - Pre-req for owl's gutter-marker integration — owl will call this per file to paint changed lines.
 - Verified against six scenarios: clean tree, combined staged+unstaged change (shows both), working-deletion, untracked-file addition, `.sitignore` respected for new files, no-commits-yet repo (HEAD-empty → all working files shown as additions).
 
+### v0.2.0 — HEAD-aware branch resolution
+
+- **`read_head_ref_path()`** — parses `.sit/HEAD` as `ref: refs/heads/<branch>\n`, returns the ref path ("refs/heads/main") or 0 on detached/malformed HEAD.
+- **`read_head_ref()`** + **`write_head_ref(hex)`** — compose the ref path with `.sit/` to read/write the branch's commit hex. Drop-in replacements for the old `read_main_ref` / `write_main_ref` hardcodes.
+- **`current_branch_name()`** — strips `refs/heads/` prefix off the ref path for display. Falls back to `(detached)` for non-branch HEAD.
+- **Everywhere-refactor**: `cmd_commit`, `cmd_log`, `cmd_status`, `cmd_show`, `cmd_diff`, and `read_head_tree_entries` all route through the new helpers. Status's `On branch main\n` and commit's `[main ...]` are now dynamic.
+- Verified against seven scenarios: main-branch regression, manual HEAD retarget to `dev`, commit lands on correct ref (main untouched), log follows active branch, switch back via HEAD edit, new-branch creation by committing with HEAD pointing at a nonexistent ref (creates `refs/heads/<name>` on write), malformed HEAD shows `(detached)` and commit errors out cleanly.
+
 ## Post-0.1 Backlog
 
 ### v0.2 — Branches
 
-- **v0.2.0 — HEAD-aware branch selection.** `sit commit` / `sit log` / `sit status` currently hardcode `refs/heads/main`. Parse `.sit/HEAD` as `ref: refs/heads/<branch>` and use that branch's ref. Prerequisite for anything multi-branch.
-- **v0.2.1 — `sit branch [<name>]` + `sit checkout <name>`.** First multi-ref feature. Writes `.sit/refs/heads/<name>`, updates HEAD, materializes the branch's tree into the working directory.
+- **v0.2.1 — `sit branch [<name>]` + `sit checkout <name>`.** First multi-ref feature. `sit branch` creates `.sit/refs/heads/<name>` pointing at HEAD's current commit; `sit checkout` updates HEAD, materializes the target's tree into the working directory, and rewrites the index to match.
 
 ### Longer horizon
 
