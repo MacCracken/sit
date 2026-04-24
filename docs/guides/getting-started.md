@@ -131,18 +131,46 @@ sit cat-file 8cf1dc9 | xxd
 
 **Current limitation**: staged paths must be flat (no subdirectories). `sit add src/main.cyr` works, but `sit commit` will error out with a pointer to [arch 003](../architecture/003-flat-paths-in-commits.md). Recursive trees land in v0.3.0.
 
+## View history
+
+```sh
+/path/to/sit/build/sit log
+# commit 39cec8d7f0a5e65721fc903a67acb1e2b5cd1ffb2a81a08dbdb838fd32f179ce
+# Author: Your Name <you@example.com>
+# Date:   2026-04-24T03:07:29Z
+#
+#     third
+#
+# commit c0772e81223544e732d1176e1494bdfc11fb202808a340eee78e6b54ae95f691
+# Author: Your Name <you@example.com>
+# Date:   2026-04-24T03:07:29Z
+#
+#     second commit
+#
+#     with a longer body
+#     on multiple lines
+#
+# commit 0d5aa988afbd4aa15140bc249b0b8afd96352292628a9aa3bbbe4db85bc333e3
+# ...
+```
+
+Walks the commit chain starting from `HEAD` (currently hardcoded to `refs/heads/main`), following each commit's `parent <hex>` line. Terminates at the root commit (no parent line). Multi-line messages are indented 4 spaces per git convention.
+
+Empty repo prints `sit: no commits yet` to stderr and exits 0 — not an error.
+
 ## What works today
 
 - `sit init` — create empty repository
 - `sit add <path>` — hash, compress, and store a file as a blob object; append to staging index
 - `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
+- `sit log` — walk commit history from HEAD with git-style output
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
 
 ## What doesn't yet
 
-- `sit status`, `sit log`, `sit diff`
+- `sit status`, `sit diff`
 - Recursive trees (subdirectories) — see [arch 003](../architecture/003-flat-paths-in-commits.md)
-- HEAD-aware branch selection — `sit commit` always writes to `refs/heads/main`
+- HEAD-aware branch selection — `sit commit` / `sit log` always use `refs/heads/main`
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).

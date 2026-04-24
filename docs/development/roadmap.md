@@ -31,11 +31,20 @@
 - **Root-commit marker**: output reads `[main (root-commit) <hash>] <msg>` when no parent exists, `[main <hash>] <msg>` otherwise.
 - Arch 003 — subdirectory paths deferred to v0.3.0 (recursive trees); commit rejects nested paths with a clear error.
 
+### v0.1.3 — `sit log`
+
+- **`sit log`** — walks `HEAD` → `refs/heads/main` → parent pointers, printing each commit in git-style format (`commit <hex>`, `Author: NAME <EMAIL>`, `Date: <ISO-8601>`, blank line, indented message). Uses `iso8601()` from the chrono stdlib for date rendering.
+- **Commit body parser** — line-based walk extracting `parent <hex>\n` and `author <line>\n`; `parse_author_line` splits the author identity (up to `>`) from the trailing timestamp and timezone. `print_indented_message` handles multi-line messages with git's 4-space indent convention.
+- **Fix**: `read_object` now sizes its decompression buffer from the compressed input (256× upper bound, capped at 16 MB) instead of unconditionally allocating 16 MB. The old code exhausted the bump allocator after ~15 calls — caught when walking a two-commit history segfaulted on the second `read_object`. Dynamic sizing lets `sit log` scale to arbitrarily long histories.
+- Handles empty repo ("no commits yet"), root commit (walk terminates when `parent_hex` stays 0), and multi-line commit messages (each physical line gets indented).
+
 ## Post-0.1 Backlog
 
 ### Priority — the v0.2.0 loop
 
-- **Recursive trees** (arch 003) — lift the flat-path restriction on `sit commit`. Path segmentation + per-directory subtree construction + git's directory-sort rule (`<name>/` vs `<name>`). Will likely coincide with v0.2.0's `sit status` / `sit log`, which need tree readers anyway.
+- **`sit status`** — diff working tree vs staging index vs HEAD tree. Needs a tree reader (walk tree objects, yield `(path, mode, hash)` tuples).
+- **`sit diff`** — sankoch-backed text diff between two blobs / working tree / index.
+- **Recursive trees** (arch 003) — lift the flat-path restriction on `sit commit`. Path segmentation + per-directory subtree construction + git's directory-sort rule (`<name>/` vs `<name>`). Often paired with the tree reader from `sit status`.
 
 ### Working-tree visibility
 
