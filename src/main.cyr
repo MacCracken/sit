@@ -357,13 +357,10 @@ fn cmd_add() {
         return 1;
     }
 
-    var entry_len = 64 + 1 + path_len + 1;
-    var entry = alloc(entry_len);
-    memcpy(entry, hex, 64);
-    store8(entry + 64, 9);
-    memcpy(entry + 64 + 1, path, path_len);
-    store8(entry + 64 + 1 + path_len, 10);
-    file_append_locked(".sit/index", entry, entry_len);
+    if (index_upsert(hex, path) != 0) {
+        eprintln("sit: failed to update index");
+        return 1;
+    }
 
     syscall(SYS_WRITE, STDOUT, "added ", 6);
     syscall(SYS_WRITE, STDOUT, hex, 12);
@@ -468,41 +465,128 @@ fn cmd_owl_file() {
     return rc;
 }
 
-# Rewrite .sit/index from a vec of entries (truncates and overwrites).
-# Returns 0 on success, negative on I/O error.
-fn rewrite_index(entries) {
-    var n = vec_len(entries);
-    if (n == 0) {
-        if (file_write_all(".sit/index", "", 0) < 0) { return 0 - 1; }
-        return 0;
+# Open (or create) the patra-backed staging index. Returns db handle, or 0.
+fn index_db_open() {
+    patra_init();
+    var db = patra_open(".sit/index.patra");
+    if (db == 0) { return 0; }
+    # Idempotent — second call returns "already exists", which we ignore.
+    patra_exec(db, "CREATE TABLE entries (path STR, hash_hex STR)");
+    return db;
+}
+
+# Migrate legacy plaintext .sit/index (v0.1 format) into the patra table.
+# No-op if the plaintext file is absent. Deletes it on successful migration.
+fn index_migrate_from_plaintext(db) {
+    if (file_exists(".sit/index") != 1) { return 0; }
+    var pair[16];
+    if (read_file_heap(".sit/index", &pair) != 0) { return 0; }
+    var data = load64(&pair);
+    var len = load64(&pair + 8);
+
+    var pos = 0;
+    while (pos < len) {
+        if (pos + 65 > len) { pos = len; }
+        else {
+            if (load8(data + pos + 64) != 9) { pos = len; }
+            else {
+                var nl = pos + 65;
+                while (nl < len) {
+                    if (load8(data + nl) == 10) { break; }
+                    nl = nl + 1;
+                }
+                var plen = nl - pos - 65;
+
+                var hash_copy = alloc(65);
+                memcpy(hash_copy, data + pos, 64);
+                store8(hash_copy + 64, 0);
+                var path_copy = alloc(plen + 1);
+                memcpy(path_copy, data + pos + 65, plen);
+                store8(path_copy + plen, 0);
+
+                var types[16];
+                store64(&types + 0, 1);
+                store64(&types + 8, 1);
+                var ivals[16];
+                var sptrs[16];
+                store64(&sptrs + 0, path_copy);
+                store64(&sptrs + 8, hash_copy);
+                var slens[16];
+                store64(&slens + 0, plen);
+                store64(&slens + 8, 64);
+                var bptrs[16];
+                var blens[16];
+                patra_insert_row(db, "entries", 7, 2,
+                    &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+
+                pos = nl + 1;
+            }
+        }
     }
-    var total_size = 0;
+    sys_unlink(".sit/index");
+    return 0;
+}
+
+# Rewrite the staging index to exactly the given entries. DELETE + insert all.
+fn rewrite_index(entries) {
+    var db = index_db_open();
+    if (db == 0) { return 0 - 1; }
+    patra_exec(db, "DELETE FROM entries");
+
+    var n = vec_len(entries);
     var i = 0;
     while (i < n) {
         var e = vec_get(entries, i);
-        total_size = total_size + 64 + 1 + strlen(entry_path(e)) + 1;
-        i = i + 1;
-    }
-    var buf = alloc(total_size);
-    var pos = 0;
-    i = 0;
-    while (i < n) {
-        var e = vec_get(entries, i);
         var path = entry_path(e);
-        var hex = hex_encode(entry_hash(e), 32);
-        memcpy(buf + pos, hex, 64);
-        pos = pos + 64;
-        store8(buf + pos, 9);
-        pos = pos + 1;
-        var plen = strlen(path);
-        memcpy(buf + pos, path, plen);
-        pos = pos + plen;
-        store8(buf + pos, 10);
-        pos = pos + 1;
+        var hash_hex = hex_encode(entry_hash(e), 32);
+
+        var types[16];
+        store64(&types + 0, 1);
+        store64(&types + 8, 1);
+        var ivals[16];
+        var sptrs[16];
+        store64(&sptrs + 0, path);
+        store64(&sptrs + 8, hash_hex);
+        var slens[16];
+        store64(&slens + 0, strlen(path));
+        store64(&slens + 8, 64);
+        var bptrs[16];
+        var blens[16];
+        patra_insert_row(db, "entries", 7, 2,
+            &types, &ivals, &sptrs, &slens, &bptrs, &blens);
         i = i + 1;
     }
-    if (file_write_all(".sit/index", buf, total_size) < 0) { return 0 - 1; }
+    patra_close(db);
     return 0;
+}
+
+# Upsert a single (hash, path) entry — replaces any existing row for that path.
+# Used by `sit add` to stage a file.
+fn index_upsert(hash_hex, path) {
+    var existing = parse_index();
+    var filtered = vec_new();
+    if (existing != 0) {
+        var n = vec_len(existing);
+        var i = 0;
+        while (i < n) {
+            var e = vec_get(existing, i);
+            if (streq(entry_path(e), path) == 0) { vec_push(filtered, e); }
+            i = i + 1;
+        }
+    }
+
+    var bytes = hex_decode(hash_hex, 64);
+    if (bytes == 0) { return 0 - 1; }
+    var new_e = alloc(40);
+    memcpy(new_e, bytes, 32);
+    var plen = strlen(path);
+    var path_copy = alloc(plen + 1);
+    memcpy(path_copy, path, plen);
+    store8(path_copy + plen, 0);
+    store64(new_e + 32, path_copy);
+    vec_push(filtered, new_e);
+
+    return rewrite_index(filtered);
 }
 
 # Staging entry layout (40 bytes):
@@ -511,55 +595,50 @@ fn rewrite_index(entries) {
 fn entry_hash(e) { return e; }
 fn entry_path(e) { return load64(e + 32); }
 
-# Parse .sit/index into a vec of entries. Returns 0 on missing/empty/corrupt.
+# Load staging index from .sit/index.patra. Returns vec of entries or 0.
+# Auto-migrates plaintext .sit/index from v0.1 layout if present.
 fn parse_index() {
-    if (file_exists(".sit/index") != 1) { return 0; }
-
-    var fd = file_open(".sit/index", 0, 0);
-    if (fd < 0) { return 0; }
-    var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
-    syscall(SYS_LSEEK, fd, 0, SEEK_SET);
-    if (size <= 0) { file_close(fd); return 0; }
-
-    var data = alloc(size);
-    var total = 0;
-    var rgo = 1;
-    while (rgo == 1) {
-        var n = file_read(fd, data + total, size - total);
-        if (n <= 0) { rgo = 0; }
-        else { total = total + n; if (total >= size) { rgo = 0; } }
+    # Nothing to load if neither file exists
+    if (file_exists(".sit/index.patra") != 1) {
+        if (file_exists(".sit/index") != 1) { return 0; }
     }
-    file_close(fd);
+
+    var db = index_db_open();
+    if (db == 0) { return 0; }
+    index_migrate_from_plaintext(db);
+
+    var rs = patra_query(db, "SELECT path, hash_hex FROM entries");
+    if (rs == 0) { patra_close(db); return 0; }
+
+    var count = patra_result_count(rs);
+    if (count == 0) {
+        patra_result_free(rs);
+        patra_close(db);
+        return 0;
+    }
 
     var entries = vec_new();
-    var pos = 0;
-    while (pos < size) {
-        if (pos + 65 > size) { return 0; }
-        if (load8(data + pos + 64) != 9) { return 0; }
+    var i = 0;
+    while (i < count) {
+        var path_str = patra_result_get_str(rs, i, 0);
+        var hash_str = patra_result_get_str(rs, i, 1);
 
-        var nl = pos + 65;
-        while (nl < size) {
-            if (load8(data + nl) == 10) { break; }
-            nl = nl + 1;
+        var bytes = hex_decode(hash_str, 64);
+        if (bytes != 0) {
+            var entry = alloc(40);
+            memcpy(entry, bytes, 32);
+            var plen = strlen(path_str);
+            var p = alloc(plen + 1);
+            memcpy(p, path_str, plen);
+            store8(p + plen, 0);
+            store64(entry + 32, p);
+            vec_push(entries, entry);
         }
-        if (nl >= size) { return 0; }
-
-        var plen = nl - pos - 65;
-        var hash_bytes = hex_decode(data + pos, 64);
-        if (hash_bytes == 0) { return 0; }
-
-        var path = alloc(plen + 1);
-        memcpy(path, data + pos + 65, plen);
-        store8(path + plen, 0);
-
-        var entry = alloc(40);
-        memcpy(entry, hash_bytes, 32);
-        store64(entry + 32, path);
-        vec_push(entries, entry);
-
-        pos = nl + 1;
+        i = i + 1;
     }
 
+    patra_result_free(rs);
+    patra_close(db);
     if (vec_len(entries) == 0) { return 0; }
     return entries;
 }

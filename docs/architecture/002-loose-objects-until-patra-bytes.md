@@ -29,7 +29,7 @@ The staging index is a plaintext append-only file at `.sit/index`, format `<hex>
 
 ## What patra is used for today
 
-Nothing, in sit. The dep is declared in `cyrius.cyml` and link-resolves cleanly, but we don't open a patra store yet. That turns on when we implement a proper staging index with mutation (update-in-place on re-add, deletion on `sit rm`).
+As of v0.2.5, the **staging index lives in patra** — `.sit/index.patra` with a single `entries(path STR, hash_hex STR)` table. `parse_index()` queries it, `rewrite_index()` DELETEs + re-INSERTs, and `sit add` does an upsert. Legacy plaintext `.sit/index` files auto-migrate on first access. Objects are still loose files; see "Resolution" for the remaining migration.
 
 ## Resolution
 

@@ -146,6 +146,18 @@
 - Fixes UX gap flagged in v0.2.3: `sit show v0.1` no longer errors with "too short prefix" and instead resolves to the tagged commit.
 - Verified against eight scenarios: `show HEAD`, `show <tag>`, `show <branch>`, `show` on cross-branch tag, `show` on non-current branch, `cat-file <tag>`, short-name-as-tag beats too-short-prefix rule, empty-repo `show HEAD` returns cleanly.
 
+### v0.2.5 — Staging index migrates to patra
+
+- Patra 1.6.0 ships with `COL_BYTES` and its prerequisites (`patra_insert_row`, `patra_result_read_bytes`). sit's first real patra consumer is the staging index.
+- **`.sit/index.patra`** — single-table schema `entries(path STR, hash_hex STR)`. Replaces the plaintext `.sit/index` appended by `file_append_locked` in prior versions.
+- **`index_db_open()`** — opens the patra db and ensures the `entries` table exists (CREATE is idempotent; patra returns a cheap error on second call, which we ignore).
+- **`index_migrate_from_plaintext(db)`** — on first read of any repo that still has the old plaintext `.sit/index`, parse it line-by-line and `patra_insert_row` each entry, then `sys_unlink` the old file. Transparent to the user — first `sit status` after upgrade does the migration.
+- **`parse_index()`** now walks `SELECT path, hash_hex FROM entries`; reallocates rows into the same 40-byte `(hash_bytes, path_ptr)` layout the rest of sit already uses, so no call-site changes outside the parser.
+- **`rewrite_index(entries)`** now `DELETE FROM entries; patra_insert_row(...)` per row. Same external contract — truncate + re-serialize — different backing store.
+- **`index_upsert(hash_hex, path)`** new helper, replaces `cmd_add`'s inline `file_append_locked`. Loads current entries, filters out any row matching the path, appends the new entry, rewrites. Same last-write-wins semantics as the old append-then-dedupe-at-commit dance, but the index now holds at most one row per path at rest.
+- Required toolchain bump: `cyrius = "5.6.22"` (5.6.21 had a sankoch mutex regression that hung `zlib_compress`; 5.6.22 fixes it).
+- Verified against five scenarios: fresh add + commit flow, add + rm workflow, cross-branch checkout round-trip, legacy plaintext auto-migration, clean-tree status.
+
 ### v0.2.2 — `sit config` + `sit fsck`
 
 - **`sit config [--global] <key> [<value>]`** — flat `key = value` format, git-compatible priority chain for author identity (`SIT_AUTHOR_NAME` env → `.sit/config` → `~/.sitconfig` → `"sit user"` fallback). Get mode returns the value and exits 0; set mode upserts (replaces the first matching line or appends, preserving comments and blanks).
@@ -159,8 +171,7 @@
 
 ### Longer horizon
 
-- **Staging index into patra** — `index(path STR, hash STR, mode INT)` table. Fits current `COL_STR`/`COL_INT`, unblocks mutation semantics without the append-only-then-dedupe dance. Likely the first real patra consumer in sit.
-- **Objects into patra** — contingent on patra's `COL_BYTES` landing. Migrates sit off the loose-file object store; see [arch 002](../architecture/002-loose-objects-until-patra-bytes.md).
+- **Objects into patra** — `COL_BYTES` is live (patra 1.6.0). The last piece of arch 002's migration: move `.sit/objects/<xx>/<yy...>` loose files into a `objects(hash STR PRIMARY, type INT, content BYTES)` patra table. See [arch 002](../architecture/002-loose-objects-until-patra-bytes.md).
 - **Pack format** — delta-compressed multi-object storage; depends on `COL_BYTES` and sankoch delta primitives.
 - **Wire protocol** — first-party smart-HTTP / ssh replacement. Not on the AGNOS critical path; revisit once the local VCS loop is solid.
 - **Merge** — 3-way merge with conflict markers. Needs a merge-base finder (walk commit ancestors to find LCA) and per-file three-way text merge.
