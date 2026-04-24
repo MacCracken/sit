@@ -89,13 +89,22 @@
 - **`cmd_diff` path corrected**: early-return on empty index moved past the HEAD-deletion pass so `sit diff --staged` works even when every file is rm'd.
 - Verified against six scenarios: rm-untracked error, rm-tracked end-to-end (working + index + status + diff), commit-then-verify-tree-omits-file, `--cached` semantics (status correctly separates Staged-deleted from Untracked since HEAD still contains the on-disk file), rm of an already-manually-deleted file.
 
+### v0.1.10 — `.sitignore`
+
+- **`.sitignore`** at the repo root, read by `load_sitignore()`. Blank lines and `#`-comments are skipped; trailing `/` on a pattern is stripped (directory-only hints not enforced in v1).
+- **`glob_match(pat, name)`** — recursive single-segment glob matcher with `*` (any run) and `?` (exactly one char). Operates on a single segment so `*` never crosses `/`.
+- **`is_ignored(path, patterns)`** — segment-level check: a pattern without `/` matches any segment of the path. `build` ignores `build/`, `src/build/`, and `lib/build/foo.cyr` alike — simple and matches the 80% use case. Anchored (`/build`) and path-patterns (`src/build`) are v2.
+- **`list_working_walk` behavior change**: previously skipped all dotfiles blanket-style. Now only hardcodes `.sit/`; everything else is included unless matched by a pattern. Ignored *directories* aren't descended into (no wasted I/O on `node_modules`/`build`).
+- **`cmd_add`** now rejects ignored paths with `sit: '<path>' matches a .sitignore pattern` — git's behavior, without `-f` override yet.
+- **`.sitignore` is itself trackable** — not auto-ignored; users `sit add .sitignore` normally.
+- Verified against ten scenarios: dotfile visibility without `.sitignore`, `.env`/`build`/`*.log`/`*.tmp` ignore patterns, nested-dir non-recursion, `sit add` rejection, tree omits ignored files on commit, `*` boundary (`*.log` vs `logfile`), `?` single-char semantics, blank/comment lines, empty `.sitignore`.
+
 ## Post-0.1 Backlog
 
 ### Priority — correctness and noise floor (before branches)
 
 Branches on top of a VCS that can't record deletions or ignore `build/` is a shaky foundation. These land first:
 
-- **v0.1.10 — `.sitignore`.** Gitignore-style glob patterns, applied in `list_working_walk` and `sit add`. Without this, `sit status` in any non-trivial repo is noise. Probably supports just `*`, `?`, and literal segments + `/` anchoring in v1 — full gitignore semantics (negation, double-star) later.
 - **v0.1.11 — `sit diff HEAD`.** Working vs HEAD directly, skipping the index. Useful standalone, and it's the query owl will call per file when it wires up gutter markers for changed lines.
 
 ### Branches

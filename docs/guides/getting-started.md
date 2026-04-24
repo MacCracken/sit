@@ -226,11 +226,33 @@ Algorithm is classical LCS (longest common subsequence) — DP table capped at 1
 
 Output is the log-style header followed by the diff of that commit against its parent (root commits get new-file diffs for everything). Each file's diff goes through the same hunk-grouped renderer as `sit diff`, so you get `@@` headers and 3-line context automatically.
 
+## Ignore files with `.sitignore`
+
+Drop a `.sitignore` at the repo root to keep build artifacts, editor junk, and secrets out of status and commits:
+
+```
+# .sitignore — blank lines and comments are skipped
+.env
+build
+*.log
+*.tmp
+file?.bak
+```
+
+- Patterns are segment-matched: `build` ignores `build/`, `src/build/`, and `lib/build/foo.cyr`.
+- `*` matches any run of non-`/` chars; `?` matches exactly one. No `**` yet.
+- Trailing `/` on a pattern is allowed but not enforced (v1 doesn't restrict matches to directories).
+- `sit add <ignored>` errors out — like git, no `-f` override in v1.
+- `.sitignore` itself is trackable; `sit add .sitignore` works normally.
+
+**Note**: unlike older sit versions, dotfiles aren't hidden by default anymore — only `.sit/` is hardcoded-skipped. To keep `.git/` out of your sit repo when both coexist, list `.git` in your `.sitignore`.
+
 ## What works today
 
 - `sit init` — create empty repository
 - `sit add <path>` — hash, compress, and store a file as a blob object; append to staging index
 - `sit rm [--cached] <path>` — remove a tracked file from working tree + index (or just the index with `--cached`)
+- `.sitignore` — gitignore-style pattern file (at repo root) filters untracked-file display and `sit add`
 - `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
 - `sit log` — walk commit history from HEAD with git-style output
 - `sit status` — three-way diff across HEAD tree, staging index, and working directory

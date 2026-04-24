@@ -247,6 +247,14 @@ fn cmd_add() {
         return 1;
     }
 
+    var patterns = load_sitignore();
+    if (is_ignored(path, patterns) == 1) {
+        syscall(SYS_WRITE, STDERR, "sit: '", 6);
+        syscall(SYS_WRITE, STDERR, path, path_len);
+        syscall(SYS_WRITE, STDERR, "' matches a .sitignore pattern\n", 31);
+        return 1;
+    }
+
     var fd = file_open(path, 0, 0);
     if (fd < 0) {
         syscall(SYS_WRITE, STDERR, "sit: cannot open '", 18);
@@ -1296,10 +1304,113 @@ fn index_find(entries, path) {
     return 0;
 }
 
+# Glob match (single segment, no '/' crossing). Supports `*` (any run) and
+# `?` (single char). Recursive — pattern segments are short, no depth issue.
+fn glob_match(pat, pat_len, name, name_len) {
+    if (pat_len == 0) {
+        if (name_len == 0) { return 1; }
+        return 0;
+    }
+    var pc = load8(pat);
+    if (pc == 42) {
+        if (glob_match(pat + 1, pat_len - 1, name, name_len) == 1) { return 1; }
+        if (name_len == 0) { return 0; }
+        return glob_match(pat, pat_len, name + 1, name_len - 1);
+    }
+    if (name_len == 0) { return 0; }
+    if (pc == 63) {
+        return glob_match(pat + 1, pat_len - 1, name + 1, name_len - 1);
+    }
+    if (pc != load8(name)) { return 0; }
+    return glob_match(pat + 1, pat_len - 1, name + 1, name_len - 1);
+}
+
+# True if `path` is matched by any pattern. Each pattern is tested against
+# every path segment — a pattern like `build` matches `build/`, `src/build/`,
+# or `lib/build/foo.cyr`. First-match wins.
+fn is_ignored(path, patterns) {
+    if (patterns == 0) { return 0; }
+    var path_len = strlen(path);
+    var n = vec_len(patterns);
+    var i = 0;
+    while (i < n) {
+        var pat = vec_get(patterns, i);
+        var pat_len = strlen(pat);
+
+        var seg_start = 0;
+        var j = 0;
+        while (j <= path_len) {
+            var is_boundary = 0;
+            if (j == path_len) { is_boundary = 1; }
+            else { if (load8(path + j) == 47) { is_boundary = 1; } }
+            if (is_boundary == 1) {
+                var seg_len = j - seg_start;
+                if (seg_len > 0) {
+                    if (glob_match(pat, pat_len, path + seg_start, seg_len) == 1) {
+                        return 1;
+                    }
+                }
+                seg_start = j + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Read `.sitignore` into a vec of pattern cstrings. Blank lines and lines
+# starting with `#` are skipped. Trailing `/` on a pattern is stripped
+# (directory-only hints aren't enforced yet).
+fn load_sitignore() {
+    if (file_exists(".sitignore") != 1) { return 0; }
+    var pair[16];
+    if (read_file_heap(".sitignore", &pair) != 0) { return 0; }
+    var data = load64(&pair);
+    var len = load64(&pair + 8);
+
+    var patterns = vec_new();
+    var pos = 0;
+    while (pos < len) {
+        var line_end = pos;
+        while (line_end < len) {
+            if (load8(data + line_end) == 10) { break; }
+            line_end = line_end + 1;
+        }
+
+        var line_start = pos;
+        var line_stop = line_end;
+        if (line_stop > line_start) {
+            if (load8(data + line_stop - 1) == 13) { line_stop = line_stop - 1; }
+        }
+
+        var keep = 1;
+        if (line_stop == line_start) { keep = 0; }
+        else {
+            if (load8(data + line_start) == 35) { keep = 0; }
+        }
+
+        if (keep == 1) {
+            var p_len = line_stop - line_start;
+            if (p_len > 0) {
+                if (load8(data + line_start + p_len - 1) == 47) { p_len = p_len - 1; }
+            }
+            if (p_len > 0) {
+                var pat = alloc(p_len + 1);
+                memcpy(pat, data + line_start, p_len);
+                store8(pat + p_len, 0);
+                vec_push(patterns, pat);
+            }
+        }
+        pos = line_end + 1;
+    }
+    return patterns;
+}
+
 # Recursive working-dir walker. Entries are pushed as full repo-relative
-# paths ("src/main.cyr"). Dotfiles and dot-directories are skipped — this
-# includes `.sit/`, `.git/`, `.env`, etc.
-fn list_working_walk(prefix, fs_path, out) {
+# paths ("src/main.cyr"). Hardcoded skip: `.sit/`. Everything else is
+# included unless it matches a `.sitignore` pattern.
+fn list_working_walk(prefix, fs_path, out, patterns) {
     var raw = dir_list(str_from(fs_path));
     var n = vec_len(raw);
     var fs_path_len = strlen(fs_path);
@@ -1310,7 +1421,21 @@ fn list_working_walk(prefix, fs_path, out) {
         var sdata = str_data(s);
         var slen = str_len(s);
 
-        if (load8(sdata) != 46) {
+        var skip = 0;
+        if (slen == 4) {
+            if (memeq(sdata, ".sit", 4) == 1) { skip = 1; }
+        }
+
+        if (skip == 0) {
+            var rel_path_len = prefix_len + slen;
+            var rel_path = alloc(rel_path_len + 1);
+            memcpy(rel_path, prefix, prefix_len);
+            memcpy(rel_path + prefix_len, sdata, slen);
+            store8(rel_path + rel_path_len, 0);
+            if (is_ignored(rel_path, patterns) == 1) { skip = 1; }
+        }
+
+        if (skip == 0) {
             var child_fs = alloc(fs_path_len + 1 + slen + 1);
             memcpy(child_fs, fs_path, fs_path_len);
             store8(child_fs + fs_path_len, 47);
@@ -1323,7 +1448,7 @@ fn list_working_walk(prefix, fs_path, out) {
                 memcpy(new_prefix + prefix_len, sdata, slen);
                 store8(new_prefix + prefix_len + slen, 47);
                 store8(new_prefix + prefix_len + slen + 1, 0);
-                list_working_walk(new_prefix, child_fs, out);
+                list_working_walk(new_prefix, child_fs, out, patterns);
             }
             else {
                 var full_len = prefix_len + slen;
@@ -1341,7 +1466,8 @@ fn list_working_walk(prefix, fs_path, out) {
 
 fn list_working_files() {
     var files = vec_new();
-    list_working_walk("", ".", files);
+    var patterns = load_sitignore();
+    list_working_walk("", ".", files, patterns);
     return files;
 }
 
