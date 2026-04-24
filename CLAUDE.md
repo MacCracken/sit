@@ -24,7 +24,7 @@ Project was scaffolded with `cyrius init sit`. Do not manually create project st
 
 ## Current State
 
-- **Source**: `src/main.cyr` — subcommand dispatch; `init`, `add`, `commit`, `log`, `status`, `diff`, `cat-file`, `owl-file` implemented
+- **Source**: `src/main.cyr` — subcommand dispatch; `init`, `add`, `commit`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` implemented
 - **Tests**: `tests/sit.tcyr` smoke only; integration coverage is shell-level for now
 - **Binary**: `cyrius build src/main.cyr build/sit`
 - **Object writer**: single type-agnostic `write_typed_object(type, len, content, content_len)` drives blob, tree, and commit writes. SHA-256 via sigil, zlib via sankoch, loose storage at `.sit/objects/<hex[0:2]>/<hex[2:64]>`. Framing `"<type> <len>\0<content>"` is byte-compatible with git's SHA-256 object format for all three object types

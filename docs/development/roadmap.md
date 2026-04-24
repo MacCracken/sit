@@ -72,12 +72,20 @@
 - **`@@ -oldstart,oldlen +newstart,newlen @@`** headers emitted per hunk. `hunk_ranges` computes ranges by walking the hunk once (first-keep-or-delete → `old_start`; first-keep-or-insert → `new_start`; counts derive len). Pure-insertion hunks correctly print `-0,0` (new-file case).
 - Verified against six scenarios: mid-file single change, adjacent changes merged, far-apart changes split, start-of-file (0 leading context), end-of-file (0 trailing context), pure new-file insertion (`@@ -0,0 +1,N @@`).
 
+### v0.1.8 — `sit show`
+
+- **`sit show [<hash>]`** — prints a single commit: log-style header (author, date, indented message) + diff against parent. No-arg defaults to HEAD; accepts any hash prefix ≥ 4 chars via `resolve_hash`.
+- **Refactor**: extracted `parse_commit_body(body, len, out)` (56-byte struct: tree_hex, parent_hex, author identity + ts + tz, msg_start) and `print_commit_header(hex, info, body, len)` from the inline `cmd_log` logic. Both `cmd_log` and `cmd_show` now compose them.
+- **`commit_tree_entries(commit_hex)`** — loads a commit → its tree → flattened entries vec. Used for both "this commit's files" and "parent commit's files" in the diff pass.
+- **Diff pass**: walk new entries (emit new-file diff for paths missing from parent, modified diff for differing hashes) then walk old entries (emit deletion diff for paths missing from new). Each file goes through `print_file_diff` so hunk grouping applies uniformly.
+- Verified against seven scenarios: empty repo, root commit (new-file hunks, `@@ -0,0 +1,N @@`), modification commit (hunk-grouped diff), hash-prefix resolution, multi-file commit (two files, two diffs), bad hash, outside-repo.
+
 ## Post-0.1 Backlog
 
 ### Priority — the v0.2.0 loop
 
-- **`sit show <commit>`** — combines `cat-file` + diff-against-parent for a single commit. All primitives already in place; hunk-grouped diff from v0.1.7 provides the right output shape.
 - **HEAD-aware branch selection** — `sit commit` / `sit log` / `sit status` currently hardcode `refs/heads/main`. Needs HEAD parsing (`ref: refs/heads/<branch>`).
+- **Branches**: `sit branch [<name>]`, `sit checkout <name>`. First multi-ref feature — writes `.sit/refs/heads/<name>`, updates HEAD, materializes the branch's tree into the working directory.
 
 ### Working-tree visibility
 

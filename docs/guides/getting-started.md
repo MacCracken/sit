@@ -217,6 +217,15 @@ The diff walks each entry in the staging index:
 
 Algorithm is classical LCS (longest common subsequence) — DP table capped at 16M cells (≈128 MB). Files beyond that threshold print a "too large" notice and are skipped.
 
+## Show a single commit
+
+```sh
+/path/to/sit/build/sit show           # defaults to HEAD
+/path/to/sit/build/sit show 2b33d699  # 4-char-minimum hash prefix
+```
+
+Output is the log-style header followed by the diff of that commit against its parent (root commits get new-file diffs for everything). Each file's diff goes through the same hunk-grouped renderer as `sit diff`, so you get `@@` headers and 3-line context automatically.
+
 ## What works today
 
 - `sit init` — create empty repository
@@ -224,13 +233,13 @@ Algorithm is classical LCS (longest common subsequence) — DP table capped at 1
 - `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
 - `sit log` — walk commit history from HEAD with git-style output
 - `sit status` — three-way diff across HEAD tree, staging index, and working directory
-- `sit diff [--staged]` — line-level unified-ish diff (working vs index, or index vs HEAD)
+- `sit diff [--staged]` — unified diff with `@@` hunk headers (working vs index, or index vs HEAD)
+- `sit show [<hash>]` — show a single commit's header + parent-diff (defaults to HEAD)
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
 
 ## What doesn't yet
 
-- `sit show <commit>` — commit-at-a-glance with parent diff
 - HEAD-aware branch selection — `sit commit` / `sit log` / `sit status` always use `refs/heads/main`
 - Branch create/switch / `sit checkout`
 
