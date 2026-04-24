@@ -769,9 +769,12 @@ fn current_branch_name() {
 
 # Build and write a commit object. Returns hex hash or 0.
 fn build_commit(tree_hex, parent_hex, message) {
+    # Priority: env → .sit/config → ~/.sitconfig → fallback
     var name = getenv("SIT_AUTHOR_NAME");
+    if (name == 0) { name = config_get("user.name"); }
     if (name == 0) { name = "sit user"; }
     var email = getenv("SIT_AUTHOR_EMAIL");
+    if (email == 0) { email = config_get("user.email"); }
     if (email == 0) { email = "user@localhost"; }
     var ts = clock_epoch_secs();
 
@@ -820,6 +823,320 @@ fn build_commit(tree_hex, parent_hex, message) {
     }
 
     return write_typed_object("commit", 6, body, pos);
+}
+
+# Advance past any run of spaces or tabs in [pos, stop).
+fn skip_ws(data, pos, stop) {
+    var i = pos;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (i >= stop) { scanning = 0; }
+        else {
+            var c = load8(data + i);
+            if (c == 32) { i = i + 1; }
+            else {
+                if (c == 9) { i = i + 1; }
+                else { scanning = 0; }
+            }
+        }
+    }
+    return i;
+}
+
+# Parse a `key = value` line in [start, stop). Returns heap cstring value
+# if the key matches, else 0. Tolerates arbitrary whitespace and skips
+# `#`-comment / blank lines.
+fn config_parse_value(data, start, stop, key, key_len) {
+    var i = skip_ws(data, start, stop);
+    if (i >= stop) { return 0; }
+    if (load8(data + i) == 35) { return 0; }
+
+    if (stop - i < key_len) { return 0; }
+    if (memeq(data + i, key, key_len) == 0) { return 0; }
+    i = i + key_len;
+
+    i = skip_ws(data, i, stop);
+    if (i >= stop) { return 0; }
+    if (load8(data + i) != 61) { return 0; }
+    i = i + 1;
+
+    i = skip_ws(data, i, stop);
+
+    var end = stop;
+    var trimming = 1;
+    while (trimming == 1) {
+        if (end <= i) { trimming = 0; }
+        else {
+            var c = load8(data + end - 1);
+            if (c == 32) { end = end - 1; }
+            else {
+                if (c == 9) { end = end - 1; }
+                else { trimming = 0; }
+            }
+        }
+    }
+
+    var value_len = end - i;
+    var val = alloc(value_len + 1);
+    memcpy(val, data + i, value_len);
+    store8(val + value_len, 0);
+    return val;
+}
+
+# Look up `key` in a single config file. Returns heap cstring value or 0.
+fn config_file_get(path, key) {
+    if (file_exists(path) != 1) { return 0; }
+    var pair[16];
+    if (read_file_heap(path, &pair) != 0) { return 0; }
+    var data = load64(&pair);
+    var len = load64(&pair + 8);
+    var key_len = strlen(key);
+
+    var pos = 0;
+    while (pos < len) {
+        var le = pos;
+        var finding = 1;
+        while (finding == 1) {
+            if (le >= len) { finding = 0; }
+            else {
+                if (load8(data + le) == 10) { finding = 0; }
+                else { le = le + 1; }
+            }
+        }
+        var stop = le;
+        if (stop > pos) {
+            if (load8(data + stop - 1) == 13) { stop = stop - 1; }
+        }
+        var v = config_parse_value(data, pos, stop, key, key_len);
+        if (v != 0) { return v; }
+        pos = le + 1;
+    }
+    return 0;
+}
+
+# Look up `key` in .sit/config (local, higher precedence) then ~/.sitconfig.
+fn config_get(key) {
+    var v = config_file_get(".sit/config", key);
+    if (v != 0) { return v; }
+    var home = getenv("HOME");
+    if (home == 0) { return 0; }
+    var hlen = strlen(home);
+    var path = alloc(hlen + 12);
+    memcpy(path, home, hlen);
+    memcpy(path + hlen, "/.sitconfig", 11);
+    store8(path + hlen + 11, 0);
+    return config_file_get(path, key);
+}
+
+# Upsert `key = value` in a config file. Replaces the first matching line
+# or appends a new one. Returns 0 on success, negative on write failure.
+fn config_file_set(path, key, value) {
+    var key_len = strlen(key);
+    var val_len = strlen(value);
+
+    var data = 0;
+    var len = 0;
+    if (file_exists(path) == 1) {
+        var pair[16];
+        if (read_file_heap(path, &pair) == 0) {
+            data = load64(&pair);
+            len = load64(&pair + 8);
+        }
+    }
+
+    var out = alloc(len + key_len + val_len + 8);
+    var out_pos = 0;
+    var replaced = 0;
+
+    var pos = 0;
+    while (pos < len) {
+        var le = pos;
+        var finding = 1;
+        while (finding == 1) {
+            if (le >= len) { finding = 0; }
+            else {
+                if (load8(data + le) == 10) { finding = 0; }
+                else { le = le + 1; }
+            }
+        }
+        var stop = le;
+        if (stop > pos) {
+            if (load8(data + stop - 1) == 13) { stop = stop - 1; }
+        }
+
+        var v = config_parse_value(data, pos, stop, key, key_len);
+        if (v != 0) {
+            memcpy(out + out_pos, key, key_len);
+            out_pos = out_pos + key_len;
+            memcpy(out + out_pos, " = ", 3);
+            out_pos = out_pos + 3;
+            memcpy(out + out_pos, value, val_len);
+            out_pos = out_pos + val_len;
+            store8(out + out_pos, 10);
+            out_pos = out_pos + 1;
+            replaced = 1;
+        }
+        else {
+            var copy_len = le - pos;
+            if (le < len) { copy_len = copy_len + 1; }
+            memcpy(out + out_pos, data + pos, copy_len);
+            out_pos = out_pos + copy_len;
+        }
+        pos = le + 1;
+    }
+
+    if (replaced == 0) {
+        if (out_pos > 0) {
+            if (load8(out + out_pos - 1) != 10) {
+                store8(out + out_pos, 10);
+                out_pos = out_pos + 1;
+            }
+        }
+        memcpy(out + out_pos, key, key_len);
+        out_pos = out_pos + key_len;
+        memcpy(out + out_pos, " = ", 3);
+        out_pos = out_pos + 3;
+        memcpy(out + out_pos, value, val_len);
+        out_pos = out_pos + val_len;
+        store8(out + out_pos, 10);
+        out_pos = out_pos + 1;
+    }
+
+    if (file_write_all(path, out, out_pos) < 0) { return 0 - 1; }
+    return 0;
+}
+
+fn cmd_fsck() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    if (file_exists(".sit/objects") != 1) {
+        syscall(SYS_WRITE, STDOUT, "checked 0 objects, 0 bad\n", 25);
+        return 0;
+    }
+
+    var dirs = dir_list(str_from(".sit/objects"));
+    var total = 0;
+    var bad = 0;
+
+    var dn = vec_len(dirs);
+    var di = 0;
+    while (di < dn) {
+        var s = vec_get(dirs, di);
+        var sdata = str_data(s);
+        var slen = str_len(s);
+
+        if (slen == 2) {
+            var sub_path = alloc(16);
+            memcpy(sub_path, ".sit/objects/", 13);
+            memcpy(sub_path + 13, sdata, 2);
+            store8(sub_path + 15, 0);
+
+            var files = dir_list(str_from(sub_path));
+            var fn_ct = vec_len(files);
+            var fi = 0;
+            while (fi < fn_ct) {
+                var f = vec_get(files, fi);
+                var fdata = str_data(f);
+                var flen = str_len(f);
+
+                if (flen == 62) {
+                    var hex = alloc(65);
+                    memcpy(hex, sdata, 2);
+                    memcpy(hex + 2, fdata, 62);
+                    store8(hex + 64, 0);
+
+                    var obj[24];
+                    if (read_object(hex, &obj) == 0) {
+                        var buf = load64(&obj);
+                        var blen = load64(&obj + 8);
+                        var actual = hash_data(buf, blen);
+                        if (streq(hex, actual) == 0) {
+                            syscall(SYS_WRITE, STDERR, "bad object ", 11);
+                            syscall(SYS_WRITE, STDERR, hex, 64);
+                            syscall(SYS_WRITE, STDERR, "\n", 1);
+                            bad = bad + 1;
+                        }
+                        total = total + 1;
+                    }
+                    else {
+                        syscall(SYS_WRITE, STDERR, "unreadable ", 11);
+                        syscall(SYS_WRITE, STDERR, hex, 64);
+                        syscall(SYS_WRITE, STDERR, "\n", 1);
+                        bad = bad + 1;
+                    }
+                }
+                fi = fi + 1;
+            }
+        }
+        di = di + 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "checked ", 8);
+    write_unsigned(total);
+    syscall(SYS_WRITE, STDOUT, " objects, ", 10);
+    write_unsigned(bad);
+    syscall(SYS_WRITE, STDOUT, " bad\n", 5);
+
+    if (bad > 0) { return 1; }
+    return 0;
+}
+
+fn cmd_config() {
+    var global = 0;
+    var arg_base = 2;
+    if (argc() >= 3) {
+        if (streq(argv(2), "--global") == 1) {
+            global = 1;
+            arg_base = 3;
+        }
+    }
+
+    if (argc() < arg_base + 1) {
+        eprintln("usage: sit config [--global] <key> [<value>]");
+        return 1;
+    }
+    var key = argv_heap(arg_base);
+
+    var path = 0;
+    if (global == 1) {
+        var home = getenv("HOME");
+        if (home == 0) {
+            eprintln("sit: HOME not set");
+            return 1;
+        }
+        var hlen = strlen(home);
+        path = alloc(hlen + 12);
+        memcpy(path, home, hlen);
+        memcpy(path + hlen, "/.sitconfig", 11);
+        store8(path + hlen + 11, 0);
+    }
+    else {
+        if (file_exists(".sit/HEAD") != 1) {
+            eprintln("sit: not a sit repository (run 'sit init')");
+            return 1;
+        }
+        path = ".sit/config";
+    }
+
+    if (argc() < arg_base + 2) {
+        var val = 0;
+        if (global == 1) { val = config_file_get(path, key); }
+        else             { val = config_get(key); }
+        if (val == 0) { return 1; }
+        syscall(SYS_WRITE, STDOUT, val, strlen(val));
+        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        return 0;
+    }
+
+    var value = argv_heap(arg_base + 1);
+    if (config_file_set(path, key, value) < 0) {
+        eprintln("sit: failed to write config");
+        return 1;
+    }
+    return 0;
 }
 
 fn sort_cstrings(vec) {
@@ -2623,6 +2940,8 @@ fn print_usage() {
     eprintln("  rm [--cached] <path>    remove a tracked file from working tree and index");
     eprintln("  branch [<name>]         list branches, or create one at HEAD");
     eprintln("  checkout <branch>       switch to <branch>, updating working tree + index");
+    eprintln("  config [--global] <key> [<value>]  read or write a config value");
+    eprintln("  fsck                    verify object integrity (sha-256 vs filename)");
     eprintln("  commit [-m] <message>   record staged changes as a new commit");
     eprintln("  log                     show commit history from HEAD");
     eprintln("  status                  show working tree status");
@@ -2649,6 +2968,8 @@ fn main() {
     if (streq(cmd, "rm")       == 1) { return cmd_rm(); }
     if (streq(cmd, "branch")   == 1) { return cmd_branch(); }
     if (streq(cmd, "checkout") == 1) { return cmd_checkout(); }
+    if (streq(cmd, "config")   == 1) { return cmd_config(); }
+    if (streq(cmd, "fsck")     == 1) { return cmd_fsck(); }
     if (streq(cmd, "commit")   == 1) { return cmd_commit(); }
     if (streq(cmd, "log")      == 1) { return cmd_log(); }
     if (streq(cmd, "status")   == 1) { return cmd_status(); }

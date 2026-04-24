@@ -132,18 +132,29 @@
 - **`set_head_ref(ref_path)`** — writes `ref: <ref_path>\n` to `.sit/HEAD`. Used by checkout; probably also by future `sit checkout -b`.
 - Verified against 13 scenarios: empty-branch-list (no commits), list-with-just-main, create-dev, checkout dev (materialize), checkout main (cleanup dev-only files), roundtrip, dirty blocking, clean allows, bad-branch error, dup-branch error, untracked collision, nested-dir create/delete across branches, log-follows-active-branch.
 
+### v0.2.2 — `sit config` + `sit fsck`
+
+- **`sit config [--global] <key> [<value>]`** — flat `key = value` format, git-compatible priority chain for author identity (`SIT_AUTHOR_NAME` env → `.sit/config` → `~/.sitconfig` → `"sit user"` fallback). Get mode returns the value and exits 0; set mode upserts (replaces the first matching line or appends, preserving comments and blanks).
+- **`config_parse_value`, `config_file_get`, `config_get`, `config_file_set`** helpers — the file walker tolerates arbitrary whitespace around `=`, skips `#`-comments and blanks, preserves surrounding lines on write. `skip_ws(data, pos, stop)` utility for whitespace runs.
+- **`build_commit` author fallback chain updated** — env first (matches git), then config, then the hardcoded fallback.
+- Verified against nine scenarios: missing-key exit 1, set-then-get, set-existing-replaces, commit uses config when env unset, env overrides config, `--global` set/get, local-beats-global, comments+blanks preserved through set, usage error.
+- **`sit fsck`** — walks every `.sit/objects/<xx>/<yy...>`, decompresses, re-hashes via `hash_data` over the framed bytes, compares to the filename. Reports `bad object <hex>` for hash mismatches and `unreadable <hex>` for decompression / read failures. Exit 1 if any bad object found. Emits `checked <n> objects, <m> bad` summary on stdout.
+- Verified against four scenarios: empty repo (0 objects), populated repo (8 objects clean after two commits), corrupted object (GARBAGE overwrite detected as unreadable), missing object file (detected).
+
 ## Post-0.1 Backlog
 
 ### Longer horizon
 
-- **`sit config`** — `.sit/config` + `~/.sitconfig` replacing env-var-only author identity. TOML-ish, reuse `cyml.cyr` parser if applicable.
 - **Staging index into patra** — `index(path STR, hash STR, mode INT)` table. Fits current `COL_STR`/`COL_INT`, unblocks mutation semantics without the append-only-then-dedupe dance. Likely the first real patra consumer in sit.
 - **Objects into patra** — contingent on patra's `COL_BLOB` landing. Migrates sit off the loose-file object store; see [arch 002](../architecture/002-loose-objects-until-patra-blobs.md).
 - **Pack format** — delta-compressed multi-object storage; depends on `COL_BLOB` and sankoch delta primitives.
 - **Wire protocol** — first-party smart-HTTP / ssh replacement. Not on the AGNOS critical path; revisit once the local VCS loop is solid.
+- **Merge** — 3-way merge with conflict markers. Needs a merge-base finder (walk commit ancestors to find LCA) and per-file three-way text merge.
+- **Tags** — lightweight refs in `.sit/refs/tags/`. Analogous to branches but immutable.
 - **Signed commits** — sigil-backed signatures on commit objects.
-- **`sit fsck`** — verify object hashes, walk commit chain, report corruption.
 - **Integration tests in-tree** — promote the shell-level smoke tests from `docs/guides/getting-started.md` into `tests/` with fixtures. Current `tests/sit.tcyr` is stdlib-assert smoke only.
-- **Hunk-grouping polish** — collapse stretches of context between changes in per-hunk output further; handle the `@@ -N +N,M @@` one-line-count abbreviation.
+- **`sit fsck` reachability** — walk commit chain, flag dangling objects (current v0.2.2 only checks integrity, not reachability).
+- **Hunk-grouping polish** — handle the `@@ -N +N,M @@` one-line-count abbreviation.
 - **`sit add -f`** — force-add an ignored path (currently rejected without override).
+- **`sit checkout -b <name>`** — create-and-switch convenience (currently `sit branch <n> && sit checkout <n>`).
 - **Full `.sitignore` semantics** — negation (`!pattern`), double-star (`**`), character classes (`[abc]`), anchored patterns (`/foo`), path patterns (`foo/bar`).

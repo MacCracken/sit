@@ -254,6 +254,8 @@ file?.bak
 - `sit rm [--cached] <path>` — remove a tracked file from working tree + index (or just the index with `--cached`)
 - `sit branch [<name>]` — list branches, or create one at HEAD
 - `sit checkout <branch>` — switch branches: materializes the target tree into the working directory, rewrites the index, updates HEAD
+- `sit config [--global] <key> [<value>]` — read/write config entries (`user.name`, `user.email`, etc). Local at `.sit/config`, global at `~/.sitconfig`
+- `sit fsck` — verify that each stored object's content hashes back to its filename
 - `.sitignore` — gitignore-style pattern file (at repo root) filters untracked-file display and `sit add`
 - `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
 - `sit log` — walk commit history from HEAD with git-style output
@@ -265,9 +267,9 @@ file?.bak
 
 ## What doesn't yet
 
-- `sit config` (author identity is env-var-only)
 - Remote / push / pull / fetch / wire protocol
-- `sit fsck`, merge, rebase, tags
+- Merge, rebase, tags
 - `sit checkout -b <name>` convenience (use `sit branch <name>` then `sit checkout <name>`)
+- Full gitignore semantics (no negation / `**` / char-classes yet)
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).
