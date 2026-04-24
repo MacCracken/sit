@@ -230,6 +230,7 @@ Output is the log-style header followed by the diff of that commit against its p
 
 - `sit init` — create empty repository
 - `sit add <path>` — hash, compress, and store a file as a blob object; append to staging index
+- `sit rm [--cached] <path>` — remove a tracked file from working tree + index (or just the index with `--cached`)
 - `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
 - `sit log` — walk commit history from HEAD with git-style output
 - `sit status` — three-way diff across HEAD tree, staging index, and working directory

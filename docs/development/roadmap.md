@@ -80,12 +80,37 @@
 - **Diff pass**: walk new entries (emit new-file diff for paths missing from parent, modified diff for differing hashes) then walk old entries (emit deletion diff for paths missing from new). Each file goes through `print_file_diff` so hunk grouping applies uniformly.
 - Verified against seven scenarios: empty repo, root commit (new-file hunks, `@@ -0,0 +1,N @@`), modification commit (hunk-grouped diff), hash-prefix resolution, multi-file commit (two files, two diffs), bad hash, outside-repo.
 
+### v0.1.9 — `sit rm` + staged deletions
+
+- **`sit rm [--cached] <path>`** — removes `<path>` from the staging index and (unless `--cached`) from the working tree. Errors with `'<path>' is not tracked` if the path is neither in the index nor HEAD's tree.
+- **`rewrite_index(entries)`** — truncates and re-serializes `.sit/index` from a vec of entries. Handles the zero-entries case by writing an empty file. First index-mutating helper; opens the door for future unstage/reset commands.
+- **`cmd_status` HEAD-walk**: files in HEAD but not in the index now render as `Staged for commit: deleted: <path>`. Covers both `sit rm <path>` (working also gone) and `sit rm --cached <path>` (working retained but untracked, HEAD entry triggers the flag).
+- **`cmd_diff --staged` HEAD-walk**: same logic, emits full-file `@@ -1,N +0,0 @@` deletion diffs for index-absent HEAD paths.
+- **`cmd_diff` path corrected**: early-return on empty index moved past the HEAD-deletion pass so `sit diff --staged` works even when every file is rm'd.
+- Verified against six scenarios: rm-untracked error, rm-tracked end-to-end (working + index + status + diff), commit-then-verify-tree-omits-file, `--cached` semantics (status correctly separates Staged-deleted from Untracked since HEAD still contains the on-disk file), rm of an already-manually-deleted file.
+
 ## Post-0.1 Backlog
 
-### Priority — the v0.2.0 loop
+### Priority — correctness and noise floor (before branches)
 
-- **HEAD-aware branch selection** — `sit commit` / `sit log` / `sit status` currently hardcode `refs/heads/main`. Needs HEAD parsing (`ref: refs/heads/<branch>`).
-- **Branches**: `sit branch [<name>]`, `sit checkout <name>`. First multi-ref feature — writes `.sit/refs/heads/<name>`, updates HEAD, materializes the branch's tree into the working directory.
+Branches on top of a VCS that can't record deletions or ignore `build/` is a shaky foundation. These land first:
+
+- **v0.1.10 — `.sitignore`.** Gitignore-style glob patterns, applied in `list_working_walk` and `sit add`. Without this, `sit status` in any non-trivial repo is noise. Probably supports just `*`, `?`, and literal segments + `/` anchoring in v1 — full gitignore semantics (negation, double-star) later.
+- **v0.1.11 — `sit diff HEAD`.** Working vs HEAD directly, skipping the index. Useful standalone, and it's the query owl will call per file when it wires up gutter markers for changed lines.
+
+### Branches
+
+- **v0.2.0 — HEAD-aware branch selection.** `sit commit` / `sit log` / `sit status` currently hardcode `refs/heads/main`. Parse `.sit/HEAD` as `ref: refs/heads/<branch>` and use that branch's ref. Prerequisite for anything multi-branch.
+- **v0.2.1 — `sit branch [<name>]` + `sit checkout <name>`.** First multi-ref feature. Writes `.sit/refs/heads/<name>`, updates HEAD, materializes the branch's tree into the working directory.
+
+### Longer horizon
+
+- **Staging index into patra** — `index(path STR, hash STR, mode INT)`. Unblocks mutation semantics without append-only hacks.
+- **Objects into patra** — contingent on patra's `COL_BLOB` (tracked on patra's roadmap).
+- **Wire protocol** — first-party smart-HTTP / ssh replacement. Not on AGNOS critical path.
+- **Signed commits** — sigil-backed commit-object signatures.
+- **`sit fsck`** — verify object hashes, walk commit chain, report corruption.
+- **Integration tests in-tree** — promote the shell smoke tests from `docs/guides/getting-started.md` into `tests/` with fixtures.
 
 ### Working-tree visibility
 
