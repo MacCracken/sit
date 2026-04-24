@@ -205,7 +205,13 @@ fn cmd_key_generate() {
     }
     # sk layout is seed||pk; store only the 32-byte seed (hex).
     var seed_hex = hex_encode(&sk, 32);
-    var fd = sys_open(priv_path, O_WRONLY | O_CREAT | O_TRUNC, 0x180);
+    # S-12: O_EXCL closes the symlink-plant TOCTOU between the
+    # file_exists() check above and this open. O_EXCL is 0x80 on Linux.
+    if (path_is_symlink(priv_path) == 1) {
+        eprintln("sit: refusing to overwrite symlink at signing key path");
+        return 1;
+    }
+    var fd = sys_open(priv_path, O_WRONLY | O_CREAT | O_TRUNC | 0x80, 0x180);
     if (fd < 0) { eprintln("sit: cannot write signing key"); return 1; }
     syscall(SYS_WRITE, fd, seed_hex, 64);
     syscall(SYS_WRITE, fd, "\n", 1);

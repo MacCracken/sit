@@ -77,8 +77,6 @@ fn build_commit_signed(tree_hex, parent_hex, message, seed) {
     return write_typed_object("commit", 6, body, pos);
 }
 
-
-
 fn is_ancestor(ancestor_hex, descendant_hex) {
     if (streq(ancestor_hex, descendant_hex) == 1) { return 1; }
 
@@ -110,13 +108,18 @@ fn materialize_target(target_hex) {
     var curr_entries = read_head_tree_entries();
     if (curr_entries == 0) { curr_entries = vec_new(); }
 
+    # S-03 belt-and-suspenders: `flatten_tree` concatenates prefix + name, so
+    # even if parse_tree screened each component, a pre-existing bogus tree
+    # in the local store still needs gating before we act on its paths.
     var cn = vec_len(curr_entries);
     var ci = 0;
     while (ci < cn) {
         var ce = vec_get(curr_entries, ci);
         var cpath = tree_entry_name(ce);
-        if (tree_find(target_entries, cpath) == 0) {
-            if (file_exists(cpath) == 1) { sys_unlink(cpath); }
+        if (tree_flat_path_valid(cpath) == 1) {
+            if (tree_find(target_entries, cpath) == 0) {
+                if (file_exists(cpath) == 1) { sys_unlink(cpath); }
+            }
         }
         ci = ci + 1;
     }
@@ -127,10 +130,20 @@ fn materialize_target(target_hex) {
         var te = vec_get(target_entries, ti);
         var tpath = tree_entry_name(te);
         var thex = tree_entry_hash(te);
-        ensure_dirs_for(tpath);
-        var tp[16];
-        if (read_blob_content(thex, &tp) == 0) {
-            file_write_all(tpath, load64(&tp), load64(&tp + 8));
+        if (tree_flat_path_valid(tpath) == 0) {
+            # Silently skip rather than abort — materialize runs over many
+            # paths and we want the valid ones to land. Emit to stderr so
+            # operator knows something was filtered.
+            syscall(SYS_WRITE, STDERR, "sit: refusing unsafe tree path: ", 32);
+            syscall(SYS_WRITE, STDERR, tpath, strlen(tpath));
+            syscall(SYS_WRITE, STDERR, "\n", 1);
+        }
+        else {
+            ensure_parent_dirs(tpath);
+            var tp[16];
+            if (read_blob_content(thex, &tp) == 0) {
+                file_write_all(tpath, load64(&tp), load64(&tp + 8));
+            }
         }
         ti = ti + 1;
     }
@@ -141,16 +154,18 @@ fn materialize_target(target_hex) {
         var te = vec_get(target_entries, ti);
         var tpath = tree_entry_name(te);
         var thex = tree_entry_hash(te);
-        var bytes = hex_decode(thex, 64);
-        if (bytes != 0) {
-            var entry = alloc(40);
-            memcpy(entry, bytes, 32);
-            var plen = strlen(tpath);
-            var pcopy = alloc(plen + 1);
-            memcpy(pcopy, tpath, plen);
-            store8(pcopy + plen, 0);
-            store64(entry + 32, pcopy);
-            vec_push(new_index, entry);
+        if (tree_flat_path_valid(tpath) == 1) {
+            var bytes = hex_decode(thex, 64);
+            if (bytes != 0) {
+                var entry = alloc(40);
+                memcpy(entry, bytes, 32);
+                var plen = strlen(tpath);
+                var pcopy = alloc(plen + 1);
+                memcpy(pcopy, tpath, plen);
+                store8(pcopy + plen, 0);
+                store64(entry + 32, pcopy);
+                vec_push(new_index, entry);
+            }
         }
         ti = ti + 1;
     }
@@ -316,7 +331,10 @@ fn print_commit_header(commit_hex, info, body, body_len) {
     if (ident != 0) {
         var ts = load64(info + 24);
         syscall(SYS_WRITE, STDOUT, "Author: ", 8);
-        syscall(SYS_WRITE, STDOUT, ident, strlen(ident));
+        # S-21: author identity is attacker-controlled in a cloned commit.
+        # Scrub control chars so a crafted commit can't forge log lines
+        # via \r\n or drive terminal-escape attacks via \x1b[.
+        write_sanitized(STDOUT, ident, strlen(ident));
         syscall(SYS_WRITE, STDOUT, "\n", 1);
         var iso = iso8601(ts);
         syscall(SYS_WRITE, STDOUT, "Date:   ", 8);
@@ -331,7 +349,6 @@ fn print_commit_header(commit_hex, info, body, body_len) {
     }
     return 0;
 }
-
 
 # Print a one-line summary of a commit: "<hex12> <first line of message>".
 fn print_commit_oneline(commit_hex, body, body_len, msg_start) {

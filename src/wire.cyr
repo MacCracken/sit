@@ -40,9 +40,25 @@ fn remote_objects_path(repo_path) {
 }
 
 # Open (or create) a patra objects DB at `<repo_path>/.sit/objects.patra`.
+# S-04: refuse to follow a symlink at either `.sit/` or the patra file itself.
+# Blocks the CVE-2023-22490 shape where a malicious remote's .sit points at
+# /etc/shadow or similar.
 fn remote_objects_open(repo_path) {
     patra_init();
+    var rl = strlen(repo_path);
+    var sit_dir = alloc(rl + 6);
+    memcpy(sit_dir, repo_path, rl);
+    memcpy(sit_dir + rl, "/.sit", 5);
+    store8(sit_dir + rl + 5, 0);
+    if (path_is_symlink(sit_dir) == 1) {
+        eprintln("sit: refusing to follow symlink at remote's .sit/");
+        return 0;
+    }
     var p = remote_objects_path(repo_path);
+    if (path_is_symlink(p) == 1) {
+        eprintln("sit: refusing to follow symlink at remote's .sit/objects.patra");
+        return 0;
+    }
     var db = patra_open(p);
     if (db == 0) { return 0; }
     patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
@@ -96,13 +112,24 @@ fn db_object_read_decompressed(db, hex, out) {
     if (db_object_read_raw(db, hex, &raw) != 0) { return 0 - 1; }
     var compressed = load64(&raw);
     var clen = load64(&raw + 8);
-    var dec_cap = clen * 256;
+    # S-08: 16× multiplier with one retry at the 16 MiB ceiling. Matches
+    # read_object's policy so reachability walks and local reads see the
+    # same failure modes.
+    var dec_cap = clen * 16;
     if (dec_cap < 4096) { dec_cap = 4096; }
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
     var decompressed = alloc(dec_cap);
     if (decompressed == 0) { return 0 - 2; }
     var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
-    if (dlen <= 0) { return 0 - 3; }
+    if (dlen <= 0) {
+        if (dec_cap < 16 * 1024 * 1024) {
+            dec_cap = 16 * 1024 * 1024;
+            decompressed = alloc(dec_cap);
+            if (decompressed == 0) { return 0 - 2; }
+            dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+        }
+        if (dlen <= 0) { return 0 - 3; }
+    }
     var nul = 0;
     while (nul < dlen) {
         if (load8(decompressed + nul) == 0) { break; }
@@ -138,7 +165,15 @@ fn db_object_insert_raw(db, hex, type_code, compressed, clen) {
 
 # Walk every object reachable from `root_commit_hex` in `src_db` and append
 # each object's hex hash to `out`. Uses `seen` (map_new) for dedup.
+# S-14: depth cap via module-level counter; same limit as flatten_tree.
+var _WIRE_MAX_DEPTH = 256;
+var _wire_walk_depth = 0;
+
 fn walk_reachable_tree(src_db, tree_hex, out, seen) {
+    if (_wire_walk_depth >= _WIRE_MAX_DEPTH) {
+        eprintln("sit: remote tree depth exceeds 256 — refusing to walk further");
+        return 0;
+    }
     if (map_has(seen, tree_hex) == 1) { return 0; }
     map_set(seen, tree_hex, 1);
     var hex_copy = alloc(65);
@@ -146,8 +181,12 @@ fn walk_reachable_tree(src_db, tree_hex, out, seen) {
     store8(hex_copy + 64, 0);
     vec_push(out, hex_copy);
 
+    _wire_walk_depth = _wire_walk_depth + 1;
     var obj[24];
-    if (db_object_read_decompressed(src_db, tree_hex, &obj) != 0) { return 0; }
+    if (db_object_read_decompressed(src_db, tree_hex, &obj) != 0) {
+        _wire_walk_depth = _wire_walk_depth - 1;
+        return 0;
+    }
     var buf = load64(&obj);
     var blen = load64(&obj + 8);
     var coff = load64(&obj + 16);
@@ -172,6 +211,7 @@ fn walk_reachable_tree(src_db, tree_hex, out, seen) {
         }
         i = i + 1;
     }
+    _wire_walk_depth = _wire_walk_depth - 1;
     return 0;
 }
 
@@ -244,9 +284,16 @@ fn read_remote_ref(repo_path, branch) {
     memcpy(p + rl + 17, branch, bl);
     store8(p + rl + 17 + bl, 0);
     if (file_exists(p) != 1) { return 0; }
+    # S-04 belt-and-suspenders: refuse symlinks at the ref file itself.
+    if (path_is_symlink(p) == 1) {
+        eprintln("sit: refusing to follow symlink at remote ref file");
+        return 0;
+    }
     var buf = alloc(128);
     var n = file_read_all(p, buf, 128);
     if (n < 64) { return 0; }
+    # S-11: validate hex before treating the bytes as a hash.
+    if (hex_prefix_valid(buf, 64) == 0) { return 0; }
     var out = alloc(65);
     memcpy(out, buf, 64);
     store8(out + 64, 0);
@@ -270,22 +317,26 @@ fn write_remote_ref(repo_path, branch, hex) {
 
 # Write 65-byte hex to `.sit/refs/remotes/<remote>/<branch>`.
 fn write_remote_tracking(remote, branch, hex) {
-    var dir = alloc(128);
-    memcpy(dir, ".sit/refs/remotes", 17);
-    store8(dir + 17, 0);
-    ensure_dir(dir);
+    # S-02 / S-26: branch came from the remote's advertisement — validate
+    # before it becomes a filesystem path. S-13: size the staging buffer
+    # from the actual lengths rather than a fixed 128 bytes.
+    if (refname_valid(remote) == 0) { return 0 - 1; }
+    if (refname_valid(branch) == 0) { return 0 - 1; }
     var rl = strlen(remote);
-    memcpy(dir + 17, "/", 1);
+    var bl = strlen(branch);
+    var dir = alloc(18 + rl + 1);
+    memcpy(dir, ".sit/refs/remotes/", 18);
     memcpy(dir + 18, remote, rl);
     store8(dir + 18 + rl, 0);
+    ensure_dir(".sit/refs/remotes");
     ensure_dir(dir);
-    var bl = strlen(branch);
-    var p = alloc(32 + rl + bl);
+    var p = alloc(18 + rl + 1 + bl + 1);
     memcpy(p, ".sit/refs/remotes/", 18);
     memcpy(p + 18, remote, rl);
     memcpy(p + 18 + rl, "/", 1);
     memcpy(p + 18 + rl + 1, branch, bl);
     store8(p + 18 + rl + 1 + bl, 0);
+    ensure_parent_dirs(p);
     var buf = alloc(66);
     memcpy(buf, hex, 64);
     store8(buf + 64, 10);
@@ -331,6 +382,17 @@ fn cmd_remote_add() {
     }
     var name = argv_heap(3);
     var url = argv_heap(4);
+    # S-02: remote name becomes a config-key fragment and part of the
+    # .sit/refs/remotes/<name>/... path. Same grammar as a branch.
+    if (refname_valid(name) == 0) {
+        eprintln("sit: invalid remote name (see git check-ref-format rules)");
+        return 1;
+    }
+    # S-04: v0.6.0 accepts only local-path URLs.
+    if (remote_url_valid(url) == 0) {
+        eprintln("sit: invalid or unsupported remote URL (file:// or absolute/relative path only in v0.6)");
+        return 1;
+    }
     var nlen = strlen(name);
     var key = alloc(nlen + 12);
     memcpy(key, "remote.", 7);
@@ -574,6 +636,12 @@ fn cmd_clone() {
         return 1;
     }
     var url = argv_heap(2);
+    # S-04: reject unknown schemes up-front so we fail cleanly instead of
+    # trying to open `http://…` as a filesystem path.
+    if (remote_url_valid(url) == 0) {
+        eprintln("sit: invalid or unsupported clone URL (file:// or absolute/relative path only in v0.6)");
+        return 1;
+    }
 
     var target = 0;
     if (argc() >= 4) { target = argv_heap(3); }
@@ -600,6 +668,19 @@ fn cmd_clone() {
         store8(target + tlen, 0);
     }
 
+    # S-04: if target already exists, make sure it's a directory and not a
+    # symlink pointing somewhere surprising.
+    var existing_kind = path_lstat_kind(target);
+    if (existing_kind >= 0) {
+        if (existing_kind == 0xA000) {
+            eprintln("sit: target path is a symlink — refusing to clone into it");
+            return 1;
+        }
+        if (existing_kind != 0x4000) {
+            eprintln("sit: target exists and is not a directory");
+            return 1;
+        }
+    }
     if (ensure_dir(target) != 0) {
         eprintln("sit: cannot create target directory");
         return 1;

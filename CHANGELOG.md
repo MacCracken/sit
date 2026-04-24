@@ -4,6 +4,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-04-24
+
+Security hardening release. All CRITICAL + HIGH findings from the 2026-04-24 P(-1) audit ([`docs/audit/2026-04-24-audit.md`](docs/audit/2026-04-24-audit.md)) are fixed. Network transport work (originally planned for 0.6.0) moves to v0.7.0.
+
+### Security
+
+- **S-01** — `hex_prefix_valid` gate in `resolve_hash` rejects any non-hex character before interpolation into `LIKE '<prefix>%'`. Closes SQL-injection via `sit cat-file "abc' OR 1=1 --"`.
+- **S-02 / S-26** — `refname_valid` enforces the full [`git check-ref-format`](https://git-scm.com/docs/git-check-ref-format) grammar. Wired into `cmd_branch`, `cmd_tag` create, `cmd_checkout -b`, `cmd_remote_add`, and `write_remote_tracking` (fetch-receive side). A malicious remote advertising a branch named `../../../etc/cron.d/x` can no longer poison `.sit/refs/remotes/`.
+- **S-03** — `tree_entry_name_valid` + `tree_flat_path_valid` + `tree_entry_mode_valid` gate tree objects at two boundaries. `parse_tree` drops invalid entries inline; `materialize_target` second-gates flattened paths before `file_write_all` / `sys_unlink` / `ensure_parent_dirs`. Mode allowlist accepts only `100644` and `40000`. Closes the CVE-2018-11235 / CVE-2019-1352 / CVE-2024-32002 shape for `sit clone` of a malicious repo.
+- **S-04** — Local-clone symlink guards via `path_is_symlink` (newfstatat with `AT_SYMLINK_NOFOLLOW`). `remote_objects_open` refuses if `<repo>/.sit` or `<repo>/.sit/objects.patra` is a symlink. `read_remote_ref` refuses symlinked ref files. `cmd_clone` refuses to clone into an existing symlink target. Closes the CVE-2023-22490 shape.
+- **S-05** — `config_value_valid` + `config_key_valid` reject `\n`, `\r`, `\0`, control chars, and oversized values in `config_file_set`. Closes the CVE-2023-29007 / CVE-2025-48384 config-line-injection primitive.
+- **S-06** — File-size caps: `sit add` refuses files >1 GiB (prevents `sit add /dev/zero` OOM); `read_file_heap` refuses >64 MiB (config/ref files stay sane).
+- **S-07** — LCS dimensions pre-checked against `sqrt(cap)` before multiplying, preventing `cells = (n1+1) * (n2+1)` integer overflow that would bypass the existing 16M-cell cap and under-allocate the DP table.
+- **S-08** — Decompression caps tightened from 256× to 16× with a single retry at the 16 MiB ceiling. Applies to `read_object`, `db_object_read_decompressed`, and the loose-file migration path. Reduces the per-object memory footprint of attacker-controlled decompression by 16×.
+- **S-09** — Owl path resolution honors `$SIT_OWL` env var before the hard-coded fallbacks (`/usr/local/bin/owl` → `/usr/bin/owl` → `/opt/owl/bin/owl`).
+- **S-10** — `sit owl-file` tempfiles land in `$XDG_RUNTIME_DIR` (or `$HOME/.cache/sit/` fallback), opened with `O_CREAT | O_EXCL | O_WRONLY` + mode 0600. Closes the /tmp symlink-plant TOCTOU and the world-readable info-leak.
+- **S-11** — Every ref-file reader (`resolve_ref_name` tag/head/remote paths, `read_head_ref`, `read_remote_ref`) validates the first 64 bytes are hex before returning. Corrupt or hostile ref files are treated as "no such ref" instead of flowing garbage downstream.
+- **S-12** — `cmd_key_generate` opens `~/.sit/signing_key` with `O_EXCL` and pre-checks `path_is_symlink`. Closes the TOCTOU where another local user could symlink-plant between the `file_exists` check and the open.
+- **S-13** — `write_remote_tracking` sizes staging buffers from actual remote/branch name lengths instead of a fixed 128 bytes. Closes a long-remote-name heap overflow.
+- **S-14** — Recursion depth capped at 256 for both `flatten_tree` (local) and `walk_reachable_tree` (remote). Closes stack-overflow DoS on crafted object sets with deep subtree nesting.
+- **S-15** — `glob_match` pattern length capped at 256 bytes. Closes the O(2^N) recursion DoS via crafted `.sitignore` patterns.
+- **S-21** — Author identity bytes sanitized before writing to stdout via a new `write_sanitized` helper in util.cyr. Control chars (`< 0x20` except tab) and `\x7f` replaced with `?`. Closes the terminal-escape / log-line-forgery vector.
+
+### Added
+
+- **`src/validate.cyr`** — new module housing all input validators. Pure functions, no side effects. Callers decide error messages and disposition.
+  - `hex_prefix_valid`, `refname_valid`, `tree_entry_name_valid`, `tree_flat_path_valid`, `tree_entry_mode_valid`, `config_value_valid`, `config_key_valid`, `remote_url_valid`
+  - `path_is_symlink`, `path_lstat_kind` — `newfstatat`-based primitives for symlink / file-type checks without follow.
+- **`src/util.cyr`** grew `write_sanitized(fd, bytes, len)` for the S-21 output escape filter.
+- **Test coverage**: `tests/sit.tcyr` grew 70 new assertions across six `test_validate_*` functions — positive + negative cases for every validator. **101 total assertions**, up from 31.
+- **ADR 0003** — sit does not search upward for `.sit/` (locks in correct behavior against CVE-2022-24765 class).
+- **ADR 0004** — sit is SHA-256 only (no SHA-1 interop, even for legacy-repo imports).
+- **ADR 0005** — Local-clone threat model (what sit trusts and doesn't, and which validator enforces which boundary).
+
+### Changed
+
+- `src/commit.cyr` lint cleanup (consecutive blank-line warnings from the v0.5.1 refactor).
+- `config_file_set` return code `-2` now means "invalid input" (`cmd_config` surfaces this as a specific error message instead of the generic "failed to write config").
+
+### Removed / deprecated
+
+- Nothing user-facing. Implementation detail: the `write_remote_tracking` fixed-size `alloc(128)` is gone.
+
+### Deferred to future releases
+
+- **MEDIUM findings S-16–S-27** (filesystem mutation return checks, alloc null-checks everywhere, author-timestamp overflow guards, cleanup sweep) — v0.6.1 patch.
+- **LOW findings S-28–S-32** (env scrubbing, patra cstring defense-in-depth, mode-literal lifetime audit) — v0.6.x as convenient.
+- **Performance findings P-01 through P-25** — separate perf-focused minor after the security baseline bakes. The DB-handle caching refactor alone collapses 5 of the top-10 findings.
+
 ## [0.5.1] — 2026-04-24
 
 File-split refactor. No feature changes, no bug fixes beyond what the split itself surfaced.
@@ -93,7 +142,8 @@ First official release. Rolls up the entire pre-release development arc (scaffol
 - **Git format compatibility** — object framing + tree format are byte-compatible with git's SHA-256 mode, but sit is *not* a drop-in for a git repo (the wire protocol is sit-native, signed commits use sit's `sitsig` header rather than git's `gpgsig`).
 - **Not on the AGNOS critical path** — post-boot, when-there's-time project.
 
-[Unreleased]: https://github.com/MacCracken/sit/compare/0.5.1...HEAD
+[Unreleased]: https://github.com/MacCracken/sit/compare/0.6.0...HEAD
+[0.6.0]: https://github.com/MacCracken/sit/releases/tag/0.6.0
 [0.5.1]: https://github.com/MacCracken/sit/releases/tag/0.5.1
 [0.5.0]: https://github.com/MacCracken/sit/releases/tag/0.5.0
 [0.4.0]: https://github.com/MacCracken/sit/releases/tag/0.4.0

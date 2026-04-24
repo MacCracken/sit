@@ -51,6 +51,13 @@ fn cmd_add() {
         eprintln("sit: cannot stat file");
         return 1;
     }
+    # S-06: cap single-blob add at 1 GiB to prevent OOM from `sit add /dev/zero`
+    # or symlinked-to-huge-file. Real-world source files don't approach this.
+    if (size > 1073741824) {
+        file_close(fd);
+        eprintln("sit: file too large (> 1 GiB)");
+        return 1;
+    }
 
     var content = alloc(size);
     var total = 0;
@@ -488,7 +495,13 @@ fn index_find(entries, path) {
 
 # Glob match (single segment, no '/' crossing). Supports `*` (any run) and
 # `?` (single char). Recursive — pattern segments are short, no depth issue.
+var _GLOB_PAT_MAX = 256;
+
 fn glob_match(pat, pat_len, name, name_len) {
+    # S-15: cap pattern length at entry — prevents a crafted .sitignore
+    # from triggering O(2^N) recursion via many '*' chars. Real patterns
+    # fit easily under 256.
+    if (pat_len > _GLOB_PAT_MAX) { return 0; }
     if (pat_len == 0) {
         if (name_len == 0) { return 1; }
         return 0;

@@ -6,6 +6,7 @@
 # grouping (primitives first, then storage, refs, objects, commands).
 
 include "src/util.cyr"
+include "src/validate.cyr"
 include "src/config.cyr"
 include "src/object_db.cyr"
 include "src/index.cyr"

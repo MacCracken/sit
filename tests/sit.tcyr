@@ -2,6 +2,12 @@
 # Exercises the dep primitives sit's correctness rests on: sigil SHA-256,
 # sankoch zlib roundtrip, hex encode/decode, and git-SHA-256-framed blob
 # hashing. Stdlib + deps are auto-included via cyrius.cyml.
+#
+# As of v0.6.0: validate.cyr is included directly so its pure validators
+# can be tested without the full sit include chain (they only depend on
+# stdlib primitives).
+
+include "src/validate.cyr"
 
 fn test_sigil_hash_known_answer() {
     test_group("sigil SHA-256 known answers");
@@ -221,6 +227,122 @@ fn test_ed25519_sign_verify_roundtrip() {
     return 0;
 }
 
+fn test_validate_refname() {
+    test_group("validate.cyr — refname_valid");
+
+    # git check-ref-format rules
+    assert_eq(refname_valid("main"),          1, "main");
+    assert_eq(refname_valid("feature/foo"),   1, "feature/foo");
+    assert_eq(refname_valid("release-1.0"),   1, "release-1.0");
+
+    assert_eq(refname_valid(""),              0, "empty");
+    assert_eq(refname_valid("@"),             0, "single @");
+    assert_eq(refname_valid("../evil"),       0, "path traversal");
+    assert_eq(refname_valid(".hidden"),       0, "leading dot");
+    assert_eq(refname_valid("foo.lock"),      0, "trailing .lock");
+    assert_eq(refname_valid("has space"),     0, "embedded space");
+    assert_eq(refname_valid("has:colon"),     0, "colon");
+    assert_eq(refname_valid("has~tilde"),     0, "tilde");
+    assert_eq(refname_valid("has..dots"),     0, "consecutive dots");
+    assert_eq(refname_valid("trailing."),     0, "trailing dot");
+    assert_eq(refname_valid("/abs"),          0, "leading slash");
+    assert_eq(refname_valid("trail/"),        0, "trailing slash");
+    assert_eq(refname_valid("two//slash"),    0, "consecutive slashes");
+    assert_eq(refname_valid("has@{"),         0, "at-brace");
+    assert_eq(refname_valid("foo\\bar"),      0, "backslash");
+    return 0;
+}
+
+fn test_validate_tree_entry_name() {
+    test_group("validate.cyr — tree_entry_name_valid");
+
+    assert_eq(tree_entry_name_valid("main.cyr"),   1, "normal file");
+    assert_eq(tree_entry_name_valid("README.md"),  1, "dotted file");
+
+    assert_eq(tree_entry_name_valid(""),           0, "empty");
+    assert_eq(tree_entry_name_valid("."),          0, "dot");
+    assert_eq(tree_entry_name_valid(".."),         0, "double dot");
+    assert_eq(tree_entry_name_valid("has/slash"),  0, "slash");
+    assert_eq(tree_entry_name_valid("has\\slash"), 0, "backslash");
+    assert_eq(tree_entry_name_valid("has:colon"),  0, "colon (NTFS ADS / drive letter)");
+    assert_eq(tree_entry_name_valid("trailing "),  0, "trailing space");
+    assert_eq(tree_entry_name_valid("trailing."),  0, "trailing dot");
+    assert_eq(tree_entry_name_valid(".sit"),       0, ".sit rejected");
+    assert_eq(tree_entry_name_valid(".SIT"),       0, ".SIT rejected (case-fold)");
+    assert_eq(tree_entry_name_valid(".git"),       0, ".git rejected");
+    assert_eq(tree_entry_name_valid(".ssh"),       0, ".ssh rejected");
+    assert_eq(tree_entry_name_valid("CON"),        0, "NTFS reserved CON");
+    assert_eq(tree_entry_name_valid("com1"),       0, "NTFS reserved com1");
+    assert_eq(tree_entry_name_valid("LPT9.txt"),   0, "NTFS reserved LPT9 with ext");
+
+    return 0;
+}
+
+fn test_validate_tree_flat_path() {
+    test_group("validate.cyr — tree_flat_path_valid");
+
+    assert_eq(tree_flat_path_valid("a"),              1, "single segment");
+    assert_eq(tree_flat_path_valid("src/main.cyr"),   1, "nested");
+    assert_eq(tree_flat_path_valid("a/b/c/d.txt"),    1, "deep");
+
+    assert_eq(tree_flat_path_valid(""),               0, "empty");
+    assert_eq(tree_flat_path_valid("/abs"),           0, "absolute");
+    assert_eq(tree_flat_path_valid("../evil"),        0, "traversal");
+    assert_eq(tree_flat_path_valid("src/../evil"),    0, "mid-path traversal");
+    assert_eq(tree_flat_path_valid("a//b"),           0, "empty segment");
+    assert_eq(tree_flat_path_valid("a/.sit/HEAD"),    0, ".sit segment case-fold");
+    return 0;
+}
+
+fn test_validate_hex_prefix() {
+    test_group("validate.cyr — hex_prefix_valid");
+
+    assert_eq(hex_prefix_valid("abcd", 4),                                1, "4 hex chars");
+    assert_eq(hex_prefix_valid("0123456789abcdef", 16),                    1, "all hex digits");
+    assert_eq(hex_prefix_valid("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 64), 1, "full length");
+
+    assert_eq(hex_prefix_valid("", 0),                                    0, "empty");
+    assert_eq(hex_prefix_valid("abcd' OR 1=1 --", 15),                    0, "SQL injection attempt");
+    assert_eq(hex_prefix_valid("ABCD", 4),                                0, "uppercase rejected");
+    assert_eq(hex_prefix_valid("abcg", 4),                                0, "g not hex");
+    return 0;
+}
+
+fn test_validate_config_value() {
+    test_group("validate.cyr — config_value_valid / config_key_valid");
+
+    assert_eq(config_value_valid("Some Name"),             1, "normal value");
+    assert_eq(config_value_valid("you@example.com"),       1, "email");
+    assert_eq(config_value_valid(""),                      1, "empty (allowed)");
+
+    # Newlines and NULs rejected (CVE-2023-29007 / CVE-2025-48384 shape)
+    assert_eq(config_value_valid("name\ninjected=evil"),   0, "newline injection");
+    assert_eq(config_value_valid("has\rcr"),               0, "carriage return");
+
+    assert_eq(config_key_valid("user.name"),               1, "dotted key");
+    assert_eq(config_key_valid("remote.origin.url"),       1, "three segments");
+    assert_eq(config_key_valid(""),                        0, "empty key");
+    assert_eq(config_key_valid("has space"),               0, "space in key");
+    assert_eq(config_key_valid("has=equals"),              0, "equals in key");
+    return 0;
+}
+
+fn test_validate_remote_url() {
+    test_group("validate.cyr — remote_url_valid");
+
+    assert_eq(remote_url_valid("file:///srv/repo"),  1, "file:// scheme");
+    assert_eq(remote_url_valid("/abs/path"),         1, "absolute path");
+    assert_eq(remote_url_valid("./relative"),        1, "relative ./");
+    assert_eq(remote_url_valid("../parent"),         1, "relative ../");
+
+    assert_eq(remote_url_valid(""),                  0, "empty");
+    assert_eq(remote_url_valid("http://evil.com"),   0, "http rejected in v0.6");
+    assert_eq(remote_url_valid("ssh://user@host"),   0, "ssh rejected in v0.6");
+    assert_eq(remote_url_valid("-oProxyCommand=x"),  0, "leading dash (CVE-2017-1000117)");
+    assert_eq(remote_url_valid("file://good\nbad"),  0, "embedded newline");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -230,6 +352,12 @@ fn main() {
     test_patra_col_bytes_small();
     test_patra_col_bytes_overflow();
     test_ed25519_sign_verify_roundtrip();
+    test_validate_refname();
+    test_validate_tree_entry_name();
+    test_validate_tree_flat_path();
+    test_validate_hex_prefix();
+    test_validate_config_value();
+    test_validate_remote_url();
     return assert_summary();
 }
 

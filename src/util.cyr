@@ -148,6 +148,29 @@ fn sort_cstrings(vec) {
     return 0;
 }
 
+# Write a sanitized copy of `bytes[len]` to stdout, replacing ASCII control
+# chars (< 0x20 except \t, plus \x7f, plus ESC 0x1b specifically) with '?'.
+# Used (S-21) for attacker-controlled commit body fragments like Author
+# identity so a malicious commit can't emit ANSI escape sequences that
+# forge log output or manipulate the terminal.
+fn write_sanitized(fd, bytes, len) {
+    var i = 0;
+    while (i < len) {
+        var c = load8(bytes + i) & 0xFF;
+        var emit = c;
+        if (c < 32) {
+            if (c == 9) { } # allow tab
+            else { emit = 63; } # '?'
+        }
+        if (c == 127) { emit = 63; }
+        var single[1];
+        store8(&single, emit);
+        syscall(SYS_WRITE, fd, &single, 1);
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Read an entire file into a heap buffer. Writes (ptr, len) to out_pair.
 # Returns 0 on success, negative on failure.
 fn read_file_heap(path, out_pair) {
@@ -156,6 +179,10 @@ fn read_file_heap(path, out_pair) {
     var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
     syscall(SYS_LSEEK, fd, 0, SEEK_SET);
     if (size < 0) { file_close(fd); return 0 - 2; }
+    # S-06: read_file_heap is used for config files and ref files, which should
+    # never exceed a few KB. Cap at 64 MiB to keep a hostile / accidentally-huge
+    # file from triggering a multi-GB allocation here.
+    if (size > 67108864) { file_close(fd); return 0 - 4; }
     var buf = alloc(size + 1);
     if (buf == 0) { file_close(fd); return 0 - 3; }
     var total = 0;

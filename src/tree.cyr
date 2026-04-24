@@ -158,12 +158,21 @@ fn parse_tree(body, body_len) {
 
                 if (nu + 1 + 32 > body_len) { pos = body_len; }
                 else {
-                    var hash_hex = hex_encode(body + nu + 1, 32);
-                    var e = alloc(24);
-                    store64(e, mode);
-                    store64(e + 8, name);
-                    store64(e + 16, hash_hex);
-                    vec_push(entries, e);
+                    # S-03: reject tree entries whose mode isn't allowlisted or
+                    # whose name would let an attacker escape the working tree.
+                    # Silent drop here means a malicious subtree is treated as
+                    # empty — materialize_target won't act on it, and fsck will
+                    # flag the mismatch on the outer tree's hash-of-bytes.
+                    if (tree_entry_mode_valid(mode) == 1) {
+                        if (tree_entry_name_valid(name) == 1) {
+                            var hash_hex = hex_encode(body + nu + 1, 32);
+                            var e = alloc(24);
+                            store64(e, mode);
+                            store64(e + 8, name);
+                            store64(e + 16, hash_hex);
+                            vec_push(entries, e);
+                        }
+                    }
                     pos = nu + 1 + 32;
                 }
             }
@@ -176,9 +185,24 @@ fn parse_tree(body, body_len) {
 # path (e.g., "src/main.cyr") stored in the `name` slot. Subtree entries are
 # traversed, not emitted. Returned entries can be searched by `tree_find`
 # against full paths because it only uses the name/hash slots.
+#
+# S-14: bounds recursion depth via a module-level counter. 256 levels matches
+# git's limit and covers every realistic project hierarchy.
+
+var _TREE_MAX_DEPTH = 256;
+var _tree_walk_depth = 0;
+
 fn flatten_tree(tree_hex, prefix, out) {
+    if (_tree_walk_depth >= _TREE_MAX_DEPTH) {
+        eprintln("sit: tree depth exceeds 256 — refusing to walk further");
+        return 0 - 2;
+    }
+    _tree_walk_depth = _tree_walk_depth + 1;
     var obj[24];
-    if (read_object(tree_hex, &obj) != 0) { return 0 - 1; }
+    if (read_object(tree_hex, &obj) != 0) {
+        _tree_walk_depth = _tree_walk_depth - 1;
+        return 0 - 1;
+    }
     var buf = load64(&obj);
     var blen = load64(&obj + 8);
     var coff = load64(&obj + 16);
@@ -217,6 +241,7 @@ fn flatten_tree(tree_hex, prefix, out) {
         }
         i = i + 1;
     }
+    _tree_walk_depth = _tree_walk_depth - 1;
     return 0;
 }
 

@@ -21,3 +21,6 @@ Decisions about sit — what we chose, the context, and the consequences we acce
 
 - [0001 — No FFI, first-party only](0001-no-ffi-first-party-only.md) — sit reimplements every layer in Cyrius rather than binding to libgit2/zlib/OpenSSL.
 - [0002 — Signed commits use a `sitsig` header, not `gpgsig`](0002-sitsig-not-gpgsig.md) — why sit signs with raw ed25519 via sigil instead of OpenPGP-armored signatures via GPG.
+- [0003 — sit does not search upward for `.sit/`](0003-no-upward-repo-discovery.md) — CVE-2022-24765 is structurally impossible.
+- [0004 — sit is SHA-256 only](0004-sha256-only.md) — no SHA-1 interop, ever. Immune to Shattered-class attacks.
+- [0005 — Local-clone threat model](0005-local-clone-threat-model.md) — what sit does and doesn't trust in a malicious remote, and which validator enforces which boundary.

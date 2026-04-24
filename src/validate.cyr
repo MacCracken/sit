@@ -1,0 +1,429 @@
+# validate.cyr — input validators for the P(-1) audit fixes.
+#
+# Every validator is PURE: returns 1 if the input is acceptable, 0 otherwise.
+# No stdout, no side effects. Callers decide the error message and disposition.
+#
+# See docs/audit/2026-04-24-audit.md for the finding-by-finding rationale.
+
+# Length caps picked to match git conventions where they exist and to avoid
+# pathological allocations where they don't.
+var VAL_REFNAME_MAX = 255;         # S-02 / S-26
+var VAL_TREE_NAME_MAX = 255;       # S-03
+var VAL_CONFIG_VALUE_MAX = 1024;   # S-05
+var VAL_CONFIG_KEY_MAX = 128;      # S-05
+var VAL_REMOTE_URL_MAX = 4096;     # S-04
+
+# ── Hex prefix (S-01) ───────────────────────────────────────────────
+#
+# Accept only [0-9a-f], length 4..64. Used by resolve_hash before interpolating
+# the prefix into `LIKE '<prefix>%'`. Preserves sit's existing "too short" (-2)
+# behavior by letting the caller check length separately first; this validator
+# only checks the CHARACTER set so callers can distinguish "too short" from
+# "has bogus characters".
+
+fn hex_prefix_valid(s, len) {
+    if (len == 0) { return 0; }
+    if (len > 64) { return 0; }
+    var i = 0;
+    while (i < len) {
+        var c = load8(s + i) & 0xFF;
+        var ok = 0;
+        if (c >= 48) { if (c <= 57) { ok = 1; } }  # 0-9
+        if (c >= 97) { if (c <= 102) { ok = 1; } } # a-f
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# ── Ref name (S-02, S-26) ───────────────────────────────────────────
+#
+# Enforces git check-ref-format rules:
+#   - non-empty, <= VAL_REFNAME_MAX
+#   - no component begins with '.'
+#   - no component ends with '.lock'
+#   - no '..' anywhere
+#   - no ASCII control chars (< 0x20 or == 0x7F)
+#   - no space, '~', '^', ':', '?', '*', '['
+#   - cannot begin or end with '/', no '//'
+#   - cannot end with '.'
+#   - no '@{'
+#   - cannot be the single '@'
+#   - no '\'
+
+fn _ref_is_bad_char(c) {
+    if (c < 32) { return 1; }
+    if (c == 127) { return 1; }
+    if (c == 32) { return 1; }       # space
+    if (c == 126) { return 1; }      # ~
+    if (c == 94) { return 1; }       # ^
+    if (c == 58) { return 1; }       # :
+    if (c == 63) { return 1; }       # ?
+    if (c == 42) { return 1; }       # *
+    if (c == 91) { return 1; }       # [
+    if (c == 92) { return 1; }       # backslash
+    return 0;
+}
+
+fn refname_valid(name) {
+    if (name == 0) { return 0; }
+    var len = strlen(name);
+    if (len == 0) { return 0; }
+    if (len > VAL_REFNAME_MAX) { return 0; }
+
+    # Single-char '@' rejected
+    if (len == 1) {
+        if (load8(name) == 64) { return 0; }
+    }
+
+    # First or last char cannot be '/'
+    if (load8(name) == 47) { return 0; }
+    if (load8(name + len - 1) == 47) { return 0; }
+    # Last char cannot be '.'
+    if (load8(name + len - 1) == 46) { return 0; }
+
+    var i = 0;
+    var comp_start = 0;  # Start offset of current '/'-separated component
+    while (i < len) {
+        var c = load8(name + i) & 0xFF;
+        if (_ref_is_bad_char(c) == 1) { return 0; }
+
+        # Check for '@{' sequence
+        if (c == 64) {
+            if (i + 1 < len) {
+                if (load8(name + i + 1) == 123) { return 0; }
+            }
+        }
+
+        # Check for '..' sequence
+        if (c == 46) {
+            if (i + 1 < len) {
+                if (load8(name + i + 1) == 46) { return 0; }
+            }
+        }
+
+        if (c == 47) {
+            # End of a component: validate it was nonempty (i.e. no '//'),
+            # didn't end with .lock, didn't start with '.', etc.
+            if (i == comp_start) { return 0; }  # '//'
+            # Component-start checks already handled at the boundary transition below.
+            # Component-end .lock check: does component end with ".lock"?
+            var comp_len = i - comp_start;
+            if (comp_len >= 5) {
+                if (memeq(name + i - 5, ".lock", 5) == 1) { return 0; }
+            }
+            # Next component starts right after the '/'
+            comp_start = i + 1;
+            # Must not start with '.'
+            if (comp_start < len) {
+                if (load8(name + comp_start) == 46) { return 0; }
+            }
+        }
+        i = i + 1;
+    }
+
+    # First component: name cannot begin with '.'
+    if (load8(name) == 46) { return 0; }
+
+    # Final component .lock check
+    var final_len = len - comp_start;
+    if (final_len >= 5) {
+        if (memeq(name + len - 5, ".lock", 5) == 1) { return 0; }
+    }
+
+    return 1;
+}
+
+# ── Tree entry name (S-03) ──────────────────────────────────────────
+#
+# Called by parse_tree on each entry, AND by materialize_target before the
+# write, so attackers have to clear two hurdles. Belt-and-suspenders.
+#
+# Rejects:
+#   - empty
+#   - ".", ".."
+#   - any '/' or '\' or NUL
+#   - any ':' (NTFS ADS + Windows drive letter)
+#   - any ASCII control char (< 0x20 or == 0x7F)
+#   - trailing space or dot (Windows)
+#   - case-fold-equal to ".sit", ".git", ".ssh"
+#   - NTFS reserved names (CON, PRN, NUL, AUX, COM1-9, LPT1-9)
+#   - length > VAL_TREE_NAME_MAX
+#
+# HFS-ignorable Unicode codepoints are not handled byte-level here — they
+# belong in a higher-level check that operates on decoded Unicode. Flagged
+# as a v0.7 follow-up.
+
+fn _ascii_tolower(c) {
+    if (c >= 65) { if (c <= 90) { return c + 32; } }
+    return c;
+}
+
+# Case-insensitive match: is `name` equal to `lower_ref` ignoring ASCII case?
+# `lower_ref` must already be lowercase (saves an op per char).
+fn _name_iequal_ascii(name, name_len, lower_ref, ref_len) {
+    if (name_len != ref_len) { return 0; }
+    var i = 0;
+    while (i < name_len) {
+        var nc = _ascii_tolower(load8(name + i) & 0xFF);
+        var rc = load8(lower_ref + i) & 0xFF;
+        if (nc != rc) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _is_ntfs_reserved(name, name_len) {
+    # Strip trailing extension for comparison: CON, CON.txt both reserved.
+    var stem_len = name_len;
+    var i = 0;
+    while (i < name_len) {
+        if (load8(name + i) == 46) { stem_len = i; i = name_len; }
+        else { i = i + 1; }
+    }
+    if (stem_len == 3) {
+        if (_name_iequal_ascii(name, 3, "con", 3) == 1) { return 1; }
+        if (_name_iequal_ascii(name, 3, "prn", 3) == 1) { return 1; }
+        if (_name_iequal_ascii(name, 3, "nul", 3) == 1) { return 1; }
+        if (_name_iequal_ascii(name, 3, "aux", 3) == 1) { return 1; }
+    }
+    if (stem_len == 4) {
+        # COM1..COM9, LPT1..LPT9
+        var c0 = _ascii_tolower(load8(name) & 0xFF);
+        var c1 = _ascii_tolower(load8(name + 1) & 0xFF);
+        var c2 = _ascii_tolower(load8(name + 2) & 0xFF);
+        var c3 = load8(name + 3) & 0xFF;
+        if (c3 >= 49) {
+            if (c3 <= 57) {
+                if (c0 == 99) {
+                    if (c1 == 111) {
+                        if (c2 == 109) { return 1; }  # com1..com9
+                    }
+                }
+                if (c0 == 108) {
+                    if (c1 == 112) {
+                        if (c2 == 116) { return 1; }  # lpt1..lpt9
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+fn tree_entry_name_valid(name) {
+    if (name == 0) { return 0; }
+    var len = strlen(name);
+    if (len == 0) { return 0; }
+    if (len > VAL_TREE_NAME_MAX) { return 0; }
+
+    # Reject "." and ".."
+    if (len == 1) {
+        if (load8(name) == 46) { return 0; }
+    }
+    if (len == 2) {
+        if (load8(name) == 46) {
+            if (load8(name + 1) == 46) { return 0; }
+        }
+    }
+
+    # Character-by-character sweep
+    var i = 0;
+    while (i < len) {
+        var c = load8(name + i) & 0xFF;
+        if (c == 0) { return 0; }       # embedded NUL
+        if (c < 32) { return 0; }       # control char
+        if (c == 127) { return 0; }     # DEL
+        if (c == 47) { return 0; }      # /
+        if (c == 92) { return 0; }      # \
+        if (c == 58) { return 0; }      # :
+        i = i + 1;
+    }
+
+    # Trailing space or dot (Windows)
+    var last = load8(name + len - 1) & 0xFF;
+    if (last == 32) { return 0; }
+    if (last == 46) { return 0; }
+
+    # Case-fold comparison to dot-directories we guard
+    if (_name_iequal_ascii(name, len, ".sit", 4) == 1) { return 0; }
+    if (_name_iequal_ascii(name, len, ".git", 4) == 1) { return 0; }
+    if (_name_iequal_ascii(name, len, ".ssh", 4) == 1) { return 0; }
+
+    # NTFS reserved names
+    if (_is_ntfs_reserved(name, len) == 1) { return 0; }
+
+    return 1;
+}
+
+# Flattened tree path (S-03 second gate).
+#
+# `flatten_tree` concatenates prefix + entry-name producing paths like
+# "src/main.cyr". Each segment between '/'s must individually pass
+# tree_entry_name_valid; the full path must also be relative and capped.
+
+var VAL_TREE_PATH_MAX = 4096;
+
+fn tree_flat_path_valid(path) {
+    if (path == 0) { return 0; }
+    var len = strlen(path);
+    if (len == 0) { return 0; }
+    if (len > VAL_TREE_PATH_MAX) { return 0; }
+
+    # Cannot be absolute — no leading '/'
+    if (load8(path) == 47) { return 0; }
+
+    # Walk '/'-separated segments; each must pass tree_entry_name_valid.
+    var seg_start = 0;
+    var i = 0;
+    while (i <= len) {
+        var at_end = 0;
+        if (i == len) { at_end = 1; }
+        else {
+            if (load8(path + i) == 47) { at_end = 1; }
+        }
+        if (at_end == 1) {
+            var seg_len = i - seg_start;
+            if (seg_len == 0) { return 0; }  # leading/trailing/consecutive '/'
+            # Copy segment to a nul-terminated scratch buffer for the validator.
+            var seg = alloc(seg_len + 1);
+            memcpy(seg, path + seg_start, seg_len);
+            store8(seg + seg_len, 0);
+            if (tree_entry_name_valid(seg) == 0) { return 0; }
+            seg_start = i + 1;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Tree entry mode allowlist (S-03). Only "100644" (regular file) and "40000"
+# (directory) are accepted. Reject symlinks (120000), submodules (160000),
+# executable (100755) — sit doesn't emit those today; accepting them from a
+# remote tree gives an attacker surface we don't need.
+
+fn tree_entry_mode_valid(mode) {
+    if (mode == 0) { return 0; }
+    if (streq(mode, "100644") == 1) { return 1; }
+    if (streq(mode, "40000") == 1) { return 1; }
+    return 0;
+}
+
+# ── Config key / value (S-05) ───────────────────────────────────────
+#
+# Reject control chars (includes \n, \r, \0), cap lengths, and for the key
+# require dot-separated tokens that look reasonable.
+
+fn config_value_valid(v) {
+    if (v == 0) { return 0; }
+    var len = strlen(v);
+    if (len > VAL_CONFIG_VALUE_MAX) { return 0; }
+    var i = 0;
+    while (i < len) {
+        var c = load8(v + i) & 0xFF;
+        if (c == 0) { return 0; }
+        if (c == 10) { return 0; }
+        if (c == 13) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn config_key_valid(k) {
+    if (k == 0) { return 0; }
+    var len = strlen(k);
+    if (len == 0) { return 0; }
+    if (len > VAL_CONFIG_KEY_MAX) { return 0; }
+    var i = 0;
+    while (i < len) {
+        var c = load8(k + i) & 0xFF;
+        # Keys may contain ASCII letters, digits, '.', '_', '-'
+        var ok = 0;
+        if (c >= 97) { if (c <= 122) { ok = 1; } }  # a-z
+        if (c >= 65) { if (c <= 90) { ok = 1; } }   # A-Z
+        if (c >= 48) { if (c <= 57) { ok = 1; } }   # 0-9
+        if (c == 46) { ok = 1; }  # .
+        if (c == 95) { ok = 1; }  # _
+        if (c == 45) { ok = 1; }  # -
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# ── Remote URL (S-04) ───────────────────────────────────────────────
+#
+# v0.6.0 accepts only local-path schemes. Anything else — http://, ssh://,
+# scp-style user@host:path — is rejected up front with a clear "not yet
+# supported" error. Prevents accidental fetches against URLs that would
+# silently fall through to a filesystem path.
+#
+# Also rejects URLs beginning with '-' (CVE-2017-1000117 prophylactic for
+# the day a transport forks a subprocess).
+
+fn remote_url_valid(url) {
+    if (url == 0) { return 0; }
+    var len = strlen(url);
+    if (len == 0) { return 0; }
+    if (len > VAL_REMOTE_URL_MAX) { return 0; }
+
+    # CVE-2017-1000117 prophylactic
+    if (load8(url) == 45) { return 0; }
+
+    # Control chars / NUL
+    var i = 0;
+    while (i < len) {
+        var c = load8(url + i) & 0xFF;
+        if (c == 0) { return 0; }
+        if (c == 10) { return 0; }
+        if (c == 13) { return 0; }
+        i = i + 1;
+    }
+
+    # file:// prefix → valid
+    if (len >= 7) {
+        if (memeq(url, "file://", 7) == 1) { return 1; }
+    }
+    # Absolute path (/…)
+    if (load8(url) == 47) { return 1; }
+    # Relative path (./… or ../…)
+    if (load8(url) == 46) { return 1; }
+    # Anything else: reject
+    return 0;
+}
+
+# ── Filesystem symlink guard (S-04, S-12) ──────────────────────────
+#
+# Calls newfstatat(AT_FDCWD, path, &stat, AT_SYMLINK_NOFOLLOW) and returns:
+#   1 if path exists and is a SYMLINK
+#   0 if path exists and is NOT a symlink (regular file, dir, etc.)
+#  -1 if path does not exist or stat failed
+#
+# struct stat layout on Linux x86_64: st_mode is u32 at offset 24.
+# S_IFMT = 0xF000, S_IFLNK = 0xA000.
+
+var VAL_AT_FDCWD = 0 - 100;
+var VAL_AT_SYMLINK_NOFOLLOW = 256;
+
+fn path_is_symlink(path) {
+    var stbuf[144];
+    var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, VAL_AT_SYMLINK_NOFOLLOW);
+    if (rc < 0) { return 0 - 1; }
+    var mode = load32(&stbuf + 24);
+    var fmt = mode & 0xF000;
+    if (fmt == 0xA000) { return 1; }
+    return 0;
+}
+
+# Return the file-type bits (S_IFMT-masked mode) for a path via lstat, or -1
+# if stat failed. Caller compares against 0xA000 (symlink), 0x4000 (dir),
+# 0x8000 (regular), etc. Useful for S-04's "is this a directory" and for
+# S-25's "does target already exist as something other than a dir".
+
+fn path_lstat_kind(path) {
+    var stbuf[144];
+    var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, VAL_AT_SYMLINK_NOFOLLOW);
+    if (rc < 0) { return 0 - 1; }
+    var mode = load32(&stbuf + 24);
+    return mode & 0xF000;
+}

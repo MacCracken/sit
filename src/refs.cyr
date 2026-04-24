@@ -19,6 +19,9 @@ fn resolve_ref_name(name, out_buf) {
     memcpy(tag_path, ".sit/refs/tags/", 15);
     memcpy(tag_path + 15, name, name_len);
     store8(tag_path + 15 + name_len, 0);
+    # S-11: all three ref-file readers below validate that the first 64 bytes
+    # are actual hex before accepting. A garbage or attacker-crafted ref is
+    # treated as "no such ref" rather than flowed through as a "hash".
     if (file_exists(tag_path) == 1) {
         var tfd = file_open(tag_path, 0, 0);
         if (tfd >= 0) {
@@ -26,9 +29,11 @@ fn resolve_ref_name(name, out_buf) {
             var tn = file_read(tfd, tbuf, 80);
             file_close(tfd);
             if (tn >= 64) {
-                memcpy(out_buf, tbuf, 64);
-                store8(out_buf + 64, 0);
-                return 1;
+                if (hex_prefix_valid(tbuf, 64) == 1) {
+                    memcpy(out_buf, tbuf, 64);
+                    store8(out_buf + 64, 0);
+                    return 1;
+                }
             }
         }
     }
@@ -44,9 +49,11 @@ fn resolve_ref_name(name, out_buf) {
             var hn = file_read(hfd, hbuf, 80);
             file_close(hfd);
             if (hn >= 64) {
-                memcpy(out_buf, hbuf, 64);
-                store8(out_buf + 64, 0);
-                return 1;
+                if (hex_prefix_valid(hbuf, 64) == 1) {
+                    memcpy(out_buf, hbuf, 64);
+                    store8(out_buf + 64, 0);
+                    return 1;
+                }
             }
         }
     }
@@ -63,9 +70,11 @@ fn resolve_ref_name(name, out_buf) {
             var rn = file_read(rfd, rbuf, 80);
             file_close(rfd);
             if (rn >= 64) {
-                memcpy(out_buf, rbuf, 64);
-                store8(out_buf + 64, 0);
-                return 1;
+                if (hex_prefix_valid(rbuf, 64) == 1) {
+                    memcpy(out_buf, rbuf, 64);
+                    store8(out_buf + 64, 0);
+                    return 1;
+                }
             }
         }
     }
@@ -129,6 +138,10 @@ fn read_head_ref() {
     var n = file_read(fd, buf, 80);
     file_close(fd);
     if (n < 64) { return 0; }
+    # S-11: validate the first 64 bytes are actual hex before returning —
+    # otherwise a corrupt or hostile ref file flows garbage through the
+    # whole stack (and into resolve_hash's LIKE after S-01 rejects it).
+    if (hex_prefix_valid(buf, 64) == 0) { return 0; }
     store8(buf + 64, 0);
     return buf;
 }
@@ -251,6 +264,11 @@ fn cmd_tag() {
 
     var name = argv_heap(2);
     var nlen = strlen(name);
+    # S-02: tag names follow the same ref-format grammar as branches.
+    if (refname_valid(name) == 0) {
+        eprintln("sit: invalid tag name (see git check-ref-format rules)");
+        return 1;
+    }
     var path = alloc(15 + nlen + 1);
     memcpy(path, ".sit/refs/tags/", 15);
     memcpy(path + 15, name, nlen);
@@ -379,6 +397,11 @@ fn cmd_branch() {
 
     var name = argv_heap(2);
     var nlen = strlen(name);
+    # S-02: reject names that don't satisfy git check-ref-format rules.
+    if (refname_valid(name) == 0) {
+        eprintln("sit: invalid branch name (see git check-ref-format rules)");
+        return 1;
+    }
     var path = alloc(16 + nlen + 1);
     memcpy(path, ".sit/refs/heads/", 16);
     memcpy(path + 16, name, nlen);
@@ -439,6 +462,11 @@ fn cmd_checkout() {
     var tlen = strlen(target);
 
     if (create == 1) {
+        # S-02: validate branch name before touching the filesystem.
+        if (refname_valid(target) == 0) {
+            eprintln("sit: invalid branch name (see git check-ref-format rules)");
+            return 1;
+        }
         var new_branch = alloc(16 + tlen + 1);
         memcpy(new_branch, ".sit/refs/heads/", 16);
         memcpy(new_branch + 16, target, tlen);

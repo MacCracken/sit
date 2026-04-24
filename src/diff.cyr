@@ -291,6 +291,11 @@ fn lines_equal(a, b) {
 fn lcs_diff(a, b) {
     var n1 = vec_len(a);
     var n2 = vec_len(b);
+    # S-07: per-dimension cap BEFORE the multiply to prevent integer-overflow
+    # that would let `cells` wrap into a small positive and bypass the cap.
+    # sqrt(16M) ~ 4096; keep a little headroom.
+    if (n1 > 8192) { return 0; }
+    if (n2 > 8192) { return 0; }
     var stride = n2 + 1;
     var cells = (n1 + 1) * stride;
     if (cells > 16 * 1024 * 1024) { return 0; }

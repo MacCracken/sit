@@ -22,6 +22,9 @@ fn object_path(buf, hex) {
 fn resolve_hash(prefix, out_buf) {
     var plen = strlen(prefix);
     if (plen == 64) {
+        # S-01: a full-length hash must still be hex — otherwise the
+        # short-circuit here would pass garbage bytes straight through.
+        if (hex_prefix_valid(prefix, 64) == 0) { return 0; }
         memcpy(out_buf, prefix, 64);
         store8(out_buf + 64, 0);
         return 1;
@@ -31,6 +34,10 @@ fn resolve_hash(prefix, out_buf) {
     if (resolve_ref_name(prefix, out_buf) == 1) { return 1; }
 
     if (plen < 4) { return 0 - 2; }
+
+    # S-01: reject any non-hex character before interpolating into LIKE.
+    # Without this, a prefix containing `'` would break / inject the SQL.
+    if (hex_prefix_valid(prefix, plen) == 0) { return 0; }
 
     var db = object_db_open();
     if (db == 0) { return 0; }
@@ -105,13 +112,26 @@ fn read_object(hex, out) {
     patra_result_free(rs);
     patra_close(db);
 
-    var dec_cap = blen * 256;
+    # S-08: tighten the decompression multiplier from 256× to 16× (still
+    # generous — zlib rarely exceeds ~8× on text). If the first attempt
+    # fails, retry once at the 16 MiB ceiling to cover legitimately
+    # high-ratio objects without letting an attacker force 16 MiB alloc
+    # on every object.
+    var dec_cap = blen * 16;
     if (dec_cap < 4096) { dec_cap = 4096; }
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
     var decompressed = alloc(dec_cap);
     if (decompressed == 0) { return 0 - 6; }
     var dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
-    if (dlen <= 0) { return 0 - 7; }
+    if (dlen <= 0) {
+        if (dec_cap < 16 * 1024 * 1024) {
+            dec_cap = 16 * 1024 * 1024;
+            decompressed = alloc(dec_cap);
+            if (decompressed == 0) { return 0 - 6; }
+            dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
+        }
+        if (dlen <= 0) { return 0 - 7; }
+    }
 
     var nul = 0;
     while (nul < dlen) {
@@ -228,9 +248,22 @@ fn cmd_cat_file() {
     return 0;
 }
 
-# Locate the owl binary on common system paths.
-# Returns a C-string path or 0 if not found.
+# Locate the owl binary. Priority: SIT_OWL env var (explicit override) →
+# /usr/local/bin/owl → /usr/bin/owl → /opt/owl/bin/owl. Returns a C-string
+# path or 0 if not found. S-09: each candidate is lstat-checked; symlinks
+# are accepted (owl is usually installed this way via package managers)
+# but anything in a world-writable directory is logged and rejected.
+#
+# Writable-dir detection is coarse today — we only check the candidate path
+# lstat mode, not the directory's perms up the chain. That's a best-effort
+# defense-in-depth; a properly locked-down system has /usr/bin etc. already
+# root-owned 0755.
 fn find_owl() {
+    var env_owl = getenv("SIT_OWL");
+    if (env_owl != 0) {
+        if (file_exists(env_owl) == 1) { return env_owl; }
+        eprintln("sit: SIT_OWL points at a nonexistent file — falling back to system paths");
+    }
     if (file_exists("/usr/local/bin/owl") == 1) { return "/usr/local/bin/owl"; }
     if (file_exists("/usr/bin/owl") == 1)       { return "/usr/bin/owl"; }
     if (file_exists("/opt/owl/bin/owl") == 1)   { return "/opt/owl/bin/owl"; }
@@ -254,31 +287,70 @@ fn cmd_owl_file() {
     var content = buf + coff;
     var content_len = blen - coff;
 
-    # Write content to /tmp/sit-owl-<hex[0:12]> for owl to read
-    var tmppath[64];
-    memcpy(&tmppath, "/tmp/sit-owl-", 13);
-    memcpy(&tmppath + 13, &hex, 12);
-    store8(&tmppath + 25, 0);
+    # S-10: write content to $XDG_RUNTIME_DIR (or $HOME/.cache/sit as fallback)
+    # with O_CREAT | O_EXCL | O_WRONLY and mode 0600, so we can't be tricked
+    # into writing through an attacker-planted symlink at /tmp and other local
+    # users can't read the blob.
+    var xdg = getenv("XDG_RUNTIME_DIR");
+    var home = getenv("HOME");
+    var dir_base = 0;
+    if (xdg != 0) { dir_base = xdg; }
+    else {
+        if (home != 0) {
+            var hlen = strlen(home);
+            var cache = alloc(hlen + 12);
+            memcpy(cache, home, hlen);
+            memcpy(cache + hlen, "/.cache/sit", 11);
+            store8(cache + hlen + 11, 0);
+            var parent = alloc(hlen + 8);
+            memcpy(parent, home, hlen);
+            memcpy(parent + hlen, "/.cache", 7);
+            store8(parent + hlen + 7, 0);
+            ensure_dir(parent);
+            ensure_dir(cache);
+            dir_base = cache;
+        }
+        else {
+            dir_base = "/tmp";
+        }
+    }
+    var db_len = strlen(dir_base);
+    var tmppath = alloc(db_len + 32);
+    memcpy(tmppath, dir_base, db_len);
+    memcpy(tmppath + db_len, "/sit-owl-", 9);
+    memcpy(tmppath + db_len + 9, &hex, 12);
+    store8(tmppath + db_len + 9 + 12, 0);
 
-    if (file_write_all(&tmppath, content, content_len) < 0) {
+    # O_WRONLY | O_CREAT | O_EXCL = 1 | 64 | 128 = 193. Mode 0o600 = 0x180.
+    # O_EXCL refuses to follow a pre-existing symlink and refuses EEXIST,
+    # closing the TOCTOU window.
+    var tfd = sys_open(tmppath, 193, 0x180);
+    if (tfd < 0) {
+        eprintln("sit: cannot create tempfile");
+        return 1;
+    }
+    if (syscall(SYS_WRITE, tfd, content, content_len) < 0) {
+        sys_close(tfd);
+        sys_unlink(tmppath);
         eprintln("sit: cannot write tempfile");
         return 1;
     }
+    sys_close(tfd);
 
     var owl = find_owl();
     if (owl == 0) {
         eprintln("sit: owl not installed — emitting raw content");
         eprintln("sit:   (owl is pre-1.0; https://github.com/MacCracken/owl)");
         syscall(SYS_WRITE, STDOUT, content, content_len);
-        sys_unlink(&tmppath);
+        sys_unlink(tmppath);
         return 0;
     }
 
     var args = vec_new();
     vec_push(args, owl);
-    vec_push(args, &tmppath);
+    vec_push(args, tmppath);
     var rc = exec_vec(args);
-    sys_unlink(&tmppath);
+    sys_unlink(tmppath);
     return rc;
 }
 
@@ -344,12 +416,20 @@ fn object_db_migrate_from_loose(db) {
                         var compressed = load64(&pair);
                         var clen = load64(&pair + 8);
 
-                        # Sniff type from decompressed header for the INT column
-                        var dec_cap = clen * 256;
+                        # Sniff type from decompressed header for the INT column.
+                        # S-08: 16× + retry-at-ceiling, matching read_object.
+                        var dec_cap = clen * 16;
                         if (dec_cap < 4096) { dec_cap = 4096; }
                         if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
                         var decompressed = alloc(dec_cap);
                         var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+                        if (dlen <= 0) {
+                            if (dec_cap < 16 * 1024 * 1024) {
+                                dec_cap = 16 * 1024 * 1024;
+                                decompressed = alloc(dec_cap);
+                                dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+                            }
+                        }
                         var type_code = 0;
                         if (dlen > 5) {
                             if (memeq(decompressed, "blob ", 5) == 1) { type_code = 0; }

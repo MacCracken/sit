@@ -8,7 +8,7 @@ The name is from *smriti* (स्मृति — "that which is remembered"). T
 
 ## Status
 
-- **Version**: 0.5.1 — file-split refactor. `src/main.cyr` broken into 11 topical modules; no feature changes. Wire protocol (local-path transport) shipped in 0.5.0.
+- **Version**: 0.6.0 — security hardening. All CRITICAL + HIGH findings from the 2026-04-24 P(-1) audit fixed: input validators for ref names / tree entries / hash prefixes / config values / remote URLs, local-clone symlink guards (CVE-2023-22490 class), tightened decompression caps, output escape filter for attacker-controlled identity bytes. 3 new ADRs, 101 test assertions (up from 31). Network transport shifts to v0.7.0.
 - **Language**: Cyrius (toolchain pinned in `cyrius.cyml` under `[package].cyrius`)
 - **Commands** (24): `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `reset`, `commit`, `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md)
 

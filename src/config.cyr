@@ -91,7 +91,13 @@ fn config_get(key) {
 
 # Upsert `key = value` in a config file. Replaces the first matching line
 # or appends a new one. Returns 0 on success, negative on write failure.
+#
+# S-05: reject newlines/NUL/control chars in both key and value. Prevents
+# `sit remote add origin $'foo\nother = attacker'`-shape injection
+# (CVE-2023-29007 / CVE-2025-48384).
 fn config_file_set(path, key, value) {
+    if (config_key_valid(key) == 0) { return 0 - 2; }
+    if (config_value_valid(value) == 0) { return 0 - 2; }
     var key_len = strlen(key);
     var val_len = strlen(value);
 
@@ -305,6 +311,10 @@ fn cmd_config() {
             syscall(SYS_WRITE, STDERR, "\n", 1);
             return 1;
         }
+        if (r == 0 - 2) {
+            eprintln("sit: invalid key or value (no newlines, control chars, or NULs)");
+            return 1;
+        }
         if (r < 0) {
             eprintln("sit: failed to write config");
             return 1;
@@ -324,7 +334,12 @@ fn cmd_config() {
     }
 
     var value = argv_heap(arg_base + 1);
-    if (config_file_set(path, key, value) < 0) {
+    var set_r = config_file_set(path, key, value);
+    if (set_r == 0 - 2) {
+        eprintln("sit: invalid key or value (no newlines, control chars, or NULs)");
+        return 1;
+    }
+    if (set_r < 0) {
         eprintln("sit: failed to write config");
         return 1;
     }
