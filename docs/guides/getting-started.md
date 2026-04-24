@@ -189,6 +189,32 @@ Categories:
 
 Empty repo with no files prints `nothing to commit, working tree clean`.
 
+## See what changed
+
+```sh
+# Unstaged changes — working tree vs index
+/path/to/sit/build/sit diff
+# --- a/fruits.txt
+# +++ b/fruits.txt
+#  alpha
+# -beta
+# +bravo
+#  gamma
+# +delta
+
+# Staged changes — index vs HEAD tree
+/path/to/sit/build/sit diff --staged
+```
+
+Output is a simplified unified diff: ` ` prefix for unchanged context, `-` for removed, `+` for added. No `@@` hunk headers in v0.2 — every line of the diff is emitted, no hunk compression yet.
+
+The diff walks each entry in the staging index:
+
+- **Default mode**: hashes the working file, compares to the staged hash. If they differ (or the working file is missing), reads both blobs and emits a line diff.
+- **`--staged` mode**: looks up the path in HEAD's tree. If missing, shows all lines as inserts (new file). If the tree hash differs, reads both blobs and diffs.
+
+Algorithm is classical LCS (longest common subsequence) — DP table capped at 16M cells (≈128 MB). Files beyond that threshold print a "too large" notice and are skipped.
+
 ## What works today
 
 - `sit init` — create empty repository
@@ -196,12 +222,13 @@ Empty repo with no files prints `nothing to commit, working tree clean`.
 - `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
 - `sit log` — walk commit history from HEAD with git-style output
 - `sit status` — three-way diff across HEAD tree, staging index, and working directory
+- `sit diff [--staged]` — line-level unified-ish diff (working vs index, or index vs HEAD)
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
 
 ## What doesn't yet
 
-- `sit diff` — line-level comparison between blobs / working / index
+- Hunk grouping in `sit diff` (`@@ -a,b +c,d @@`)
 - Recursive trees (subdirectories) — see [arch 003](../architecture/003-flat-paths-in-commits.md)
 - HEAD-aware branch selection — `sit commit` / `sit log` / `sit status` always use `refs/heads/main`
 

@@ -1178,6 +1178,249 @@ fn cmd_status() {
     return 0;
 }
 
+# ---- diff ------------------------------------------------------------------
+# Line layout (16 bytes): { ptr_into_data, len } — \n excluded.
+fn line_ptr(l) { return load64(l); }
+fn line_len(l) { return load64(l + 8); }
+
+fn split_lines(data, len) {
+    var lines = vec_new();
+    var pos = 0;
+    while (pos < len) {
+        var start = pos;
+        while (pos < len) {
+            if (load8(data + pos) == 10) { break; }
+            pos = pos + 1;
+        }
+        var line = alloc(16);
+        store64(line, data + start);
+        store64(line + 8, pos - start);
+        vec_push(lines, line);
+        if (pos < len) { pos = pos + 1; }
+    }
+    return lines;
+}
+
+fn lines_equal(a, b) {
+    var alen = line_len(a);
+    var blen = line_len(b);
+    if (alen != blen) { return 0; }
+    return memeq(line_ptr(a), line_ptr(b), alen);
+}
+
+# LCS-based diff. Returns a vec of op-tuples (16 bytes):
+#   op kind: 0 = keep, 1 = delete, 2 = insert
+#   line ptr: points at one of the input line tuples
+# Returns 0 if the DP table would be too large (caller must handle).
+fn lcs_diff(a, b) {
+    var n1 = vec_len(a);
+    var n2 = vec_len(b);
+    var stride = n2 + 1;
+    var cells = (n1 + 1) * stride;
+    if (cells > 16 * 1024 * 1024) { return 0; }
+    var T = alloc(cells * 8);
+    if (T == 0) { return 0; }
+
+    var i = 1;
+    while (i <= n1) {
+        var j = 1;
+        while (j <= n2) {
+            var aline = vec_get(a, i - 1);
+            var bline = vec_get(b, j - 1);
+            var cellval = 0;
+            if (lines_equal(aline, bline) == 1) {
+                cellval = load64(T + ((i - 1) * stride + (j - 1)) * 8) + 1;
+            }
+            else {
+                var up = load64(T + ((i - 1) * stride + j) * 8);
+                var left = load64(T + (i * stride + (j - 1)) * 8);
+                if (up >= left) { cellval = up; }
+                else { cellval = left; }
+            }
+            store64(T + (i * stride + j) * 8, cellval);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var script = vec_new();
+    i = n1;
+    var j = n2;
+    while (i > 0) {
+        if (j > 0) {
+            if (lines_equal(vec_get(a, i - 1), vec_get(b, j - 1)) == 1) {
+                var op = alloc(16);
+                store64(op, 0);
+                store64(op + 8, vec_get(a, i - 1));
+                vec_push(script, op);
+                i = i - 1;
+                j = j - 1;
+            }
+            else {
+                var up = load64(T + ((i - 1) * stride + j) * 8);
+                var left = load64(T + (i * stride + (j - 1)) * 8);
+                if (left >= up) {
+                    var op = alloc(16);
+                    store64(op, 2);
+                    store64(op + 8, vec_get(b, j - 1));
+                    vec_push(script, op);
+                    j = j - 1;
+                }
+                else {
+                    var op = alloc(16);
+                    store64(op, 1);
+                    store64(op + 8, vec_get(a, i - 1));
+                    vec_push(script, op);
+                    i = i - 1;
+                }
+            }
+        }
+        else {
+            var op = alloc(16);
+            store64(op, 1);
+            store64(op + 8, vec_get(a, i - 1));
+            vec_push(script, op);
+            i = i - 1;
+        }
+    }
+    while (j > 0) {
+        var op = alloc(16);
+        store64(op, 2);
+        store64(op + 8, vec_get(b, j - 1));
+        vec_push(script, op);
+        j = j - 1;
+    }
+
+    var reversed = vec_new();
+    var k = vec_len(script) - 1;
+    while (k >= 0) {
+        vec_push(reversed, vec_get(script, k));
+        k = k - 1;
+    }
+    return reversed;
+}
+
+fn print_file_diff(path, old_buf, old_len, new_buf, new_len) {
+    syscall(SYS_WRITE, STDOUT, "--- a/", 6);
+    syscall(SYS_WRITE, STDOUT, path, strlen(path));
+    syscall(SYS_WRITE, STDOUT, "\n+++ b/", 7);
+    syscall(SYS_WRITE, STDOUT, path, strlen(path));
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+
+    var a = split_lines(old_buf, old_len);
+    var b = split_lines(new_buf, new_len);
+    var ops = lcs_diff(a, b);
+    if (ops == 0) {
+        eprintln("sit: diff table exceeds cap; file too large in v0.2");
+        return 1;
+    }
+
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        var kind = load64(op);
+        var l = load64(op + 8);
+        if (kind == 0) { syscall(SYS_WRITE, STDOUT, " ", 1); }
+        if (kind == 1) { syscall(SYS_WRITE, STDOUT, "-", 1); }
+        if (kind == 2) { syscall(SYS_WRITE, STDOUT, "+", 1); }
+        syscall(SYS_WRITE, STDOUT, line_ptr(l), line_len(l));
+        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Read a blob object by hex hash; write (content_ptr, content_len) to out_pair.
+# Returns 0 on success, negative on error.
+fn read_blob_content(hex, out_pair) {
+    var obj[24];
+    if (read_object(hex, &obj) != 0) { return 0 - 1; }
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    store64(out_pair, buf + coff);
+    store64(out_pair + 8, blen - coff);
+    return 0;
+}
+
+fn cmd_diff() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var staged = 0;
+    if (argc() >= 3) {
+        if (streq(argv(2), "--staged") == 1) { staged = 1; }
+    }
+
+    var index_entries = parse_index();
+    if (index_entries == 0) { return 0; }
+    sort_entries(index_entries);
+    index_entries = dedupe_entries(index_entries);
+
+    var head_entries = 0;
+    if (staged == 1) { head_entries = read_head_tree_entries(); }
+
+    var n = vec_len(index_entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(index_entries, i);
+        var path = entry_path(e);
+        var idx_hash_hex = hex_encode(entry_hash(e), 32);
+
+        if (staged == 1) {
+            var head_ent = tree_find(head_entries, path);
+            if (head_ent == 0) {
+                var ip[16];
+                if (read_blob_content(idx_hash_hex, &ip) == 0) {
+                    print_file_diff(path, 0, 0, load64(&ip), load64(&ip + 8));
+                }
+            }
+            else {
+                if (streq(tree_entry_hash(head_ent), idx_hash_hex) == 0) {
+                    var hp[16];
+                    var ip[16];
+                    if (read_blob_content(tree_entry_hash(head_ent), &hp) == 0) {
+                        if (read_blob_content(idx_hash_hex, &ip) == 0) {
+                            print_file_diff(path,
+                                load64(&hp), load64(&hp + 8),
+                                load64(&ip), load64(&ip + 8));
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            if (file_exists(path) == 1) {
+                var working_hex = hash_file_as_blob(path);
+                if (working_hex != 0) {
+                    if (streq(working_hex, idx_hash_hex) == 0) {
+                        var ip[16];
+                        var wp[16];
+                        if (read_blob_content(idx_hash_hex, &ip) == 0) {
+                            if (read_file_heap(path, &wp) == 0) {
+                                print_file_diff(path,
+                                    load64(&ip), load64(&ip + 8),
+                                    load64(&wp), load64(&wp + 8));
+                            }
+                        }
+                    }
+                }
+            }
+            else {
+                var ip[16];
+                if (read_blob_content(idx_hash_hex, &ip) == 0) {
+                    print_file_diff(path, load64(&ip), load64(&ip + 8), 0, 0);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn print_usage() {
     eprintln("usage: sit <command> [<args>]");
     eprintln("");
@@ -1187,6 +1430,7 @@ fn print_usage() {
     eprintln("  commit [-m] <message>   record staged changes as a new commit");
     eprintln("  log                     show commit history from HEAD");
     eprintln("  status                  show working tree status");
+    eprintln("  diff [--staged]         show unstaged (or staged) line-level changes");
     eprintln("  cat-file <hash>         emit object content to stdout (plumbing)");
     eprintln("  owl-file <hash>         view object through owl (bat-like viewer)");
     return 0;
@@ -1208,6 +1452,7 @@ fn main() {
     if (streq(cmd, "commit")   == 1) { return cmd_commit(); }
     if (streq(cmd, "log")      == 1) { return cmd_log(); }
     if (streq(cmd, "status")   == 1) { return cmd_status(); }
+    if (streq(cmd, "diff")     == 1) { return cmd_diff(); }
     if (streq(cmd, "cat-file") == 1) { return cmd_cat_file(); }
     if (streq(cmd, "owl-file") == 1) { return cmd_owl_file(); }
 

@@ -47,12 +47,21 @@
 - **Deletion detection**: index entry whose path is missing in the working tree shows as `Unstaged changes: deleted: <path>`.
 - Covers nine scenarios: empty repo, untracked-only, staged-new, clean-after-commit, modified-unstaged, re-staged-after-modify, multi-mixed (staged + unstaged + untracked), deleted, outside-repo.
 
+### v0.1.5 — `sit diff`
+
+- **`sit diff`** (default) — line-level diff of working tree vs staging index. For each index entry: hash the working file; if hashes differ (or the working file is missing), read both blobs and run an LCS-based diff.
+- **`sit diff --staged`** — index vs HEAD tree. Each index entry compared to HEAD's matching tree entry; entries absent from HEAD show as new-file insertions, entries whose HEAD hash differs from the index hash get a full line diff.
+- **LCS algorithm**: classical DP table, `lines_equal` for cell comparison, backtrace to produce an op-script (`keep` / `delete` / `insert`). Script is reversed before emission so output reads top-to-bottom. Capped at 16M cells (≈128 MB table) — larger files fall through with a clear message.
+- **Output**: `--- a/<path>` / `+++ b/<path>` header followed by the script with ` ` / `-` / `+` prefixes per line. No `@@` hunk headers in v0.2 — all context lines are printed; hunk grouping waits for a later pass.
+- **Primitives**: `split_lines`, `lines_equal`, `lcs_diff`, `print_file_diff`, `read_blob_content` (thin wrapper around `read_object` that returns just the content span). Reusable for future `sit show`, `sit blame`, etc.
+- Eight scenarios verified: clean repo, modified staged file, post-commit working divergence, `--staged` clean, `--staged` new-file adds, working deletion, multi-file mixed, outside-repo.
+
 ## Post-0.1 Backlog
 
 ### Priority — the v0.2.0 loop
 
-- **`sit diff`** — sankoch-backed text diff between two blobs / working tree / index. Needs a line-diff algorithm (Myers or similar).
 - **Recursive trees** (arch 003) — lift the flat-path restriction on `sit commit`. Path segmentation + per-directory subtree construction + git's directory-sort rule (`<name>/` vs `<name>`). Tree *reader* (v0.1.4) already in place; only the writer needs to go recursive.
+- **Hunk grouping for `sit diff`** — collapse stretches of context between changes into 3-line windows, emit `@@ -a,b +c,d @@` headers. Straightforward follow-on to the v0.1.5 LCS script.
 
 ### Working-tree visibility
 
