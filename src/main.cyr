@@ -1483,6 +1483,34 @@ fn cmd_tag() {
         return 0;
     }
 
+    # Deletion: sit tag -d <name>
+    if (streq(argv(2), "-d") == 1) {
+        if (argc() < 4) {
+            eprintln("usage: sit tag -d <name>");
+            return 1;
+        }
+        var dname = argv_heap(3);
+        var dnlen = strlen(dname);
+        var dpath = alloc(15 + dnlen + 1);
+        memcpy(dpath, ".sit/refs/tags/", 15);
+        memcpy(dpath + 15, dname, dnlen);
+        store8(dpath + 15 + dnlen, 0);
+        if (file_exists(dpath) != 1) {
+            syscall(SYS_WRITE, STDERR, "sit: tag '", 10);
+            syscall(SYS_WRITE, STDERR, dname, dnlen);
+            syscall(SYS_WRITE, STDERR, "' not found\n", 12);
+            return 1;
+        }
+        if (sys_unlink(dpath) != 0) {
+            eprintln("sit: failed to remove tag ref");
+            return 1;
+        }
+        syscall(SYS_WRITE, STDOUT, "deleted tag '", 13);
+        syscall(SYS_WRITE, STDOUT, dname, dnlen);
+        syscall(SYS_WRITE, STDOUT, "'\n", 2);
+        return 0;
+    }
+
     var name = argv_heap(2);
     var nlen = strlen(name);
     var path = alloc(15 + nlen + 1);
@@ -1572,6 +1600,41 @@ fn cmd_branch() {
             syscall(SYS_WRITE, STDOUT, "\n", 1);
             i = i + 1;
         }
+        return 0;
+    }
+
+    # Deletion: sit branch -d <name>
+    if (streq(argv(2), "-d") == 1) {
+        if (argc() < 4) {
+            eprintln("usage: sit branch -d <name>");
+            return 1;
+        }
+        var dname = argv_heap(3);
+        var dnlen = strlen(dname);
+        var dpath = alloc(16 + dnlen + 1);
+        memcpy(dpath, ".sit/refs/heads/", 16);
+        memcpy(dpath + 16, dname, dnlen);
+        store8(dpath + 16 + dnlen, 0);
+        if (file_exists(dpath) != 1) {
+            syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
+            syscall(SYS_WRITE, STDERR, dname, dnlen);
+            syscall(SYS_WRITE, STDERR, "' not found\n", 12);
+            return 1;
+        }
+        var curr_br = current_branch_name();
+        if (curr_br != 0) {
+            if (streq(curr_br, dname) == 1) {
+                eprintln("sit: cannot delete the currently checked-out branch");
+                return 1;
+            }
+        }
+        if (sys_unlink(dpath) != 0) {
+            eprintln("sit: failed to remove branch ref");
+            return 1;
+        }
+        syscall(SYS_WRITE, STDOUT, "deleted branch '", 16);
+        syscall(SYS_WRITE, STDOUT, dname, dnlen);
+        syscall(SYS_WRITE, STDOUT, "'\n", 2);
         return 0;
     }
 
@@ -2933,10 +2996,40 @@ fn print_commit_header(commit_hex, info, body, body_len) {
     return 0;
 }
 
+# Print a one-line summary of a commit: "<hex12> <first line of message>".
+fn print_commit_oneline(commit_hex, body, body_len, msg_start) {
+    syscall(SYS_WRITE, STDOUT, commit_hex, 12);
+    syscall(SYS_WRITE, STDOUT, " ", 1);
+    if (msg_start > 0) {
+        var p = msg_start;
+        while (p < body_len) {
+            if (load8(body + p) == 10) { p = body_len; }
+            else { p = p + 1; }
+        }
+        # Walk back to find the first \n after msg_start
+        var first_nl = msg_start;
+        while (first_nl < body_len) {
+            if (load8(body + first_nl) == 10) { break; }
+            first_nl = first_nl + 1;
+        }
+        var subj_len = first_nl - msg_start;
+        if (subj_len > 0) {
+            syscall(SYS_WRITE, STDOUT, body + msg_start, subj_len);
+        }
+    }
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    return 0;
+}
+
 fn cmd_log() {
     if (file_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
+    }
+
+    var oneline = 0;
+    if (argc() >= 3) {
+        if (streq(argv(2), "--oneline") == 1) { oneline = 1; }
     }
 
     var current_hex = read_head_ref();
@@ -2964,9 +3057,14 @@ fn cmd_log() {
             return 1;
         }
 
-        if (first == 0) { syscall(SYS_WRITE, STDOUT, "\n", 1); }
-        first = 0;
-        print_commit_header(current_hex, &info, body, body_len);
+        if (oneline == 1) {
+            print_commit_oneline(current_hex, body, body_len, load64(&info + 40));
+        }
+        else {
+            if (first == 0) { syscall(SYS_WRITE, STDOUT, "\n", 1); }
+            first = 0;
+            print_commit_header(current_hex, &info, body, body_len);
+        }
 
         current_hex = load64(&info + 8);
     }
@@ -3750,14 +3848,21 @@ fn write_unsigned(n) {
 fn print_hunk_header(hunk) {
     var r[32];
     hunk_ranges(hunk, &r);
+    var old_len = load64(&r + 8);
+    var new_len = load64(&r + 24);
     syscall(SYS_WRITE, STDOUT, "@@ -", 4);
     write_unsigned(load64(&r));
-    syscall(SYS_WRITE, STDOUT, ",", 1);
-    write_unsigned(load64(&r + 8));
+    # Git convention: omit ",1" when the count is 1.
+    if (old_len != 1) {
+        syscall(SYS_WRITE, STDOUT, ",", 1);
+        write_unsigned(old_len);
+    }
     syscall(SYS_WRITE, STDOUT, " +", 2);
     write_unsigned(load64(&r + 16));
-    syscall(SYS_WRITE, STDOUT, ",", 1);
-    write_unsigned(load64(&r + 24));
+    if (new_len != 1) {
+        syscall(SYS_WRITE, STDOUT, ",", 1);
+        write_unsigned(new_len);
+    }
     syscall(SYS_WRITE, STDOUT, " @@\n", 4);
     return 0;
 }
@@ -4099,14 +4204,14 @@ fn print_usage() {
     eprintln("  init                    create an empty sit repository");
     eprintln("  add [-f] <path>         hash and store a file as a blob object");
     eprintln("  rm [--cached] <path>    remove a tracked file from working tree and index");
-    eprintln("  branch [<name>]         list branches, or create one at HEAD");
+    eprintln("  branch [-d <name>|<name>]  list / create / delete branch (-d deletes)");
     eprintln("  checkout [-b] <branch>  switch to <branch>, optionally creating it first");
-    eprintln("  tag [<name> [<commit>]] list tags, or create one at HEAD (or at commit)");
+    eprintln("  tag [-d <name>|<name> [<commit>]]  list / create / delete tag (-d deletes)");
     eprintln("  merge <branch>          fast-forward HEAD to <branch> (3-way deferred)");
     eprintln("  config [--global] <key> [<value>]  read or write a config value");
     eprintln("  fsck                    verify object integrity (sha-256 vs filename)");
     eprintln("  commit [-m] <message>   record staged changes as a new commit");
-    eprintln("  log                     show commit history from HEAD");
+    eprintln("  log [--oneline]         show commit history from HEAD");
     eprintln("  status                  show working tree status");
     eprintln("  diff [--staged|HEAD]    show unstaged / staged / working-vs-HEAD diffs");
     eprintln("  show [<hash>]           show a single commit with its parent diff");
