@@ -132,6 +132,13 @@
 - **`set_head_ref(ref_path)`** — writes `ref: <ref_path>\n` to `.sit/HEAD`. Used by checkout; probably also by future `sit checkout -b`.
 - Verified against 13 scenarios: empty-branch-list (no commits), list-with-just-main, create-dev, checkout dev (materialize), checkout main (cleanup dev-only files), roundtrip, dirty blocking, clean allows, bad-branch error, dup-branch error, untracked collision, nested-dir create/delete across branches, log-follows-active-branch.
 
+### v0.2.3 — Polish batch: tags, `checkout -b`, `add -f`
+
+- **`sit tag`** — lightweight refs at `.sit/refs/tags/<name>`. `sit tag` lists alphabetically; `sit tag <name>` creates at HEAD; `sit tag <name> <hash-prefix>` creates at a resolved commit via `resolve_hash`. Ensures `.sit/refs/tags/` exists lazily. Duplicate-tag errors cleanly.
+- **`sit checkout -b <branch>`** — create-and-switch convenience. If the target branch doesn't exist, creates it at HEAD before running normal checkout. Errors if the branch already exists (matches git's behavior). Lets us collapse the `sit branch X && sit checkout X` two-step.
+- **`sit add -f <path>`** — force-add an ignored path. Skips the `is_ignored` check when `-f` is present. Non-ignored paths work the same with or without `-f`.
+- Verified against nine scenarios across all three features: empty tag list, tag-at-HEAD, tag-at-hash-prefix, duplicate-tag error, tag-hash-correctness, `checkout -b` creates+switches, `checkout -b` dup error, `add -f` overrides ignore, `add -f` on non-ignored path.
+
 ### v0.2.2 — `sit config` + `sit fsck`
 
 - **`sit config [--global] <key> [<value>]`** — flat `key = value` format, git-compatible priority chain for author identity (`SIT_AUTHOR_NAME` env → `.sit/config` → `~/.sitconfig` → `"sit user"` fallback). Get mode returns the value and exits 0; set mode upserts (replaces the first matching line or appends, preserving comments and blanks).
@@ -150,11 +157,9 @@
 - **Pack format** — delta-compressed multi-object storage; depends on `COL_BLOB` and sankoch delta primitives.
 - **Wire protocol** — first-party smart-HTTP / ssh replacement. Not on the AGNOS critical path; revisit once the local VCS loop is solid.
 - **Merge** — 3-way merge with conflict markers. Needs a merge-base finder (walk commit ancestors to find LCA) and per-file three-way text merge.
-- **Tags** — lightweight refs in `.sit/refs/tags/`. Analogous to branches but immutable.
 - **Signed commits** — sigil-backed signatures on commit objects.
 - **Integration tests in-tree** — promote the shell-level smoke tests from `docs/guides/getting-started.md` into `tests/` with fixtures. Current `tests/sit.tcyr` is stdlib-assert smoke only.
 - **`sit fsck` reachability** — walk commit chain, flag dangling objects (current v0.2.2 only checks integrity, not reachability).
 - **Hunk-grouping polish** — handle the `@@ -N +N,M @@` one-line-count abbreviation.
-- **`sit add -f`** — force-add an ignored path (currently rejected without override).
-- **`sit checkout -b <name>`** — create-and-switch convenience (currently `sit branch <n> && sit checkout <n>`).
 - **Full `.sitignore` semantics** — negation (`!pattern`), double-star (`**`), character classes (`[abc]`), anchored patterns (`/foo`), path patterns (`foo/bar`).
+- **Tag resolution in `cat-file` / `log` / `show`** — `resolve_hash` currently doesn't consult `refs/tags/`, so `sit show v1.0` won't work. Small addition once we decide on ref-name vs hash-prefix disambiguation.

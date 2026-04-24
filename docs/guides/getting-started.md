@@ -253,10 +253,11 @@ file?.bak
 - `sit add <path>` — hash, compress, and store a file as a blob object; append to staging index
 - `sit rm [--cached] <path>` — remove a tracked file from working tree + index (or just the index with `--cached`)
 - `sit branch [<name>]` — list branches, or create one at HEAD
-- `sit checkout <branch>` — switch branches: materializes the target tree into the working directory, rewrites the index, updates HEAD
+- `sit checkout [-b] <branch>` — switch branches; `-b` creates the branch first at HEAD
+- `sit tag [<name> [<commit>]]` — list tags, or create a lightweight tag at HEAD (or at a given commit)
 - `sit config [--global] <key> [<value>]` — read/write config entries (`user.name`, `user.email`, etc). Local at `.sit/config`, global at `~/.sitconfig`
 - `sit fsck` — verify that each stored object's content hashes back to its filename
-- `.sitignore` — gitignore-style pattern file (at repo root) filters untracked-file display and `sit add`
+- `.sitignore` — gitignore-style pattern file (at repo root) filters untracked-file display and `sit add` (override with `-f`)
 - `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
 - `sit log` — walk commit history from HEAD with git-style output
 - `sit status` — three-way diff across HEAD tree, staging index, and working directory
@@ -268,8 +269,8 @@ file?.bak
 ## What doesn't yet
 
 - Remote / push / pull / fetch / wire protocol
-- Merge, rebase, tags
-- `sit checkout -b <name>` convenience (use `sit branch <name>` then `sit checkout <name>`)
+- Merge, rebase
+- Tag resolution in `sit show`/`sit log` (tag refs exist but `sit show v1.0` won't find them yet)
 - Full gitignore semantics (no negation / `**` / char-classes yet)
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).

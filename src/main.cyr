@@ -236,10 +236,21 @@ fn write_blob_object(content, content_len) {
 
 fn cmd_add() {
     if (argc() < 3) {
-        eprintln("usage: sit add <path>");
+        eprintln("usage: sit add [-f] <path>");
         return 1;
     }
-    var path = argv_heap(2);
+
+    var forced = 0;
+    var arg_idx = 2;
+    if (streq(argv(2), "-f") == 1) {
+        forced = 1;
+        arg_idx = 3;
+        if (argc() < 4) {
+            eprintln("usage: sit add -f <path>");
+            return 1;
+        }
+    }
+    var path = argv_heap(arg_idx);
     var path_len = strlen(path);
 
     if (file_exists(".sit/HEAD") != 1) {
@@ -247,12 +258,14 @@ fn cmd_add() {
         return 1;
     }
 
-    var patterns = load_sitignore();
-    if (is_ignored(path, patterns) == 1) {
-        syscall(SYS_WRITE, STDERR, "sit: '", 6);
-        syscall(SYS_WRITE, STDERR, path, path_len);
-        syscall(SYS_WRITE, STDERR, "' matches a .sitignore pattern\n", 31);
-        return 1;
+    if (forced == 0) {
+        var patterns = load_sitignore();
+        if (is_ignored(path, patterns) == 1) {
+            syscall(SYS_WRITE, STDERR, "sit: '", 6);
+            syscall(SYS_WRITE, STDERR, path, path_len);
+            syscall(SYS_WRITE, STDERR, "' matches a .sitignore pattern (use -f to override)\n", 52);
+            return 1;
+        }
     }
 
     var fd = file_open(path, 0, 0);
@@ -1163,6 +1176,91 @@ fn sort_cstrings(vec) {
     return 0;
 }
 
+fn cmd_tag() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    if (argc() < 3) {
+        if (file_exists(".sit/refs/tags") != 1) { return 0; }
+        var raw = dir_list(str_from(".sit/refs/tags"));
+        var names = vec_new();
+        var n = vec_len(raw);
+        var i = 0;
+        while (i < n) {
+            var s = vec_get(raw, i);
+            var slen = str_len(s);
+            var nm = alloc(slen + 1);
+            memcpy(nm, str_data(s), slen);
+            store8(nm + slen, 0);
+            vec_push(names, nm);
+            i = i + 1;
+        }
+        sort_cstrings(names);
+        var m = vec_len(names);
+        i = 0;
+        while (i < m) {
+            var nm = vec_get(names, i);
+            syscall(SYS_WRITE, STDOUT, nm, strlen(nm));
+            syscall(SYS_WRITE, STDOUT, "\n", 1);
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    var name = argv_heap(2);
+    var nlen = strlen(name);
+    var path = alloc(15 + nlen + 1);
+    memcpy(path, ".sit/refs/tags/", 15);
+    memcpy(path + 15, name, nlen);
+    store8(path + 15 + nlen, 0);
+
+    if (file_exists(path) == 1) {
+        syscall(SYS_WRITE, STDERR, "sit: tag '", 10);
+        syscall(SYS_WRITE, STDERR, name, nlen);
+        syscall(SYS_WRITE, STDERR, "' already exists\n", 17);
+        return 1;
+    }
+
+    var target_hex = 0;
+    if (argc() >= 4) {
+        var prefix = argv_heap(3);
+        var hex[72];
+        var rr = resolve_hash(prefix, &hex);
+        if (rr != 1) {
+            eprintln("sit: cannot resolve target commit");
+            return 1;
+        }
+        target_hex = alloc(65);
+        memcpy(target_hex, &hex, 64);
+        store8(target_hex + 64, 0);
+    }
+    else {
+        target_hex = read_head_ref();
+        if (target_hex == 0) {
+            eprintln("sit: cannot tag with no commits");
+            return 1;
+        }
+    }
+
+    ensure_dir(".sit/refs/tags");
+
+    var buf = alloc(66);
+    memcpy(buf, target_hex, 64);
+    store8(buf + 64, 10);
+    store8(buf + 65, 0);
+    if (file_write_all(path, buf, 65) < 0) {
+        eprintln("sit: failed to write tag ref");
+        return 1;
+    }
+
+    syscall(SYS_WRITE, STDOUT, "created tag '", 13);
+    syscall(SYS_WRITE, STDOUT, name, nlen);
+    syscall(SYS_WRITE, STDOUT, "'\n", 2);
+    return 0;
+}
+
 fn cmd_branch() {
     if (file_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -1317,12 +1415,48 @@ fn cmd_checkout() {
         return 1;
     }
     if (argc() < 3) {
-        eprintln("usage: sit checkout <branch>");
+        eprintln("usage: sit checkout [-b] <branch>");
         return 1;
     }
 
-    var target = argv_heap(2);
+    var create = 0;
+    var arg_idx = 2;
+    if (streq(argv(2), "-b") == 1) {
+        create = 1;
+        arg_idx = 3;
+        if (argc() < 4) {
+            eprintln("usage: sit checkout -b <branch>");
+            return 1;
+        }
+    }
+    var target = argv_heap(arg_idx);
     var tlen = strlen(target);
+
+    if (create == 1) {
+        var new_branch = alloc(16 + tlen + 1);
+        memcpy(new_branch, ".sit/refs/heads/", 16);
+        memcpy(new_branch + 16, target, tlen);
+        store8(new_branch + 16 + tlen, 0);
+        if (file_exists(new_branch) == 1) {
+            syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
+            syscall(SYS_WRITE, STDERR, target, tlen);
+            syscall(SYS_WRITE, STDERR, "' already exists\n", 17);
+            return 1;
+        }
+        var head_hex = read_head_ref();
+        if (head_hex == 0) {
+            eprintln("sit: cannot create a branch with no commits");
+            return 1;
+        }
+        var buf = alloc(66);
+        memcpy(buf, head_hex, 64);
+        store8(buf + 64, 10);
+        store8(buf + 65, 0);
+        if (file_write_all(new_branch, buf, 65) < 0) {
+            eprintln("sit: failed to write branch ref");
+            return 1;
+        }
+    }
 
     var target_ref_len = 11 + tlen;
     var target_ref = alloc(target_ref_len + 1);
@@ -2936,10 +3070,11 @@ fn print_usage() {
     eprintln("");
     eprintln("commands:");
     eprintln("  init                    create an empty sit repository");
-    eprintln("  add <path>              hash and store a file as a blob object");
+    eprintln("  add [-f] <path>         hash and store a file as a blob object");
     eprintln("  rm [--cached] <path>    remove a tracked file from working tree and index");
     eprintln("  branch [<name>]         list branches, or create one at HEAD");
-    eprintln("  checkout <branch>       switch to <branch>, updating working tree + index");
+    eprintln("  checkout [-b] <branch>  switch to <branch>, optionally creating it first");
+    eprintln("  tag [<name> [<commit>]] list tags, or create one at HEAD (or at commit)");
     eprintln("  config [--global] <key> [<value>]  read or write a config value");
     eprintln("  fsck                    verify object integrity (sha-256 vs filename)");
     eprintln("  commit [-m] <message>   record staged changes as a new commit");
@@ -2968,6 +3103,7 @@ fn main() {
     if (streq(cmd, "rm")       == 1) { return cmd_rm(); }
     if (streq(cmd, "branch")   == 1) { return cmd_branch(); }
     if (streq(cmd, "checkout") == 1) { return cmd_checkout(); }
+    if (streq(cmd, "tag")      == 1) { return cmd_tag(); }
     if (streq(cmd, "config")   == 1) { return cmd_config(); }
     if (streq(cmd, "fsck")     == 1) { return cmd_fsck(); }
     if (streq(cmd, "commit")   == 1) { return cmd_commit(); }
