@@ -8,9 +8,9 @@ The name is from *smriti* (स्मृति — "that which is remembered"). T
 
 ## Status
 
-- **Version**: 0.4.0 — first official release. Local multi-branch VCS with signed commits; wire protocol (fetch/push) landing in this release.
+- **Version**: 0.5.0 — wire protocol (local-path transport). Remotes, fetch, pull, push, clone across bare-path remotes. Network transports (HTTP, SSH) are v0.6.x work.
 - **Language**: Cyrius (toolchain pinned in `cyrius.cyml` under `[package].cyrius`)
-- **Commands** (19): `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `reset`, `commit`, `config`, `fsck`, `key`, `verify-commit`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md)
+- **Commands** (24): `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `reset`, `commit`, `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md)
 
 Objects are SHA-256-hashed (via [sigil](https://github.com/MacCracken/sigil)) and zlib-compressed (via [sankoch](https://github.com/MacCracken/sankoch)), stored in a [patra](https://github.com/MacCracken/patra) table with a `COL_BYTES` content column. Trees are recursive and byte-compatible with git's SHA-256 object format. Commits can be ed25519-signed via sigil. Still exploratory, post-boot — not on the AGNOS critical path.
 

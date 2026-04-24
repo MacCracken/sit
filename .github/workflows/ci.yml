@@ -77,6 +77,25 @@ jobs:
           "$GITHUB_WORKSPACE/build/sit" commit -S -m "signed smoke"
           "$GITHUB_WORKSPACE/build/sit" verify-commit
 
+      - name: Smoke — wire protocol (clone, pull, push)
+        run: |
+          export HOME=$GITHUB_WORKSPACE/ci-home
+          export SIT_AUTHOR_NAME="CI Runner"
+          export SIT_AUTHOR_EMAIL="ci@example.com"
+          ORIG=$(mktemp -d)
+          (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" init && echo hello > a && "$GITHUB_WORKSPACE/build/sit" add a && "$GITHUB_WORKSPACE/build/sit" commit -m "origin-root")
+          CLONE=$(mktemp -d)/repo
+          "$GITHUB_WORKSPACE/build/sit" clone "$ORIG" "$CLONE"
+          cd "$CLONE"
+          test "$(cat a)" = "hello" || { echo "clone content wrong"; exit 1; }
+          echo world > b
+          "$GITHUB_WORKSPACE/build/sit" add b
+          "$GITHUB_WORKSPACE/build/sit" commit -m "clone-add-b"
+          "$GITHUB_WORKSPACE/build/sit" push origin main
+          # Verify origin received the push
+          cd "$ORIG"
+          test -f b && grep -q world b && echo "wire smoke ok" || { echo "push content missing"; exit 1; }
+
   docs:
     name: Documentation
     runs-on: ubuntu-latest

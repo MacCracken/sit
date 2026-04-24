@@ -65,8 +65,8 @@ EOF
 hr "status (clean, one commit ahead of feature branch)"
 "$SIT" status
 
-hr "merge extra-fruit into main (3-way, non-overlapping changes)"
-"$SIT" merge extra-fruit
+hr "merge extra-fruit into main, signed (3-way, non-overlapping changes)"
+"$SIT" merge -S extra-fruit
 
 hr "final log"
 "$SIT" log
@@ -74,10 +74,8 @@ hr "final log"
 hr "show --stat for the merge commit"
 "$SIT" show --stat
 
-hr "verify-commit on the signed 'add delta' commit"
-# HEAD is the merge commit, which sit merge doesn't yet sign (roadmap item).
-# Verify the explicit signed commit on extra-fruit instead — it has a sitsig.
-"$SIT" verify-commit extra-fruit
+hr "verify-commit on HEAD (the signed merge commit)"
+"$SIT" verify-commit
 
 hr "fsck — confirm every stored object re-hashes to its key"
 "$SIT" fsck

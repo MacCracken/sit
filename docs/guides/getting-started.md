@@ -170,6 +170,60 @@ sit show
 
 The signature is a `sitsig <128-hex-sig> <64-hex-pubkey>` line spliced into the commit header between `committer` and the blank separator. `cat-file` shows it verbatim; the signed payload is the commit body *without* the sitsig line, matching git's self-consistent `gpgsig` convention.
 
+## Sync with a remote
+
+In v0.5.0 a "remote" is another sit working-tree directory on the same filesystem. Network transports (HTTP, SSH) land in v0.6.x; the object-transfer mechanics here carry over unchanged.
+
+```sh
+# Register a remote. The URL is a path (bare or file://).
+/path/to/sit/build/sit remote add origin /srv/sit-repos/demo
+/path/to/sit/build/sit remote list
+# origin	/srv/sit-repos/demo
+```
+
+Fetch objects and the tracking ref:
+
+```sh
+sit fetch origin            # defaults to main
+sit fetch origin feature-x  # or a specific branch
+# fetched origin/main at 05359719b7c3 (7 new objects)
+```
+
+The fetched objects land in your local `.sit/objects.patra`; the remote's tip is written to `.sit/refs/remotes/origin/<branch>`. Fetch does not merge — run `sit merge origin/main` (or, when v0.5.1 lands, `sit pull`) to integrate.
+
+Push the current branch back upstream:
+
+```sh
+sit push origin             # defaults to current branch
+sit push origin main
+# pushed main -> origin at 859d7b43afef (3 new objects)
+```
+
+Push is fast-forward-only: if the remote has commits your local branch doesn't contain, the push aborts with `non-fast-forward push rejected (remote has diverged)`. Fetch, merge, and re-push is the resolution path.
+
+### Pull and clone
+
+`sit pull` is fetch + fast-forward merge:
+
+```sh
+sit pull origin             # defaults to main
+# fetched origin/main at 0755fb124e1a (3 new objects)
+# fast-forward to 0755fb124e1a
+```
+
+If your local branch has diverged from origin, `sit pull` bails out with `local and remote have diverged; run 'sit merge origin/main' to resolve`. This matches `git pull --ff-only` and avoids surprising auto-merges.
+
+`sit clone` bootstraps a new repo from a remote path:
+
+```sh
+cd /tmp
+sit clone /srv/sit-repos/demo my-demo
+cd my-demo
+sit log
+```
+
+Under the hood it's `mkdir` + `chdir` + `sit init` + `sit remote add origin <url>` + `sit fetch origin main` + `write HEAD ref` + materialize the tree. The target directory defaults to the URL's last path segment when you don't pass one.
+
 ## View history
 
 ```sh
@@ -308,13 +362,20 @@ file?.bak
 - `sit key generate` / `sit key show` — create / inspect the local ed25519 signing key at `~/.sit/signing_key`
 - `sit commit -S` — sign the commit body (inserts a `sitsig <sig> <pubkey>` header line)
 - `sit verify-commit [<hash>]` — check a commit's signature; defaults to HEAD
+- `sit remote add|list|remove <name> [<url>]` — manage named remotes (local-path URLs for now)
+- `sit fetch <remote> [<branch>]` — copy remote objects + tracking ref into the local repo
+- `sit pull <remote> [<branch>]` — fetch + fast-forward merge (divergence → use `sit merge` manually)
+- `sit push <remote> [<branch>]` — push HEAD's branch to a remote (fast-forward only)
+- `sit clone <url> [<dir>]` — init + remote add + fetch + materialize in one shot
+- `sit merge -S <branch>` — signed merge commit (same ed25519 flow as `sit commit -S`)
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
 
 ## What doesn't yet
 
-- Remote / push / pull / fetch / wire protocol
-- Merge, rebase
+- Network transports (HTTP / SSH) — v0.5.0 ships local-path remotes only
+- Pack bundles / delta compression for object transfer
+- Rebase
 - Full gitignore semantics (no negation / `**` / char-classes yet)
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).
