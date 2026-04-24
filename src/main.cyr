@@ -47,6 +47,114 @@ fn argv_heap(n) {
     return s;
 }
 
+# Write ".sit/objects/<xx>/<yy...>" into buf for a 64-char hex hash.
+# buf must hold at least 80 bytes. Returns the path length (78).
+fn object_path(buf, hex) {
+    memcpy(buf, ".sit/objects/", 13);
+    store8(buf + 13, load8(hex));
+    store8(buf + 14, load8(hex + 1));
+    store8(buf + 15, 47);
+    memcpy(buf + 16, hex + 2, 62);
+    store8(buf + 78, 0);
+    return 78;
+}
+
+# Resolve a hex hash prefix (4-64 chars) to a full 64-char hash.
+# Writes null-terminated hash into out_buf (65 bytes) and returns:
+#    1  exact match
+#    0  no match
+#   -1  ambiguous
+#   -2  prefix too short
+fn resolve_hash(prefix, out_buf) {
+    var plen = strlen(prefix);
+    if (plen == 64) {
+        memcpy(out_buf, prefix, 64);
+        store8(out_buf + 64, 0);
+        return 1;
+    }
+    if (plen < 4) { return 0 - 2; }
+
+    var dir = alloc(32);
+    memcpy(dir, ".sit/objects/", 13);
+    store8(dir + 13, load8(prefix));
+    store8(dir + 14, load8(prefix + 1));
+    store8(dir + 15, 0);
+
+    var entries = dir_list(str_from(dir));
+    var rest = prefix + 2;
+    var rest_len = plen - 2;
+
+    var match_count = 0;
+    var match_entry = 0;
+    var i = 0;
+    while (i < vec_len(entries)) {
+        var entry = vec_get(entries, i);
+        var elen = str_len(entry);
+        var edata = str_data(entry);
+        if (elen >= rest_len) {
+            if (memeq(edata, rest, rest_len) == 1) {
+                match_count = match_count + 1;
+                match_entry = entry;
+            }
+        }
+        i = i + 1;
+    }
+
+    if (match_count == 0) { return 0; }
+    if (match_count > 1) { return 0 - 1; }
+
+    store8(out_buf, load8(prefix));
+    store8(out_buf + 1, load8(prefix + 1));
+    memcpy(out_buf + 2, str_data(match_entry), 62);
+    store8(out_buf + 64, 0);
+    return 1;
+}
+
+# Read and decompress an object by full 64-char hex hash.
+# On success, writes to out (24 bytes):
+#   out[0..8)    decompressed buffer ptr
+#   out[8..16)   decompressed length (framing + content)
+#   out[16..24)  content offset (first byte past framing \0)
+# Returns 0 on success, negative on error.
+fn read_object(hex, out) {
+    var path[96];
+    object_path(&path, hex);
+
+    var fd = file_open(&path, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+
+    var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
+    syscall(SYS_LSEEK, fd, 0, SEEK_SET);
+    if (size <= 0) { file_close(fd); return 0 - 2; }
+
+    var compressed = alloc(size);
+    var total = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        var n = file_read(fd, compressed + total, size - total);
+        if (n <= 0) { rgo = 0; }
+        else { total = total + n; if (total >= size) { rgo = 0; } }
+    }
+    file_close(fd);
+
+    var dec_cap = 16 * 1024 * 1024;
+    var decompressed = alloc(dec_cap);
+    var dlen = zlib_decompress(compressed, total, decompressed, dec_cap);
+    if (dlen <= 0) { return 0 - 3; }
+
+    var nul = 0;
+    while (nul < dlen) {
+        if (load8(decompressed + nul) == 0) { break; }
+        nul = nul + 1;
+    }
+    if (nul >= dlen) { return 0 - 4; }
+
+    store64(out, decompressed);
+    store64(out + 8, dlen);
+    store64(out + 16, nul + 1);
+    return 0;
+}
+
 fn cmd_init() {
     var reinit = file_exists(".sit/HEAD");
 
@@ -107,19 +215,16 @@ fn write_blob_object(content, content_len) {
     var clen = zlib_compress(full, full_len, compressed, out_cap);
     if (clen <= 0) { return 0; }
 
-    # Object path: .sit/objects/<hex[0:2]>/<hex[2:64]>
-    var obj_path = alloc(96);
-    memcpy(obj_path, ".sit/objects/", 13);
-    store8(obj_path + 13, load8(hex));
-    store8(obj_path + 14, load8(hex + 1));
-    store8(obj_path + 15, 0);
-    ensure_dir(obj_path);
+    var obj_dir = alloc(32);
+    memcpy(obj_dir, ".sit/objects/", 13);
+    store8(obj_dir + 13, load8(hex));
+    store8(obj_dir + 14, load8(hex + 1));
+    store8(obj_dir + 15, 0);
+    ensure_dir(obj_dir);
 
-    store8(obj_path + 15, 47);  # '/'
-    memcpy(obj_path + 16, hex + 2, 62);
-    store8(obj_path + 78, 0);
-
-    if (file_write_all(obj_path, compressed, clen) < 0) { return 0; }
+    var obj = alloc(96);
+    object_path(obj, hex);
+    if (file_write_all(obj, compressed, clen) < 0) { return 0; }
     return hex;
 }
 
@@ -167,7 +272,6 @@ fn cmd_add() {
         return 1;
     }
 
-    # Append to staging index: <hex>\t<path>\n
     var entry_len = 64 + 1 + path_len + 1;
     var entry = alloc(entry_len);
     memcpy(entry, hex, 64);
@@ -184,12 +288,109 @@ fn cmd_add() {
     return 0;
 }
 
+# Common setup for read-side commands: parse prefix, resolve to full hash,
+# read+decompress. On success: writes 24-byte struct to obj_out, returns 0.
+# On error: emits message to stderr and returns non-zero for main to return.
+fn resolve_and_read(obj_out, hex_out) {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var prefix = argv_heap(2);
+    var rr = resolve_hash(prefix, hex_out);
+    if (rr == 0 - 2) { eprintln("sit: hash prefix too short (min 4 chars)"); return 1; }
+    if (rr == 0 - 1) { eprintln("sit: ambiguous hash prefix"); return 1; }
+    if (rr == 0)     { eprintln("sit: no object matches"); return 1; }
+
+    var er = read_object(hex_out, obj_out);
+    if (er != 0) {
+        eprintln("sit: cannot read object (corrupt or missing)");
+        return 1;
+    }
+    return 0;
+}
+
+fn cmd_cat_file() {
+    if (argc() < 3) {
+        eprintln("usage: sit cat-file <hash>");
+        return 1;
+    }
+
+    var hex[72];
+    var obj[24];
+    var r = resolve_and_read(&obj, &hex);
+    if (r != 0) { return r; }
+
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    syscall(SYS_WRITE, STDOUT, buf + coff, blen - coff);
+    return 0;
+}
+
+# Locate the owl binary on common system paths.
+# Returns a C-string path or 0 if not found.
+fn find_owl() {
+    if (file_exists("/usr/local/bin/owl") == 1) { return "/usr/local/bin/owl"; }
+    if (file_exists("/usr/bin/owl") == 1)       { return "/usr/bin/owl"; }
+    if (file_exists("/opt/owl/bin/owl") == 1)   { return "/opt/owl/bin/owl"; }
+    return 0;
+}
+
+fn cmd_owl_file() {
+    if (argc() < 3) {
+        eprintln("usage: sit owl-file <hash>");
+        return 1;
+    }
+
+    var hex[72];
+    var obj[24];
+    var r = resolve_and_read(&obj, &hex);
+    if (r != 0) { return r; }
+
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    var content = buf + coff;
+    var content_len = blen - coff;
+
+    # Write content to /tmp/sit-owl-<hex[0:12]> for owl to read
+    var tmppath[64];
+    memcpy(&tmppath, "/tmp/sit-owl-", 13);
+    memcpy(&tmppath + 13, &hex, 12);
+    store8(&tmppath + 25, 0);
+
+    if (file_write_all(&tmppath, content, content_len) < 0) {
+        eprintln("sit: cannot write tempfile");
+        return 1;
+    }
+
+    var owl = find_owl();
+    if (owl == 0) {
+        eprintln("sit: owl not installed — emitting raw content");
+        eprintln("sit:   (owl is pre-1.0; https://github.com/MacCracken/owl)");
+        syscall(SYS_WRITE, STDOUT, content, content_len);
+        sys_unlink(&tmppath);
+        return 0;
+    }
+
+    var args = vec_new();
+    vec_push(args, owl);
+    vec_push(args, &tmppath);
+    var rc = exec_vec(args);
+    sys_unlink(&tmppath);
+    return rc;
+}
+
 fn print_usage() {
     eprintln("usage: sit <command> [<args>]");
     eprintln("");
     eprintln("commands:");
-    eprintln("  init           create an empty sit repository");
-    eprintln("  add <path>     hash and store a file as a blob object");
+    eprintln("  init               create an empty sit repository");
+    eprintln("  add <path>         hash and store a file as a blob object");
+    eprintln("  cat-file <hash>    emit object content to stdout (plumbing)");
+    eprintln("  owl-file <hash>    view object through owl (bat-like viewer)");
     return 0;
 }
 
@@ -204,8 +405,10 @@ fn main() {
 
     var cmd = argv(1);
 
-    if (streq(cmd, "init") == 1) { return cmd_init(); }
-    if (streq(cmd, "add") == 1)  { return cmd_add(); }
+    if (streq(cmd, "init")     == 1) { return cmd_init(); }
+    if (streq(cmd, "add")      == 1) { return cmd_add(); }
+    if (streq(cmd, "cat-file") == 1) { return cmd_cat_file(); }
+    if (streq(cmd, "owl-file") == 1) { return cmd_owl_file(); }
 
     eprintln("sit: unknown command");
     print_usage();

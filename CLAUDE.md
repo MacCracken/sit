@@ -24,12 +24,13 @@ Project was scaffolded with `cyrius init sit`. Do not manually create project st
 
 ## Current State
 
-- **Source**: `src/main.cyr` — subcommand dispatch; `sit init` and `sit add` implemented
+- **Source**: `src/main.cyr` — subcommand dispatch; `init`, `add`, `cat-file`, `owl-file` implemented
 - **Tests**: `tests/sit.tcyr` smoke only; integration coverage is shell-level for now
-- **Binary**: `cyrius build src/main.cyr build/sit` produces a working `sit init` / `sit add <path>`
+- **Binary**: `cyrius build src/main.cyr build/sit`
 - **Objects**: SHA-256 hashed via sigil, zlib-compressed via sankoch, stored loose at `.sit/objects/<hex[0:2]>/<hex[2:64]>`. Framing is `"blob <len>\0<content>"` — byte-compatible with git's SHA-256 object format
 - **Staging index**: plaintext `<hex>\t<path>\n` lines at `.sit/index` (placeholder — migrates to patra once the index grows mutation semantics; see [arch 002](docs/architecture/002-loose-objects-until-patra-blobs.md))
-- **Integration**: no downstream consumers yet; owl will consume sit for git-marker gutter decorations once sit is functional
+- **Read commands**: `cat-file` (plumbing, raw bytes) and `owl-file` (decorated via [owl](https://github.com/MacCracken/owl); falls back to raw when owl isn't on PATH — owl is pre-1.0)
+- **Integration**: owl consumes sit for git-marker gutter decorations once both land; owl is the downstream
 
 ## Dependencies
 

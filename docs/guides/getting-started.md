@@ -80,14 +80,38 @@ print(zlib.decompress(open('.sit/objects/37/f70a18b0d27d5dd912f6080063bf6fe10820
 
 Sit's object hashes are byte-identical to git's SHA-256 object hashes for the same content — see [ADR 0001](../adr/0001-no-ffi-first-party-only.md) for why we reimplement the stack rather than bind to libgit2.
 
+## View an object — plumbing (`cat-file`)
+
+```sh
+# Full 64-char hash
+/path/to/sit/build/sit cat-file 37f70a18b0d27d5dd912f6080063bf6fe10820814bccc4bcd13c67ce97c2a96c
+
+# Or any prefix ≥ 4 chars
+/path/to/sit/build/sit cat-file 37f7
+```
+
+Output is the raw blob content — the framing (`"blob <len>\0"`) is stripped. Errors on ambiguous prefixes, prefixes shorter than 4 characters, or missing objects.
+
+## View an object — decorated (`owl-file`)
+
+```sh
+/path/to/sit/build/sit owl-file 37f7
+```
+
+Runs the content through [owl](https://github.com/MacCracken/owl) — bat-like file viewer with syntax highlighting, line numbers, and git-aware gutter markers. Looks for owl at `/usr/local/bin/owl`, `/usr/bin/owl`, `/opt/owl/bin/owl`.
+
+If owl isn't installed (it's currently pre-1.0), `owl-file` prints a notice and falls back to emitting raw content — so the command is usable today, and transparently upgrades to decorated output once owl ships.
+
 ## What works today
 
 - `sit init` — create empty repository
 - `sit add <path>` — hash, compress, and store a file as a blob object; append to staging index
+- `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
+- `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
 
 ## What doesn't yet
 
 - `sit commit` — tree + commit object creation
-- `sit status`, `sit log`, `sit cat-file`, everything else
+- `sit status`, `sit log`, `sit diff`, everything else
 
-Track progress in `CHANGELOG.md`. Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).
+Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).
