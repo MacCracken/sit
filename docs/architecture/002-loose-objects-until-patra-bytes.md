@@ -1,6 +1,6 @@
 # 002 — Loose-file object store until patra grows a `COL_BYTES` type
 
-**Status**: superseded by patra 1.6.0 (2026-04-23). `COL_BYTES` ships; sit can migrate its object store into a patra table. This ADR is kept for historical context; the "How to apply" section is the current migration guide.
+**Status**: **Fully resolved in sit v0.2.6** (2026-04-24). patra 1.6.0 shipped `COL_BYTES`, sit migrated both the staging index (v0.2.5) and the object store (v0.2.6) into patra. Loose-file layout is gone; legacy repos auto-migrate on first access. Kept for historical context.
 **Related**: [ADR 0001](../adr/0001-no-ffi-first-party-only.md) (first-party only).
 
 ## The issue (resolved in patra 1.6.0)
@@ -29,7 +29,12 @@ The staging index is a plaintext append-only file at `.sit/index`, format `<hex>
 
 ## What patra is used for today
 
-As of v0.2.5, the **staging index lives in patra** — `.sit/index.patra` with a single `entries(path STR, hash_hex STR)` table. `parse_index()` queries it, `rewrite_index()` DELETEs + re-INSERTs, and `sit add` does an upsert. Legacy plaintext `.sit/index` files auto-migrate on first access. Objects are still loose files; see "Resolution" for the remaining migration.
+As of v0.2.6, **both the staging index and the object store live in patra**:
+
+- **`.sit/index.patra`** — `entries(path STR, hash_hex STR)`. Shipped v0.2.5.
+- **`.sit/objects.patra`** — `objects(hash STR, ty INT, content BYTES)`. Shipped v0.2.6. Every `sit add` / `sit commit` writes blobs / trees / commits here; every `cat-file` / `log` / `show` / `diff` / `checkout` reads from here.
+
+Legacy repos (plaintext index + loose files under `.sit/objects/<xx>/<yy...>`) auto-migrate on first access to either table — `index_migrate_from_plaintext` and `object_db_migrate_from_loose` do one-shot imports and then delete the old artifacts. `cmd_init` still creates the `.sit/objects/` directory for backward compat, but it stays empty in new repos.
 
 ## Resolution
 

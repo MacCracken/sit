@@ -146,6 +146,19 @@
 - Fixes UX gap flagged in v0.2.3: `sit show v0.1` no longer errors with "too short prefix" and instead resolves to the tagged commit.
 - Verified against eight scenarios: `show HEAD`, `show <tag>`, `show <branch>`, `show` on cross-branch tag, `show` on non-current branch, `cat-file <tag>`, short-name-as-tag beats too-short-prefix rule, empty-repo `show HEAD` returns cleanly.
 
+### v0.2.6 — Objects migrate to patra (arch 002 fully resolved)
+
+- **`.sit/objects.patra`** — `objects(hash STR, ty INT, content BYTES)` replaces the loose `.sit/objects/<xx>/<yy...>` file tree. Every sit object (blob, tree, commit) is now a row; `content` is the zlib-compressed framed bytes, same on-the-wire shape as the old loose files. `ty` is a small INT (0=blob / 1=tree / 2=commit) kept for future GC / stats filtering even though it's redundant with the framing prefix.
+- **`object_db_open()`** — idempotent `CREATE TABLE` on every call; patra's "table exists" error on second+ call is silently swallowed. Returns the db handle.
+- **`object_db_migrate_from_loose(db)`** — walks `.sit/objects/<xx>/<yy...>`, decompresses each, sniffs type from the framing, `patra_insert_row`s it, `sys_unlink`s the loose file, then `sys_rmdir`s the now-empty 2-char bucket. Triggered at the top of `read_object` / `resolve_hash` / `cmd_fsck` — any code path that might need an object.
+- **`write_typed_object`** rewritten: frame + hash + compress as before, then content-addressed upsert — `SELECT hash FROM objects WHERE hash = '...'` to skip duplicate inserts, otherwise `patra_insert_row`. Same write-once semantics as the old store.
+- **`read_object`** rewritten: `SELECT content FROM objects WHERE hash = '...'`, `patra_result_get_bytes_len` + `patra_result_read_bytes` for the compressed payload, then existing `zlib_decompress` + framing-null scan. Same 24-byte output struct.
+- **`resolve_hash`** prefix path rewritten: `WHERE hash LIKE 'abcd%'`. Count-of-rows drives match/ambiguous/no-match return.
+- **`cmd_fsck`** rewritten: snapshot hashes via `SELECT hash FROM objects`, close the db, then call `read_object` per hash (each does its own open/close). Keeps two simultaneous patra handles off the same file.
+- **CLAUDE.md's thesis met**: sit now uses "patra-backed objects and sigil-hashed refs" top to bottom. No loose files, no plaintext index, no side-channel storage.
+- Perf: re-benchmarked against git on init / add-small / commit-20 — all three stay faster than git (0.40× / 0.83× / 0.49×). Patra open/close per command adds modest overhead; sit's single-static-binary startup advantage still dominates.
+- Verified against seven scenarios: fresh init+add+commit (no loose files produced), nested subdir commits, log+show+cat-file through patra, fsck across 10 objects, branch+checkout roundtrip with materialization, tag + ref resolution via LIKE query, legacy loose-files migration on fsck.
+
 ### v0.2.5 — Staging index migrates to patra
 
 - Patra 1.6.0 ships with `COL_BYTES` and its prerequisites (`patra_insert_row`, `patra_result_read_bytes`). sit's first real patra consumer is the staging index.
@@ -171,7 +184,6 @@
 
 ### Longer horizon
 
-- **Objects into patra** — `COL_BYTES` is live (patra 1.6.0). The last piece of arch 002's migration: move `.sit/objects/<xx>/<yy...>` loose files into a `objects(hash STR PRIMARY, type INT, content BYTES)` patra table. See [arch 002](../architecture/002-loose-objects-until-patra-bytes.md).
 - **Pack format** — delta-compressed multi-object storage; depends on `COL_BYTES` and sankoch delta primitives.
 - **Wire protocol** — first-party smart-HTTP / ssh replacement. Not on the AGNOS critical path; revisit once the local VCS loop is solid.
 - **Merge** — 3-way merge with conflict markers. Needs a merge-base finder (walk commit ancestors to find LCA) and per-file three-way text merge.

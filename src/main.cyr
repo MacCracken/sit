@@ -132,39 +132,35 @@ fn resolve_hash(prefix, out_buf) {
 
     if (plen < 4) { return 0 - 2; }
 
-    var dir = alloc(32);
-    memcpy(dir, ".sit/objects/", 13);
-    store8(dir + 13, load8(prefix));
-    store8(dir + 14, load8(prefix + 1));
-    store8(dir + 15, 0);
+    var db = object_db_open();
+    if (db == 0) { return 0; }
+    object_db_migrate_from_loose(db);
 
-    var entries = dir_list(str_from(dir));
-    var rest = prefix + 2;
-    var rest_len = plen - 2;
+    var sql = alloc(64 + plen);
+    memcpy(sql, "SELECT hash FROM objects WHERE hash LIKE '", 42);
+    memcpy(sql + 42, prefix, plen);
+    memcpy(sql + 42 + plen, "%'", 2);
+    store8(sql + 42 + plen + 2, 0);
 
-    var match_count = 0;
-    var match_entry = 0;
-    var i = 0;
-    while (i < vec_len(entries)) {
-        var entry = vec_get(entries, i);
-        var elen = str_len(entry);
-        var edata = str_data(entry);
-        if (elen >= rest_len) {
-            if (memeq(edata, rest, rest_len) == 1) {
-                match_count = match_count + 1;
-                match_entry = entry;
-            }
-        }
-        i = i + 1;
+    var rs = patra_query(db, sql);
+    if (rs == 0) { patra_close(db); return 0; }
+    var count = patra_result_count(rs);
+    if (count == 0) {
+        patra_result_free(rs);
+        patra_close(db);
+        return 0;
+    }
+    if (count > 1) {
+        patra_result_free(rs);
+        patra_close(db);
+        return 0 - 1;
     }
 
-    if (match_count == 0) { return 0; }
-    if (match_count > 1) { return 0 - 1; }
-
-    store8(out_buf, load8(prefix));
-    store8(out_buf + 1, load8(prefix + 1));
-    memcpy(out_buf + 2, str_data(match_entry), 62);
+    var hash_str = patra_result_get_str(rs, 0, 0);
+    memcpy(out_buf, hash_str, 64);
     store8(out_buf + 64, 0);
+    patra_result_free(rs);
+    patra_close(db);
     return 1;
 }
 
@@ -175,42 +171,54 @@ fn resolve_hash(prefix, out_buf) {
 #   out[16..24)  content offset (first byte past framing \0)
 # Returns 0 on success, negative on error.
 fn read_object(hex, out) {
-    var path[96];
-    object_path(&path, hex);
+    var db = object_db_open();
+    if (db == 0) { return 0 - 1; }
+    object_db_migrate_from_loose(db);
 
-    var fd = file_open(&path, 0, 0);
-    if (fd < 0) { return 0 - 1; }
+    var sql = alloc(128);
+    memcpy(sql, "SELECT content FROM objects WHERE hash = '", 42);
+    memcpy(sql + 42, hex, 64);
+    memcpy(sql + 42 + 64, "'", 1);
+    store8(sql + 42 + 64 + 1, 0);
 
-    var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
-    syscall(SYS_LSEEK, fd, 0, SEEK_SET);
-    if (size <= 0) { file_close(fd); return 0 - 2; }
-
-    var compressed = alloc(size);
-    var total = 0;
-    var rgo = 1;
-    while (rgo == 1) {
-        var n = file_read(fd, compressed + total, size - total);
-        if (n <= 0) { rgo = 0; }
-        else { total = total + n; if (total >= size) { rgo = 0; } }
+    var rs = patra_query(db, sql);
+    if (rs == 0) { patra_close(db); return 0 - 2; }
+    if (patra_result_count(rs) == 0) {
+        patra_result_free(rs);
+        patra_close(db);
+        return 0 - 3;
     }
-    file_close(fd);
 
-    # Heuristic: allow up to 256x expansion, capped at a reasonable ceiling.
-    # Commits/trees are small; blobs can be larger but nowhere near this.
-    var dec_cap = total * 256;
+    var blen = patra_result_get_bytes_len(rs, 0, 0);
+    if (blen <= 0) {
+        patra_result_free(rs);
+        patra_close(db);
+        return 0 - 4;
+    }
+
+    var compressed = alloc(blen);
+    if (patra_result_read_bytes(db, rs, 0, 0, compressed) != 0) {
+        patra_result_free(rs);
+        patra_close(db);
+        return 0 - 5;
+    }
+    patra_result_free(rs);
+    patra_close(db);
+
+    var dec_cap = blen * 256;
     if (dec_cap < 4096) { dec_cap = 4096; }
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
     var decompressed = alloc(dec_cap);
-    if (decompressed == 0) { return 0 - 5; }
-    var dlen = zlib_decompress(compressed, total, decompressed, dec_cap);
-    if (dlen <= 0) { return 0 - 3; }
+    if (decompressed == 0) { return 0 - 6; }
+    var dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
+    if (dlen <= 0) { return 0 - 7; }
 
     var nul = 0;
     while (nul < dlen) {
         if (load8(decompressed + nul) == 0) { break; }
         nul = nul + 1;
     }
-    if (nul >= dlen) { return 0 - 4; }
+    if (nul >= dlen) { return 0 - 8; }
 
     store64(out, decompressed);
     store64(out + 8, dlen);
@@ -275,16 +283,43 @@ fn write_typed_object(type_str, type_len, content, content_len) {
     var clen = zlib_compress(full, full_len, compressed, out_cap);
     if (clen <= 0) { return 0; }
 
-    var obj_dir = alloc(32);
-    memcpy(obj_dir, ".sit/objects/", 13);
-    store8(obj_dir + 13, load8(hex));
-    store8(obj_dir + 14, load8(hex + 1));
-    store8(obj_dir + 15, 0);
-    ensure_dir(obj_dir);
+    var db = object_db_open();
+    if (db == 0) { return 0; }
 
-    var obj = alloc(96);
-    object_path(obj, hex);
-    if (file_write_all(obj, compressed, clen) < 0) { return 0; }
+    # Content-addressed — skip if hash already present.
+    var check_sql = alloc(128);
+    memcpy(check_sql, "SELECT hash FROM objects WHERE hash = '", 39);
+    memcpy(check_sql + 39, hex, 64);
+    memcpy(check_sql + 39 + 64, "'", 1);
+    store8(check_sql + 39 + 64 + 1, 0);
+    var rs = patra_query(db, check_sql);
+    var exists = 0;
+    if (rs != 0) {
+        if (patra_result_count(rs) > 0) { exists = 1; }
+        patra_result_free(rs);
+    }
+
+    if (exists == 0) {
+        var type_code = type_code_of(type_str, type_len);
+        var types[24];
+        store64(&types + 0, 1);
+        store64(&types + 8, 0);
+        store64(&types + 16, 2);
+        var ivals[24];
+        store64(&ivals + 8, type_code);
+        var sptrs[24];
+        store64(&sptrs + 0, hex);
+        var slens[24];
+        store64(&slens + 0, 64);
+        var bptrs[24];
+        store64(&bptrs + 16, compressed);
+        var blens[24];
+        store64(&blens + 16, clen);
+        patra_insert_row(db, "objects", 7, 3,
+            &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+    }
+
+    patra_close(db);
     return hex;
 }
 
@@ -463,6 +498,116 @@ fn cmd_owl_file() {
     var rc = exec_vec(args);
     sys_unlink(&tmppath);
     return rc;
+}
+
+# Type codes stored in the objects.type INT column.
+fn type_code_of(type_str, type_len) {
+    if (type_len == 4) {
+        if (memeq(type_str, "blob", 4) == 1) { return 0; }
+        if (memeq(type_str, "tree", 4) == 1) { return 1; }
+    }
+    if (type_len == 6) {
+        if (memeq(type_str, "commit", 6) == 1) { return 2; }
+    }
+    return 0 - 1;
+}
+
+# Open (or create) the patra-backed object store. Returns db handle, or 0.
+fn object_db_open() {
+    patra_init();
+    var db = patra_open(".sit/objects.patra");
+    if (db == 0) { return 0; }
+    patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
+    return db;
+}
+
+# Migrate legacy loose-file objects (under .sit/objects/<xx>/<yy...>) into
+# the patra table. No-op if no legacy files present. Deletes loose files
+# + empty 2-char directories as they're migrated.
+fn object_db_migrate_from_loose(db) {
+    if (file_exists(".sit/objects") != 1) { return 0; }
+
+    var dirs = dir_list(str_from(".sit/objects"));
+    var dn = vec_len(dirs);
+    var di = 0;
+    while (di < dn) {
+        var s = vec_get(dirs, di);
+        var sdata = str_data(s);
+        var slen = str_len(s);
+
+        if (slen == 2) {
+            var sub_path = alloc(16);
+            memcpy(sub_path, ".sit/objects/", 13);
+            memcpy(sub_path + 13, sdata, 2);
+            store8(sub_path + 15, 0);
+
+            var files = dir_list(str_from(sub_path));
+            var fn_ct = vec_len(files);
+            var fi = 0;
+            while (fi < fn_ct) {
+                var f = vec_get(files, fi);
+                var fdata = str_data(f);
+                var flen = str_len(f);
+
+                if (flen == 62) {
+                    var hex = alloc(65);
+                    memcpy(hex, sdata, 2);
+                    memcpy(hex + 2, fdata, 62);
+                    store8(hex + 64, 0);
+
+                    var loose_path = alloc(96);
+                    object_path(loose_path, hex);
+                    var pair[16];
+                    if (read_file_heap(loose_path, &pair) == 0) {
+                        var compressed = load64(&pair);
+                        var clen = load64(&pair + 8);
+
+                        # Sniff type from decompressed header for the INT column
+                        var dec_cap = clen * 256;
+                        if (dec_cap < 4096) { dec_cap = 4096; }
+                        if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
+                        var decompressed = alloc(dec_cap);
+                        var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+                        var type_code = 0;
+                        if (dlen > 5) {
+                            if (memeq(decompressed, "blob ", 5) == 1) { type_code = 0; }
+                            else {
+                                if (memeq(decompressed, "tree ", 5) == 1) { type_code = 1; }
+                                else {
+                                    if (dlen > 7) {
+                                        if (memeq(decompressed, "commit ", 7) == 1) { type_code = 2; }
+                                    }
+                                }
+                            }
+                        }
+
+                        var types[24];
+                        store64(&types + 0, 1);
+                        store64(&types + 8, 0);
+                        store64(&types + 16, 2);
+                        var ivals[24];
+                        store64(&ivals + 8, type_code);
+                        var sptrs[24];
+                        store64(&sptrs + 0, hex);
+                        var slens[24];
+                        store64(&slens + 0, 64);
+                        var bptrs[24];
+                        store64(&bptrs + 16, compressed);
+                        var blens[24];
+                        store64(&blens + 16, clen);
+                        patra_insert_row(db, "objects", 7, 3,
+                            &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+
+                        sys_unlink(loose_path);
+                    }
+                }
+                fi = fi + 1;
+            }
+            sys_rmdir(sub_path);
+        }
+        di = di + 1;
+    }
+    return 0;
 }
 
 # Open (or create) the patra-backed staging index. Returns db handle, or 0.
@@ -1162,66 +1307,58 @@ fn cmd_fsck() {
         return 1;
     }
 
-    if (file_exists(".sit/objects") != 1) {
+    var db = object_db_open();
+    if (db == 0) {
         syscall(SYS_WRITE, STDOUT, "checked 0 objects, 0 bad\n", 25);
         return 0;
     }
+    object_db_migrate_from_loose(db);
 
-    var dirs = dir_list(str_from(".sit/objects"));
+    # Snapshot the hash list first, then close the db so read_object can open
+    # its own handle without contention.
+    var rs = patra_query(db, "SELECT hash FROM objects");
     var total = 0;
     var bad = 0;
-
-    var dn = vec_len(dirs);
-    var di = 0;
-    while (di < dn) {
-        var s = vec_get(dirs, di);
-        var sdata = str_data(s);
-        var slen = str_len(s);
-
-        if (slen == 2) {
-            var sub_path = alloc(16);
-            memcpy(sub_path, ".sit/objects/", 13);
-            memcpy(sub_path + 13, sdata, 2);
-            store8(sub_path + 15, 0);
-
-            var files = dir_list(str_from(sub_path));
-            var fn_ct = vec_len(files);
-            var fi = 0;
-            while (fi < fn_ct) {
-                var f = vec_get(files, fi);
-                var fdata = str_data(f);
-                var flen = str_len(f);
-
-                if (flen == 62) {
-                    var hex = alloc(65);
-                    memcpy(hex, sdata, 2);
-                    memcpy(hex + 2, fdata, 62);
-                    store8(hex + 64, 0);
-
-                    var obj[24];
-                    if (read_object(hex, &obj) == 0) {
-                        var buf = load64(&obj);
-                        var blen = load64(&obj + 8);
-                        var actual = hash_data(buf, blen);
-                        if (streq(hex, actual) == 0) {
-                            syscall(SYS_WRITE, STDERR, "bad object ", 11);
-                            syscall(SYS_WRITE, STDERR, hex, 64);
-                            syscall(SYS_WRITE, STDERR, "\n", 1);
-                            bad = bad + 1;
-                        }
-                        total = total + 1;
-                    }
-                    else {
-                        syscall(SYS_WRITE, STDERR, "unreadable ", 11);
-                        syscall(SYS_WRITE, STDERR, hex, 64);
-                        syscall(SYS_WRITE, STDERR, "\n", 1);
-                        bad = bad + 1;
-                    }
-                }
-                fi = fi + 1;
-            }
+    var hashes = vec_new();
+    if (rs != 0) {
+        var count = patra_result_count(rs);
+        var i = 0;
+        while (i < count) {
+            var s = patra_result_get_str(rs, i, 0);
+            var copy = alloc(65);
+            memcpy(copy, s, 64);
+            store8(copy + 64, 0);
+            vec_push(hashes, copy);
+            i = i + 1;
         }
-        di = di + 1;
+        patra_result_free(rs);
+    }
+    patra_close(db);
+
+    var hn = vec_len(hashes);
+    var hi = 0;
+    while (hi < hn) {
+        var hex = vec_get(hashes, hi);
+        var obj[24];
+        if (read_object(hex, &obj) == 0) {
+            var buf = load64(&obj);
+            var blen = load64(&obj + 8);
+            var actual = hash_data(buf, blen);
+            if (streq(hex, actual) == 0) {
+                syscall(SYS_WRITE, STDERR, "bad object ", 11);
+                syscall(SYS_WRITE, STDERR, hex, 64);
+                syscall(SYS_WRITE, STDERR, "\n", 1);
+                bad = bad + 1;
+            }
+            total = total + 1;
+        }
+        else {
+            syscall(SYS_WRITE, STDERR, "unreadable ", 11);
+            syscall(SYS_WRITE, STDERR, hex, 64);
+            syscall(SYS_WRITE, STDERR, "\n", 1);
+            bad = bad + 1;
+        }
+        hi = hi + 1;
     }
 
     syscall(SYS_WRITE, STDOUT, "checked ", 8);
