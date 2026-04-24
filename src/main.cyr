@@ -1,6 +1,9 @@
 # sit — main entry point
 # Stdlib auto-included via cyrius.cyml
 
+var SEEK_SET = 0;
+var SEEK_END = 2;
+
 fn eprintln(s) {
     var len = strlen(s);
     syscall(SYS_WRITE, STDERR, s, len);
@@ -14,6 +17,34 @@ fn ensure_dir(path) {
     if (r == 0) { return 0; }
     if (r == 0 - 17) { return 0; }
     return r;
+}
+
+# Write decimal representation of n into buf. Returns digit count.
+fn write_decimal(buf, n) {
+    if (n == 0) { store8(buf, 48); return 1; }
+    var digits = 0;
+    var m = n;
+    while (m > 0) { digits = digits + 1; m = m / 10; }
+    m = n;
+    var i = digits - 1;
+    while (m > 0) {
+        store8(buf + i, 48 + m % 10);
+        i = i - 1;
+        m = m / 10;
+    }
+    return digits;
+}
+
+# Copy argv(n) into a heap-owned, null-terminated string. See
+# docs/architecture/001 — argv pointers alias post-return stack memory,
+# so we must copy before doing anything stack-heavy.
+fn argv_heap(n) {
+    var raw = argv(n);
+    var len = strlen(raw);
+    var s = alloc(len + 1);
+    memcpy(s, raw, len);
+    store8(s + len, 0);
+    return s;
 }
 
 fn cmd_init() {
@@ -50,11 +81,115 @@ fn cmd_init() {
     return 0;
 }
 
+# Build "blob <len>\0" header at buf. Returns header length.
+fn write_blob_header(buf, content_len) {
+    memcpy(buf, "blob ", 5);
+    var digits = write_decimal(buf + 5, content_len);
+    store8(buf + 5 + digits, 0);
+    return 5 + digits + 1;
+}
+
+# Hash, compress, and write a blob object. Returns the sigil hex hash
+# (64-char null-terminated C-string) on success, or 0 on failure.
+fn write_blob_object(content, content_len) {
+    var hdr_max = 32;
+    var full_cap = hdr_max + content_len;
+    var full = alloc(full_cap);
+    var hdr_len = write_blob_header(full, content_len);
+    memcpy(full + hdr_len, content, content_len);
+    var full_len = hdr_len + content_len;
+
+    var hex = hash_data(full, full_len);
+
+    var out_cap = full_len + 64 + full_len / 10;
+    if (out_cap < 128) { out_cap = 128; }
+    var compressed = alloc(out_cap);
+    var clen = zlib_compress(full, full_len, compressed, out_cap);
+    if (clen <= 0) { return 0; }
+
+    # Object path: .sit/objects/<hex[0:2]>/<hex[2:64]>
+    var obj_path = alloc(96);
+    memcpy(obj_path, ".sit/objects/", 13);
+    store8(obj_path + 13, load8(hex));
+    store8(obj_path + 14, load8(hex + 1));
+    store8(obj_path + 15, 0);
+    ensure_dir(obj_path);
+
+    store8(obj_path + 15, 47);  # '/'
+    memcpy(obj_path + 16, hex + 2, 62);
+    store8(obj_path + 78, 0);
+
+    if (file_write_all(obj_path, compressed, clen) < 0) { return 0; }
+    return hex;
+}
+
+fn cmd_add() {
+    if (argc() < 3) {
+        eprintln("usage: sit add <path>");
+        return 1;
+    }
+    var path = argv_heap(2);
+    var path_len = strlen(path);
+
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var fd = file_open(path, 0, 0);
+    if (fd < 0) {
+        syscall(SYS_WRITE, STDERR, "sit: cannot open '", 18);
+        syscall(SYS_WRITE, STDERR, path, path_len);
+        syscall(SYS_WRITE, STDERR, "'\n", 2);
+        return 1;
+    }
+    var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
+    syscall(SYS_LSEEK, fd, 0, SEEK_SET);
+    if (size < 0) {
+        file_close(fd);
+        eprintln("sit: cannot stat file");
+        return 1;
+    }
+
+    var content = alloc(size);
+    var total = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        var r = file_read(fd, content + total, size - total);
+        if (r <= 0) { rgo = 0; }
+        else { total = total + r; if (total >= size) { rgo = 0; } }
+    }
+    file_close(fd);
+
+    var hex = write_blob_object(content, total);
+    if (hex == 0) {
+        eprintln("sit: failed to write object");
+        return 1;
+    }
+
+    # Append to staging index: <hex>\t<path>\n
+    var entry_len = 64 + 1 + path_len + 1;
+    var entry = alloc(entry_len);
+    memcpy(entry, hex, 64);
+    store8(entry + 64, 9);
+    memcpy(entry + 64 + 1, path, path_len);
+    store8(entry + 64 + 1 + path_len, 10);
+    file_append_locked(".sit/index", entry, entry_len);
+
+    syscall(SYS_WRITE, STDOUT, "added ", 6);
+    syscall(SYS_WRITE, STDOUT, hex, 12);
+    syscall(SYS_WRITE, STDOUT, " ", 1);
+    syscall(SYS_WRITE, STDOUT, path, path_len);
+    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    return 0;
+}
+
 fn print_usage() {
     eprintln("usage: sit <command> [<args>]");
     eprintln("");
     eprintln("commands:");
-    eprintln("  init    create an empty sit repository");
+    eprintln("  init           create an empty sit repository");
+    eprintln("  add <path>     hash and store a file as a blob object");
     return 0;
 }
 
@@ -69,9 +204,8 @@ fn main() {
 
     var cmd = argv(1);
 
-    if (streq(cmd, "init") == 1) {
-        return cmd_init();
-    }
+    if (streq(cmd, "init") == 1) { return cmd_init(); }
+    if (streq(cmd, "add") == 1)  { return cmd_add(); }
 
     eprintln("sit: unknown command");
     print_usage();

@@ -24,9 +24,11 @@ Project was scaffolded with `cyrius init sit`. Do not manually create project st
 
 ## Current State
 
-- **Source**: `src/main.cyr` — subcommand dispatch; `sit init` implemented
+- **Source**: `src/main.cyr` — subcommand dispatch; `sit init` and `sit add` implemented
 - **Tests**: `tests/sit.tcyr` smoke only; integration coverage is shell-level for now
-- **Binary**: `cyrius build src/main.cyr build/sit` produces a working `sit init`
+- **Binary**: `cyrius build src/main.cyr build/sit` produces a working `sit init` / `sit add <path>`
+- **Objects**: SHA-256 hashed via sigil, zlib-compressed via sankoch, stored loose at `.sit/objects/<hex[0:2]>/<hex[2:64]>`. Framing is `"blob <len>\0<content>"` — byte-compatible with git's SHA-256 object format
+- **Staging index**: plaintext `<hex>\t<path>\n` lines at `.sit/index` (placeholder — migrates to patra once the index grows mutation semantics; see [arch 002](docs/architecture/002-loose-objects-until-patra-blobs.md))
 - **Integration**: no downstream consumers yet; owl will consume sit for git-marker gutter decorations once sit is functional
 
 ## Dependencies
@@ -43,12 +45,15 @@ Cyrius has no transitive dep resolution as of 5.6.16 (fix targeted for 5.7.x), s
 
 ## Docs
 
+- [`docs/development/roadmap.md`](docs/development/roadmap.md) — shipped releases + forward-looking backlog. **Single source of truth for what sit is doing next.** Same path across every MacCracken-verse project.
 - [`docs/adr/`](docs/adr/) — architecture decision records. Start here for *why* sit chose X over Y. [0001](docs/adr/0001-no-ffi-first-party-only.md) is the first-party/no-FFI thesis.
 - [`docs/architecture/`](docs/architecture/) — non-obvious constraints and quirks a reader can't derive from the code. **Skim this before writing new code** — e.g. [001](docs/architecture/001-args-stack-buffer-lifetime.md) documents a stdlib `args.cyr` lifetime hazard that silently affects any `argv(n)` usage.
-- [`docs/guides/`](docs/guides/) — task-oriented how-tos. [Getting started](docs/guides/getting-started.md) covers build + first `sit init`.
-- [`docs/examples/`](docs/examples/) — runnable examples; empty until sit's surface area grows past `init`.
+- [`docs/guides/`](docs/guides/) — task-oriented how-tos. [Getting started](docs/guides/getting-started.md) covers build + first `sit init` / `sit add`.
+- [`docs/examples/`](docs/examples/) — runnable examples; empty until sit's surface area grows past the init/add loop.
 
 New quirks and constraints land in `docs/architecture/` as numbered items. New decisions land in `docs/adr/` using [`template.md`](docs/adr/template.md). Never renumber either series.
+
+**Cross-project feature requests go on the target repo's `docs/development/roadmap.md`, not GitHub issues** (these repos don't use the issue tracker). When sit needs something from a dep, draft a backlog entry for the dep's roadmap rather than opening an ADR on sit's side.
 
 ## Rules
 
