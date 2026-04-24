@@ -45,7 +45,7 @@ All times in milliseconds, lower is better.
 ## Honest caveats
 
 - **One machine, one run.** These numbers are a snapshot, not a study. Re-run on your own hardware before quoting.
-- **sit is young.** The loose-object store (see [arch 002](../architecture/002-loose-objects-until-patra-blobs.md)) is not optimized; we don't have packfiles yet. The `log` and `status` numbers will likely improve when the object store migrates to patra (once `COL_BLOB` lands on patra's roadmap).
+- **sit is young.** The loose-object store (see [arch 002](../architecture/002-loose-objects-until-patra-bytes.md)) is not optimized; we don't have packfiles yet. The `log` and `status` numbers will likely improve when the object store migrates to patra (once `COL_BYTES` lands on patra's roadmap).
 - **git is doing more.** The git install bundles pcregrep, rebase, gc, merge-base, diff-tree, hundreds of plumbing commands. sit has 15 so far — the size comparison is not "git does the same work in 12× the bytes." It's "sit covers the core VCS loop in 12× less disk."
 - **sit has no network yet.** These benchmarks are all local. When sit gains a wire protocol, network ops will add a whole new comparison axis.
 

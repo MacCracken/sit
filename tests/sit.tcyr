@@ -75,12 +75,121 @@ fn test_sankoch_zlib_roundtrip() {
     return 0;
 }
 
+fn test_patra_col_bytes_small() {
+    test_group("patra COL_BYTES small roundtrip");
+
+    sys_unlink("/tmp/sit-patra-bytes-small.db");
+    patra_init();
+    var db = patra_open("/tmp/sit-patra-bytes-small.db");
+    assert(db != 0, "open db");
+
+    var r = patra_exec(db, "CREATE TABLE objs (hash STR, ty INT, content BYTES)");
+    assert_eq(r, 0, "create table with BYTES column");
+
+    # 3 cols: 0=STR, 1=INT, 2=BYTES
+    var types[24];
+    store64(&types +  0, 1);  # COL_STR
+    store64(&types +  8, 0);  # COL_INT
+    store64(&types + 16, 2);  # COL_BYTES
+
+    var ivals[24];
+    store64(&ivals +  8, 42);
+
+    var sptrs[24];
+    store64(&sptrs +  0, "deadbeef");
+    var slens[24];
+    store64(&slens +  0, 8);
+
+    var content = "hello, sit via patra BYTES!";
+    var clen = 27;
+    var bptrs[24];
+    store64(&bptrs + 16, content);
+    var blens[24];
+    store64(&blens + 16, clen);
+
+    r = patra_insert_row(db, "objs", 4, 3, &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+    assert_eq(r, 0, "insert_row returned PATRA_OK");
+
+    var rs = patra_query(db, "SELECT hash, ty, content FROM objs");
+    assert(rs != 0, "select returned result set");
+    assert_eq(patra_result_count(rs), 1, "one row");
+
+    var blen = patra_result_get_bytes_len(rs, 0, 2);
+    assert_eq(blen, clen, "reported BYTES length matches");
+
+    var out = alloc(clen + 1);
+    r = patra_result_read_bytes(db, rs, 0, 2, out);
+    assert_eq(r, 0, "read_bytes returned PATRA_OK");
+    assert_eq(memeq(out, content, clen), 1, "byte content roundtrips");
+
+    patra_result_free(rs);
+    patra_close(db);
+    sys_unlink("/tmp/sit-patra-bytes-small.db");
+    return 0;
+}
+
+fn test_patra_col_bytes_overflow() {
+    test_group("patra COL_BYTES overflow-page roundtrip");
+
+    # Write 16 KB (> one 4072-byte page) to exercise the overflow chain.
+    var content = alloc(16384);
+    var i = 0;
+    while (i < 16384) {
+        store8(content + i, (i * 2654435769 + i / 7) & 0xFF);
+        i = i + 1;
+    }
+    var clen = 16384;
+
+    sys_unlink("/tmp/sit-patra-bytes-big.db");
+    patra_init();
+    var db = patra_open("/tmp/sit-patra-bytes-big.db");
+    assert(db != 0, "open db");
+
+    var r = patra_exec(db, "CREATE TABLE blobs (hash STR, content BYTES)");
+    assert_eq(r, 0, "create blobs table");
+
+    var types[16];
+    store64(&types + 0, 1);  # COL_STR
+    store64(&types + 8, 2);  # COL_BYTES
+
+    var ivals[16];
+    var sptrs[16];
+    store64(&sptrs + 0, "k1");
+    var slens[16];
+    store64(&slens + 0, 2);
+    var bptrs[16];
+    store64(&bptrs + 8, content);
+    var blens[16];
+    store64(&blens + 8, clen);
+
+    r = patra_insert_row(db, "blobs", 5, 2, &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+    assert_eq(r, 0, "insert 16 KB row");
+
+    var rs = patra_query(db, "SELECT hash, content FROM blobs");
+    assert_eq(patra_result_count(rs), 1, "one row back");
+
+    var blen = patra_result_get_bytes_len(rs, 0, 1);
+    assert_eq(blen, clen, "16 KB length preserved");
+
+    var out = alloc(clen + 16);
+    r = patra_result_read_bytes(db, rs, 0, 1, out);
+    assert_eq(r, 0, "read 16 KB ok");
+    assert_eq(memeq(out, content, clen), 1, "16 KB bytes match (overflow chain correct)");
+
+    patra_result_free(rs);
+    patra_close(db);
+    sys_unlink("/tmp/sit-patra-bytes-big.db");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
     test_blob_framing_git_compatible();
     test_hex_roundtrip();
     test_sankoch_zlib_roundtrip();
+    test_patra_col_bytes_small();
+    test_patra_col_bytes_overflow();
     return assert_summary();
 }
 

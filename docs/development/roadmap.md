@@ -13,7 +13,7 @@
 - Documentation scaffold: `docs/{adr,architecture,guides,examples,development}/`.
 - ADR 0001 — no FFI, first-party only.
 - Arch 001 — `args.cyr` post-return stack memory quirk (Cyrius stdlib).
-- Arch 002 — loose-file objects until patra grows `COL_BLOB`.
+- Arch 002 — loose-file objects until patra grows `COL_BYTES` (patra keeps `COL_BLOB` as an alias for the habit crowd).
 
 ### v0.1.1
 
@@ -160,8 +160,8 @@
 ### Longer horizon
 
 - **Staging index into patra** — `index(path STR, hash STR, mode INT)` table. Fits current `COL_STR`/`COL_INT`, unblocks mutation semantics without the append-only-then-dedupe dance. Likely the first real patra consumer in sit.
-- **Objects into patra** — contingent on patra's `COL_BLOB` landing. Migrates sit off the loose-file object store; see [arch 002](../architecture/002-loose-objects-until-patra-blobs.md).
-- **Pack format** — delta-compressed multi-object storage; depends on `COL_BLOB` and sankoch delta primitives.
+- **Objects into patra** — contingent on patra's `COL_BYTES` landing. Migrates sit off the loose-file object store; see [arch 002](../architecture/002-loose-objects-until-patra-bytes.md).
+- **Pack format** — delta-compressed multi-object storage; depends on `COL_BYTES` and sankoch delta primitives.
 - **Wire protocol** — first-party smart-HTTP / ssh replacement. Not on the AGNOS critical path; revisit once the local VCS loop is solid.
 - **Merge** — 3-way merge with conflict markers. Needs a merge-base finder (walk commit ancestors to find LCA) and per-file three-way text merge.
 - **Signed commits** — sigil-backed signatures on commit objects.
