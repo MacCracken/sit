@@ -1,7 +1,13 @@
 # sit — benchmark harness
-# Measures throughput of the primitives sit's hot paths depend on: sigil
-# SHA-256 and sankoch zlib compress/decompress. Results go to stdout in
-# ns/op, ops/s, and MB/s where meaningful.
+# Measures throughput of the primitives sit's hot paths depend on. Results go
+# to stdout in ns/op, ops/s, and MB/s where meaningful.
+#
+# Phase 1 (pre-0.6.0): sigil SHA-256 + sankoch zlib micro-benchmarks.
+# Phase 2 (0.6.0, added alongside the P(-1) audit): patra open/close,
+# copy_objects per-row cost, commit-body parse, ed25519 sign/verify,
+# validator throughput.
+
+include "src/lib.cyr"
 
 fn fill_pseudo_random(buf, len) {
     var i = 0;
@@ -11,6 +17,8 @@ fn fill_pseudo_random(buf, len) {
     }
     return 0;
 }
+
+# ── Phase 1: sigil + sankoch primitive throughput ──────────────────
 
 fn bench_sigil_sha256(size, iters) {
     var name_prefix = "sha256-";
@@ -85,38 +93,251 @@ fn bench_sankoch_decompress(size, iters) {
     return 0;
 }
 
+# ── Phase 2 ────────────────────────────────────────────────────────
+#
+# These benches directly drive the v0.6.x performance roadmap. The
+# patra-open-close number is the baseline that the P-01 DB-handle-caching
+# refactor targets — every read_object pays this cost once per call today.
+# Copy-objects per-row measures the 3-SQL-op-per-object cost P-03 wants
+# to collapse into a single transaction. Commit-parse and iso8601 scale
+# directly with sit log history length (P-05).
+
+fn bench_patra_open_close(iters) {
+    var path = "/tmp/sit-bench-openclose.patra";
+    sys_unlink(path);
+    patra_init();
+
+    var b = bench_new("patra-open-close");
+    bench_batch_start(b);
+    var i = 0;
+    while (i < iters) {
+        var db = patra_open(path);
+        patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
+        patra_close(db);
+        i = i + 1;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    sys_unlink(path);
+    return 0;
+}
+
+# Insert `count` pseudo-random rows into an objects table so copy_objects has
+# something to walk. Uses a single open handle — this is the setup cost, not
+# part of the measured span.
+fn bench_populate_db(db, count, content_size) {
+    var content = alloc(content_size);
+    fill_pseudo_random(content, content_size);
+
+    var types[24];
+    store64(&types +  0, 1);
+    store64(&types +  8, 0);
+    store64(&types + 16, 2);
+
+    var i = 0;
+    while (i < count) {
+        # Generate a deterministic 64-char hex key from i.
+        var hex = alloc(65);
+        var j = 0;
+        while (j < 64) {
+            var nibble = (i + j * 17) & 0xF;
+            if (nibble < 10) { store8(hex + j, 48 + nibble); }
+            else { store8(hex + j, 87 + nibble); }
+            j = j + 1;
+        }
+        store8(hex + 64, 0);
+
+        var ivals[24];
+        store64(&ivals + 8, 0);
+        var sptrs[24];
+        store64(&sptrs + 0, hex);
+        var slens[24];
+        store64(&slens + 0, 64);
+        var bptrs[24];
+        store64(&bptrs + 16, content);
+        var blens[24];
+        store64(&blens + 16, content_size);
+        patra_insert_row(db, "objects", 7, 3,
+            &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Measure the per-object copy cost of the fetch/push/clone inner loop. Matches
+# the current 3-SQL-op shape: has(dst, hex) + read_raw(src, hex) + insert_raw.
+# Setup is out of band; only the loop body is timed.
+fn bench_copy_objects_per_row(count) {
+    var src_path = "/tmp/sit-bench-copy-src.patra";
+    var dst_path = "/tmp/sit-bench-copy-dst.patra";
+    sys_unlink(src_path);
+    sys_unlink(dst_path);
+    patra_init();
+
+    var src_db = patra_open(src_path);
+    patra_exec(src_db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
+    bench_populate_db(src_db, count, 256);
+
+    var dst_db = patra_open(dst_path);
+    patra_exec(dst_db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
+
+    # Build the hashes vec the way walk_reachable_from_commit would.
+    var hashes = vec_new();
+    var i = 0;
+    while (i < count) {
+        var hex = alloc(65);
+        var j = 0;
+        while (j < 64) {
+            var nibble = (i + j * 17) & 0xF;
+            if (nibble < 10) { store8(hex + j, 48 + nibble); }
+            else { store8(hex + j, 87 + nibble); }
+            j = j + 1;
+        }
+        store8(hex + 64, 0);
+        vec_push(hashes, hex);
+        i = i + 1;
+    }
+
+    var b = bench_new("copy-objects-100");
+    bench_batch_start(b);
+    copy_objects(src_db, dst_db, hashes);
+    bench_batch_stop(b, count);
+    bench_report(b);
+
+    patra_close(src_db);
+    patra_close(dst_db);
+    sys_unlink(src_path);
+    sys_unlink(dst_path);
+    return 0;
+}
+
+# commit-body parse + iso8601 — the per-commit cost during `sit log`.
+fn bench_commit_parse(iters) {
+    var body = "tree 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nparent fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\nauthor Test Author <test@example.com> 1776999445 +0000\ncommitter Test Author <test@example.com> 1776999445 +0000\n\nTypical commit message body on one line.\n";
+    var body_len = strlen(body);
+
+    var b = bench_new("commit-parse+iso8601");
+    bench_batch_start(b);
+    var i = 0;
+    while (i < iters) {
+        var info[56];
+        parse_commit_body(body, body_len, &info);
+        iso8601(1776999445);
+        i = i + 1;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    return 0;
+}
+
+# ed25519 sign / verify throughput — governs `sit commit -S` and
+# `sit verify-commit`. Worth an explicit measurement so sigil regressions
+# show up in sit's bench output, not just sigil's.
+fn bench_ed25519_sign_verify(iters) {
+    var seed[32];
+    var s = 0;
+    while (s < 32) { store8(&seed + s, s); s = s + 1; }
+    var sk[64];
+    var pk[32];
+    ed25519_keypair(&seed, &sk, &pk);
+
+    var msg = "tree 0123456789abcdef\nparent fedcba98\nauthor t <t@t> 1 +0000\ncommitter t <t@t> 1 +0000\n\nbench";
+    var msg_len = strlen(msg);
+    var sig[64];
+
+    var bs = bench_new("ed25519-sign");
+    bench_batch_start(bs);
+    var i = 0;
+    while (i < iters) {
+        ed25519_sign(&sk, msg, msg_len, &sig);
+        i = i + 1;
+    }
+    bench_batch_stop(bs, iters);
+    bench_report(bs);
+
+    # Pre-sign once so the verify loop has a valid signature to check each time.
+    ed25519_sign(&sk, msg, msg_len, &sig);
+    var bv = bench_new("ed25519-verify");
+    bench_batch_start(bv);
+    i = 0;
+    while (i < iters) {
+        ed25519_verify(&pk, msg, msg_len, &sig);
+        i = i + 1;
+    }
+    bench_batch_stop(bv, iters);
+    bench_report(bv);
+    return 0;
+}
+
+# Validator throughput — called on every ref write, every tree parse, every
+# clone. Cheap, but "cheap × 10000 entries" adds up; track so regressions
+# don't silently creep in.
+fn bench_validators(iters) {
+    var b1 = bench_new("refname_valid-good");
+    bench_batch_start(b1);
+    var i = 0;
+    while (i < iters) {
+        refname_valid("feature/nested/branch-name");
+        i = i + 1;
+    }
+    bench_batch_stop(b1, iters);
+    bench_report(b1);
+
+    var b2 = bench_new("tree_entry_name_valid-good");
+    bench_batch_start(b2);
+    i = 0;
+    while (i < iters) {
+        tree_entry_name_valid("main.cyr");
+        i = i + 1;
+    }
+    bench_batch_stop(b2, iters);
+    bench_report(b2);
+
+    var b3 = bench_new("tree_flat_path_valid-good");
+    bench_batch_start(b3);
+    i = 0;
+    while (i < iters) {
+        tree_flat_path_valid("src/deep/nested/path/to/file.cyr");
+        i = i + 1;
+    }
+    bench_batch_stop(b3, iters);
+    bench_report(b3);
+
+    var b4 = bench_new("hex_prefix_valid-64char");
+    bench_batch_start(b4);
+    i = 0;
+    var sample = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    while (i < iters) {
+        hex_prefix_valid(sample, 64);
+        i = i + 1;
+    }
+    bench_batch_stop(b4, iters);
+    bench_report(b4);
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
-    # SHA-256 at multiple sizes (pseudo-random to defeat cache-friendly zero-page paths)
+    # ── Phase 1: primitive throughput ─────────────────────────────
     bench_sigil_sha256(64, 10000);
     bench_sigil_sha256(1024, 5000);
     bench_sigil_sha256(65536, 500);
 
-    # zlib compress and decompress
     bench_sankoch_compress(1024, 2000);
     bench_sankoch_compress(65536, 200);
     bench_sankoch_decompress(1024, 5000);
     bench_sankoch_decompress(65536, 500);
+
+    # ── Phase 2: sit-level hot paths (0.6.0 additions) ────────────
+    bench_patra_open_close(500);
+    bench_copy_objects_per_row(100);
+    bench_commit_parse(10000);
+    bench_ed25519_sign_verify(1000);
+    bench_validators(100000);
 
     return 0;
 }
 
 var r = main();
 syscall(60, r);
-
-# write_decimal helper (lifted from src/main.cyr so tests don't include it)
-fn write_decimal(buf, n) {
-    if (n == 0) { store8(buf, 48); return 1; }
-    var digits = 0;
-    var m = n;
-    while (m > 0) { digits = digits + 1; m = m / 10; }
-    m = n;
-    var i = digits - 1;
-    while (m > 0) {
-        store8(buf + i, 48 + m % 10);
-        i = i - 1;
-        m = m / 10;
-    }
-    return digits;
-}

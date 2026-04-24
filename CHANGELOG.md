@@ -4,6 +4,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Known issues
+
+- **S-33**: `sit status` SIGSEGVs on repositories with ~100 commits and ~100 tracked files. Caught by the new git-vs-sit comparison bench (`scripts/benchmark.sh`); the `bench_status` and `bench_clone` rows are disabled pending the fix. Root cause likely overlaps with audit findings S-17 (alloc null-check) or P-07 (bump allocator exhaustion). **First v0.6.1 fix.**
+
+### Added
+
+- `scripts/benchmark.sh` — reproducible git-vs-sit bench harness. Produces a markdown table of min + median wall-clock times over 10–15 runs per operation. Updates `docs/development/benchmarks-git-v-sit.md`.
+- Five new benches in `tests/sit.bcyr`: `patra-open-close`, `copy-objects-100`, `commit-parse+iso8601`, `ed25519-sign` / `ed25519-verify`, validator throughput (`refname_valid`, `tree_entry_name_valid`, `tree_flat_path_valid`, `hex_prefix_valid`). All land in the single bench binary.
+- `docs/benchmarks/2026-04-24-v0.6.0.md` — snapshot of post-audit numbers for comparison against future work.
+
 ## [0.6.0] — 2026-04-24
 
 Security hardening release. All CRITICAL + HIGH findings from the 2026-04-24 P(-1) audit ([`docs/audit/2026-04-24-audit.md`](docs/audit/2026-04-24-audit.md)) are fixed. Network transport work (originally planned for 0.6.0) moves to v0.7.0.

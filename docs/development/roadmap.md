@@ -71,7 +71,11 @@ The local VCS loop is complete end-to-end, with ed25519 signing and a local-path
 
 ## Backlog
 
-### v0.6.1 — Security hygiene (MEDIUM batch)
+### v0.6.1 — Security hygiene (MEDIUM batch) + S-33 `sit status` crash
+
+**URGENT**: ship first.
+
+- **S-33** — `sit status` SIGSEGVs on a 100-commit / 100-file repo. Reproducible via the v0.6.0 git-vs-sit comparison bench (`scripts/benchmark.sh`). Root cause TBD; triage starts by narrowing between `list_working_files` / `read_head_tree_entries` / the per-file hash loop. Likely candidates: `alloc()` null on deep hash_file_as_blob chain, or a bump-allocator exhaustion (P-07). See [`docs/audit/2026-04-24-audit.md`](../audit/2026-04-24-audit.md#s-33-sit-status-segfault-on-multi-commit-multi-file-repos).
 
 From the audit; doesn't change behavior on the hot path but closes several defense-in-depth gaps.
 
@@ -116,7 +120,17 @@ Ship after security baseline is clean. Collapses P-01, P-02, P-05, P-08, P-12, P
 - **sigil** — `hex_decode` that strictly fails on invalid chars rather than partial decode (S-20). Flag SHA-256 software throughput; software vs hardware story.
 - **sankoch** — `zlib_decompress_with_ratio_cap` primitive to give every consumer a one-call decompression bomb defense (S-08 root-cause fix).
 
-### v0.7.0 — Network wire protocol
+### v0.7.0 — Network wire protocol + deferred bench fixtures
+
+**Network wire protocol**
+
+**Benchmarks** — three bench targets were scoped but deferred from v0.6.0 because they need larger fixtures or a companion algorithm change:
+
+- **LCS diff** at 100×100 / 1000×1000 / 4000×4000 line counts. Shows the cost curve and the 16M-cell cliff; motivates the Myers O((N+M)D) fallback (P-14).
+- **`glob_match`** against 10 / 50 / 200-pattern `.sitignore` files. Baseline for the P-13 pattern pre-classification refactor.
+- **`hash_file_as_blob` end-to-end** on 1 KB / 64 KB / 1 MB inputs. Measures the true `sit add` floor and maps sigil's software-SHA-256 bottleneck.
+
+Add these alongside the algorithm / transport work that justifies them.
 
 - **HTTP transport** — sit-native JSON/REST (not git-wire-compatible). Likely shape: `GET /sit/v1/refs`, `GET /sit/v1/object/<hash>`, `POST /sit/v1/refs/<name>`, `POST /sit/v1/object`. Server is a thin patra-to-HTTP translator.
 - **SSH transport** — run `sit-upload-pack` / `sit-receive-pack` over stdin/stdout (same pattern as git).
