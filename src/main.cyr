@@ -1683,6 +1683,149 @@ fn set_head_ref(ref_path) {
     return 0;
 }
 
+# Walk descendant's parent chain; return 1 if ancestor_hex is descendant
+# or any of its ancestors. Linear — sit has no merge commits yet.
+fn is_ancestor(ancestor_hex, descendant_hex) {
+    if (streq(ancestor_hex, descendant_hex) == 1) { return 1; }
+
+    var current = descendant_hex;
+    while (current != 0) {
+        var obj[24];
+        if (read_object(current, &obj) != 0) { return 0; }
+        var buf = load64(&obj);
+        var blen = load64(&obj + 8);
+        var coff = load64(&obj + 16);
+
+        var info[56];
+        if (parse_commit_body(buf + coff, blen - coff, &info) != 0) { return 0; }
+        var parent_hex = load64(&info + 8);
+        if (parent_hex == 0) { current = 0; }
+        else {
+            if (streq(ancestor_hex, parent_hex) == 1) { return 1; }
+            current = parent_hex;
+        }
+    }
+    return 0;
+}
+
+# Overwrite working tree + index with target commit's tree. Used by both
+# checkout and fast-forward merge. Does NOT update HEAD — caller does that.
+fn materialize_target(target_hex) {
+    var target_entries = commit_tree_entries(target_hex);
+    if (target_entries == 0) { target_entries = vec_new(); }
+    var curr_entries = read_head_tree_entries();
+    if (curr_entries == 0) { curr_entries = vec_new(); }
+
+    var cn = vec_len(curr_entries);
+    var ci = 0;
+    while (ci < cn) {
+        var ce = vec_get(curr_entries, ci);
+        var cpath = tree_entry_name(ce);
+        if (tree_find(target_entries, cpath) == 0) {
+            if (file_exists(cpath) == 1) { sys_unlink(cpath); }
+        }
+        ci = ci + 1;
+    }
+
+    var tn = vec_len(target_entries);
+    var ti = 0;
+    while (ti < tn) {
+        var te = vec_get(target_entries, ti);
+        var tpath = tree_entry_name(te);
+        var thex = tree_entry_hash(te);
+        ensure_dirs_for(tpath);
+        var tp[16];
+        if (read_blob_content(thex, &tp) == 0) {
+            file_write_all(tpath, load64(&tp), load64(&tp + 8));
+        }
+        ti = ti + 1;
+    }
+
+    var new_index = vec_new();
+    ti = 0;
+    while (ti < tn) {
+        var te = vec_get(target_entries, ti);
+        var tpath = tree_entry_name(te);
+        var thex = tree_entry_hash(te);
+        var bytes = hex_decode(thex, 64);
+        if (bytes != 0) {
+            var entry = alloc(40);
+            memcpy(entry, bytes, 32);
+            var plen = strlen(tpath);
+            var pcopy = alloc(plen + 1);
+            memcpy(pcopy, tpath, plen);
+            store8(pcopy + plen, 0);
+            store64(entry + 32, pcopy);
+            vec_push(new_index, entry);
+        }
+        ti = ti + 1;
+    }
+    rewrite_index(new_index);
+    return 0;
+}
+
+fn cmd_merge() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+    if (argc() < 3) {
+        eprintln("usage: sit merge <branch>");
+        return 1;
+    }
+
+    var target_name = argv_heap(2);
+    var tnlen = strlen(target_name);
+
+    var target_hex[72];
+    var rr = resolve_hash(target_name, &target_hex);
+    if (rr == 0 - 2) { eprintln("sit: merge target too short"); return 1; }
+    if (rr == 0 - 1) { eprintln("sit: ambiguous merge target"); return 1; }
+    if (rr == 0)     {
+        syscall(SYS_WRITE, STDERR, "sit: '", 6);
+        syscall(SYS_WRITE, STDERR, target_name, tnlen);
+        syscall(SYS_WRITE, STDERR, "' is not a known branch, tag, or commit\n", 40);
+        return 1;
+    }
+
+    var head_hex = read_head_ref();
+    if (head_hex == 0) {
+        eprintln("sit: current branch has no commits");
+        return 1;
+    }
+
+    if (streq(&target_hex, head_hex) == 1) {
+        syscall(SYS_WRITE, STDOUT, "already up to date\n", 19);
+        return 0;
+    }
+    if (is_ancestor(&target_hex, head_hex) == 1) {
+        syscall(SYS_WRITE, STDOUT, "already up to date\n", 19);
+        return 0;
+    }
+
+    if (is_ancestor(head_hex, &target_hex) == 1) {
+        if (is_dirty() == 1) {
+            eprintln("sit: working tree has uncommitted changes");
+            eprintln("sit:   commit or revert before merging");
+            return 1;
+        }
+        if (write_head_ref(&target_hex) != 0) {
+            eprintln("sit: failed to update branch ref");
+            return 1;
+        }
+        materialize_target(&target_hex);
+
+        syscall(SYS_WRITE, STDOUT, "fast-forward to ", 16);
+        syscall(SYS_WRITE, STDOUT, &target_hex, 12);
+        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        return 0;
+    }
+
+    eprintln("sit: branches have diverged");
+    eprintln("sit:   non-fast-forward merge (3-way) is not yet implemented");
+    return 1;
+}
+
 fn cmd_checkout() {
     if (file_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -1782,7 +1925,6 @@ fn cmd_checkout() {
 
     var target_entries = commit_tree_entries(target_hex);
     if (target_entries == 0) { target_entries = vec_new(); }
-
     var curr_entries = read_head_tree_entries();
     if (curr_entries == 0) { curr_entries = vec_new(); }
 
@@ -1803,54 +1945,7 @@ fn cmd_checkout() {
         wi = wi + 1;
     }
 
-    # Delete files in current tree not in target
-    var cn = vec_len(curr_entries);
-    var ci = 0;
-    while (ci < cn) {
-        var ce = vec_get(curr_entries, ci);
-        var cpath = tree_entry_name(ce);
-        if (tree_find(target_entries, cpath) == 0) {
-            if (file_exists(cpath) == 1) { sys_unlink(cpath); }
-        }
-        ci = ci + 1;
-    }
-
-    # Write target tree files
-    var tn = vec_len(target_entries);
-    var ti = 0;
-    while (ti < tn) {
-        var te = vec_get(target_entries, ti);
-        var tpath = tree_entry_name(te);
-        var thex = tree_entry_hash(te);
-        ensure_dirs_for(tpath);
-        var tp[16];
-        if (read_blob_content(thex, &tp) == 0) {
-            file_write_all(tpath, load64(&tp), load64(&tp + 8));
-        }
-        ti = ti + 1;
-    }
-
-    # Rebuild index from target tree
-    var new_index = vec_new();
-    ti = 0;
-    while (ti < tn) {
-        var te = vec_get(target_entries, ti);
-        var tpath = tree_entry_name(te);
-        var thex = tree_entry_hash(te);
-        var bytes = hex_decode(thex, 64);
-        if (bytes != 0) {
-            var entry = alloc(40);
-            memcpy(entry, bytes, 32);
-            var plen = strlen(tpath);
-            var pcopy = alloc(plen + 1);
-            memcpy(pcopy, tpath, plen);
-            store8(pcopy + plen, 0);
-            store64(entry + 32, pcopy);
-            vec_push(new_index, entry);
-        }
-        ti = ti + 1;
-    }
-    rewrite_index(new_index);
+    materialize_target(target_hex);
 
     if (set_head_ref(target_ref) != 0) {
         eprintln("sit: failed to update HEAD");
@@ -3349,6 +3444,7 @@ fn print_usage() {
     eprintln("  branch [<name>]         list branches, or create one at HEAD");
     eprintln("  checkout [-b] <branch>  switch to <branch>, optionally creating it first");
     eprintln("  tag [<name> [<commit>]] list tags, or create one at HEAD (or at commit)");
+    eprintln("  merge <branch>          fast-forward HEAD to <branch> (3-way deferred)");
     eprintln("  config [--global] <key> [<value>]  read or write a config value");
     eprintln("  fsck                    verify object integrity (sha-256 vs filename)");
     eprintln("  commit [-m] <message>   record staged changes as a new commit");
@@ -3378,6 +3474,7 @@ fn main() {
     if (streq(cmd, "branch")   == 1) { return cmd_branch(); }
     if (streq(cmd, "checkout") == 1) { return cmd_checkout(); }
     if (streq(cmd, "tag")      == 1) { return cmd_tag(); }
+    if (streq(cmd, "merge")    == 1) { return cmd_merge(); }
     if (streq(cmd, "config")   == 1) { return cmd_config(); }
     if (streq(cmd, "fsck")     == 1) { return cmd_fsck(); }
     if (streq(cmd, "commit")   == 1) { return cmd_commit(); }

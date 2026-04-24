@@ -24,7 +24,7 @@ Project was scaffolded with `cyrius init sit`. Do not manually create project st
 
 ## Current State
 
-- **Source**: `src/main.cyr` — subcommand dispatch; `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `commit`, `config`, `fsck`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` implemented
+- **Source**: `src/main.cyr` — subcommand dispatch; `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `commit`, `config`, `fsck`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` implemented
 - **Tests**: `tests/sit.tcyr` smoke only; integration coverage is shell-level for now
 - **Binary**: `cyrius build src/main.cyr build/sit`
 - **Object store**: `.sit/objects.patra` with schema `objects(hash STR, ty INT, content BYTES)`. `write_typed_object` does content-addressed upsert; `read_object` queries + decompresses. `resolve_hash` prefix-match uses `WHERE hash LIKE 'abcd%'`. SHA-256 via sigil, zlib via sankoch; framing `"<type> <len>\0<content>"` is byte-compatible with git's SHA-256 object format. Legacy `.sit/objects/<xx>/<yy...>` loose files auto-migrate on first access

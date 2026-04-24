@@ -146,6 +146,16 @@
 - Fixes UX gap flagged in v0.2.3: `sit show v0.1` no longer errors with "too short prefix" and instead resolves to the tagged commit.
 - Verified against eight scenarios: `show HEAD`, `show <tag>`, `show <branch>`, `show` on cross-branch tag, `show` on non-current branch, `cat-file <tag>`, short-name-as-tag beats too-short-prefix rule, empty-repo `show HEAD` returns cleanly.
 
+### v0.2.7 — `sit merge` (fast-forward) + cyrius 5.6.25
+
+- **`sit merge <branch>`** — fast-forward merge. Resolves the target via `resolve_hash` (accepts branch names, tag names, or commit prefixes). Four outcomes: `already up to date` (target == HEAD or is ancestor), `fast-forward to <hex>` (HEAD is ancestor of target → move branch ref, materialize target tree), dirty-tree block, or `branches have diverged` when neither is an ancestor.
+- **`is_ancestor(a, d)`** — linear parent-chain walk. Returns 1 if `a` equals `d` or any ancestor of `d`. Relies on sit having no merge commits (each commit has ≤1 parent).
+- **`materialize_target(hex)`** — extracted from `cmd_checkout`. Overwrites working tree + rebuilds index from a given commit's tree. Shared by checkout and fast-forward merge. Doesn't touch HEAD — caller owns the ref update.
+- **`cmd_checkout` now calls `materialize_target`** directly (DRY). ~60 lines of duplicated tree-materialization logic removed from the checkout body.
+- Verified against five scenarios: fast-forward, already-up-to-date, divergent-error, branch-not-found, fsck-clean-after-merge.
+
+- **Toolchain bump to cyrius 5.6.25**. 5.6.22 had a scalar-local clobber bug where i64 locals (ints + pointers) got corrupted across deep call chains (notably any path through `patra_insert_row`). 5.6.23 identified the issue, 5.6.24 shipped the fix in the asm backend, 5.6.25 is a subsequent release we verified. sit builds clean against 5.6.25 with no source-level workarounds — the slot-based pattern we'd prototyped (`var x_slot[8]; store64 / load64`) is not needed in the final code.
+
 ### v0.2.6 — Objects migrate to patra (arch 002 fully resolved)
 
 - **`.sit/objects.patra`** — `objects(hash STR, ty INT, content BYTES)` replaces the loose `.sit/objects/<xx>/<yy...>` file tree. Every sit object (blob, tree, commit) is now a row; `content` is the zlib-compressed framed bytes, same on-the-wire shape as the old loose files. `ty` is a small INT (0=blob / 1=tree / 2=commit) kept for future GC / stats filtering even though it's redundant with the framing prefix.
