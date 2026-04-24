@@ -196,17 +196,19 @@ Empty repo with no files prints `nothing to commit, working tree clean`.
 /path/to/sit/build/sit diff
 # --- a/fruits.txt
 # +++ b/fruits.txt
+# @@ -1,5 +1,6 @@
 #  alpha
 # -beta
 # +bravo
 #  gamma
 # +delta
+#  epsilon
 
 # Staged changes — index vs HEAD tree
 /path/to/sit/build/sit diff --staged
 ```
 
-Output is a simplified unified diff: ` ` prefix for unchanged context, `-` for removed, `+` for added. No `@@` hunk headers in v0.2 — every line of the diff is emitted, no hunk compression yet.
+Output is unified diff: `@@ -oldstart,oldlen +newstart,newlen @@` hunk headers, then ` ` prefix for unchanged context, `-` for removed, `+` for added. Up to 3 lines of context before and after each change; adjacent changes within 6 context lines get merged into a single hunk (standard git behavior).
 
 The diff walks each entry in the staging index:
 
@@ -228,7 +230,6 @@ Algorithm is classical LCS (longest common subsequence) — DP table capped at 1
 
 ## What doesn't yet
 
-- Hunk grouping in `sit diff` (`@@ -a,b +c,d @@`)
 - `sit show <commit>` — commit-at-a-glance with parent diff
 - HEAD-aware branch selection — `sit commit` / `sit log` / `sit status` always use `refs/heads/main`
 - Branch create/switch / `sit checkout`

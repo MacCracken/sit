@@ -1436,6 +1436,170 @@ fn lcs_diff(a, b) {
     return reversed;
 }
 
+# Annotated op layout (32 bytes):
+#   0..8:   kind (0=keep, 1=del, 2=ins)
+#   8..16:  line ptr
+#   16..24: old_line (1-indexed; 0 if op has no presence in old)
+#   24..32: new_line (1-indexed; 0 if op has no presence in new)
+fn ann_kind(a) { return load64(a); }
+fn ann_line(a) { return load64(a + 8); }
+fn ann_old(a)  { return load64(a + 16); }
+fn ann_new(a)  { return load64(a + 24); }
+
+fn annotate_ops(ops) {
+    var out = vec_new();
+    var old_line = 0;
+    var new_line = 0;
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        var kind = load64(op);
+        var line = load64(op + 8);
+        var a = alloc(32);
+        store64(a, kind);
+        store64(a + 8, line);
+        if (kind == 0) {
+            old_line = old_line + 1;
+            new_line = new_line + 1;
+            store64(a + 16, old_line);
+            store64(a + 24, new_line);
+        }
+        else {
+            if (kind == 1) {
+                old_line = old_line + 1;
+                store64(a + 16, old_line);
+                store64(a + 24, 0);
+            }
+            else {
+                new_line = new_line + 1;
+                store64(a + 16, 0);
+                store64(a + 24, new_line);
+            }
+        }
+        vec_push(out, a);
+        i = i + 1;
+    }
+    return out;
+}
+
+# Group annotated ops into hunks. Each hunk is a vec of ops.
+# Algorithm: keep up to N leading-context keeps before the first change of a
+# hunk; extend the hunk as long as consecutive keep-runs stay within 2N; when
+# we see a (2N+1)-th keep since the last change, trim the hunk's trailing
+# keeps to N and close it. The overshoot keep becomes the first of the next
+# hunk's leading-context buffer.
+fn group_hunks(annotated, ctx) {
+    var hunks = vec_new();
+    var pending = vec_new();
+    var hunk = 0;
+    var since_change = 0;
+
+    var n = vec_len(annotated);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(annotated, i);
+        var kind = ann_kind(op);
+
+        if (kind == 0) {
+            if (hunk == 0) {
+                vec_push(pending, op);
+                if (vec_len(pending) > ctx) { vec_remove(pending, 0); }
+            }
+            else {
+                since_change = since_change + 1;
+                if (since_change <= 2 * ctx) { vec_push(hunk, op); }
+                else {
+                    # Close hunk: trim trailing keeps to exactly ctx.
+                    var k = 0;
+                    while (k < ctx) { vec_pop(hunk); k = k + 1; }
+                    vec_push(hunks, hunk);
+                    hunk = 0;
+                    pending = vec_new();
+                    vec_push(pending, op);
+                    since_change = 0;
+                }
+            }
+        }
+        else {
+            if (hunk == 0) {
+                hunk = vec_new();
+                var pi = 0;
+                var pn = vec_len(pending);
+                while (pi < pn) {
+                    vec_push(hunk, vec_get(pending, pi));
+                    pi = pi + 1;
+                }
+                pending = vec_new();
+            }
+            vec_push(hunk, op);
+            since_change = 0;
+        }
+        i = i + 1;
+    }
+
+    if (hunk != 0) {
+        var trim = since_change - ctx;
+        if (trim > 0) {
+            var k = 0;
+            while (k < trim) { vec_pop(hunk); k = k + 1; }
+        }
+        vec_push(hunks, hunk);
+    }
+    return hunks;
+}
+
+# Compute hunk header ranges. Writes to out (32 bytes):
+#   0..8:   old_start, 8..16: old_len, 16..24: new_start, 24..32: new_len
+fn hunk_ranges(hunk, out) {
+    var old_start = 0;
+    var new_start = 0;
+    var old_len = 0;
+    var new_len = 0;
+    var n = vec_len(hunk);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(hunk, i);
+        var kind = ann_kind(op);
+        if (kind != 2) {
+            if (old_start == 0) { old_start = ann_old(op); }
+            old_len = old_len + 1;
+        }
+        if (kind != 1) {
+            if (new_start == 0) { new_start = ann_new(op); }
+            new_len = new_len + 1;
+        }
+        i = i + 1;
+    }
+    store64(out, old_start);
+    store64(out + 8, old_len);
+    store64(out + 16, new_start);
+    store64(out + 24, new_len);
+    return 0;
+}
+
+fn write_unsigned(n) {
+    var buf[24];
+    var digits = write_decimal(&buf, n);
+    syscall(SYS_WRITE, STDOUT, &buf, digits);
+    return 0;
+}
+
+fn print_hunk_header(hunk) {
+    var r[32];
+    hunk_ranges(hunk, &r);
+    syscall(SYS_WRITE, STDOUT, "@@ -", 4);
+    write_unsigned(load64(&r));
+    syscall(SYS_WRITE, STDOUT, ",", 1);
+    write_unsigned(load64(&r + 8));
+    syscall(SYS_WRITE, STDOUT, " +", 2);
+    write_unsigned(load64(&r + 16));
+    syscall(SYS_WRITE, STDOUT, ",", 1);
+    write_unsigned(load64(&r + 24));
+    syscall(SYS_WRITE, STDOUT, " @@\n", 4);
+    return 0;
+}
+
 fn print_file_diff(path, old_buf, old_len, new_buf, new_len) {
     syscall(SYS_WRITE, STDOUT, "--- a/", 6);
     syscall(SYS_WRITE, STDOUT, path, strlen(path));
@@ -1447,22 +1611,33 @@ fn print_file_diff(path, old_buf, old_len, new_buf, new_len) {
     var b = split_lines(new_buf, new_len);
     var ops = lcs_diff(a, b);
     if (ops == 0) {
-        eprintln("sit: diff table exceeds cap; file too large in v0.2");
+        eprintln("sit: diff table exceeds cap; file too large");
         return 1;
     }
 
-    var n = vec_len(ops);
-    var i = 0;
-    while (i < n) {
-        var op = vec_get(ops, i);
-        var kind = load64(op);
-        var l = load64(op + 8);
-        if (kind == 0) { syscall(SYS_WRITE, STDOUT, " ", 1); }
-        if (kind == 1) { syscall(SYS_WRITE, STDOUT, "-", 1); }
-        if (kind == 2) { syscall(SYS_WRITE, STDOUT, "+", 1); }
-        syscall(SYS_WRITE, STDOUT, line_ptr(l), line_len(l));
-        syscall(SYS_WRITE, STDOUT, "\n", 1);
-        i = i + 1;
+    var annotated = annotate_ops(ops);
+    var hunks = group_hunks(annotated, 3);
+
+    var h = 0;
+    var hn = vec_len(hunks);
+    while (h < hn) {
+        var hunk = vec_get(hunks, h);
+        print_hunk_header(hunk);
+
+        var ni = 0;
+        var nn = vec_len(hunk);
+        while (ni < nn) {
+            var op = vec_get(hunk, ni);
+            var kind = ann_kind(op);
+            var l = ann_line(op);
+            if (kind == 0) { syscall(SYS_WRITE, STDOUT, " ", 1); }
+            if (kind == 1) { syscall(SYS_WRITE, STDOUT, "-", 1); }
+            if (kind == 2) { syscall(SYS_WRITE, STDOUT, "+", 1); }
+            syscall(SYS_WRITE, STDOUT, line_ptr(l), line_len(l));
+            syscall(SYS_WRITE, STDOUT, "\n", 1);
+            ni = ni + 1;
+        }
+        h = h + 1;
     }
     return 0;
 }

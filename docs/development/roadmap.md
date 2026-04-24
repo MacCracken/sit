@@ -65,12 +65,18 @@
 - **Arch 003 resolved.** `cmd_commit`'s flat-paths rejection is gone; `entries_have_subdirs` deleted; `sit add src/main.cyr && sit commit` works end-to-end.
 - Verified against an 8-test matrix with nested structure (`src/`, `src/lib/`, `docs/`): root tree has correct `100644 README.md / 40000 docs / 40000 src` layout (byte-verified via hexdump), status+diff see nested files correctly, log + commit chain work across subdirectory layouts.
 
+### v0.1.7 — Hunk grouping in `sit diff`
+
+- **`annotate_ops(ops)`** — tags each LCS op with `(old_line, new_line)` 1-indexed line numbers. `keep` advances both, `delete` advances only old, `insert` advances only new.
+- **`group_hunks(annotated, ctx)`** — canonical unified-diff hunk grouper. Buffers up to `ctx` recent keeps as leading context; extends a hunk while keeps-since-last-change stays `<= 2*ctx`; on the `(2*ctx)+1`-th keep, trims trailing keeps to `ctx` and starts the next hunk with the overshoot keep as new leading context. Default `ctx=3` matches git.
+- **`@@ -oldstart,oldlen +newstart,newlen @@`** headers emitted per hunk. `hunk_ranges` computes ranges by walking the hunk once (first-keep-or-delete → `old_start`; first-keep-or-insert → `new_start`; counts derive len). Pure-insertion hunks correctly print `-0,0` (new-file case).
+- Verified against six scenarios: mid-file single change, adjacent changes merged, far-apart changes split, start-of-file (0 leading context), end-of-file (0 trailing context), pure new-file insertion (`@@ -0,0 +1,N @@`).
+
 ## Post-0.1 Backlog
 
 ### Priority — the v0.2.0 loop
 
-- **Hunk grouping for `sit diff`** — collapse stretches of context between changes into 3-line windows, emit `@@ -a,b +c,d @@` headers. Straightforward follow-on to the v0.1.5 LCS script.
-- **`sit show <commit>`** — combines `cat-file` + diff-against-parent for a single commit. All primitives already in place.
+- **`sit show <commit>`** — combines `cat-file` + diff-against-parent for a single commit. All primitives already in place; hunk-grouped diff from v0.1.7 provides the right output shape.
 - **HEAD-aware branch selection** — `sit commit` / `sit log` / `sit status` currently hardcode `refs/heads/main`. Needs HEAD parsing (`ref: refs/heads/<branch>`).
 
 ### Working-tree visibility
