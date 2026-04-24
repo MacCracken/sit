@@ -256,7 +256,7 @@ file?.bak
 - `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
 - `sit log` — walk commit history from HEAD with git-style output
 - `sit status` — three-way diff across HEAD tree, staging index, and working directory
-- `sit diff [--staged]` — unified diff with `@@` hunk headers (working vs index, or index vs HEAD)
+- `sit diff [--staged|HEAD]` — unified diff with `@@` hunk headers (working vs index / index vs HEAD / working vs HEAD)
 - `sit show [<hash>]` — show a single commit's header + parent-diff (defaults to HEAD)
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)

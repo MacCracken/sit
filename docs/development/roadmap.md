@@ -99,46 +99,30 @@
 - **`.sitignore` is itself trackable** — not auto-ignored; users `sit add .sitignore` normally.
 - Verified against ten scenarios: dotfile visibility without `.sitignore`, `.env`/`build`/`*.log`/`*.tmp` ignore patterns, nested-dir non-recursion, `sit add` rejection, tree omits ignored files on commit, `*` boundary (`*.log` vs `logfile`), `?` single-char semantics, blank/comment lines, empty `.sitignore`.
 
+### v0.1.11 — `sit diff HEAD`
+
+- **`sit diff HEAD`** — working tree vs HEAD tree, skipping the index. Complements the existing `sit diff` (working vs index) and `sit diff --staged` (index vs HEAD): diff HEAD is `diff + diff --staged` combined into one view, answering "what's the total change since my last commit?".
+- Walks HEAD entries: modified files → line diff; missing files → full-deletion diff. Then walks `list_working_files()` (which already respects `.sitignore`): paths not in HEAD → full-addition diff.
+- Pre-req for owl's gutter-marker integration — owl will call this per file to paint changed lines.
+- Verified against six scenarios: clean tree, combined staged+unstaged change (shows both), working-deletion, untracked-file addition, `.sitignore` respected for new files, no-commits-yet repo (HEAD-empty → all working files shown as additions).
+
 ## Post-0.1 Backlog
 
-### Priority — correctness and noise floor (before branches)
-
-Branches on top of a VCS that can't record deletions or ignore `build/` is a shaky foundation. These land first:
-
-- **v0.1.11 — `sit diff HEAD`.** Working vs HEAD directly, skipping the index. Useful standalone, and it's the query owl will call per file when it wires up gutter markers for changed lines.
-
-### Branches
+### v0.2 — Branches
 
 - **v0.2.0 — HEAD-aware branch selection.** `sit commit` / `sit log` / `sit status` currently hardcode `refs/heads/main`. Parse `.sit/HEAD` as `ref: refs/heads/<branch>` and use that branch's ref. Prerequisite for anything multi-branch.
 - **v0.2.1 — `sit branch [<name>]` + `sit checkout <name>`.** First multi-ref feature. Writes `.sit/refs/heads/<name>`, updates HEAD, materializes the branch's tree into the working directory.
 
 ### Longer horizon
 
-- **Staging index into patra** — `index(path STR, hash STR, mode INT)`. Unblocks mutation semantics without append-only hacks.
-- **Objects into patra** — contingent on patra's `COL_BLOB` (tracked on patra's roadmap).
-- **Wire protocol** — first-party smart-HTTP / ssh replacement. Not on AGNOS critical path.
-- **Signed commits** — sigil-backed commit-object signatures.
-- **`sit fsck`** — verify object hashes, walk commit chain, report corruption.
-- **Integration tests in-tree** — promote the shell smoke tests from `docs/guides/getting-started.md` into `tests/` with fixtures.
-
-### Working-tree visibility
-
-- **`sit status`** — diff working tree vs staging index vs HEAD.
-- **`sit log`** — walk commit parent chain from HEAD, print summary.
-- **`sit diff`** — sankoch-backed text diff between two blobs / working tree / index.
-
-### Storage migrations
-
-- **Staging index into patra** — `index(path STR, hash STR, mode INT)` table. Fits current `COL_STR`/`COL_INT`, unblocks mutation semantics (`sit rm`, re-add updates existing row instead of appending). Likely the first real patra consumer in sit.
-- **Objects into patra** — contingent on patra's roadmap `COL_BLOB` landing. Migrates sit off the loose-file object store; see [arch 002](../architecture/002-loose-objects-until-patra-blobs.md).
-- **Pack format** — delta-compressed multi-object storage for density; depends on `COL_BLOB` and on sankoch delta primitives. Deferred until the simple store proves out.
-
-### Network / interop
-
+- **`sit config`** — `.sit/config` + `~/.sitconfig` replacing env-var-only author identity. TOML-ish, reuse `cyml.cyr` parser if applicable.
+- **Staging index into patra** — `index(path STR, hash STR, mode INT)` table. Fits current `COL_STR`/`COL_INT`, unblocks mutation semantics without the append-only-then-dedupe dance. Likely the first real patra consumer in sit.
+- **Objects into patra** — contingent on patra's `COL_BLOB` landing. Migrates sit off the loose-file object store; see [arch 002](../architecture/002-loose-objects-until-patra-blobs.md).
+- **Pack format** — delta-compressed multi-object storage; depends on `COL_BLOB` and sankoch delta primitives.
 - **Wire protocol** — first-party smart-HTTP / ssh replacement. Not on the AGNOS critical path; revisit once the local VCS loop is solid.
 - **Signed commits** — sigil-backed signatures on commit objects.
-
-### Quality
-
-- **Integration tests in-tree** — promote the shell-level smoke tests from `docs/guides/getting-started.md` into `tests/` with fixtures. Current `tests/sit.tcyr` is stdlib-assert smoke only.
 - **`sit fsck`** — verify object hashes, walk commit chain, report corruption.
+- **Integration tests in-tree** — promote the shell-level smoke tests from `docs/guides/getting-started.md` into `tests/` with fixtures. Current `tests/sit.tcyr` is stdlib-assert smoke only.
+- **Hunk-grouping polish** — collapse stretches of context between changes in per-hunk output further; handle the `@@ -N +N,M @@` one-line-count abbreviation.
+- **`sit add -f`** — force-add an ignored path (currently rejected without override).
+- **Full `.sitignore` semantics** — negation (`!pattern`), double-star (`**`), character classes (`[abc]`), anchored patterns (`/foo`), path patterns (`foo/bar`).
