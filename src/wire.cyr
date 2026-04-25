@@ -143,8 +143,11 @@ fn db_object_read_decompressed(db, hex, out) {
 }
 
 # Insert a pre-compressed object (hex key, type code, zlib bytes) into db.
+# Returns 0 if a new row was inserted; 1 if the object was already present
+# (caller can use this to count "actually new" inserts vs. all attempts);
+# negative on error from patra_insert_row.
 fn db_object_insert_raw(db, hex, type_code, compressed, clen) {
-    if (db_object_has(db, hex) == 1) { return 0; }
+    if (db_object_has(db, hex) == 1) { return 1; }
     var types[24];
     store64(&types +  0, 1);
     store64(&types +  8, 0);
@@ -255,21 +258,29 @@ fn copy_objects(src_db, dst_db, hashes) {
     var n = vec_len(hashes);
     var i = 0;
     var copied = 0;
+    # P-03: wrap the insert loop in a single patra transaction so the N
+    # individual writes share one WAL fsync at commit instead of N. On a
+    # 100-commit/100-file clone fixture, this collapses ~300 fsyncs into 1.
+    # Removed the outer db_object_has check that duplicates the one already
+    # inside db_object_insert_raw — every object was paying for two SELECTs
+    # plus an insert. Batched WHERE hash IN (...) pre-filter is deferred to
+    # a later release (would need 60-hash chunking per patra's SQL parser
+    # limits).
+    patra_begin(dst_db);
     while (i < n) {
         var hex = vec_get(hashes, i);
-        if (db_object_has(dst_db, hex) == 0) {
-            var raw[24];
-            if (db_object_read_raw(src_db, hex, &raw) == 0) {
-                var compressed = load64(&raw);
-                var clen = load64(&raw + 8);
-                var ty = load64(&raw + 16);
-                if (db_object_insert_raw(dst_db, hex, ty, compressed, clen) == 0) {
-                    copied = copied + 1;
-                }
+        var raw[24];
+        if (db_object_read_raw(src_db, hex, &raw) == 0) {
+            var compressed = load64(&raw);
+            var clen = load64(&raw + 8);
+            var ty = load64(&raw + 16);
+            if (db_object_insert_raw(dst_db, hex, ty, compressed, clen) == 0) {
+                copied = copied + 1;
             }
         }
         i = i + 1;
     }
+    patra_commit(dst_db);
     return copied;
 }
 
@@ -513,13 +524,14 @@ fn do_fetch(name, branch) {
         eprintln("sit: cannot open remote object db");
         return 0;
     }
-    var dst_db = object_db_open();
+    # v0.6.4: local DB via the process-wide cache; remote stays per-call
+    # because each fetch addresses a different file.
+    var dst_db = get_object_db();
     if (dst_db == 0) {
         patra_close(src_db);
         eprintln("sit: cannot open local object db");
         return 0;
     }
-    object_db_migrate_from_loose(dst_db);
 
     var seen = map_new();
     var hashes = vec_new();
@@ -527,7 +539,6 @@ fn do_fetch(name, branch) {
     var copied = copy_objects(src_db, dst_db, hashes);
 
     patra_close(src_db);
-    patra_close(dst_db);
 
     # S-16: a write_remote_tracking failure leaves origin/<branch> stale,
     # which silently desyncs subsequent fetches (FF logic compares against
@@ -814,16 +825,15 @@ fn cmd_push() {
         return 1;
     }
 
-    var src_db = object_db_open();
+    # v0.6.4: local source via the cache; remote dst stays per-call.
+    var src_db = get_object_db();
     if (src_db == 0) {
         eprintln("sit: cannot open local object db");
         return 1;
     }
-    object_db_migrate_from_loose(src_db);
 
     var dst_db = remote_objects_open(repo_path);
     if (dst_db == 0) {
-        patra_close(src_db);
         eprintln("sit: cannot open remote object db");
         return 1;
     }
@@ -832,7 +842,6 @@ fn cmd_push() {
     if (remote_tip != 0) {
         # Fast-forward check: remote_tip must be an ancestor of local_tip.
         if (is_ancestor_in_db(src_db, remote_tip, local_tip) == 0) {
-            patra_close(src_db);
             patra_close(dst_db);
             eprintln("sit: non-fast-forward push rejected (remote has diverged)");
             return 1;
@@ -844,7 +853,6 @@ fn cmd_push() {
     walk_reachable_from_commit(src_db, local_tip, hashes, seen);
     var copied = copy_objects(src_db, dst_db, hashes);
 
-    patra_close(src_db);
     patra_close(dst_db);
 
     if (write_remote_ref(repo_path, branch, local_tip) < 0) {

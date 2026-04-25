@@ -4,6 +4,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-04-25
+
+P-03 perf release: `copy_objects` batched into a single patra transaction, redundant outer has-check dropped. **`sit clone` of a 100-commit / 100-file repo: −15%** (245.19 → 208.44 ms min, 16.13x git → 13.82x git). All other operations within run-to-run noise — their bottlenecks remain dep-side (sigil SHA-256 throughput, sankoch zlib throughput) and are filed on those repos' roadmaps.
+
+### Performance
+
+- **`sit clone` (100-commit / 100-file fixture): −15%** at `RUNS_LIGHT=20 RUNS_HEAVY=10`. Three changes in `src/wire.cyr:copy_objects`:
+  1. Wrap the insert loop in `patra_begin` / `patra_commit`. Collapses ~300 individual WAL fsyncs into one commit. Patra exposes these primitives as stdlib functions; they were dead code in every sit build prior to v0.6.5.
+  2. Drop the outer `db_object_has` check. `db_object_insert_raw` already does its own has-check internally — every object was paying for two SELECTs instead of one. Halves the SQL round-trips on the dedup path.
+  3. Side-effect counting fix: `db_object_insert_raw` now returns `1` for already-existed (vs. `0` for actually-inserted; negative for error), so `copy_objects` counts only genuine new inserts. Caught by the wire-protocol smoke test — without the fix, `sit push` on a clone reported all reachable objects as "new" instead of just the locally-added ones.
+
+The bigger wins on `clone` are gated on patra-side work — `WAL group commit / batched fsync` and `INSERT OR IGNORE` / `UPSERT` are filed on patra's roadmap (entries cite this release's bench snapshot). Once those land, a follow-on sit release can drop the manual transaction wrapping and the inner has-check; expected combined improvement is another ~30-50% on top of v0.6.5's gain.
+
+### Documentation
+
+- New bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.5.md`](docs/benchmarks/2026-04-25-v0.6.5.md).
+- `docs/development/roadmap.md` v0.6.5+ section gained a "Waiting on dep updates" subsection that lists the patra / sigil / sankoch items now tracked on each lib's own roadmap. When any of those ship, sit can drop the corresponding workaround / pick up the matching improvement without further sit-side code changes.
+
+## [0.6.4] — 2026-04-25
+
+First v0.6.x perf release. Process-wide patra-handle caching collapses six audit findings (P-01, P-02, P-05, P-08, P-12, P-25) plus the deferred S-24 into one refactor. `sit log` on a 100-commit history is **~17% faster** (33.67 → 27.84 ms min, RUNS_LIGHT=20). Other commands (status, clone, fetch, add) unchanged in this release — their bottlenecks (sigil throughput, per-object zlib_decompress, file_write_all) are downstream of patra open/close cost. Real status / clone wins need separate work in subsequent releases.
+
+### Changed
+
+- **`src/object_db.cyr`** — added `get_object_db()` process-wide cached handle for `.sit/objects.patra`. Lazy-open + lazy `object_db_migrate_from_loose` on first call. fd dies with the process (`patra_close` is just buffer-free + close — no WAL flush — so skipping it at exit is safe). `read_object`, `write_typed_object`, `resolve_hash`, `cmd_fsck` migrated to the cache; their previous `var db = open(); ... patra_close(db);` pattern is gone.
+- **`src/index.cyr`** — added `get_index_db()` cached handle for `.sit/index.patra` (same shape). `parse_index` and `rewrite_index` migrated.
+- **`src/wire.cyr`** — `do_fetch` and `do_push` use the cached local DB; the remote DB end (different file each call) stays per-operation.
+
+### Fixed
+
+- **S-24** (Patra-handle + SQL-string leaks; `read_object` single-exit refactor) — landed as part of the cache refactor, as planned in v0.6.2's deferral note. The single-exit shape fell out naturally once the open/close pattern was gone. SQL-string buffers in `read_object` / `resolve_hash` / `write_typed_object` switched from `alloc_or_die` (bump-heap, lives forever) to `fl_alloc` + `fl_free` (mmap'd, freed after each query). Trims per-query bump-heap pressure on long-running ops like `sit log` / `sit fsck` over thousands of objects.
+
+### Performance
+
+- **`sit log`** (100-commit walk): **−17%** (33.67 ms → 27.84 ms min, `RUNS_LIGHT=20` against git 2.53.0). Higher commit counts amortize the same fixed-cost win — expect proportionally larger savings on 1K- or 10K-commit histories.
+- **`sit fsck`** (100-commit / 100-file fixture): not in the bench harness yet, but exercises the same pattern (one query → N read_object calls). Wins should match or exceed `log`.
+- **`sit status`**, **`sit clone`**, **`sit add`**, **`sit commit`**, **`sit fetch`**: within run-to-run noise. Their bottlenecks are sigil hash throughput (status / add) or per-object zlib_decompress + file_write_all (clone) — both downstream of patra open/close. Queued for separate releases:
+  - **P-03** batch `copy_objects` in a single transaction → clone speedup
+  - **P-06 + P-15** smarter decompression sizing + LCS DP table via fl_alloc → diff / clone speedup
+  - **P-04** denormalize tree/parent hashes so `walk_reachable_from_commit` doesn't decompress every commit/tree just to read headers
+  - sigil SHA-256 throughput → upstream sigil's roadmap
+
+Full snapshot: [`docs/benchmarks/2026-04-25-v0.6.4.md`](docs/benchmarks/2026-04-25-v0.6.4.md).
+
 ## [0.6.3] — 2026-04-25
 
 LOW-severity batch from the 2026-04-24 P(-1) audit. All audit findings (CRITICAL, HIGH, MEDIUM, LOW) are now closed or explicitly deferred to the v0.6.x perf arc. Two of the three v0.6.3 items resolved via documentation rather than code change, since the underlying invariants were already in place.

@@ -39,36 +39,33 @@ fn resolve_hash(prefix, out_buf) {
     # Without this, a prefix containing `'` would break / inject the SQL.
     if (hex_prefix_valid(prefix, plen) == 0) { return 0; }
 
-    var db = object_db_open();
+    var db = get_object_db();
     if (db == 0) { return 0; }
-    object_db_migrate_from_loose(db);
 
-    var sql = alloc_or_die(64 + plen);
+    # S-24: SQL strings on the freelist instead of bump heap so they don't
+    # accumulate per-call.
+    var sql = fl_alloc(64 + plen);
     memcpy(sql, "SELECT hash FROM objects WHERE hash LIKE '", 42);
     memcpy(sql + 42, prefix, plen);
     memcpy(sql + 42 + plen, "%'", 2);
     store8(sql + 42 + plen + 2, 0);
 
     var rs = patra_query(db, sql);
-    if (rs == 0) { patra_close(db); return 0; }
+    fl_free(sql);
+    if (rs == 0) { return 0; }
     var count = patra_result_count(rs);
-    if (count == 0) {
-        patra_result_free(rs);
-        patra_close(db);
-        return 0;
+    var ret = 0;
+    if (count == 1) {
+        var hash_str = patra_result_get_str(rs, 0, 0);
+        memcpy(out_buf, hash_str, 64);
+        store8(out_buf + 64, 0);
+        ret = 1;
     }
-    if (count > 1) {
-        patra_result_free(rs);
-        patra_close(db);
-        return 0 - 1;
+    else {
+        if (count > 1) { ret = 0 - 1; }
     }
-
-    var hash_str = patra_result_get_str(rs, 0, 0);
-    memcpy(out_buf, hash_str, 64);
-    store8(out_buf + 64, 0);
     patra_result_free(rs);
-    patra_close(db);
-    return 1;
+    return ret;
 }
 
 # Read and decompress an object by full 64-char hex hash.
@@ -78,39 +75,37 @@ fn resolve_hash(prefix, out_buf) {
 #   out[16..24)  content offset (first byte past framing \0)
 # Returns 0 on success, negative on error.
 fn read_object(hex, out) {
-    var db = object_db_open();
+    var db = get_object_db();
     if (db == 0) { return 0 - 1; }
-    object_db_migrate_from_loose(db);
 
-    var sql = alloc_or_die(128);
+    # S-24: SQL string via fl_alloc + fl_free; freed before any non-trivial
+    # work below so we don't hold both the buffer and the result-set.
+    var sql = fl_alloc(128);
     memcpy(sql, "SELECT content FROM objects WHERE hash = '", 42);
     memcpy(sql + 42, hex, 64);
     memcpy(sql + 42 + 64, "'", 1);
     store8(sql + 42 + 64 + 1, 0);
 
     var rs = patra_query(db, sql);
-    if (rs == 0) { patra_close(db); return 0 - 2; }
+    fl_free(sql);
+    if (rs == 0) { return 0 - 2; }
     if (patra_result_count(rs) == 0) {
         patra_result_free(rs);
-        patra_close(db);
         return 0 - 3;
     }
 
     var blen = patra_result_get_bytes_len(rs, 0, 0);
     if (blen <= 0) {
         patra_result_free(rs);
-        patra_close(db);
         return 0 - 4;
     }
 
     var compressed = alloc_or_die(blen);
     if (patra_result_read_bytes(db, rs, 0, 0, compressed) != 0) {
         patra_result_free(rs);
-        patra_close(db);
         return 0 - 5;
     }
     patra_result_free(rs);
-    patra_close(db);
 
     # S-08: tighten the decompression multiplier from 256× to 16× (still
     # generous — zlib rarely exceeds ~8× on text). If the first attempt
@@ -166,16 +161,18 @@ fn write_typed_object(type_str, type_len, content, content_len) {
     var clen = zlib_compress(full, full_len, compressed, out_cap);
     if (clen <= 0) { return 0; }
 
-    var db = object_db_open();
+    var db = get_object_db();
     if (db == 0) { return 0; }
 
     # Content-addressed — skip if hash already present.
-    var check_sql = alloc_or_die(128);
+    # S-24: SQL on the freelist; freed before the insert path runs.
+    var check_sql = fl_alloc(128);
     memcpy(check_sql, "SELECT hash FROM objects WHERE hash = '", 39);
     memcpy(check_sql + 39, hex, 64);
     memcpy(check_sql + 39 + 64, "'", 1);
     store8(check_sql + 39 + 64 + 1, 0);
     var rs = patra_query(db, check_sql);
+    fl_free(check_sql);
     var exists = 0;
     if (rs != 0) {
         if (patra_result_count(rs) > 0) { exists = 1; }
@@ -201,8 +198,6 @@ fn write_typed_object(type_str, type_len, content, content_len) {
         patra_insert_row(db, "objects", 7, 3,
             &types, &ivals, &sptrs, &slens, &bptrs, &blens);
     }
-
-    patra_close(db);
     return hex;
 }
 
@@ -376,12 +371,32 @@ fn type_code_of(type_str, type_len) {
 }
 
 # Open (or create) the patra-backed object store. Returns db handle, or 0.
+# Used by the wire protocol when it needs an explicit handle (push/fetch
+# open both ends with named locals); hot read paths should go through
+# get_object_db() instead.
 fn object_db_open() {
     patra_init();
     var db = patra_open(".sit/objects.patra");
     if (db == 0) { return 0; }
     patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
     return db;
+}
+
+# v0.6.4: process-wide cached handle for .sit/objects.patra. Collapses
+# P-01/02/05/08/12/25 — every read_object / write_typed_object /
+# resolve_hash previously did patra_init + patra_open + CREATE TABLE +
+# loose-migration check + patra_close on every call. With the cache:
+# first call opens + migrates once; subsequent calls reuse the handle;
+# fd dies with the process (patra_close just frees in-process buffers
+# and closes the fd — no WAL flush — so skipping it at exit is safe).
+var _object_db_cached = 0;
+
+fn get_object_db() {
+    if (_object_db_cached != 0) { return _object_db_cached; }
+    _object_db_cached = object_db_open();
+    if (_object_db_cached == 0) { return 0; }
+    object_db_migrate_from_loose(_object_db_cached);
+    return _object_db_cached;
 }
 
 # Migrate legacy loose-file objects (under .sit/objects/<xx>/<yy...>) into
@@ -488,15 +503,16 @@ fn cmd_fsck() {
         return 1;
     }
 
-    var db = object_db_open();
+    var db = get_object_db();
     if (db == 0) {
         syscall(SYS_WRITE, STDOUT, "checked 0 objects, 0 bad\n", 25);
         return 0;
     }
-    object_db_migrate_from_loose(db);
 
-    # Snapshot the hash list first, then close the db so read_object can open
-    # its own handle without contention.
+    # Snapshot the hash list once. v0.6.4: with the cached handle, the
+    # subsequent read_object loop reuses this same db, so the previous
+    # "snapshot then close so read_object can open without contention"
+    # workaround is no longer needed — there's no contention to begin with.
     var rs = patra_query(db, "SELECT hash FROM objects");
     var total = 0;
     var bad = 0;
@@ -514,7 +530,6 @@ fn cmd_fsck() {
         }
         patra_result_free(rs);
     }
-    patra_close(db);
 
     var hn = vec_len(hashes);
     var hi = 0;

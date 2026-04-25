@@ -6,10 +6,12 @@
 
 ## Current
 
-- **Version**: 0.6.3 (read `VERSION` for the authoritative number)
+- **Version**: 0.6.5 (read `VERSION` for the authoritative number)
 - **Cyrius toolchain**: 5.6.35 (pinned in `cyrius.cyml [package].cyrius`)
-- **Status**: 2026-04-24 P(-1) audit fully closed across CRITICAL/HIGH/MEDIUM/LOW (S-24 deferred to the v0.6.x perf arc; everything else shipped). Next: v0.6.x patra-handle-caching refactor — collapses ~5 of the top-10 hot paths and folds in S-24's `read_object` rewrite. Then v0.7.0 network transport
+- **Status**: Second v0.6.x perf release shipped. v0.6.4 patra-handle caching → `sit log` -17%. v0.6.5 P-03 (batched `copy_objects` transaction) → `sit clone` -15% (245 → 208 ms; ratio 16.13x git → 13.82x git). Bigger clone wins gated on patra-side `WAL group commit` + `UPSERT` (filed on patra's roadmap). Next sit-side targets: P-04 walk-reachable cache, P-06+P-15 decompression sizing, P-10+P-18 hashmap-backed lookups, P-17 buffered stdout. Then v0.7.0 network transport
 - **Primary target**: Linux x86_64. aarch64 cross-build is best-effort in CI
+- **Patra handle caching**: `get_object_db()` (object_db.cyr) and `get_index_db()` (index.cyr) memoize per-process. `object_db_open()` / `index_db_open()` still exported for the wire-protocol callers that need an explicit fresh handle for the remote-side DB (every fetch/push targets a different file)
+- **Wire transactions**: `copy_objects` (src/wire.cyr) wraps the insert loop in `patra_begin` / `patra_commit` since v0.6.5. `db_object_insert_raw` returns `1` for already-existed and `0` for actually-inserted (caller increments `copied` only on `== 0`)
 - **exec_vec envp**: empty (cyrius stdlib `lib/process.cyr` passes a NULL-only envp; no env-var inheritance in `cmd_owl_file`). Any future curated-envp shape (e.g. preserving `PATH`/`HOME`/`TERM`/`LANG` for owl UX) would be a deliberate widening
 
 ## Source layout
@@ -72,6 +74,8 @@ All git-tag pinned in `cyrius.cyml`. No FFI, no C, no libgit2 — see [ADR 0001]
 
 | Version | Date | Summary |
 |---------|------|---------|
+| 0.6.5 | 2026-04-25 | P-03: `copy_objects` batched into a single `patra_begin`/`patra_commit` transaction; redundant outer `db_object_has` dropped (was paying for 2 SELECTs per object, now 1); `db_object_insert_raw` return convention extended to distinguish "newly inserted" from "already present" so the wire-side `copied` counter is accurate. **`sit clone` -15%** (245 → 208 ms; 16.13x git → 13.82x git). Bench snapshot at `docs/benchmarks/2026-04-25-v0.6.5.md`. Bigger clone wins still gated on patra-side group-commit + UPSERT (filed on patra's roadmap). |
+| 0.6.4 | 2026-04-25 | First v0.6.x perf release. Process-wide patra-handle caching for `.sit/objects.patra` + `.sit/index.patra` (P-01/02/05/08/12/25). S-24 fold-in: SQL-string allocs in object_db swapped to `fl_alloc`/`fl_free`; read_object's single-exit shape fell out for free. `sit log` -17% on a 100-commit walk; status / clone unchanged (bottlenecks are downstream). Bench snapshot at `docs/benchmarks/2026-04-25-v0.6.4.md`. |
 | 0.6.3 | 2026-04-25 | LOW-severity batch + audit closeout. `strnlen` added to util.cyr; `parse_index`'s `patra_result_get_str` walk now bounded at 256 (S-31). S-28 confirmed already addressed by stdlib's empty-envp `exec_vec`. S-32 documented as a Cyrius compile-time invariant in `docs/architecture/004-*.md` (Cyrius string literals are program-lifetime; tree.cyr's mode-pointer pattern is safe). 2026-04-24 P(-1) audit fully closed; only S-24 deferred (folds into v0.6.x patra-cache refactor). |
 | 0.6.2 | 2026-04-25 | Security hygiene MEDIUM batch from the 2026-04-24 audit. `alloc_or_die` helper + 52-site swap (S-17). Materialize / merge / commit / clone now fail loudly on FS-mutation errors instead of silently producing partial state (S-16, S-27). Author-line + sitsig parsers hardened against integer overflow + partial hex decode (S-18, S-19, S-20). `cmd_clone` requires `--force-absolute` for absolute targets (S-23). Index-migrate caps per-line path length at 4096 (S-22). Latent `ensure_dirs_for` mkdir("") bug removed (S-25). |
 | 0.6.1 | 2026-04-25 | S-33 fix release. Pure dep-pin bumps — sankoch 2.0.1 → 2.0.3 (zlib symmetry) + cyrius 5.6.25 → 5.6.35 (allocator grow defense-in-depth). Status / fsck / clone clean on 100-commit / 100-file fixture. `bench_status` + `bench_clone` re-enabled. New `docs/development/issues/` for upstream-bug writeups. |

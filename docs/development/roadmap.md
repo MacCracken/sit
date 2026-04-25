@@ -6,6 +6,22 @@ Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHAN
 
 ## Released
 
+### v0.6.5 — P-03: `copy_objects` batched transaction
+
+- `src/wire.cyr:copy_objects` now wraps the insert loop in `patra_begin` / `patra_commit` (collapses N WAL fsyncs into 1) and drops the outer redundant `db_object_has` check (`db_object_insert_raw` already does the check internally — every object was paying for 2 SELECTs instead of 1).
+- Side-effect counting fix: `db_object_insert_raw` returns `1` when the object was already present, `0` when actually inserted, negative on error. `copy_objects` increments `copied` only on `== 0`. Without this, `sit push` reported all reachable objects as "new" after a clone (caught by wire smoke).
+- **Win**: `sit clone-100commits` **−15%** (245.19 → 208.44 ms min, 16.13x git → 13.82x git). Other ops within noise.
+- Bigger clone wins still on patra's roadmap (`WAL group commit`, `UPSERT`) — when those land, a follow-on sit release can drop the manual transaction wrapping AND the inner has-check; expected combined improvement another ~30-50% on top of v0.6.5.
+- Bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.5.md`](../benchmarks/2026-04-25-v0.6.5.md).
+
+### v0.6.4 — First v0.6.x perf release: patra-handle caching + S-24 fold-in
+
+- Process-wide cached handles for `.sit/objects.patra` (`get_object_db()`) and `.sit/index.patra` (`get_index_db()`). Collapses **P-01, P-02, P-05, P-08, P-12, P-25** — every `read_object` / `write_typed_object` / `resolve_hash` previously did patra_init + patra_open + CREATE TABLE + loose-migration check + patra_close on every call. Now: open + migrate once per process; reuse forever; fd dies with the process.
+- **S-24 fold-in**: read_object's single-exit shape fell out for free once the open/close pattern was gone. SQL-string buffers in object_db.cyr swapped from `alloc_or_die` (bump-heap, lives forever) to `fl_alloc` + `fl_free` — trims per-query bump pressure on long-running ops.
+- **Wins**: `sit log` on a 100-commit walk **−17%** (33.67 → 27.84 ms min). `sit fsck` should match or exceed (same pattern, more iterations).
+- **Honestly unchanged**: `sit status`, `sit clone`, `sit add`, `sit commit`, `sit fetch` — their bottlenecks (sigil throughput, per-object zlib_decompress, file_write_all) are downstream of the patra open/close cost the cache fixed. Other queued perf items target those: see v0.6.5+ below.
+- Bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.4.md`](../benchmarks/2026-04-25-v0.6.4.md).
+
 ### v0.6.3 — LOW-severity batch + audit closeout
 
 - **S-28** confirmed already addressed: cyrius stdlib's `exec_vec` passes an empty envp, which is more aggressive than the audit's "minimal envp" prescription. No sit-side change; documented in CHANGELOG + state.md so future readers don't re-investigate.
@@ -92,18 +108,27 @@ The local VCS loop is complete end-to-end, with ed25519 signing and a local-path
 
 ## Backlog
 
-### v0.6.x — Performance (patra handle caching) + S-24 fold-in
+### v0.6.5+ — Remaining v0.6.x perf items (one or two per release)
 
-Ship after security baseline is clean. Collapses P-01, P-02, P-05, P-08, P-12, P-25 + S-24 into one refactor:
+Patra-handle caching shipped in v0.6.4 (see Released above). Remaining items target the bottlenecks v0.6.4 didn't move: clone, status, diff. Each is independently shippable; pick by which workload is most painful for actual users.
 
-- Cache the patra object-DB handle process-wide (open on first use, close at exit); add `read_object_with_db(db, hex, out)` variant and thread the handle through `cmd_log`, `cmd_fsck`, `flatten_tree`, `materialize_target`, `is_ancestor`, `find_merge_base`.
-- **S-24** (deferred from v0.6.2) folds in here: refactor `read_object` to a single-exit pattern as part of the handle-threading rewrite; switch the SQL-string buffers to `fl_alloc` / `fl_free` in the same touch. Doing it together avoids a double-rewrite of the same function.
-- **P-03** `copy_objects`: pre-filter via `WHERE hash IN (...)` batch; wrap the insert loop in a single patra transaction.
-- **P-06** + **P-15** Smarter decompression sizing (read the framing length prefix); route LCS DP table through `fl_alloc` / `fl_free`.
-- **P-10 + P-18** Hashmap-backed `tree_find` + three_way_path_set dedup.
+**Waiting on dep updates** (filed on each dep's roadmap 2026-04-25; sit gets bigger wins once these land but is not blocked from shipping the items below):
+
+- [`patra` roadmap](../../../patra/docs/development/roadmap.md): WAL group commit / batched fsync (would amplify P-03 below); `INSERT OR IGNORE` / `UPSERT` (would simplify P-03 + unblock P-11 cleanly); sized string getter `patra_result_get_str_len` (would let sit drop the S-31 strnlen wrapper).
+- [`sigil` roadmap](../../../sigil/docs/development/roadmap.md): SHA-256 hot-path throughput investigation (~80x headroom vs modern hardware; directly improves `sit status` + `sit add`).
+- [`sankoch` roadmap](../../../sankoch/docs/development/roadmap.md): DEFLATE compress/decompress throughput investigation (5-10x headroom via libdeflate-class tuning; directly improves `sit add` + `sit clone`).
+
+When any of those ship, sit can drop the corresponding workaround / get a measurable improvement on the matching workload without further sit-side code changes. Watch their CHANGELOGs.
+
+**Sit-side items (no dep dependency, ship-ready):**
+
+- ~~**P-03** `copy_objects`~~ — **shipped in v0.6.5** (see Released above). Partial: the transaction wrap + outer has-check drop landed; the batched `WHERE hash IN (...)` pre-filter is deferred (would need 60-hash chunking per patra's 128-token / 4096-byte SQL parser limits). When patra grows `INSERT OR IGNORE` / `UPSERT`, the inner has-check goes away too.
+- **P-06** + **P-15** Smarter decompression sizing (read the framing length prefix instead of `blen * 16` + retry); route LCS DP table through `fl_alloc` / `fl_free` so diff-heavy commands don't permanently reserve bump memory. Targets diff / clone.
+- **P-04** `walk_reachable_from_commit` decompresses every commit/tree in the history just to parse 1-2 header lines. Denormalize tree/parent hex into the patra schema, or cache decompressed objects during the walk.
+- **P-10 + P-18** Hashmap-backed `tree_find` (currently O(N) called in O(N) loops) + `three_way_path_set` dedup (currently O(N²) nested `streq`).
 - **P-11** `sit add` index upsert without full rewrite (needs patra UPSERT; if patra doesn't have it, push on their roadmap).
-- **P-17** Buffered stdout.
-- Re-run `docs/benchmarks/2026-04-24-baseline.md` after each change; gate merges on no regression.
+- **P-17** Buffered stdout to coalesce per-line `write(2)` syscalls (3000+ for a 500-line diff).
+- Re-bench after each change; gate on no regression vs. the v0.6.4 snapshot.
 
 ### ADRs to write (concurrent with v0.5.2)
 

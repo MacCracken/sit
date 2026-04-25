@@ -100,6 +100,18 @@ fn index_db_open() {
     return db;
 }
 
+# v0.6.4: process-wide cache for .sit/index.patra. Same pattern as
+# get_object_db (object_db.cyr). Lazy-open + lazy-migrate-from-plaintext.
+var _index_db_cached = 0;
+
+fn get_index_db() {
+    if (_index_db_cached != 0) { return _index_db_cached; }
+    _index_db_cached = index_db_open();
+    if (_index_db_cached == 0) { return 0; }
+    index_migrate_from_plaintext(_index_db_cached);
+    return _index_db_cached;
+}
+
 # Migrate legacy plaintext .sit/index (v0.1 format) into the patra table.
 # No-op if the plaintext file is absent. Deletes it on successful migration.
 fn index_migrate_from_plaintext(db) {
@@ -161,7 +173,7 @@ fn index_migrate_from_plaintext(db) {
 
 # Rewrite the staging index to exactly the given entries. DELETE + insert all.
 fn rewrite_index(entries) {
-    var db = index_db_open();
+    var db = get_index_db();
     if (db == 0) { return 0 - 1; }
     patra_exec(db, "DELETE FROM entries");
 
@@ -188,7 +200,6 @@ fn rewrite_index(entries) {
             &types, &ivals, &sptrs, &slens, &bptrs, &blens);
         i = i + 1;
     }
-    patra_close(db);
     return 0;
 }
 
@@ -235,17 +246,15 @@ fn parse_index() {
         if (file_exists(".sit/index") != 1) { return 0; }
     }
 
-    var db = index_db_open();
+    var db = get_index_db();
     if (db == 0) { return 0; }
-    index_migrate_from_plaintext(db);
 
     var rs = patra_query(db, "SELECT path, hash_hex FROM entries");
-    if (rs == 0) { patra_close(db); return 0; }
+    if (rs == 0) { return 0; }
 
     var count = patra_result_count(rs);
     if (count == 0) {
         patra_result_free(rs);
-        patra_close(db);
         return 0;
     }
 
@@ -276,7 +285,6 @@ fn parse_index() {
     }
 
     patra_result_free(rs);
-    patra_close(db);
     if (vec_len(entries) == 0) { return 0; }
     return entries;
 }
