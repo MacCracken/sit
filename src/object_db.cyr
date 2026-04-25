@@ -43,7 +43,7 @@ fn resolve_hash(prefix, out_buf) {
     if (db == 0) { return 0; }
     object_db_migrate_from_loose(db);
 
-    var sql = alloc(64 + plen);
+    var sql = alloc_or_die(64 + plen);
     memcpy(sql, "SELECT hash FROM objects WHERE hash LIKE '", 42);
     memcpy(sql + 42, prefix, plen);
     memcpy(sql + 42 + plen, "%'", 2);
@@ -82,7 +82,7 @@ fn read_object(hex, out) {
     if (db == 0) { return 0 - 1; }
     object_db_migrate_from_loose(db);
 
-    var sql = alloc(128);
+    var sql = alloc_or_die(128);
     memcpy(sql, "SELECT content FROM objects WHERE hash = '", 42);
     memcpy(sql + 42, hex, 64);
     memcpy(sql + 42 + 64, "'", 1);
@@ -103,7 +103,7 @@ fn read_object(hex, out) {
         return 0 - 4;
     }
 
-    var compressed = alloc(blen);
+    var compressed = alloc_or_die(blen);
     if (patra_result_read_bytes(db, rs, 0, 0, compressed) != 0) {
         patra_result_free(rs);
         patra_close(db);
@@ -120,13 +120,13 @@ fn read_object(hex, out) {
     var dec_cap = blen * 16;
     if (dec_cap < 4096) { dec_cap = 4096; }
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
-    var decompressed = alloc(dec_cap);
+    var decompressed = alloc_or_die(dec_cap);
     if (decompressed == 0) { return 0 - 6; }
     var dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
     if (dlen <= 0) {
         if (dec_cap < 16 * 1024 * 1024) {
             dec_cap = 16 * 1024 * 1024;
-            decompressed = alloc(dec_cap);
+            decompressed = alloc_or_die(dec_cap);
             if (decompressed == 0) { return 0 - 6; }
             dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
         }
@@ -149,7 +149,7 @@ fn read_object(hex, out) {
 fn write_typed_object(type_str, type_len, content, content_len) {
     var hdr_max = 32;
     var full_cap = hdr_max + content_len;
-    var full = alloc(full_cap);
+    var full = alloc_or_die(full_cap);
     memcpy(full, type_str, type_len);
     store8(full + type_len, 32);
     var digits = write_decimal(full + type_len + 1, content_len);
@@ -162,7 +162,7 @@ fn write_typed_object(type_str, type_len, content, content_len) {
 
     var out_cap = full_len + 64 + full_len / 10;
     if (out_cap < 128) { out_cap = 128; }
-    var compressed = alloc(out_cap);
+    var compressed = alloc_or_die(out_cap);
     var clen = zlib_compress(full, full_len, compressed, out_cap);
     if (clen <= 0) { return 0; }
 
@@ -170,7 +170,7 @@ fn write_typed_object(type_str, type_len, content, content_len) {
     if (db == 0) { return 0; }
 
     # Content-addressed — skip if hash already present.
-    var check_sql = alloc(128);
+    var check_sql = alloc_or_die(128);
     memcpy(check_sql, "SELECT hash FROM objects WHERE hash = '", 39);
     memcpy(check_sql + 39, hex, 64);
     memcpy(check_sql + 39 + 64, "'", 1);
@@ -298,11 +298,11 @@ fn cmd_owl_file() {
     else {
         if (home != 0) {
             var hlen = strlen(home);
-            var cache = alloc(hlen + 12);
+            var cache = alloc_or_die(hlen + 12);
             memcpy(cache, home, hlen);
             memcpy(cache + hlen, "/.cache/sit", 11);
             store8(cache + hlen + 11, 0);
-            var parent = alloc(hlen + 8);
+            var parent = alloc_or_die(hlen + 8);
             memcpy(parent, home, hlen);
             memcpy(parent + hlen, "/.cache", 7);
             store8(parent + hlen + 7, 0);
@@ -315,7 +315,7 @@ fn cmd_owl_file() {
         }
     }
     var db_len = strlen(dir_base);
-    var tmppath = alloc(db_len + 32);
+    var tmppath = alloc_or_die(db_len + 32);
     memcpy(tmppath, dir_base, db_len);
     memcpy(tmppath + db_len, "/sit-owl-", 9);
     memcpy(tmppath + db_len + 9, &hex, 12);
@@ -331,7 +331,12 @@ fn cmd_owl_file() {
     }
     if (syscall(SYS_WRITE, tfd, content, content_len) < 0) {
         sys_close(tfd);
-        sys_unlink(tmppath);
+        # S-16: best-effort tempfile cleanup. Tempfiles live in
+        # $XDG_RUNTIME_DIR/sit/ so a leak gets reaped eventually; a stderr
+        # warning makes it loud rather than silent.
+        if (sys_unlink(tmppath) != 0) {
+            eprintln("sit: warning: failed to remove owl tempfile after write error");
+        }
         eprintln("sit: cannot write tempfile");
         return 1;
     }
@@ -342,7 +347,9 @@ fn cmd_owl_file() {
         eprintln("sit: owl not installed — emitting raw content");
         eprintln("sit:   (owl is pre-1.0; https://github.com/MacCracken/owl)");
         syscall(SYS_WRITE, STDOUT, content, content_len);
-        sys_unlink(tmppath);
+        if (sys_unlink(tmppath) != 0) {
+            eprintln("sit: warning: failed to remove owl tempfile");
+        }
         return 0;
     }
 
@@ -350,7 +357,9 @@ fn cmd_owl_file() {
     vec_push(args, owl);
     vec_push(args, tmppath);
     var rc = exec_vec(args);
-    sys_unlink(tmppath);
+    if (sys_unlink(tmppath) != 0) {
+        eprintln("sit: warning: failed to remove owl tempfile after exec");
+    }
     return rc;
 }
 
@@ -390,7 +399,7 @@ fn object_db_migrate_from_loose(db) {
         var slen = str_len(s);
 
         if (slen == 2) {
-            var sub_path = alloc(16);
+            var sub_path = alloc_or_die(16);
             memcpy(sub_path, ".sit/objects/", 13);
             memcpy(sub_path + 13, sdata, 2);
             store8(sub_path + 15, 0);
@@ -404,12 +413,12 @@ fn object_db_migrate_from_loose(db) {
                 var flen = str_len(f);
 
                 if (flen == 62) {
-                    var hex = alloc(65);
+                    var hex = alloc_or_die(65);
                     memcpy(hex, sdata, 2);
                     memcpy(hex + 2, fdata, 62);
                     store8(hex + 64, 0);
 
-                    var loose_path = alloc(96);
+                    var loose_path = alloc_or_die(96);
                     object_path(loose_path, hex);
                     var pair[16];
                     if (read_file_heap(loose_path, &pair) == 0) {
@@ -421,12 +430,12 @@ fn object_db_migrate_from_loose(db) {
                         var dec_cap = clen * 16;
                         if (dec_cap < 4096) { dec_cap = 4096; }
                         if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
-                        var decompressed = alloc(dec_cap);
+                        var decompressed = alloc_or_die(dec_cap);
                         var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
                         if (dlen <= 0) {
                             if (dec_cap < 16 * 1024 * 1024) {
                                 dec_cap = 16 * 1024 * 1024;
-                                decompressed = alloc(dec_cap);
+                                decompressed = alloc_or_die(dec_cap);
                                 dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
                             }
                         }
@@ -497,7 +506,7 @@ fn cmd_fsck() {
         var i = 0;
         while (i < count) {
             var s = patra_result_get_str(rs, i, 0);
-            var copy = alloc(65);
+            var copy = alloc_or_die(65);
             memcpy(copy, s, 64);
             store8(copy + 64, 0);
             vec_push(hashes, copy);
@@ -545,7 +554,7 @@ fn cmd_fsck() {
 
 fn hash_blob_of_content(content, content_len) {
     var full_cap = 32 + content_len;
-    var full = alloc(full_cap);
+    var full = alloc_or_die(full_cap);
     memcpy(full, "blob ", 5);
     var digits = write_decimal(full + 5, content_len);
     store8(full + 5 + digits, 0);

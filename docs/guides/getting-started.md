@@ -366,7 +366,7 @@ file?.bak
 - `sit fetch <remote> [<branch>]` — copy remote objects + tracking ref into the local repo
 - `sit pull <remote> [<branch>]` — fetch + fast-forward merge (divergence → use `sit merge` manually)
 - `sit push <remote> [<branch>]` — push HEAD's branch to a remote (fast-forward only)
-- `sit clone <url> [<dir>]` — init + remote add + fetch + materialize in one shot
+- `sit clone [--force-absolute] <url> [<dir>]` — init + remote add + fetch + materialize in one shot. Absolute target paths require `--force-absolute` (so `sit clone <url> /etc/passwd` doesn't silently land where you didn't mean — S-23 hardening from v0.6.2).
 - `sit merge -S <branch>` — signed merge commit (same ed25519 flow as `sit commit -S`)
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)

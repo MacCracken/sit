@@ -6,6 +6,13 @@ Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHAN
 
 ## Released
 
+### v0.6.2 — Security hygiene (MEDIUM batch)
+
+- **S-16** through **S-27** from the 2026-04-24 P(-1) audit landed. Highlights: `alloc_or_die` helper + 52-site swap (S-17); materialize / merge / commit / clone now fail loudly on FS-mutation errors instead of silently producing partial state (S-16, S-27); `cmd_clone` requires `--force-absolute` for absolute targets (S-23); author-line + sitsig parsers hardened against integer overflow + partial hex decode (S-18, S-19, S-20); index-migrate caps per-line path length at 4096 (S-22); latent `ensure_dirs_for` mkdir("") removed (S-25). Full list in [CHANGELOG § 0.6.2](../../CHANGELOG.md#062--2026-04-25). Audit findings stamped RESOLVED in [`docs/audit/2026-04-24-audit.md`](../audit/2026-04-24-audit.md).
+- **S-24 deferred to v0.6.x.** The audit's `read_object` single-exit refactor + SQL-string `fl_alloc` swap is entangled with the planned patra-handle-caching refactor (which adds `read_object_with_db(db, hex, out)` and threads the cached handle through every caller). Doing both in v0.6.2 would mean rewriting `read_object` twice in two consecutive releases.
+- All P(-1) CRITICAL/HIGH/MEDIUM findings closed except the deferred S-24.
+- Behavioral change: `sit clone <url> <abs-path>` requires `--force-absolute`. CI smoke + `scripts/benchmark.sh` + `docs/guides/getting-started.md` updated. Migration note in CHANGELOG.
+
 ### v0.6.1 — S-33 dep-bump release
 
 - **S-33** — `sit status` SIGSEGV on a 100-commit / 100-file repo: **resolved** by upstream dep bumps. Triage in [`issues/archived/2026-04-24-cyrius-stdlib-alloc-grow-undersize.md`](issues/archived/2026-04-24-cyrius-stdlib-alloc-grow-undersize.md) and [`issues/archived/2026-04-24-read-object-unreadable-at-scale.md`](issues/archived/2026-04-24-read-object-unreadable-at-scale.md). Two stacked upstream bugs: cyrius stdlib `alloc` grow-by-1MB undersize (caused the SIGSEGV via the 16 MiB retry alloc) + sankoch `zlib_compress` / `zlib_decompress` asymmetry (caused the retry path to fire in the first place; lost ~20% of objects on the fixture).
@@ -78,32 +85,18 @@ The local VCS loop is complete end-to-end, with ed25519 signing and a local-path
 
 ## Backlog
 
-### v0.6.2 — Security hygiene (MEDIUM batch)
-
-From the audit; doesn't change behavior on the hot path but closes several defense-in-depth gaps. (Was previously bundled with S-33 under v0.6.1; v0.6.1 shipped as S-33-only via dep bumps, so this batch moved down a slot.)
-
-- **S-16** Check return values on every `sys_unlink`, `file_write_all`, `sys_rmdir`, `sys_chdir` so stale tempfiles / partial materialize / stale MERGE_HEAD don't silently leave the repo in an inconsistent state.
-- **S-17** Audit every `alloc()` call site for null-check; add an `alloc_or_die` helper for the "OOM should be fatal" callers.
-- **S-18** `parse_author_line` cap digit count on timestamp parse to prevent i64 overflow on crafted commits.
-- **S-19** Explicit `body_len < 201` guard in `extract_sitsig`.
-- **S-20** Validate hex chars with `hex_is_valid` before `hex_decode` at sitsig parse sites; require `hex_decode` to decode all bytes or fail.
-- **S-22** Cap `plen` at 4096 in `index_migrate_from_plaintext`.
-- **S-23** Reject absolute paths in `cmd_clone` target without an explicit `--force-absolute` flag.
-- **S-24** Use `fl_alloc` / `fl_free` for short-lived SQL-string buffers; refactor `read_object` to a single-exit pattern so patra handles and memory close consistently on errors.
-- **S-25** Delete `ensure_dirs_for`; replace caller with `ensure_parent_dirs`.
-- **S-27** `materialize_target` emits a clear error and aborts when a blob read fails, instead of silently skipping.
-
 ### v0.6.3 — LOW-severity + hygiene
 
 - **S-28** Minimal envp for `exec_vec` (scrub `LD_*`).
 - **S-31** If patra grows a `patra_result_get_str_len` sized getter, switch to it (removes the "cstring assumed NUL-terminated" footgun).
 - **S-32** Confirm Cyrius string-literal lifetime (tree.cyr stores pointers to `"100644"` / `"40000"` into entry slots); if non-program-lifetime is ever possible, switch to integer mode codes.
 
-### v0.6.x — Performance (patra handle caching)
+### v0.6.x — Performance (patra handle caching) + S-24 fold-in
 
-Ship after security baseline is clean. Collapses P-01, P-02, P-05, P-08, P-12, P-25 into one refactor:
+Ship after security baseline is clean. Collapses P-01, P-02, P-05, P-08, P-12, P-25 + S-24 into one refactor:
 
 - Cache the patra object-DB handle process-wide (open on first use, close at exit); add `read_object_with_db(db, hex, out)` variant and thread the handle through `cmd_log`, `cmd_fsck`, `flatten_tree`, `materialize_target`, `is_ancestor`, `find_merge_base`.
+- **S-24** (deferred from v0.6.2) folds in here: refactor `read_object` to a single-exit pattern as part of the handle-threading rewrite; switch the SQL-string buffers to `fl_alloc` / `fl_free` in the same touch. Doing it together avoids a double-rewrite of the same function.
 - **P-03** `copy_objects`: pre-filter via `WHERE hash IN (...)` batch; wrap the insert loop in a single patra transaction.
 - **P-06** + **P-15** Smarter decompression sizing (read the framing length prefix); route LCS DP table through `fl_alloc` / `fl_free`.
 - **P-10 + P-18** Hashmap-backed `tree_find` + three_way_path_set dedup.

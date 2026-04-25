@@ -27,7 +27,7 @@ fn build_commit_signed(tree_hex, parent_hex, message, seed) {
 
     var cap = 512 + msg_len + name_len * 2 + email_len * 2;
     if (parent_hex != 0) { cap = cap + 80; }
-    var body = alloc(cap);
+    var body = alloc_or_die(cap);
     var pos = 0;
 
     memcpy(body + pos, "tree ", 5); pos = pos + 5;
@@ -118,7 +118,18 @@ fn materialize_target(target_hex) {
         var cpath = tree_entry_name(ce);
         if (tree_flat_path_valid(cpath) == 1) {
             if (tree_find(target_entries, cpath) == 0) {
-                if (file_exists(cpath) == 1) { sys_unlink(cpath); }
+                if (file_exists(cpath) == 1) {
+                    # S-16: refuse to declare success when a stale file the
+                    # target says shouldn't exist couldn't be removed —
+                    # otherwise `sit status` after checkout would still see
+                    # it as tracked.
+                    if (sys_unlink(cpath) != 0) {
+                        syscall(SYS_WRITE, STDERR, "sit: cannot remove stale path '", 31);
+                        syscall(SYS_WRITE, STDERR, cpath, strlen(cpath));
+                        syscall(SYS_WRITE, STDERR, "' — materialize aborted\n", 24);
+                        return 0 - 1;
+                    }
+                }
             }
         }
         ci = ci + 1;
@@ -141,8 +152,27 @@ fn materialize_target(target_hex) {
         else {
             ensure_parent_dirs(tpath);
             var tp[16];
-            if (read_blob_content(thex, &tp) == 0) {
-                file_write_all(tpath, load64(&tp), load64(&tp + 8));
+            # S-27: a blob the tree references but the object DB can't read
+            # is structural corruption — leaving the file silently absent
+            # would mask the failure and produce a half-materialized working
+            # tree. Abort with a clear error; callers that want best-effort
+            # can re-run after `sit fsck`.
+            if (read_blob_content(thex, &tp) != 0) {
+                syscall(SYS_WRITE, STDERR, "sit: cannot read blob ", 22);
+                syscall(SYS_WRITE, STDERR, thex, strlen(thex));
+                syscall(SYS_WRITE, STDERR, " for path '", 11);
+                syscall(SYS_WRITE, STDERR, tpath, strlen(tpath));
+                syscall(SYS_WRITE, STDERR, "' — materialize aborted (working tree may be partial)\n", 55);
+                return 0 - 1;
+            }
+            # S-16: file_write_all returns < 0 on any write or open failure
+            # (permissions, ENOSPC, EROFS). Same partial-tree problem as the
+            # blob-read failure above; abort with a clear pointer to the path.
+            if (file_write_all(tpath, load64(&tp), load64(&tp + 8)) < 0) {
+                syscall(SYS_WRITE, STDERR, "sit: cannot write '", 19);
+                syscall(SYS_WRITE, STDERR, tpath, strlen(tpath));
+                syscall(SYS_WRITE, STDERR, "' — materialize aborted (working tree may be partial)\n", 55);
+                return 0 - 1;
             }
         }
         ti = ti + 1;
@@ -157,10 +187,10 @@ fn materialize_target(target_hex) {
         if (tree_flat_path_valid(tpath) == 1) {
             var bytes = hex_decode(thex, 64);
             if (bytes != 0) {
-                var entry = alloc(40);
+                var entry = alloc_or_die(40);
                 memcpy(entry, bytes, 32);
                 var plen = strlen(tpath);
-                var pcopy = alloc(plen + 1);
+                var pcopy = alloc_or_die(plen + 1);
                 memcpy(pcopy, tpath, plen);
                 store8(pcopy + plen, 0);
                 store64(entry + 32, pcopy);
@@ -183,7 +213,7 @@ fn parse_author_line(line, line_len, prefix_len, out) {
     if (found_close == 0) { return 0 - 1; }
 
     var ident_len = p - prefix_len + 1;
-    var ident = alloc(ident_len + 1);
+    var ident = alloc_or_die(ident_len + 1);
     memcpy(ident, line + prefix_len, ident_len);
     store8(ident + ident_len, 0);
     store64(out, ident);
@@ -194,11 +224,19 @@ fn parse_author_line(line, line_len, prefix_len, out) {
     p = p + 1;
 
     var ts = 0;
+    var digit_count = 0;
     while (p < line_len) {
         var c = load8(line + p);
         if (c < 48) { break; }
         if (c > 57) { break; }
-        ts = ts * 10 + (c - 48);
+        digit_count = digit_count + 1;
+        # S-18: i64 has ~19 decimal digits of range. Refuse 20+ digit
+        # timestamps outright, and detect wrap on the 19th via `new < old`
+        # (the only path a single decimal digit can produce a smaller value).
+        if (digit_count > 19) { return 0 - 1; }
+        var new_ts = ts * 10 + (c - 48);
+        if (new_ts < ts) { return 0 - 1; }
+        ts = new_ts;
         p = p + 1;
     }
     store64(out + 8, ts);
@@ -210,7 +248,7 @@ fn parse_author_line(line, line_len, prefix_len, out) {
     var tz_start = p;
     while (p < line_len) { p = p + 1; }
     var tz_len = p - tz_start;
-    var tz = alloc(tz_len + 1);
+    var tz = alloc_or_die(tz_len + 1);
     memcpy(tz, line + tz_start, tz_len);
     store8(tz + tz_len, 0);
     store64(out + 16, tz);
@@ -276,7 +314,7 @@ fn parse_commit_body(body, body_len, out) {
             else {
                 if (line_len > 5) {
                     if (memeq(body + pos, "tree ", 5) == 1) {
-                        var t = alloc(65);
+                        var t = alloc_or_die(65);
                         memcpy(t, body + pos + 5, 64);
                         store8(t + 64, 0);
                         store64(out, t);
@@ -284,7 +322,7 @@ fn parse_commit_body(body, body_len, out) {
                 }
                 if (line_len > 7) {
                     if (memeq(body + pos, "parent ", 7) == 1) {
-                        var p = alloc(65);
+                        var p = alloc_or_die(65);
                         memcpy(p, body + pos + 7, 64);
                         store8(p + 64, 0);
                         store64(out + 8, p);
@@ -419,7 +457,7 @@ fn cmd_log() {
             syscall(SYS_WRITE, STDERR, "'\n", 2);
             return 1;
         }
-        current_hex = alloc(65);
+        current_hex = alloc_or_die(65);
         memcpy(current_hex, &resolved, 64);
         store8(current_hex + 64, 0);
     }
@@ -563,7 +601,15 @@ fn cmd_commit() {
     if (merge_parent != 0) {
         # Resolving an in-progress merge — 2-parent commit, then clear MERGE_HEAD.
         commit_hex = build_merge_commit_signed(tree_hex, parent_hex, merge_parent, message, seed);
-        if (commit_hex != 0) { sys_unlink(".sit/MERGE_HEAD"); }
+        if (commit_hex != 0) {
+            # S-16: a stale MERGE_HEAD silently turns the NEXT `sit commit` into
+            # an unintended 2-parent merge. Refuse to declare success on the
+            # commit if we couldn't clear it.
+            if (sys_unlink(".sit/MERGE_HEAD") != 0) {
+                eprintln("sit: commit object written but failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove the file manually");
+                return 1;
+            }
+        }
     }
     else {
         commit_hex = build_commit_signed(tree_hex, parent_hex, message, seed);

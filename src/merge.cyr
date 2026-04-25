@@ -21,7 +21,7 @@ fn extract_hunks(ops) {
         if (kind == 0) {
             # Keep — close any open hunk
             if (in_hunk == 1) {
-                var h = alloc(24);
+                var h = alloc_or_die(24);
                 store64(h, hunk_start);
                 store64(h + 8, base_pos);
                 store64(h + 16, hunk_inserts);
@@ -43,7 +43,7 @@ fn extract_hunks(ops) {
     }
 
     if (in_hunk == 1) {
-        var h = alloc(24);
+        var h = alloc_or_die(24);
         store64(h, hunk_start);
         store64(h + 8, base_pos);
         store64(h + 16, hunk_inserts);
@@ -130,7 +130,7 @@ fn three_way_line_merge(base_buf, base_len, ours_buf, ours_len, theirs_buf, thei
     var bn = vec_len(base_lines);
     # Worst-case output size: base + ours_inserts + theirs_inserts + deletions
     var cap = base_len + ours_len + theirs_len + 64;
-    var out = alloc(cap);
+    var out = alloc_or_die(cap);
     var pos = 0;
 
     var b = 0;
@@ -176,7 +176,7 @@ fn three_way_line_merge(base_buf, base_len, ours_buf, ours_len, theirs_buf, thei
 # in-progress merge. Next `sit commit` will read this and emit a 2-parent
 # commit, then unlink it.
 fn write_merge_head(hex) {
-    var buf = alloc(66);
+    var buf = alloc_or_die(66);
     memcpy(buf, hex, 64);
     store8(buf + 64, 10);
     store8(buf + 65, 0);
@@ -190,7 +190,7 @@ fn read_merge_head() {
     if (file_exists(".sit/MERGE_HEAD") != 1) { return 0; }
     var fd = file_open(".sit/MERGE_HEAD", 0, 0);
     if (fd < 0) { return 0; }
-    var buf = alloc(80);
+    var buf = alloc_or_die(80);
     var n = file_read(fd, buf, 80);
     file_close(fd);
     if (n < 64) { return 0; }
@@ -227,7 +227,7 @@ fn write_conflict_file(path, ours_hex, theirs_hex, branch_name) {
 
     var bn_len = strlen(branch_name);
     var cap = 64 + ours_len + theirs_len + bn_len;
-    var out = alloc(cap);
+    var out = alloc_or_die(cap);
     var pos = 0;
 
     memcpy(out + pos, "<<<<<<< HEAD\n", 13); pos = pos + 13;
@@ -250,7 +250,7 @@ fn write_conflict_file(path, ours_hex, theirs_hex, branch_name) {
     memcpy(out + pos, branch_name, bn_len); pos = pos + bn_len;
     store8(out + pos, 10); pos = pos + 1;
 
-    ensure_dirs_for(path);
+    ensure_parent_dirs(path);
     if (file_write_all(path, out, pos) < 0) { return 0 - 1; }
     return 0;
 }
@@ -262,7 +262,7 @@ fn find_merge_base(a_hex, b_hex) {
     var ancestors = vec_new();
     var current = a_hex;
     while (current != 0) {
-        var copy = alloc(65);
+        var copy = alloc_or_die(65);
         memcpy(copy, current, 64);
         store8(copy + 64, 0);
         vec_push(ancestors, copy);
@@ -319,7 +319,7 @@ fn build_merge_commit_signed(tree_hex, p1_hex, p2_hex, message, seed) {
     var msg_len = strlen(message);
 
     var cap = 512 + msg_len + name_len * 2 + email_len * 2 + 160;
-    var body = alloc(cap);
+    var body = alloc_or_die(cap);
     var pos = 0;
 
     memcpy(body + pos, "tree ", 5); pos = pos + 5;
@@ -389,8 +389,20 @@ fn cmd_merge() {
             return 1;
         }
         var head = read_head_ref();
-        if (head != 0) { materialize_target(head); }
-        sys_unlink(".sit/MERGE_HEAD");
+        if (head != 0) {
+            # S-16: propagate materialize failure so we don't claim "merge
+            # aborted" when the working tree wasn't actually restored.
+            if (materialize_target(head) != 0) {
+                eprintln("sit: failed to restore working tree from HEAD; .sit/MERGE_HEAD left in place");
+                return 1;
+            }
+        }
+        # S-16: a stale MERGE_HEAD silently turns the next commit into a
+        # 2-parent merge. Same cliff as cmd_commit's clear path.
+        if (sys_unlink(".sit/MERGE_HEAD") != 0) {
+            eprintln("sit: failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove manually");
+            return 1;
+        }
         syscall(SYS_WRITE, STDOUT, "merge aborted\n", 14);
         return 0;
     }
@@ -562,7 +574,7 @@ fn cmd_merge() {
         }
 
         if (needs_conflict == 1) {
-            var pc = alloc(strlen(p) + 1);
+            var pc = alloc_or_die(strlen(p) + 1);
             memcpy(pc, p, strlen(p));
             store8(pc + strlen(p), 0);
             vec_push(conflicts, pc);
@@ -571,9 +583,9 @@ fn cmd_merge() {
             if (result_h != 0) {
                 var bytes = hex_decode(result_h, 64);
                 if (bytes != 0) {
-                    var entry = alloc(40);
+                    var entry = alloc_or_die(40);
                     memcpy(entry, bytes, 32);
-                    var pc = alloc(strlen(p) + 1);
+                    var pc = alloc_or_die(strlen(p) + 1);
                     memcpy(pc, p, strlen(p));
                     store8(pc + strlen(p), 0);
                     store64(entry + 32, pc);
@@ -594,7 +606,7 @@ fn cmd_merge() {
             var mpath = load64(me + 32);
             var bytes32 = me;
             var mhex = hex_encode(bytes32, 32);
-            ensure_dirs_for(mpath);
+            ensure_parent_dirs(mpath);
             var mp[16];
             if (read_blob_content(mhex, &mp) == 0) {
                 file_write_all(mpath, load64(&mp), load64(&mp + 8));
@@ -642,13 +654,13 @@ fn cmd_merge() {
     }
 
     var msg_cap = 64 + tnlen + 32;
-    var msg = alloc(msg_cap);
+    var msg = alloc_or_die(msg_cap);
     memcpy(msg, "Merge branch '", 14);
     memcpy(msg + 14, target_name, tnlen);
     memcpy(msg + 14 + tnlen, "'", 1);
     store8(msg + 14 + tnlen + 1, 0);
 
-    var head_copy = alloc(65);
+    var head_copy = alloc_or_die(65);
     memcpy(head_copy, head_hex, 64);
     store8(head_copy + 64, 0);
 

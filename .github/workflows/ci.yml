@@ -86,8 +86,9 @@ jobs:
           (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" init && echo hello > a && "$GITHUB_WORKSPACE/build/sit" add a && "$GITHUB_WORKSPACE/build/sit" commit -m "origin-root")
 
           # 1) clone picks up origin's single commit
+          # mktemp -d returns absolute paths, so --force-absolute is required (S-23)
           CLONE=$(mktemp -d)/repo
-          "$GITHUB_WORKSPACE/build/sit" clone "$ORIG" "$CLONE"
+          "$GITHUB_WORKSPACE/build/sit" clone --force-absolute "$ORIG" "$CLONE"
           cd "$CLONE"
           test "$(cat a)" = "hello" || { echo "clone content wrong"; exit 1; }
 
@@ -105,7 +106,7 @@ jobs:
 
           # 3) pull into a second clone demonstrates the full round trip
           SECOND=$(mktemp -d)/second
-          "$GITHUB_WORKSPACE/build/sit" clone "$ORIG" "$SECOND"
+          "$GITHUB_WORKSPACE/build/sit" clone --force-absolute "$ORIG" "$SECOND"
           cd "$SECOND"
           test "$(cat b)" = "world" || { echo "second clone didn't pick up the pushed commit"; exit 1; }
           echo "wire smoke ok"

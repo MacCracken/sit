@@ -119,6 +119,10 @@ fn sign_commit_body(body, body_len, seed, out_len) {
 # a stripped-body heap buffer (with that line removed) at *out_stripped_ptr
 # with length written to *out_stripped_len. Returns 1 on match, 0 otherwise.
 fn extract_sitsig(body, body_len, out_sig, out_pub, out_stripped_ptr, out_stripped_len) {
+    # S-19: a sitsig line is exactly 200 bytes plus its trailing newline (201).
+    # Bodies shorter than that can't carry one, and the inner `body_len - 201`
+    # would underflow to ~2^64 if reached.
+    if (body_len < 201) { return 0; }
     var pos = 0;
     var in_headers = 1;
     while (pos < body_len) {
@@ -135,8 +139,19 @@ fn extract_sitsig(body, body_len, out_sig, out_pub, out_stripped_ptr, out_stripp
                 if (line_len == 200) {
                     if (memeq(body + pos, "sitsig ", 7) == 1) {
                         if (load8(body + pos + 135) == 32) {
-                            var sig_bytes = hex_decode(body + pos + 7, 128);
-                            var pub_bytes = hex_decode(body + pos + 136, 64);
+                            # S-20: belt-and-suspenders. sigil's hex_decode
+                            # already returns null on invalid chars, but
+                            # gating on hex_is_valid first locks in the
+                            # "validate before decode" invariant against
+                            # any future loosening of hex_decode's contract.
+                            var sig_ok = hex_is_valid(body + pos + 7, 128);
+                            var pub_ok = hex_is_valid(body + pos + 136, 64);
+                            var sig_bytes = 0;
+                            var pub_bytes = 0;
+                            if (sig_ok == 1) { if (pub_ok == 1) {
+                                sig_bytes = hex_decode(body + pos + 7, 128);
+                                pub_bytes = hex_decode(body + pos + 136, 64);
+                            } }
                             if (sig_bytes != 0) {
                                 if (pub_bytes != 0) {
                                     memcpy(out_sig, sig_bytes, 64);

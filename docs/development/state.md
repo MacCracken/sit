@@ -6,9 +6,9 @@
 
 ## Current
 
-- **Version**: 0.6.1 (read `VERSION` for the authoritative number)
-- **Cyrius toolchain**: 5.6.35 (pinned in `cyrius.cyml [package].cyrius`; bumped from 5.6.25 in v0.6.1 to pick up the upstream alloc-grow fix from cyrius 5.6.34)
-- **Status**: S-33 SIGSEGV fixed (sankoch + cyrius dep bumps; no sit source changes). Status / fsck / clone clean on the 100-commit / 100-file fixture. Security-hygiene MEDIUM batch is v0.6.2 next, then perf refactor, then v0.7.0 network transport
+- **Version**: 0.6.2 (read `VERSION` for the authoritative number)
+- **Cyrius toolchain**: 5.6.35 (pinned in `cyrius.cyml [package].cyrius`)
+- **Status**: Security hardening MEDIUM batch shipped (S-16/17/18/19/20/22/23/25/27 from the 2026-04-24 P(-1) audit). All P(-1) CRITICAL/HIGH/MEDIUM closed. v0.6.3 is LOW-severity + hygiene; then v0.6.x perf arc (folds in deferred S-24 with the patra-handle-caching refactor); then v0.7.0 network transport
 - **Primary target**: Linux x86_64. aarch64 cross-build is best-effort in CI
 
 ## Source layout
@@ -71,6 +71,7 @@ All git-tag pinned in `cyrius.cyml`. No FFI, no C, no libgit2 — see [ADR 0001]
 
 | Version | Date | Summary |
 |---------|------|---------|
+| 0.6.2 | 2026-04-25 | Security hygiene MEDIUM batch from the 2026-04-24 audit. `alloc_or_die` helper + 52-site swap (S-17). Materialize / merge / commit / clone now fail loudly on FS-mutation errors instead of silently producing partial state (S-16, S-27). Author-line + sitsig parsers hardened against integer overflow + partial hex decode (S-18, S-19, S-20). `cmd_clone` requires `--force-absolute` for absolute targets (S-23). Index-migrate caps per-line path length at 4096 (S-22). Latent `ensure_dirs_for` mkdir("") bug removed (S-25). |
 | 0.6.1 | 2026-04-25 | S-33 fix release. Pure dep-pin bumps — sankoch 2.0.1 → 2.0.3 (zlib symmetry) + cyrius 5.6.25 → 5.6.35 (allocator grow defense-in-depth). Status / fsck / clone clean on 100-commit / 100-file fixture. `bench_status` + `bench_clone` re-enabled. New `docs/development/issues/` for upstream-bug writeups. |
 | 0.6.0 | 2026-04-24 | Security hardening: all CRITICAL + HIGH findings from the 2026-04-24 P(-1) audit fixed. `validate.cyr` with every input validator. Tree-entry / refname / hex / config / URL gating. Symlink guards on clone paths. Output escape filter. 101 assertions (from 31). 3 new ADRs. |
 | 0.5.1 | 2026-04-24 | File-split refactor: `src/main.cyr` → 11 topical modules via `src/lib.cyr`. Zero feature changes. |

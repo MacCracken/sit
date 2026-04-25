@@ -529,7 +529,13 @@ fn do_fetch(name, branch) {
     patra_close(src_db);
     patra_close(dst_db);
 
-    write_remote_tracking(name, branch, remote_tip);
+    # S-16: a write_remote_tracking failure leaves origin/<branch> stale,
+    # which silently desyncs subsequent fetches (FF logic compares against
+    # the stale ref). Refuse to declare a successful fetch on failure.
+    if (write_remote_tracking(name, branch, remote_tip) < 0) {
+        eprintln("sit: fetched objects but failed to update remote-tracking ref");
+        return 0;
+    }
 
     syscall(SYS_WRITE, STDOUT, "fetched ", 8);
     syscall(SYS_WRITE, STDOUT, name, strlen(name));
@@ -632,10 +638,36 @@ fn cmd_pull() {
 # Target directory defaults to the last '/'-delimited segment of the URL.
 fn cmd_clone() {
     if (argc() < 3) {
-        eprintln("usage: sit clone <url> [<dir>]");
+        eprintln("usage: sit clone [--force-absolute] <url> [<dir>]");
         return 1;
     }
-    var url = argv_heap(2);
+    # S-23: --force-absolute is the explicit opt-in to clone into a path
+    # starting with `/`. Without it, an absolute target is refused (so
+    # `sit clone <url> /etc/cron.d/x` doesn't silently mkdir + chdir into
+    # a system path the invoking user happens to have write access to).
+    var force_absolute = 0;
+    var url = 0;
+    var target = 0;
+    var ai = 2;
+    while (ai < argc()) {
+        var a = argv(ai);
+        if (streq(a, "--force-absolute") == 1) { force_absolute = 1; }
+        else {
+            if (url == 0) { url = argv_heap(ai); }
+            else {
+                if (target == 0) { target = argv_heap(ai); }
+                else {
+                    eprintln("usage: sit clone [--force-absolute] <url> [<dir>]");
+                    return 1;
+                }
+            }
+        }
+        ai = ai + 1;
+    }
+    if (url == 0) {
+        eprintln("usage: sit clone [--force-absolute] <url> [<dir>]");
+        return 1;
+    }
     # S-04: reject unknown schemes up-front so we fail cleanly instead of
     # trying to open `http://…` as a filesystem path.
     if (remote_url_valid(url) == 0) {
@@ -643,9 +675,7 @@ fn cmd_clone() {
         return 1;
     }
 
-    var target = 0;
-    if (argc() >= 4) { target = argv_heap(3); }
-    else {
+    if (target == 0) {
         # Derive target from URL: strip trailing slash, take last segment, drop file:// prefix.
         var src = remote_normalize(url);
         var slen = strlen(src);
@@ -666,6 +696,14 @@ fn cmd_clone() {
         target = alloc(tlen + 1);
         memcpy(target, src + tail, tlen);
         store8(target + tlen, 0);
+    }
+
+    # S-23: opt-in gate on absolute target paths.
+    if (load8(target) == 47) {
+        if (force_absolute == 0) {
+            eprintln("sit: refusing absolute clone target without --force-absolute");
+            return 1;
+        }
     }
 
     # S-04: if target already exists, make sure it's a directory and not a

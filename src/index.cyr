@@ -121,6 +121,12 @@ fn index_migrate_from_plaintext(db) {
                     nl = nl + 1;
                 }
                 var plen = nl - pos - 65;
+                # S-22: refuse multi-megabyte path lines (a malformed legacy
+                # index could otherwise force a single huge alloc on migrate).
+                # Real paths fit in a few hundred bytes; 4096 leaves headroom
+                # for deep nested cases without paying for a malicious blob.
+                if (plen > 4096) { pos = len; }
+                else {
 
                 var hash_copy = alloc(65);
                 memcpy(hash_copy, data + pos, 64);
@@ -145,6 +151,7 @@ fn index_migrate_from_plaintext(db) {
                     &types, &ivals, &sptrs, &slens, &bptrs, &blens);
 
                 pos = nl + 1;
+                }
             }
         }
     }

@@ -32,11 +32,11 @@ fn build_tree(entries, prefix_len) {
         }
 
         if (found == 0) {
-            var name = alloc(rest_len + 1);
+            var name = alloc_or_die(rest_len + 1);
             memcpy(name, rest, rest_len);
             store8(name + rest_len, 0);
 
-            var le = alloc(24);
+            var le = alloc_or_die(24);
             store64(le, "100644");
             store64(le + 8, name);
             store64(le + 16, entry_hash(e));
@@ -44,7 +44,7 @@ fn build_tree(entries, prefix_len) {
             i = i + 1;
         }
         else {
-            var subdir_name = alloc(slash + 1);
+            var subdir_name = alloc_or_die(slash + 1);
             memcpy(subdir_name, rest, slash);
             store8(subdir_name + slash, 0);
 
@@ -83,7 +83,7 @@ fn build_tree(entries, prefix_len) {
             var sub_bytes = hex_decode(sub_hex, 64);
             if (sub_bytes == 0) { return 0; }
 
-            var le = alloc(24);
+            var le = alloc_or_die(24);
             store64(le, "40000");
             store64(le + 8, subdir_name);
             store64(le + 16, sub_bytes);
@@ -100,7 +100,7 @@ fn build_tree(entries, prefix_len) {
         k = k + 1;
     }
 
-    var body = alloc(body_size);
+    var body = alloc_or_die(body_size);
     var pos = 0;
     k = 0;
     while (k < nl) {
@@ -140,7 +140,7 @@ fn parse_tree(body, body_len) {
         if (sp >= body_len) { pos = body_len; }
         else {
             var mode_len = sp - pos;
-            var mode = alloc(mode_len + 1);
+            var mode = alloc_or_die(mode_len + 1);
             memcpy(mode, body + pos, mode_len);
             store8(mode + mode_len, 0);
 
@@ -152,7 +152,7 @@ fn parse_tree(body, body_len) {
             if (nu >= body_len) { pos = body_len; }
             else {
                 var name_len = nu - sp - 1;
-                var name = alloc(name_len + 1);
+                var name = alloc_or_die(name_len + 1);
                 memcpy(name, body + sp + 1, name_len);
                 store8(name + name_len, 0);
 
@@ -166,7 +166,7 @@ fn parse_tree(body, body_len) {
                     if (tree_entry_mode_valid(mode) == 1) {
                         if (tree_entry_name_valid(name) == 1) {
                             var hash_hex = hex_encode(body + nu + 1, 32);
-                            var e = alloc(24);
+                            var e = alloc_or_die(24);
                             store64(e, mode);
                             store64(e + 8, name);
                             store64(e + 16, hash_hex);
@@ -220,7 +220,7 @@ fn flatten_tree(tree_hex, prefix, out) {
         var name_len = strlen(name);
 
         if (streq(mode, "40000") == 1) {
-            var sub_prefix = alloc(prefix_len + name_len + 2);
+            var sub_prefix = alloc_or_die(prefix_len + name_len + 2);
             memcpy(sub_prefix, prefix, prefix_len);
             memcpy(sub_prefix + prefix_len, name, name_len);
             store8(sub_prefix + prefix_len + name_len, 47);
@@ -228,12 +228,12 @@ fn flatten_tree(tree_hex, prefix, out) {
             flatten_tree(hash_hex, sub_prefix, out);
         }
         else {
-            var full_path = alloc(prefix_len + name_len + 1);
+            var full_path = alloc_or_die(prefix_len + name_len + 1);
             memcpy(full_path, prefix, prefix_len);
             memcpy(full_path + prefix_len, name, name_len);
             store8(full_path + prefix_len + name_len, 0);
 
-            var flat = alloc(24);
+            var flat = alloc_or_die(24);
             store64(flat, mode);
             store64(flat + 8, full_path);
             store64(flat + 16, hash_hex);
@@ -261,7 +261,7 @@ fn read_head_tree_entries() {
 
     if (body_len < 70) { return 0; }
     if (memeq(body, "tree ", 5) == 0) { return 0; }
-    var tree_hex = alloc(65);
+    var tree_hex = alloc_or_die(65);
     memcpy(tree_hex, body + 5, 64);
     store8(tree_hex + 64, 0);
 
@@ -318,7 +318,7 @@ fn three_way_path_set(base, ours, theirs) {
                     else { j = j + 1; }
                 }
                 if (found == 0) {
-                    var copy = alloc(plen + 1);
+                    var copy = alloc_or_die(plen + 1);
                     memcpy(copy, p, plen);
                     store8(copy + plen, 0);
                     vec_push(paths, copy);

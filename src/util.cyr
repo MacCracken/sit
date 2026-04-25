@@ -13,6 +13,21 @@ fn eprintln(s) {
     return 0;
 }
 
+# S-17: alloc-or-die wrapper for the common case where OOM is unrecoverable
+# (no transactional rollback in sit; a half-filled buffer will be memcpy'd
+# from address 0 if alloc returns null and we don't notice). Use this at
+# every fixed-shape `alloc(N)` site in object_db / tree / commit / merge
+# instead of bare alloc; reserve bare alloc for the few callers that
+# genuinely have a propagation path (read_file_heap, read_object).
+fn alloc_or_die(size) {
+    var p = alloc(size);
+    if (p == 0) {
+        eprintln("sit: out of memory");
+        syscall(SYS_EXIT, 1);
+    }
+    return p;
+}
+
 # mkdir(path, 0o755), tolerating EEXIST (-17).
 fn ensure_dir(path) {
     var r = sys_mkdir(path, 0x1ED);
@@ -34,23 +49,6 @@ fn ensure_parent_dirs(path) {
                 store8(segment + i, 0);
                 ensure_dir(segment);
             }
-        }
-        i = i + 1;
-    }
-    return 0;
-}
-
-# Like ensure_parent_dirs but also mkdirs the root-relative prefix for an
-# absolute-looking path. Used by the merge conflict writer.
-fn ensure_dirs_for(path) {
-    var len = strlen(path);
-    var i = 0;
-    while (i < len) {
-        if (load8(path + i) == 47) {
-            var dir = alloc(i + 1);
-            memcpy(dir, path, i);
-            store8(dir + i, 0);
-            ensure_dir(dir);
         }
         i = i + 1;
     }

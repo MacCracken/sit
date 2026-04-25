@@ -4,6 +4,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-04-25
+
+Security-hygiene MEDIUM batch from the 2026-04-24 P(-1) audit. Defense-in-depth — closes silent-failure / underflow / overflow / partial-state cliffs across the validator, signing, materialize, clone, commit, and merge paths. Behavioral change: `sit clone <url> <abs-path>` now requires `--force-absolute` (S-23); see migration note below.
+
+### Security
+
+- **S-16** — Filesystem-mutation return values now checked at every audit-flagged site. `sys_unlink(".sit/MERGE_HEAD")` failure during `cmd_commit` (post-merge) and `cmd_merge --abort` aborts cleanly with a clear error instead of silently leaving a stale MERGE_HEAD that turns the next commit into an unintended 2-parent merge. `write_remote_tracking` failure during `do_fetch` aborts the fetch instead of declaring success on a partial state. `materialize_target`'s `sys_unlink` and `file_write_all` failures now stop the materialize and report the offending path. Owl tempfile cleanup failures emit a stderr warning (best-effort, leak-only).
+- **S-17** — New `alloc_or_die(size)` helper in `src/util.cyr` that prints `sit: out of memory` and exits 1 on alloc failure. 52 `alloc()` call sites across `src/object_db.cyr`, `src/tree.cyr`, `src/commit.cyr`, `src/merge.cyr` swapped from bare `alloc()` to `alloc_or_die()`. The few existing propagation-path callers (`read_file_heap`, `read_object`'s `dec_cap` path, `lcs_diff` DP table) keep their explicit null-checks; everywhere else, OOM is now loud-fatal instead of a `memcpy(0 + offset, …)` segfault.
+- **S-18** — `parse_author_line` timestamp parser caps digit count at 19 and detects per-multiply overflow (`new < old` after `ts * 10 + (c - 48)`). A crafted commit with a 20+ digit timestamp, or a 19-digit timestamp that wraps i64, now returns `0 - 1` cleanly instead of silently storing a wrapped value.
+- **S-19** — `extract_sitsig` adds an explicit `if (body_len < 201) return 0;` guard at function entry. The inner `body_len - 201` underflow was previously not reachable on real commit bodies but the guard locks in the invariant against future changes.
+- **S-20** — sitsig hex parse now gates on `hex_is_valid(...)` BEFORE calling `hex_decode(...)` for both the signature (128 hex chars → 64 bytes) and pubkey (64 → 32). Belt-and-suspenders against any future loosening of `hex_decode`'s "all-or-fail" contract.
+- **S-22** — `index_migrate_from_plaintext` caps per-line path length at 4096 bytes. A malformed legacy index with a multi-megabyte single-line `plen` is now rejected at parse instead of forcing a single huge `alloc()` on migration.
+- **S-23** — `cmd_clone` refuses absolute target paths unless `--force-absolute` is passed. `sit clone <url> /etc/passwd` no longer silently `mkdir`s + `chdir`s into a system path the invoking user has perms for. Relative targets and URL-derived basenames continue to work unchanged.
+- **S-25** — Deleted `src/util.cyr:ensure_dirs_for` (latent `mkdir("")` bug for absolute paths); both call sites in `src/merge.cyr` (`write_conflict_file` + the merged-files writer) now use `ensure_parent_dirs`. Behavior identical for relative paths; absolute paths no longer trip the latent bug.
+- **S-27** — `materialize_target` aborts with a clear stderr error on the first `read_blob_content` failure instead of silently producing a partial working tree. The error names both the unreadable hash and the path it would have landed at.
+
+### Changed
+
+- `sit clone <url> <abs-path>` now requires `--force-absolute`. **Migration**: any script that clones into an absolute path needs the flag added (e.g. `sit clone "$URL" "$DIR"` → `sit clone --force-absolute "$URL" "$DIR"` when `$DIR` starts with `/`). The flag can appear anywhere in the argv. CI smoke (`.github/workflows/ci.yml`) and `scripts/benchmark.sh` updated; `docs/guides/getting-started.md` documents the new shape.
+
+### Deferred
+
+- **S-24** (Patra-handle + SQL-string leaks; `read_object` single-exit refactor) deferred to v0.6.x along with the patra-handle-caching refactor. Doing the single-exit refactor now would mean rewriting `read_object` twice in two consecutive releases — the v0.6.x arc adds a `read_object_with_db(db, hex, out)` variant and threads the cached handle through every caller, which subsumes the single-exit cleanup. Bump-allocator pressure from un-freed SQL strings is bounded by process lifetime and not a real exposure today.
+
 ## [0.6.1] — 2026-04-25
 
 S-33 fix release. Pure dep-pin bumps — no sit source changes. Status, fsck, and clone now run cleanly on the 100-commit / 100-file fixture; the previously-disabled `bench_status` and `bench_clone` rows are re-enabled in `scripts/benchmark.sh`.

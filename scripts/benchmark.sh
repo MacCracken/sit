@@ -241,7 +241,7 @@ bench_clone() {
 $((t1-t0))"
         rm -rf "$(dirname "$dst")"
         dst=$(mktemp -d)/repo
-        t0=$(now_ns); $SIT clone "$ssrc" "$dst" > /dev/null 2>&1 ; t1=$(now_ns)
+        t0=$(now_ns); $SIT clone --force-absolute "$ssrc" "$dst" > /dev/null 2>&1 ; t1=$(now_ns)
         sit_times="$sit_times
 $((t1-t0))"
         rm -rf "$(dirname "$dst")"
@@ -269,7 +269,7 @@ $((t1-t0))"
         rm -rf "$up" "$seed" "$(dirname "$local_c")"
 
         up=$(mktemp -d); (cd "$up" && $SIT init > /dev/null && echo a > f && $SIT add f > /dev/null && $SIT commit -m r > /dev/null)
-        local_c=$(mktemp -d)/r; $SIT clone "$up" "$local_c" > /dev/null 2>&1
+        local_c=$(mktemp -d)/r; $SIT clone --force-absolute "$up" "$local_c" > /dev/null 2>&1
         (cd "$up" && echo b > g && $SIT add g > /dev/null && $SIT commit -m next > /dev/null)
         t0=$(now_ns); (cd "$local_c" && $SIT fetch origin main > /dev/null) ; t1=$(now_ns)
         sit_times="$sit_times
