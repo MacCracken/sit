@@ -259,7 +259,13 @@ fn parse_index() {
         if (bytes != 0) {
             var entry = alloc(40);
             memcpy(entry, bytes, 32);
-            var plen = strlen(path_str);
+            # S-31: defense-in-depth. patra's STR columns are 256 bytes wide
+            # and the writer always memsets the slot to 0 first, so today
+            # strlen would terminate inside the slot — but if patra ever
+            # ships a writer that skips the memset, an unterminated slot
+            # would walk into adjacent column / row memory. strnlen with the
+            # column width as the cap keeps us inside the slot regardless.
+            var plen = strnlen(path_str, 256);
             var p = alloc(plen + 1);
             memcpy(p, path_str, plen);
             store8(p + plen, 0);

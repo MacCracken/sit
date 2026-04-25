@@ -6,10 +6,11 @@
 
 ## Current
 
-- **Version**: 0.6.2 (read `VERSION` for the authoritative number)
+- **Version**: 0.6.3 (read `VERSION` for the authoritative number)
 - **Cyrius toolchain**: 5.6.35 (pinned in `cyrius.cyml [package].cyrius`)
-- **Status**: Security hardening MEDIUM batch shipped (S-16/17/18/19/20/22/23/25/27 from the 2026-04-24 P(-1) audit). All P(-1) CRITICAL/HIGH/MEDIUM closed. v0.6.3 is LOW-severity + hygiene; then v0.6.x perf arc (folds in deferred S-24 with the patra-handle-caching refactor); then v0.7.0 network transport
+- **Status**: 2026-04-24 P(-1) audit fully closed across CRITICAL/HIGH/MEDIUM/LOW (S-24 deferred to the v0.6.x perf arc; everything else shipped). Next: v0.6.x patra-handle-caching refactor — collapses ~5 of the top-10 hot paths and folds in S-24's `read_object` rewrite. Then v0.7.0 network transport
 - **Primary target**: Linux x86_64. aarch64 cross-build is best-effort in CI
+- **exec_vec envp**: empty (cyrius stdlib `lib/process.cyr` passes a NULL-only envp; no env-var inheritance in `cmd_owl_file`). Any future curated-envp shape (e.g. preserving `PATH`/`HOME`/`TERM`/`LANG` for owl UX) would be a deliberate widening
 
 ## Source layout
 
@@ -19,7 +20,7 @@
 |------|------:|----------------|
 | `src/main.cyr` | ~112 | `print_usage`, `main()`, dispatch, trailer |
 | `src/lib.cyr` | ~20 | include chain (domain modules; stdlib auto-includes via `cyrius.cyml`) |
-| `src/util.cyr` | ~200 | `eprintln`, `ensure_dir`, `ensure_parent_dirs`, `write_decimal`, `argv_heap`, `skip_ws`, `strcmp_cstr`, `sort_cstrings`, `read_file_heap`, `write_sanitized` (S-21) |
+| `src/util.cyr` | ~225 | `eprintln`, `ensure_dir`, `ensure_parent_dirs`, `strnlen` (S-31, v0.6.3), `alloc_or_die` (S-17, v0.6.2), `write_decimal`, `argv_heap`, `skip_ws`, `strcmp_cstr`, `sort_cstrings`, `read_file_heap`, `write_sanitized` (S-21) |
 | `src/validate.cyr` | ~320 | **NEW in 0.6.0.** Pure validators: `hex_prefix_valid`, `refname_valid`, `tree_entry_name_valid`, `tree_flat_path_valid`, `tree_entry_mode_valid`, `config_value_valid`, `config_key_valid`, `remote_url_valid`, `path_is_symlink`, `path_lstat_kind` |
 | `src/config.cyr` | ~335 | `config_*` helpers + `cmd_config` |
 | `src/object_db.cyr` | ~568 | patra object store, `resolve_hash`, `read_object`, framing + compression, `cat-file` / `owl-file` / `fsck` (owl tempfile hardening in 0.6.0) |
@@ -71,6 +72,7 @@ All git-tag pinned in `cyrius.cyml`. No FFI, no C, no libgit2 — see [ADR 0001]
 
 | Version | Date | Summary |
 |---------|------|---------|
+| 0.6.3 | 2026-04-25 | LOW-severity batch + audit closeout. `strnlen` added to util.cyr; `parse_index`'s `patra_result_get_str` walk now bounded at 256 (S-31). S-28 confirmed already addressed by stdlib's empty-envp `exec_vec`. S-32 documented as a Cyrius compile-time invariant in `docs/architecture/004-*.md` (Cyrius string literals are program-lifetime; tree.cyr's mode-pointer pattern is safe). 2026-04-24 P(-1) audit fully closed; only S-24 deferred (folds into v0.6.x patra-cache refactor). |
 | 0.6.2 | 2026-04-25 | Security hygiene MEDIUM batch from the 2026-04-24 audit. `alloc_or_die` helper + 52-site swap (S-17). Materialize / merge / commit / clone now fail loudly on FS-mutation errors instead of silently producing partial state (S-16, S-27). Author-line + sitsig parsers hardened against integer overflow + partial hex decode (S-18, S-19, S-20). `cmd_clone` requires `--force-absolute` for absolute targets (S-23). Index-migrate caps per-line path length at 4096 (S-22). Latent `ensure_dirs_for` mkdir("") bug removed (S-25). |
 | 0.6.1 | 2026-04-25 | S-33 fix release. Pure dep-pin bumps — sankoch 2.0.1 → 2.0.3 (zlib symmetry) + cyrius 5.6.25 → 5.6.35 (allocator grow defense-in-depth). Status / fsck / clone clean on 100-commit / 100-file fixture. `bench_status` + `bench_clone` re-enabled. New `docs/development/issues/` for upstream-bug writeups. |
 | 0.6.0 | 2026-04-24 | Security hardening: all CRITICAL + HIGH findings from the 2026-04-24 P(-1) audit fixed. `validate.cyr` with every input validator. Tree-entry / refname / hex / config / URL gating. Symlink guards on clone paths. Output escape filter. 101 assertions (from 31). 3 new ADRs. |

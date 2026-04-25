@@ -6,6 +6,13 @@ Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHAN
 
 ## Released
 
+### v0.6.3 — LOW-severity batch + audit closeout
+
+- **S-28** confirmed already addressed: cyrius stdlib's `exec_vec` passes an empty envp, which is more aggressive than the audit's "minimal envp" prescription. No sit-side change; documented in CHANGELOG + state.md so future readers don't re-investigate.
+- **S-31** — added `strnlen(s, max)` to `src/util.cyr`. Swapped `parse_index`'s `strlen(patra_result_get_str(…))` to `strnlen(…, 256)` (patra's `COL_STR_SZ` width). Defense-in-depth — patra's writer still memsets every STR slot to zero, so `strlen` would terminate inside the slot today, but the bound makes the safety property explicit at the read site instead of implicit at the write site.
+- **S-32** — Cyrius string-literal lifetime invariant documented in [`docs/architecture/004-cyrius-string-literal-lifetime.md`](../architecture/004-cyrius-string-literal-lifetime.md). The audit's alternative (switch tree.cyr's mode literals to integer codes with a format table) was rejected: trades a free invariant for runtime indirection on the hottest tree-build path.
+- **Audit closeout**: 2026-04-24 P(-1) audit fully resolved at every severity (CRITICAL / HIGH / MEDIUM / LOW). Only **S-24** is deferred — it folds into the v0.6.x patra-handle-caching refactor's `read_object` rewrite (avoids touching the same function twice in two consecutive releases).
+
 ### v0.6.2 — Security hygiene (MEDIUM batch)
 
 - **S-16** through **S-27** from the 2026-04-24 P(-1) audit landed. Highlights: `alloc_or_die` helper + 52-site swap (S-17); materialize / merge / commit / clone now fail loudly on FS-mutation errors instead of silently producing partial state (S-16, S-27); `cmd_clone` requires `--force-absolute` for absolute targets (S-23); author-line + sitsig parsers hardened against integer overflow + partial hex decode (S-18, S-19, S-20); index-migrate caps per-line path length at 4096 (S-22); latent `ensure_dirs_for` mkdir("") removed (S-25). Full list in [CHANGELOG § 0.6.2](../../CHANGELOG.md#062--2026-04-25). Audit findings stamped RESOLVED in [`docs/audit/2026-04-24-audit.md`](../audit/2026-04-24-audit.md).
@@ -84,12 +91,6 @@ The local VCS loop is complete end-to-end, with ed25519 signing and a local-path
 **Deps**: cyrius 5.6.25, sakshi 2.1.0, sankoch 2.0.1, sigil 2.9.1, patra 1.6.0. Git-tag pinned. No FFI, no C, no libgit2 — see [ADR 0001](../adr/0001-no-ffi-first-party-only.md).
 
 ## Backlog
-
-### v0.6.3 — LOW-severity + hygiene
-
-- **S-28** Minimal envp for `exec_vec` (scrub `LD_*`).
-- **S-31** If patra grows a `patra_result_get_str_len` sized getter, switch to it (removes the "cstring assumed NUL-terminated" footgun).
-- **S-32** Confirm Cyrius string-literal lifetime (tree.cyr stores pointers to `"100644"` / `"40000"` into entry slots); if non-program-lifetime is ever possible, switch to integer mode codes.
 
 ### v0.6.x — Performance (patra handle caching) + S-24 fold-in
 

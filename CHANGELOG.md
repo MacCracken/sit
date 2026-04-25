@@ -4,6 +4,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-04-25
+
+LOW-severity batch from the 2026-04-24 P(-1) audit. All audit findings (CRITICAL, HIGH, MEDIUM, LOW) are now closed or explicitly deferred to the v0.6.x perf arc. Two of the three v0.6.3 items resolved via documentation rather than code change, since the underlying invariants were already in place.
+
+### Security
+
+- **S-28** — `exec_vec` envp scrubbing: **already addressed via stdlib**. Cyrius's `lib/process.cyr:exec_vec` passes an empty envp to the child process (`var envp = alloc(8); store64(envp, 0);`), which is strictly more aggressive than the audit's "minimal envp" prescription — `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, and every other env var is dropped on owl exec by construction. No sit-side change required. Recorded in audit so future readers don't re-investigate; documented in `docs/development/state.md` so any future curated-envp shape (e.g. preserving PATH/HOME/TERM/LANG for owl UX) is a deliberate widening, not a tightening.
+- **S-31** — added `strnlen(s, max)` to `src/util.cyr`. Swapped `parse_index`'s `strlen(path_str)` over a `patra_result_get_str` result to `strnlen(path_str, 256)` (patra's `COL_STR_SZ` width). The other three `patra_result_get_str` callers in sit memcpy a fixed 64 bytes (hash columns) and are safe by construction. Defense-in-depth against any future patra writer that skips the slot zero-fill — today patra always memsets the 256-byte slot before writing, so `strlen` would terminate inside the slot, but the bound makes the safety property explicit at the read side rather than implicit at the write side.
+- **S-32** — Cyrius string-literal lifetime invariant **confirmed and documented** in [`docs/architecture/004-cyrius-string-literal-lifetime.md`](docs/architecture/004-cyrius-string-literal-lifetime.md). Cyrius compiles `"..."` literals into a fixed compile-time string-data region (cyrius's own 2026-04-13 audit pins the size at 256 KB) that is mapped for the lifetime of the process — the same model as C's `.rodata`. `src/tree.cyr`'s `store64(le, "100644")` pattern is safe because the literal pointer never goes stale. The audit's alternative fix (switch to integer mode codes with a format table) was rejected: it would trade a free invariant for runtime indirection on the hottest tree-build path. ADR-style note also explains why `argv(n)` and `patra_result_get_str` pointers do NOT have the same lifetime properties.
+
+### Added
+
+- `src/util.cyr:strnlen(s, max)` — bounded-walk replacement for `strlen` when the source has a known max length.
+- `docs/architecture/004-cyrius-string-literal-lifetime.md` — invariant note covering the program-lifetime guarantee, the 256 KB ceiling, and the don't-confuse-this-with cases (`argv`, `patra_result_get_str`).
+
+### Audit closeout
+
+With v0.6.3 the 2026-04-24 P(-1) audit is fully resolved at every severity level except the one explicit deferral:
+
+- **CRITICAL** (S-01 through S-08): closed in v0.6.0.
+- **HIGH** (S-09 through S-15): closed in v0.6.0.
+- **MEDIUM** (S-16, S-17, S-18, S-19, S-20, S-22, S-23, S-25, S-27): closed in v0.6.2.
+- **MEDIUM** (S-24): deferred to v0.6.x — folds into the patra-handle-caching refactor's `read_object` rewrite to avoid touching the same function twice.
+- **MEDIUM** (S-26): closed in v0.6.0 (`refname_valid` shipped with the validator suite).
+- **LOW** (S-28, S-29, S-30, S-31, S-32): closed in v0.6.3 (S-29 + S-30 closed in v0.6.0 via ADRs 0003/0004; the rest in this release).
+- **CRITICAL** (S-33, post-audit benchmark finding): closed in v0.6.1 via dep bumps (cyrius 5.6.35 + sankoch 2.0.3).
+
+Next release scope shifts to the v0.6.x performance arc: cache the patra object-DB handle, fold in S-24, ship measurable wins on `sit log` / `sit fsck` / `sit clone` against the v0.6.1 baseline.
+
 ## [0.6.2] — 2026-04-25
 
 Security-hygiene MEDIUM batch from the 2026-04-24 P(-1) audit. Defense-in-depth — closes silent-failure / underflow / overflow / partial-state cliffs across the validator, signing, materialize, clone, commit, and merge paths. Behavioral change: `sit clone <url> <abs-path>` now requires `--force-absolute` (S-23); see migration note below.

@@ -13,6 +13,20 @@ fn eprintln(s) {
     return 0;
 }
 
+# S-31: bounded strlen for cstrings whose backing storage has a known max
+# length. Use this when the source is a fixed-size column (e.g. patra's
+# 256-byte STR slot) so a missing-NUL bug in the producer can't walk us
+# off into adjacent memory. Returns the number of bytes before the first
+# NUL OR `max`, whichever comes first.
+fn strnlen(s, max) {
+    var i = 0;
+    while (i < max) {
+        if (load8(s + i) == 0) { return i; }
+        i = i + 1;
+    }
+    return max;
+}
+
 # S-17: alloc-or-die wrapper for the common case where OOM is unrecoverable
 # (no transactional rollback in sit; a half-filled buffer will be memcpy'd
 # from address 0 if alloc returns null and we don't notice). Use this at
