@@ -270,16 +270,49 @@ fn read_head_tree_entries() {
     return out;
 }
 
-fn tree_find(entries, name) {
-    if (entries == 0) { return 0; }
+# P-10: tree_find cache. The previous O(N) linear scan was called in O(N)
+# loops (cmd_status iterating index entries against head_entries; cmd_diff;
+# materialize_target; the merge three-way loops). For any entries vec that's
+# searched more than once, build a name → entry hashmap on first call and
+# reuse it for every subsequent tree_find on the same vec. Cache keyed by
+# vec pointer; lifetime = process (sit is short-lived per invocation).
+#
+# Worst case (one tree_find per vec): one map build + one lookup = O(N) + O(1).
+# Same complexity as the old linear scan. Strictly an improvement when called
+# more than once on the same vec, which every hot caller does.
+var _tree_find_keys = 0;
+var _tree_find_maps = 0;
+
+fn _tree_find_map(entries) {
+    if (_tree_find_keys == 0) {
+        _tree_find_keys = vec_new();
+        _tree_find_maps = vec_new();
+    }
+    var k = vec_len(_tree_find_keys);
+    var ki = 0;
+    while (ki < k) {
+        if (vec_get(_tree_find_keys, ki) == entries) {
+            return vec_get(_tree_find_maps, ki);
+        }
+        ki = ki + 1;
+    }
+    var m = map_new();
     var n = vec_len(entries);
     var i = 0;
     while (i < n) {
         var e = vec_get(entries, i);
-        if (streq(tree_entry_name(e), name) == 1) { return e; }
+        map_set(m, tree_entry_name(e), e);
         i = i + 1;
     }
-    return 0;
+    vec_push(_tree_find_keys, entries);
+    vec_push(_tree_find_maps, m);
+    return m;
+}
+
+fn tree_find(entries, name) {
+    if (entries == 0) { return 0; }
+    var m = _tree_find_map(entries);
+    return map_get(m, name);
 }
 
 fn tree_find_hash(entries, path) {
@@ -291,8 +324,14 @@ fn tree_find_hash(entries, path) {
 
 # Union of paths across three flattened tree entry vecs. Returns a vec of
 # heap-copied path cstrings, each unique.
+#
+# P-18: dedup via hashmap rather than the O(N²) nested-streq scan over the
+# growing `paths` vec. For three trees of N entries each, the old loop did
+# ~3N × (3N/2) = ~4.5N² streqs; with the map it's 3N inserts + 3N membership
+# checks, all O(1) amortized.
 fn three_way_path_set(base, ours, theirs) {
     var paths = vec_new();
+    var seen = map_new();
     var sources_cnt = 3;
     var sources[24];
     store64(&sources + 0, base);
@@ -308,19 +347,12 @@ fn three_way_path_set(base, ours, theirs) {
             while (i < n) {
                 var e = vec_get(entries, i);
                 var p = tree_entry_name(e);
-                var plen = strlen(p);
-                # Dedup against existing paths
-                var found = 0;
-                var j = 0;
-                var m = vec_len(paths);
-                while (j < m) {
-                    if (streq(vec_get(paths, j), p) == 1) { found = 1; j = m; }
-                    else { j = j + 1; }
-                }
-                if (found == 0) {
+                if (map_has(seen, p) == 0) {
+                    var plen = strlen(p);
                     var copy = alloc_or_die(plen + 1);
                     memcpy(copy, p, plen);
                     store8(copy + plen, 0);
+                    map_set(seen, copy, 1);
                     vec_push(paths, copy);
                 }
                 i = i + 1;

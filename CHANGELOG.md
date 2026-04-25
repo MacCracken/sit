@@ -4,6 +4,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.6] — 2026-04-25
+
+P-10 + P-18 perf release. Two hot-path lookups moved from O(N²) to O(N). **No measurable improvement on the 100-file synthetic bench** — the fixture is too small to show the win — but the change is real and substantial at repo scale (1000+ tracked files).
+
+### Performance
+
+- **P-10** — `tree_find` in `src/tree.cyr` now lazily builds a name → entry hashmap on first call per entries vec, cached by vec pointer for the process lifetime. Hot callers (`cmd_status` iterating index entries against `head_entries`; `cmd_diff` against tree_a/tree_b; `materialize_target`; the merge three-way loops in `merge.cyr`) drop from O(N²) total to O(N). Single tree_find calls are unchanged in cost (one map build + one lookup = same complexity as the old linear scan); multi-call hot paths see the structural improvement.
+- **P-18** — `three_way_path_set` (also `src/tree.cyr`) now dedups via `map_has` instead of a nested `streq` scan over the growing paths vec. For three trees of N entries each: was ~4.5N² streqs, now 3N inserts + 3N membership checks. Used by `cmd_merge`'s three-way path enumeration.
+
+**Why the bench didn't move**: the fixture is 100 files. At that scale, the old O(N²) cost is ~10000 streqs per status — already under the noise floor compared to the dominant costs (per-file sigil hashing for `status`, per-object zlib for `clone`). The hashmap-build adds a small constant overhead (one map per command) that's also under the noise floor. Concrete projection: a 1000-file `cmd_status` drops from ~5ms of pure scan to ~0.3ms; a 10000-file repo sees ~50× improvement on that piece. The 100-file synthetic bench can't see it, and a larger-N bench fixture is queued for whenever we have a real consumer pushing those scales.
+
+Bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.6.md`](docs/benchmarks/2026-04-25-v0.6.6.md).
+
+### Documentation
+
+- Bench snapshot adds a "Cumulative scoreboard" section showing 0.6.0 → 0.6.6 deltas: `log` -12%, `clone` -13%, everything else noise.
+
 ## [0.6.5] — 2026-04-25
 
 P-03 perf release: `copy_objects` batched into a single patra transaction, redundant outer has-check dropped. **`sit clone` of a 100-commit / 100-file repo: −15%** (245.19 → 208.44 ms min, 16.13x git → 13.82x git). All other operations within run-to-run noise — their bottlenecks remain dep-side (sigil SHA-256 throughput, sankoch zlib throughput) and are filed on those repos' roadmaps.
