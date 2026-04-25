@@ -15,6 +15,30 @@ fn remote_url(name) {
     return config_get(key);
 }
 
+# v0.7.1 transport dispatch: only file:// + bare paths carry transport today.
+# http/https/ssh URLs pass remote_url_valid (so `sit remote add origin http://...`
+# can be wired in advance) but fail here with a clean per-scheme message naming
+# the v0.7.x patch that lights each scheme up. Caller pattern:
+#   if (wire_transport_check(url) != 0) { return 1; }
+fn wire_transport_check(url) {
+    var s = url_scheme(url);
+    if (s == URL_SCHEME_FILE) { return 0; }
+    if (s == URL_SCHEME_HTTP) {
+        eprintln("sit: http transport requires sit 0.7.2+ (this is 0.7.1)");
+        return 1;
+    }
+    if (s == URL_SCHEME_HTTPS) {
+        eprintln("sit: https transport requires sit 0.7.6+ (this is 0.7.1)");
+        return 1;
+    }
+    if (s == URL_SCHEME_SSH) {
+        eprintln("sit: ssh transport requires sit 0.7.8+ (this is 0.7.1)");
+        return 1;
+    }
+    eprintln("sit: unrecognized URL scheme");
+    return 1;
+}
+
 # Strip a `file://` scheme prefix if present; otherwise return a heap copy.
 fn remote_normalize(url) {
     var ulen = strlen(url);
@@ -449,9 +473,11 @@ fn cmd_remote_add() {
         eprintln("sit: invalid remote name (see git check-ref-format rules)");
         return 1;
     }
-    # S-04: v0.6.0 accepts only local-path URLs.
+    # S-04: validator accepts file://, bare paths, and http(s)/ssh URL shapes.
+    # cmd_remote_add does not dispatch transport, so stored URLs may name a
+    # scheme whose transport ships in a later v0.7.x patch.
     if (remote_url_valid(url) == 0) {
-        eprintln("sit: invalid or unsupported remote URL (file:// or absolute/relative path only in v0.6)");
+        eprintln("sit: invalid or unsupported remote URL");
         return 1;
     }
     var nlen = strlen(name);
@@ -561,6 +587,7 @@ fn do_fetch(name, branch) {
         eprintln("sit: no such remote");
         return 0;
     }
+    if (wire_transport_check(url) != 0) { return 0; }
     var repo_path = remote_normalize(url);
 
     var remote_tip = read_remote_ref(repo_path, branch);
@@ -732,12 +759,13 @@ fn cmd_clone() {
         eprintln("usage: sit clone [--force-absolute] <url> [<dir>]");
         return 1;
     }
-    # S-04: reject unknown schemes up-front so we fail cleanly instead of
-    # trying to open `http://…` as a filesystem path.
+    # S-04: reject malformed URLs up-front so we fail cleanly instead of
+    # trying to open them as filesystem paths.
     if (remote_url_valid(url) == 0) {
-        eprintln("sit: invalid or unsupported clone URL (file:// or absolute/relative path only in v0.6)");
+        eprintln("sit: invalid or unsupported clone URL");
         return 1;
     }
+    if (wire_transport_check(url) != 0) { return 1; }
 
     if (target == 0) {
         # Derive target from URL: strip trailing slash, take last segment, drop file:// prefix.
@@ -870,6 +898,7 @@ fn cmd_push() {
         eprintln("sit: no such remote");
         return 1;
     }
+    if (wire_transport_check(url) != 0) { return 1; }
     var repo_path = remote_normalize(url);
 
     var local_tip = read_head_ref();

@@ -353,13 +353,79 @@ fn config_key_valid(k) {
 
 # ── Remote URL (S-04) ───────────────────────────────────────────────
 #
-# v0.6.0 accepts only local-path schemes. Anything else — http://, ssh://,
-# scp-style user@host:path — is rejected up front with a clear "not yet
-# supported" error. Prevents accidental fetches against URLs that would
-# silently fall through to a filesystem path.
+# Scheme-aware validator. v0.6.x accepted only local-path schemes; v0.7.1
+# extends acceptance to http://, https://, ssh:// (transport itself lands in
+# v0.7.2+, but URLs validate at remote-add time so users can wire config in
+# advance without seeing parse errors when transport ships).
 #
-# Also rejects URLs beginning with '-' (CVE-2017-1000117 prophylactic for
-# the day a transport forks a subprocess).
+# Per-scheme strictness is deliberately conservative: control-char / NUL /
+# leading-dash gates apply uniformly; the network-scheme path then runs the
+# authority+path body through a whitelist character set. v0.7.3 (HTTP fetch)
+# and v0.7.8 (SSH transport) tighten further as those code paths land —
+# e.g. RFC3986 host-label rules, port range enforcement, no-`..`-segments.
+#
+# CVE-2017-1000117 prophylactic: any URL with a leading '-' is rejected so
+# the day a transport forks a subprocess, an attacker-controlled URL cannot
+# masquerade as a flag.
+
+var URL_SCHEME_INVALID = 0 - 1;
+var URL_SCHEME_FILE = 0;
+var URL_SCHEME_HTTP = 1;
+var URL_SCHEME_HTTPS = 2;
+var URL_SCHEME_SSH = 3;
+
+# Classify a URL by its scheme prefix. Path-shaped inputs ('/abs', './rel',
+# '../rel') classify as FILE so callers can dispatch with a single switch.
+# Returns INVALID for empty / NULL / unrecognized-scheme inputs. Does NOT
+# perform body validation — pair with remote_url_valid for the full check.
+fn url_scheme(url) {
+    if (url == 0) { return URL_SCHEME_INVALID; }
+    var len = strlen(url);
+    if (len == 0) { return URL_SCHEME_INVALID; }
+    if (len >= 8) {
+        if (memeq(url, "https://", 8) == 1) { return URL_SCHEME_HTTPS; }
+    }
+    if (len >= 7) {
+        if (memeq(url, "file://", 7) == 1) { return URL_SCHEME_FILE; }
+        if (memeq(url, "http://",  7) == 1) { return URL_SCHEME_HTTP;  }
+    }
+    if (len >= 6) {
+        if (memeq(url, "ssh://",   6) == 1) { return URL_SCHEME_SSH;   }
+    }
+    # Bare paths: absolute (/…) or relative (./…, ../…).
+    if (load8(url) == 47) { return URL_SCHEME_FILE; }
+    if (load8(url) == 46) { return URL_SCHEME_FILE; }
+    return URL_SCHEME_INVALID;
+}
+
+# Whitelist body validator for the authority+path of a network URL. Accepts
+# alphanumeric plus . - _ / : @ % ~ — sufficient to express
+# user@host:port/path-with-encoded-segments without admitting shell or SQL
+# metachars. Empty body and leading '-' are rejected (the latter as a second
+# layer of CVE-2017-1000117 defense if the scheme prefix was 7+ bytes long).
+fn url_authority_path_valid(s, len) {
+    if (len == 0) { return 0; }
+    if (load8(s) == 45) { return 0; }
+    var i = 0;
+    while (i < len) {
+        var c = load8(s + i) & 0xFF;
+        var ok = 0;
+        if (c >= 48) { if (c <=  57) { ok = 1; } }  # 0-9
+        if (c >= 65) { if (c <=  90) { ok = 1; } }  # A-Z
+        if (c >= 97) { if (c <= 122) { ok = 1; } }  # a-z
+        if (c == 46) { ok = 1; }  # .
+        if (c == 45) { ok = 1; }  # -
+        if (c == 95) { ok = 1; }  # _
+        if (c == 47) { ok = 1; }  # /
+        if (c == 58) { ok = 1; }  # :
+        if (c == 64) { ok = 1; }  # @
+        if (c == 37) { ok = 1; }  # %
+        if (c == 126) { ok = 1; } # ~
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
 
 fn remote_url_valid(url) {
     if (url == 0) { return 0; }
@@ -380,15 +446,21 @@ fn remote_url_valid(url) {
         i = i + 1;
     }
 
-    # file:// prefix → valid
-    if (len >= 7) {
-        if (memeq(url, "file://", 7) == 1) { return 1; }
+    var s = url_scheme(url);
+    if (s == URL_SCHEME_FILE) {
+        # Already passed control-char + leading-dash gates above; file://
+        # plus bare absolute/relative paths are accepted as-is.
+        return 1;
     }
-    # Absolute path (/…)
-    if (load8(url) == 47) { return 1; }
-    # Relative path (./… or ../…)
-    if (load8(url) == 46) { return 1; }
-    # Anything else: reject
+    if (s == URL_SCHEME_HTTP) {
+        return url_authority_path_valid(url + 7, len - 7);
+    }
+    if (s == URL_SCHEME_HTTPS) {
+        return url_authority_path_valid(url + 8, len - 8);
+    }
+    if (s == URL_SCHEME_SSH) {
+        return url_authority_path_valid(url + 6, len - 6);
+    }
     return 0;
 }
 

@@ -330,16 +330,55 @@ fn test_validate_config_value() {
 fn test_validate_remote_url() {
     test_group("validate.cyr — remote_url_valid");
 
-    assert_eq(remote_url_valid("file:///srv/repo"),  1, "file:// scheme");
-    assert_eq(remote_url_valid("/abs/path"),         1, "absolute path");
-    assert_eq(remote_url_valid("./relative"),        1, "relative ./");
-    assert_eq(remote_url_valid("../parent"),         1, "relative ../");
+    # Local-path schemes — unchanged from v0.6.x.
+    assert_eq(remote_url_valid("file:///srv/repo"),         1, "file:// scheme");
+    assert_eq(remote_url_valid("/abs/path"),                1, "absolute path");
+    assert_eq(remote_url_valid("./relative"),               1, "relative ./");
+    assert_eq(remote_url_valid("../parent"),                1, "relative ../");
 
-    assert_eq(remote_url_valid(""),                  0, "empty");
-    assert_eq(remote_url_valid("http://evil.com"),   0, "http rejected in v0.6");
-    assert_eq(remote_url_valid("ssh://user@host"),   0, "ssh rejected in v0.6");
-    assert_eq(remote_url_valid("-oProxyCommand=x"),  0, "leading dash (CVE-2017-1000117)");
-    assert_eq(remote_url_valid("file://good\nbad"),  0, "embedded newline");
+    # v0.7.1: network schemes accepted (transport ships in later 0.7.x patches).
+    assert_eq(remote_url_valid("http://example.com/repo"),  1, "http accepted");
+    assert_eq(remote_url_valid("https://example.com/repo"), 1, "https accepted");
+    assert_eq(remote_url_valid("https://host:8080/p"),      1, "https with port");
+    assert_eq(remote_url_valid("ssh://user@host/path"),     1, "ssh with userinfo");
+    assert_eq(remote_url_valid("ssh://host/p"),             1, "ssh no userinfo");
+
+    # Universal rejects.
+    assert_eq(remote_url_valid(""),                         0, "empty");
+    assert_eq(remote_url_valid("-oProxyCommand=x"),         0, "leading dash (CVE-2017-1000117)");
+    assert_eq(remote_url_valid("file://good\nbad"),         0, "embedded newline");
+    assert_eq(remote_url_valid("ftp://ok"),                 0, "unknown scheme");
+    assert_eq(remote_url_valid("http://"),                  0, "empty authority http");
+    assert_eq(remote_url_valid("https://"),                 0, "empty authority https");
+    assert_eq(remote_url_valid("ssh://"),                   0, "empty authority ssh");
+
+    # Authority-body whitelist gates: shell metachars + spaces rejected.
+    assert_eq(remote_url_valid("http://host;rm -rf"),       0, "semicolon in authority");
+    assert_eq(remote_url_valid("http://host /p"),           0, "space in authority");
+    assert_eq(remote_url_valid("http://host`whoami`"),      0, "backtick");
+    assert_eq(remote_url_valid("http://host$(x)"),          0, "dollar paren");
+    assert_eq(remote_url_valid("http://host'q"),            0, "single quote");
+    assert_eq(remote_url_valid("ssh://-oProxyCommand=x/r"), 0, "ssh leading-dash authority");
+    return 0;
+}
+
+fn test_validate_url_scheme() {
+    test_group("validate.cyr — url_scheme");
+
+    assert_eq(url_scheme("file:///srv/repo"),      URL_SCHEME_FILE,    "file://");
+    assert_eq(url_scheme("/abs/path"),             URL_SCHEME_FILE,    "absolute path");
+    assert_eq(url_scheme("./relative"),            URL_SCHEME_FILE,    "relative ./");
+    assert_eq(url_scheme("../parent"),             URL_SCHEME_FILE,    "relative ../");
+    assert_eq(url_scheme("http://host/p"),         URL_SCHEME_HTTP,    "http://");
+    assert_eq(url_scheme("https://host/p"),        URL_SCHEME_HTTPS,   "https://");
+    assert_eq(url_scheme("ssh://host/p"),          URL_SCHEME_SSH,     "ssh://");
+    assert_eq(url_scheme(""),                      URL_SCHEME_INVALID, "empty");
+    assert_eq(url_scheme("ftp://x"),               URL_SCHEME_INVALID, "ftp unknown");
+    assert_eq(url_scheme("git://x"),               URL_SCHEME_INVALID, "git unknown");
+    assert_eq(url_scheme("nonsense"),              URL_SCHEME_INVALID, "bare bad");
+    # Prefix-collision smoke: "http" without :// is not http.
+    assert_eq(url_scheme("http"),                  URL_SCHEME_INVALID, "scheme without ://");
+    assert_eq(url_scheme("https"),                 URL_SCHEME_INVALID, "scheme without ://");
     return 0;
 }
 
@@ -358,6 +397,7 @@ fn main() {
     test_validate_hex_prefix();
     test_validate_config_value();
     test_validate_remote_url();
+    test_validate_url_scheme();
     return assert_summary();
 }
 

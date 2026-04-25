@@ -4,6 +4,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-04-25 — URL scheme detection + transport dispatch stubs
+
+**First feature-bearing patch in the v0.7.x line. Pure plumbing — no transport yet.** Sets up scheme classification and per-command dispatch so `sit remote add origin http://...` succeeds today, while `sit fetch origin` and `sit clone https://...` fail with a clean per-scheme message naming the v0.7.x patch that lights each transport up.
+
+### Added
+
+- **`url_scheme(url)`** in `src/validate.cyr` — classifies a URL as one of `URL_SCHEME_FILE` (covers `file://`, absolute, and relative paths), `URL_SCHEME_HTTP`, `URL_SCHEME_HTTPS`, `URL_SCHEME_SSH`, or `URL_SCHEME_INVALID`. Pure prefix match, no body validation; pair with `remote_url_valid` for the full check.
+- **`url_authority_path_valid(s, len)`** — whitelist body validator for the authority+path of a network URL. Accepts `[a-zA-Z0-9.-_/:@%~]`, rejects empty body and leading `-` (second-layer CVE-2017-1000117 defense). v0.7.3 (HTTP fetch) and v0.7.8 (SSH transport) will tighten further.
+- **`wire_transport_check(url)`** in `src/wire.cyr` — caller-pattern helper: `if (wire_transport_check(url) != 0) { return 1; }`. Lights up per-scheme errors naming the upcoming v0.7.x patch (HTTP→0.7.2, HTTPS→0.7.6, SSH→0.7.8).
+- **Tests** — 26 new assertions in `tests/sit.tcyr` covering positive http/https/ssh acceptance, port + userinfo shapes, empty-authority rejection, shell-metachar rejection in authority body, and the full `url_scheme` truth table including prefix-collision cases (`http` without `://` → INVALID).
+- **Fuzz** — `fuzz_url_validators` in `tests/sit.fcyr` (10000 rounds) feeds random NUL-terminated bytes through `url_scheme` + `remote_url_valid`. Caught a missing-include footgun during dev (Cyrius compiles undefined refs to null pointers and SIGILLs at call site rather than erroring at link); fuzz file now `include "src/validate.cyr"` explicitly.
+
+### Changed
+
+- **`remote_url_valid(url)`** now accepts `http://`, `https://`, `ssh://` URLs that pass the universal control-char + leading-dash gates AND have a body matching `url_authority_path_valid`. Local-path acceptance unchanged. URLs validate at remote-add time so users can wire config in advance — transport itself ships in later v0.7.x patches.
+- **`cmd_remote_add`** error message simplified ("invalid or unsupported remote URL"); the `(file:// or absolute/relative path only in v0.6)` qualifier was stale.
+- **`cmd_clone`** + **`do_fetch`** + **`cmd_push`** dispatch on URL scheme after validation. Network schemes return rc 1 with the appropriate "transport requires sit 0.7.X+" message; file/path schemes proceed exactly as v0.7.0.
+
+### Sandhi posture
+
+Adding `"sandhi"` to `[deps].stdlib` was attempted and reverted in this release — sandhi requires `SYS_SETSOCKOPT` and friends from `lib/net.cyr`, which would mean cascading `net`/`tls`/`ws`/`http`/`json` into the stdlib list. Per CLAUDE.md "ONE change at a time," that whole block lands in v0.7.2 alongside the actual `sit serve` skeleton — the first release where sandhi has a real caller. v0.7.1 ships pure URL plumbing.
+
+### Sit-side impact
+
+- Build: clean. Tests: **127/127 pass** (101 + 26 new). Fuzz: 10,000 rounds clean on `url_scheme` + `remote_url_valid`. DCE binary: **709 KB** (+2 KB vs 0.7.0; new validators + dispatch helper).
+- E2E verified: `sit remote add origin http://example.com` succeeds; `sit fetch origin` → `sit: http transport requires sit 0.7.2+ (this is 0.7.1)` rc 1; `sit clone https://...` → equivalent message; CVE-2017-1000117 inputs (`-oProxyCommand=...`) still rejected at validation.
+- Wire protocol shape, server design (`sit serve`), URL routes (`/sit/v1/...`), and bearer-token auth model settled per the v0.7.x plan; no code yet.
+
 ## [0.7.0] — 2026-04-25 — sandhi-fold unlock, v0.7.x line opens
 
 **Minor-line opener. Toolchain-only — no sit source changes yet.** This release marks the v0.6.x perf arc closed and the v0.7.x network-transport line open. The release content is just the cyrius 5.7.0 ("the sandhi fold") pickup; the actual HTTP/SSH transport work lands in subsequent v0.7.x releases now that sandhi is reachable from stdlib.

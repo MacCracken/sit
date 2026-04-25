@@ -1,10 +1,26 @@
 # sit Development Roadmap
 
-> **v0.6.0** — Security hardening release. All CRITICAL + HIGH findings from the P(-1) audit fixed, 3 new ADRs, dedicated validator module, 101 test assertions (up from 31). Network transport originally planned for v0.6.0 shifts to v0.7.0.
+> **v0.7.x active.** v0.7.0 (sandhi-fold toolchain unlock — cyrius 5.7.0 + `lib/http_server.cyr` orphan deletion) shipped 2026-04-25. v0.7.1 (URL scheme detection + per-command transport dispatch — http/https/ssh URLs now validate, error on dispatch with per-scheme version pointers) shipped 2026-04-25. Network transport (HTTP server + client, then SSH) lands across v0.7.2 → v0.7.8 per the release sequence below. The v0.6.x perf arc closed at v0.6.12 (cumulative `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%`).
 
 Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHANGELOG.md`](../../CHANGELOG.md) for the tagged artifacts.
 
 ## Released
+
+### v0.7.1 — URL scheme detection + transport dispatch stubs
+
+- **`url_scheme(url)`** + **`url_authority_path_valid(s, len)`** in `src/validate.cyr`; **`wire_transport_check(url)`** in `src/wire.cyr`. URL classification covers `file://` / `http://` / `https://` / `ssh://` / bare paths; whitelist body validator accepts `[a-zA-Z0-9.-_/:@%~]` (rejects shell metachars + leading dash for second-layer CVE-2017-1000117 defense).
+- **`remote_url_valid()` extended** to accept http/https/ssh URLs that pass control-char + leading-dash + body-whitelist gates. URLs validate at remote-add time so users wire config in advance; transport itself ships in later v0.7.x patches.
+- **`cmd_clone` / `do_fetch` / `cmd_push`** dispatch on URL scheme after validation. Network schemes return rc 1 with per-scheme version pointers (`http transport requires sit 0.7.2+`, `https → 0.7.6+`, `ssh → 0.7.8+`); file/path schemes proceed unchanged.
+- **127/127 tests pass** (101 + 26 new). `fuzz_url_validators` runs 10K rounds clean on `url_scheme` + `remote_url_valid`; debug surfaced a Cyrius missing-include footgun (undefined fn refs compile clean, SIGILL at call site) — fuzz file now `include "src/validate.cyr"` explicitly.
+- **Sandhi opt-in deferred** to v0.7.2 — adding `"sandhi"` to `[deps].stdlib` requires co-adding `net`/`tls`/`ws`/`http`/`json` (sandhi pulls `SYS_SETSOCKOPT` etc.). Per "ONE change at a time," that whole block lands alongside v0.7.2's first real sandhi caller (`sit serve`).
+- DCE binary: 709 KB (+2 KB vs 0.7.0; new validators + dispatch helper).
+
+### v0.7.0 — sandhi-fold toolchain unlock, v0.7.x line opens
+
+- **Minor-line opener.** Toolchain-only — picks up cyrius 5.7.0 ("the sandhi fold"; `sandhi` v1.0.0 vendored into stdlib as `lib/sandhi.cyr`, `lib/http_server.cyr` deleted from stdlib per [sandhi ADR 0002](https://github.com/MacCracken/sandhi/blob/main/docs/adr/0002-clean-break-fold-at-cyrius-v5-7-0.md)).
+- **Removed**: stale local `lib/http_server.cyr` orphan (15579-byte regular-file copy of the pre-fold stdlib snapshot; zero callers in sit). Cyrius 5.7.0's downstream worklist names "delete orphan only" as the action for sit.
+- No sit source changes. Build clean, 101/101 tests pass, DCE binary 707 KB (down from 710).
+- v0.7.x architectural settle: sit-native JSON/REST wire protocol under `/sit/v1/...` (reject git-smart-HTTP — wrong hash, can't carry raw compressed bytes), `sit serve <path>` daemon (one repo per process), bearer-token auth (`~/.sit/serve.token`, 0600), TLS in v0.7.6, SSH in v0.7.8.
 
 ### v0.6.12 — sigil SHA-NI + sankoch 2.1 throughput release (biggest single-release win)
 
@@ -166,9 +182,9 @@ The local VCS loop is complete end-to-end, with ed25519 signing and a local-path
 
 ## Backlog
 
-### v0.6.5+ — Remaining v0.6.x perf items (one or two per release)
+### v0.6.x perf items — closed (reference only)
 
-Patra-handle caching shipped in v0.6.4 (see Released above). Remaining items target the bottlenecks v0.6.4 didn't move: clone, status, diff. Each is independently shippable; pick by which workload is most painful for actual users.
+Patra-handle caching shipped in v0.6.4. Remaining items targeted the bottlenecks v0.6.4 didn't move: clone, status, diff. **All sit-side items shipped or explicitly deferred by v0.6.12** — the arc closed there. The waiting-on-deps subsection below is left as reference for how the cumulative scoreboard accumulated; the only forward-looking entry is `P-11` (sit add index upsert without full rewrite, gated on a patra `or_ignore` flag for `patra_insert_row`).
 
 **Waiting on dep updates** (filed on each dep's roadmap 2026-04-25; sit gets bigger wins once these land but is not blocked from shipping the items below):
 
@@ -205,9 +221,36 @@ When any of those ship, sit can drop the corresponding workaround / get a measur
 - **sigil** — `hex_decode` that strictly fails on invalid chars rather than partial decode (S-20). Flag SHA-256 software throughput; software vs hardware story.
 - **sankoch** — `zlib_decompress_with_ratio_cap` primitive to give every consumer a one-call decompression bomb defense (S-08 root-cause fix).
 
-### v0.7.0 — Network wire protocol + deferred bench fixtures
+### v0.7.x — Network transport release sequence
 
-**Network wire protocol**
+Per the v0.7.x plan settled 2026-04-25. Each release is a small bite (CLAUDE.md "Large effort: small bites only"); each ships independently with a test gate.
+
+**Architectural settles** (already locked):
+
+- **Wire protocol**: sit-native JSON/REST under `/sit/v1/...`. Git-smart-HTTP rejected (wrong hash family — sit is SHA-256 only per ADR 0004; can't carry raw compressed `objects.patra` bytes through pack rewriting; sit owns both ends so compatibility is no leverage).
+- **Routes**: `GET /capabilities`, `GET /refs[/<name>]`, `GET /objects/<hash>` (raw compressed bytes, `X-Sit-Type` header carries patra `ty`), `POST /want` (batched length-prefixed object stream), `POST /objects/<hash>` (server hashes — only place sit rehashes; trust boundary), `POST /refs/<name>` (fast-forward enforced).
+- **Server**: `sit serve <path> [--listen 127.0.0.1:8484]`. One repo per process. Reuses v0.6.4 patra-handle cache.
+- **Auth**: bearer token via `~/.sit/serve.token` (0600). Anonymous-read default; `--require-auth` flag opts to authenticated-read. mTLS as later opt-in (v0.7.7).
+
+**Releases:**
+
+| ver | scope | new modules | success gate |
+|---|---|---|---|
+| ~~0.7.0~~ | ✅ shipped — sandhi-fold toolchain unlock; orphan delete | — | (see Released) |
+| ~~0.7.1~~ | ✅ shipped — URL scheme detection + dispatch stubs | — | (see Released) |
+| **0.7.2** | `cmd_serve` + `GET /capabilities` + `GET /refs` (read-only). `"sandhi"` joins `[deps].stdlib` here, with `net`/`tls`/`ws`/`http`/`json` co-added (sandhi's transitive needs). | `src/serve.cyr` | `curl /sit/v1/refs` matches `find .sit/refs`; CI smoke `serve` + `curl` round trip |
+| **0.7.3** | `GET /objects/<hash>` (server) + `wire_http.cyr` end-to-end fetch/clone (client). Reachability walk runs over an HTTP-backed `db_object_read_both` shim. | `src/wire_http.cyr` | `sit clone http://localhost` against 100-commit fixture, `sit fsck` clean, within 3× local-path |
+| **0.7.4** | `POST /want` batched object stream. Length-prefixed framing; client falls back to per-object GET if server doesn't advertise `"batch": true`. | — (frame format ADR 0006) | ≥30% clone speedup vs 0.7.3 OR revert; frame decoder fuzzed ≥10M iters |
+| **0.7.5** | Push side: `POST /objects` + `POST /refs` + bearer auth + non-ff rejection. Server rehashes uploaded objects (trust boundary). | — (auth ADR 0007) | Push round trip; bad token 401; non-ff 409; idempotent re-push |
+| **0.7.6** | TLS — `https://`, `--tls --cert --key`, system trust + `--insecure` for dev. | — | Self-signed CI cert; clone https with `--insecure`; reject without |
+| **0.7.7** | mTLS opt-in via `sandhi_tls_policy_new_mtls`. Server `--require-client-cert`. | — (ADR 0008) | Client-cert push works; no-cert TLS handshake fails; reject mixed bearer+mTLS at boot |
+| **0.7.8** | SSH — `ssh user@host -- sit serve --stdio`; length-prefixed framing on stdin/stdout. Heavy fuzz on URL parser (CVE-2017-1000117 host-component injection). | `src/wire_ssh.cyr` (ADR 0009) | CI sshd loopback clone; `ssh://-oProxyCommand=...` rejected pre-`exec_vec` |
+
+**Out of scope for v0.7.x** (deferred to v0.8.x or later):
+
+- **Pack bundles** — batch object transfer with sankoch delta primitives. Ties to sankoch + patra storage shape work that isn't ready.
+- **Push to checked-out branch defense** — known footgun (see "Longer horizon" below); a v0.7.x patch may file the check, but it's not gating the release line.
+- **HTTP/2** — sandhi has it (`sandhi_h2_*`); whether sit's wire benefits from H/2 streaming over the v0.7.4 batched-stream endpoint is a v0.7.4-time decision.
 
 **Benchmarks** — three bench targets were scoped but deferred from v0.6.0 because they need larger fixtures or a companion algorithm change:
 
@@ -215,11 +258,7 @@ When any of those ship, sit can drop the corresponding workaround / get a measur
 - **`glob_match`** against 10 / 50 / 200-pattern `.sitignore` files. Baseline for the P-13 pattern pre-classification refactor.
 - **`hash_file_as_blob` end-to-end** on 1 KB / 64 KB / 1 MB inputs. Measures the true `sit add` floor and maps sigil's software-SHA-256 bottleneck.
 
-Add these alongside the algorithm / transport work that justifies them.
-
-- **HTTP transport** — sit-native JSON/REST (not git-wire-compatible). Likely shape: `GET /sit/v1/refs`, `GET /sit/v1/object/<hash>`, `POST /sit/v1/refs/<name>`, `POST /sit/v1/object`. Server is a thin patra-to-HTTP translator.
-- **SSH transport** — run `sit-upload-pack` / `sit-receive-pack` over stdin/stdout (same pattern as git).
-- **Pack bundles** — batch object transfer using sankoch delta primitives once patra grows the supporting storage. Reduces per-object network chatter.
+Add these alongside the algorithm / transport work that justifies them. v0.7.x bench fixtures will likely include a 100-object HTTP fetch round trip for the wire-protocol releases.
 
 ### Longer horizon
 
@@ -229,4 +268,4 @@ Add these alongside the algorithm / transport work that justifies them.
 - **`sit log --graph`** — ASCII DAG for merge history.
 - **Shallow clone** — `--depth N` limits to N commits back from HEAD.
 - **Integration tests in-tree** — promote the shell-level scenarios from `docs/guides/getting-started.md` into `tests/` with fixtures. Current `tests/sit.tcyr` is primitive-assert smoke only.
-- **sandhi migration** — cyrius 5.7.0 ships a first-party `sandhi` stdlib crate; migrate `cyrius.cyml`'s inline `stdlib = [...]` list when the release is out. Transitive dep resolution in the same release should also let us drop the expanded `thread`/`freelist`/`bigint`/`ct`/`keccak` entries.
+- **Sandhi co-adds in [deps].stdlib** — when v0.7.2 lands `sit serve`, the inline `[deps].stdlib` list grows by `net`/`tls`/`ws`/`http`/`json`/`sandhi` (sandhi's transitive needs since cyrius still has no transitive stdlib resolution). Watch whether a future cyrius release introduces transitive resolution; if so, sit can drop the explicit transitive entries (`thread`/`freelist`/`bigint`/`ct`/`keccak` + the v0.7.2 network adds) without losing reachability.
