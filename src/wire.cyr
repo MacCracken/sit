@@ -109,9 +109,18 @@ fn db_object_read_raw(db, hex, out) {
 # Read + decompress from an opened db. Same out-layout as read_object.
 fn db_object_read_decompressed(db, hex, out) {
     var raw[24];
-    if (db_object_read_raw(db, hex, &raw) != 0) { return 0 - 1; }
-    var compressed = load64(&raw);
-    var clen = load64(&raw + 8);
+    return db_object_read_both(db, hex, &raw, out);
+}
+
+# Variant that returns BOTH the compressed bytes (raw_out, 24 bytes:
+# {compressed_ptr, clen, ty}) and the decompressed view (deco_out, 24 bytes:
+# {decompressed_ptr, dlen, content_offset}). Used by walk_reachable_* so the
+# compressed bytes can be cached and reused by copy_objects without a second
+# source-DB read (P-04).
+fn db_object_read_both(db, hex, raw_out, deco_out) {
+    if (db_object_read_raw(db, hex, raw_out) != 0) { return 0 - 1; }
+    var compressed = load64(raw_out);
+    var clen = load64(raw_out + 8);
     # S-08: 16× multiplier with one retry at the 16 MiB ceiling. Matches
     # read_object's policy so reachability walks and local reads see the
     # same failure modes.
@@ -136,9 +145,9 @@ fn db_object_read_decompressed(db, hex, out) {
         nul = nul + 1;
     }
     if (nul >= dlen) { return 0 - 4; }
-    store64(out, decompressed);
-    store64(out + 8, dlen);
-    store64(out + 16, nul + 1);
+    store64(deco_out, decompressed);
+    store64(deco_out + 8, dlen);
+    store64(deco_out + 16, nul + 1);
     return 0;
 }
 
@@ -169,10 +178,29 @@ fn db_object_insert_raw(db, hex, type_code, compressed, clen) {
 # Walk every object reachable from `root_commit_hex` in `src_db` and append
 # each object's hex hash to `out`. Uses `seen` (map_new) for dedup.
 # S-14: depth cap via module-level counter; same limit as flatten_tree.
+#
+# P-04 (v0.6.7): the walk decompresses every commit + tree, which internally
+# pulls the compressed bytes from src_db via db_object_read_raw. Without the
+# `raw_cache` parameter, copy_objects later re-reads the same compressed
+# bytes — every commit + tree is a redundant source-DB SELECT. With the
+# cache, walk stuffs (hex → 24-byte raw struct) entries; copy_objects checks
+# the cache first and only falls back to read_raw for the blobs that walk
+# didn't visit. Saves ~200 source SQL ops on a 100-commit fixture.
 var _WIRE_MAX_DEPTH = 256;
 var _wire_walk_depth = 0;
 
-fn walk_reachable_tree(src_db, tree_hex, out, seen) {
+# Helper: store a copy of a 24-byte raw struct into the cache, keyed by hex.
+# The hex pointer must already be a heap-owned cstring (the walk uses the
+# `hex_copy` it just pushed onto `out`, so map_set can safely retain it).
+fn _walk_cache_insert(raw_cache, hex, raw_struct_ptr) {
+    if (raw_cache == 0) { return 0; }
+    var slot = alloc_or_die(24);
+    memcpy(slot, raw_struct_ptr, 24);
+    map_set(raw_cache, hex, slot);
+    return 0;
+}
+
+fn walk_reachable_tree(src_db, tree_hex, out, seen, raw_cache) {
     if (_wire_walk_depth >= _WIRE_MAX_DEPTH) {
         eprintln("sit: remote tree depth exceeds 256 — refusing to walk further");
         return 0;
@@ -185,11 +213,13 @@ fn walk_reachable_tree(src_db, tree_hex, out, seen) {
     vec_push(out, hex_copy);
 
     _wire_walk_depth = _wire_walk_depth + 1;
+    var raw[24];
     var obj[24];
-    if (db_object_read_decompressed(src_db, tree_hex, &obj) != 0) {
+    if (db_object_read_both(src_db, tree_hex, &raw, &obj) != 0) {
         _wire_walk_depth = _wire_walk_depth - 1;
         return 0;
     }
+    _walk_cache_insert(raw_cache, hex_copy, &raw);
     var buf = load64(&obj);
     var blen = load64(&obj + 8);
     var coff = load64(&obj + 16);
@@ -201,7 +231,7 @@ fn walk_reachable_tree(src_db, tree_hex, out, seen) {
         var mode = tree_entry_mode(e);
         var hash = tree_entry_hash(e);
         if (streq(mode, "40000") == 1) {
-            walk_reachable_tree(src_db, hash, out, seen);
+            walk_reachable_tree(src_db, hash, out, seen, raw_cache);
         }
         else {
             if (map_has(seen, hash) == 0) {
@@ -218,7 +248,7 @@ fn walk_reachable_tree(src_db, tree_hex, out, seen) {
     return 0;
 }
 
-fn walk_reachable_from_commit(src_db, root_hex, out, seen) {
+fn walk_reachable_from_commit(src_db, root_hex, out, seen, raw_cache) {
     var queue = vec_new();
     var hex_copy = alloc(65);
     memcpy(hex_copy, root_hex, 64);
@@ -232,8 +262,10 @@ fn walk_reachable_from_commit(src_db, root_hex, out, seen) {
             map_set(seen, cur, 1);
             vec_push(out, cur);
 
+            var raw[24];
             var obj[24];
-            if (db_object_read_decompressed(src_db, cur, &obj) == 0) {
+            if (db_object_read_both(src_db, cur, &raw, &obj) == 0) {
+                _walk_cache_insert(raw_cache, cur, &raw);
                 var buf = load64(&obj);
                 var blen = load64(&obj + 8);
                 var coff = load64(&obj + 16);
@@ -242,7 +274,7 @@ fn walk_reachable_from_commit(src_db, root_hex, out, seen) {
                 var info[56];
                 if (parse_commit_body(body, body_len, &info) == 0) {
                     var tree_hex = load64(&info);
-                    if (tree_hex != 0) { walk_reachable_tree(src_db, tree_hex, out, seen); }
+                    if (tree_hex != 0) { walk_reachable_tree(src_db, tree_hex, out, seen, raw_cache); }
                     var parent_hex = load64(&info + 8);
                     if (parent_hex != 0) { vec_push(queue, parent_hex); }
                 }
@@ -254,7 +286,7 @@ fn walk_reachable_from_commit(src_db, root_hex, out, seen) {
 
 # Copy every hex in `hashes` that isn't already present in `dst_db` from
 # `src_db`. Returns the count of objects newly written.
-fn copy_objects(src_db, dst_db, hashes) {
+fn copy_objects(src_db, dst_db, hashes, raw_cache) {
     var n = vec_len(hashes);
     var i = 0;
     var copied = 0;
@@ -266,11 +298,29 @@ fn copy_objects(src_db, dst_db, hashes) {
     # plus an insert. Batched WHERE hash IN (...) pre-filter is deferred to
     # a later release (would need 60-hash chunking per patra's SQL parser
     # limits).
+    #
+    # P-04 (v0.6.7): raw_cache is the (hex → 24-byte raw struct) map populated
+    # during walk_reachable_*. For commits + trees (everything walk visited),
+    # we get the compressed bytes from cache and skip the source-DB read
+    # entirely. For blobs (walk doesn't visit them) the cache misses and we
+    # fall back to db_object_read_raw. raw_cache may be 0 for callers that
+    # don't have a walk to draw from.
     patra_begin(dst_db);
     while (i < n) {
         var hex = vec_get(hashes, i);
         var raw[24];
-        if (db_object_read_raw(src_db, hex, &raw) == 0) {
+        var got = 0;
+        if (raw_cache != 0) {
+            var cached = map_get(raw_cache, hex);
+            if (cached != 0) {
+                memcpy(&raw, cached, 24);
+                got = 1;
+            }
+        }
+        if (got == 0) {
+            if (db_object_read_raw(src_db, hex, &raw) == 0) { got = 1; }
+        }
+        if (got == 1) {
             var compressed = load64(&raw);
             var clen = load64(&raw + 8);
             var ty = load64(&raw + 16);
@@ -535,8 +585,11 @@ fn do_fetch(name, branch) {
 
     var seen = map_new();
     var hashes = vec_new();
-    walk_reachable_from_commit(src_db, remote_tip, hashes, seen);
-    var copied = copy_objects(src_db, dst_db, hashes);
+    # P-04 (v0.6.7): raw_cache lets copy_objects skip the source read for
+    # commits + trees that walk_reachable already pulled.
+    var raw_cache = map_new();
+    walk_reachable_from_commit(src_db, remote_tip, hashes, seen, raw_cache);
+    var copied = copy_objects(src_db, dst_db, hashes, raw_cache);
 
     patra_close(src_db);
 
@@ -850,8 +903,10 @@ fn cmd_push() {
 
     var seen = map_new();
     var hashes = vec_new();
-    walk_reachable_from_commit(src_db, local_tip, hashes, seen);
-    var copied = copy_objects(src_db, dst_db, hashes);
+    # P-04 (v0.6.7): raw_cache shared between walk and copy.
+    var raw_cache = map_new();
+    walk_reachable_from_commit(src_db, local_tip, hashes, seen, raw_cache);
+    var copied = copy_objects(src_db, dst_db, hashes, raw_cache);
 
     patra_close(dst_db);
 

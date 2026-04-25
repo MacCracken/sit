@@ -4,6 +4,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.7] — 2026-04-25
+
+P-04 perf release: walk-reachable now caches the compressed bytes it pulled and shares them with `copy_objects`, so commits + trees aren't re-read from the source DB. **`sit clone-100commits`: −21.7%** (215.27 → 168.53 ms min, 13.64x git → 11.08x git).
+
+### Performance
+
+- **P-04** — `walk_reachable_*` was decompressing every commit + tree, which internally pulled the compressed bytes from `src_db` via `db_object_read_raw`. Then `copy_objects` re-read the same bytes for the insert into `dst_db` — every commit + tree was paying for two source-DB reads instead of one. Fix lands in three pieces in `src/wire.cyr`:
+  1. New `db_object_read_both(db, hex, raw_out, deco_out)` returns BOTH the compressed bytes (formerly thrown away after the internal call) AND the decompressed view. `db_object_read_decompressed` becomes a thin wrapper.
+  2. `walk_reachable_tree` and `walk_reachable_from_commit` gain a `raw_cache` parameter; they call `db_object_read_both` and stuff the raw bytes into the cache keyed by hex.
+  3. `copy_objects` gains a matching `raw_cache` parameter; checks the cache first per object and skips the source-DB read on hit. Cache misses (blobs only — walk doesn't visit them) fall back to `db_object_read_raw` as before.
+- **Concrete savings on the 100-commit / 100-file fixture**: 500 source SQL ops → 300 (−40%). Wall-clock goes from 215ms to 169ms (−21.7%). Bigger than the naive "saved page fetch only" projection because each cache hit also avoids SQL parse + B+ tree walk + result-set setup (~150µs per saved op × 200 saved ops).
+- Other ops within run-to-run noise as expected: `log` doesn't use walk_reachable (uses commit-chain `read_object` walk, already cached at the patra-handle level since v0.6.4); `status` / `add` are dep-side bound (sigil + sankoch).
+
+Bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.7.md`](docs/benchmarks/2026-04-25-v0.6.7.md).
+
+### Cumulative scoreboard (0.6.0 → 0.6.7)
+
+`log` **-16%**, `clone` **-32%**, everything else within noise (dep-side bound or already past sit's ceiling).
+
 ## [0.6.6] — 2026-04-25
 
 P-10 + P-18 perf release. Two hot-path lookups moved from O(N²) to O(N). **No measurable improvement on the 100-file synthetic bench** — the fixture is too small to show the win — but the change is real and substantial at repo scale (1000+ tracked files).

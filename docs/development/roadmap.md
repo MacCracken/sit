@@ -6,6 +6,14 @@ Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHAN
 
 ## Released
 
+### v0.6.7 — P-04: walk-reachable compressed-bytes cache
+
+- New `db_object_read_both(db, hex, raw_out, deco_out)` in `src/wire.cyr` returns BOTH compressed (formerly thrown away after the internal call) AND decompressed view. `db_object_read_decompressed` becomes a thin wrapper.
+- `walk_reachable_tree` + `walk_reachable_from_commit` gained a `raw_cache` parameter; they call `db_object_read_both` and stuff the raw bytes into the cache keyed by hex. `copy_objects` checks cache first; cache misses (blobs only — walk doesn't visit them) fall back to `db_object_read_raw`. Caller (`do_fetch`, `do_push`) creates a fresh `map_new()` per operation and passes it through.
+- **Win**: `sit clone-100commits` **−21.7%** (215.27 → 168.53 ms min, 13.64x git → 11.08x git). 500 source SQL ops → 300 (−40%). Other ops within noise.
+- Cumulative 0.6.0 → 0.6.7: `log` **−16%**, `clone` **−32%**.
+- Bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.7.md`](../benchmarks/2026-04-25-v0.6.7.md).
+
 ### v0.6.6 — P-10 + P-18: hashmap-backed lookups
 
 - **P-10**: `src/tree.cyr:tree_find` lazily builds a name → entry hashmap per entries vec, cached by vec pointer for the process lifetime. Hot callers (`cmd_status`, `cmd_diff`, `materialize_target`, merge three-way loops) drop from O(N²) total to O(N).
@@ -132,7 +140,7 @@ When any of those ship, sit can drop the corresponding workaround / get a measur
 
 - ~~**P-03** `copy_objects`~~ — **shipped in v0.6.5** (see Released above). Partial: the transaction wrap + outer has-check drop landed; the batched `WHERE hash IN (...)` pre-filter is deferred (would need 60-hash chunking per patra's 128-token / 4096-byte SQL parser limits). When patra grows `INSERT OR IGNORE` / `UPSERT`, the inner has-check goes away too.
 - **P-06** + **P-15** Smarter decompression sizing (read the framing length prefix instead of `blen * 16` + retry); route LCS DP table through `fl_alloc` / `fl_free` so diff-heavy commands don't permanently reserve bump memory. Targets diff / clone.
-- **P-04** `walk_reachable_from_commit` decompresses every commit/tree in the history just to parse 1-2 header lines. Denormalize tree/parent hex into the patra schema, or cache decompressed objects during the walk.
+- ~~**P-04** `walk_reachable_from_commit`~~ — **shipped in v0.6.7** (see Released above). Cached compressed bytes during the walk, shared with `copy_objects`. Final clone ratio 11.08x git (from 16.13x at v0.6.4 entry).
 - ~~**P-10 + P-18**~~ — **shipped in v0.6.6** (see Released above). Hashmap-backed `tree_find` + `three_way_path_set`. No 100-file bench movement; substantial at scale (1000-file `cmd_status` ~5ms → ~0.3ms on the tree_find piece).
 - **P-11** `sit add` index upsert without full rewrite (needs patra UPSERT; if patra doesn't have it, push on their roadmap).
 - **P-17** Buffered stdout to coalesce per-line `write(2)` syscalls (3000+ for a 500-line diff).
