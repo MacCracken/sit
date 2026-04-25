@@ -4,13 +4,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.6.13] — 2026-04-25 — cyrius 5.7.0 (sandhi fold) toolchain bump
+## [0.7.0] — 2026-04-25 — sandhi-fold unlock, v0.7.x line opens
 
-**Toolchain-only release. No sit source changes.** Picks up cyrius 5.7.0 — "the sandhi fold" — which vendors `sandhi` v1.0.0 into the stdlib as `lib/sandhi.cyr` and deletes `lib/http_server.cyr` from the stdlib (per [sandhi ADR 0002](https://github.com/MacCracken/sandhi/blob/main/docs/adr/0002-clean-break-fold-at-cyrius-v5-7-0.md)).
+**Minor-line opener. Toolchain-only — no sit source changes yet.** This release marks the v0.6.x perf arc closed and the v0.7.x network-transport line open. The release content is just the cyrius 5.7.0 ("the sandhi fold") pickup; the actual HTTP/SSH transport work lands in subsequent v0.7.x releases now that sandhi is reachable from stdlib.
+
+### Why 0.7.0 now (not 0.6.13)
+
+The v0.7.0 ship target on the roadmap was **network transport (HTTP/SSH)**, gated on sandhi being reachable from a sit consumer. Cyrius 5.7.0 vendored `sandhi` v1.0.0 into the stdlib as `lib/sandhi.cyr` (per [sandhi ADR 0002](https://github.com/MacCracken/sandhi/blob/main/docs/adr/0002-clean-break-fold-at-cyrius-v5-7-0.md)), which removes that gate. From here, opting sit into sandhi is a one-line addition (`"sandhi"` in the inline `[deps].stdlib`), not a new git-pinned `[deps.sandhi]` crate — sandhi entered maintenance mode at the fold; future surface patches ship via cyrius releases.
 
 ### Changed
 
-- **cyrius 5.6.43 → 5.7.0**: pin bumped in `cyrius.cyml`. Self-host fixpoint stable at 531,888 B; cyrius `check.sh` 26/26 green upstream.
+- **cyrius 5.6.43 → 5.7.0**: pin bumped in `cyrius.cyml`. Self-host fixpoint stable at 531,888 B upstream; cyrius `check.sh` 26/26 green.
 
 ### Removed
 
@@ -21,9 +25,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Build: clean. Test: 101/101 pass. DCE binary: **707 KB** (down from 710 KB — small drop from 5.7.0's stdlib reshape; not a perf claim, just an observation).
 - No runtime behavior change. No public-surface change. No dep-pin change beyond cyrius itself.
 
-### Sandhi posture
+### Up next (v0.7.x line)
 
-Sit has no HTTP code today (`grep -E 'http|sandhi|ws' src/ tests/` clean). With 5.7.0, sandhi is **bundled in the stdlib** as `lib/sandhi.cyr` — when the v0.7.0 network-transport (HTTP/SSH) work begins, sit will opt in by adding `"sandhi"` to the inline `[deps].stdlib` list in `cyrius.cyml`. **No `[deps.sandhi]` git pin needed** (the sandhi repo entered maintenance mode at the fold; subsequent surface patches ship via cyrius releases). Deferred per "ONE change at a time" — adding a dep with no callers is premature.
+Network transport: HTTP fetch/push first (sandhi `sandhi_http_get` / `_post`); SSH transport second. The v0.7.0 release itself is intentionally hollow on transport — it's the unlock marker — so v0.7.1 is the first feature-bearing patch in the line.
 
 ## [0.6.12] — 2026-04-25 — sigil SHA-NI + sankoch 2.1 throughput release
 
