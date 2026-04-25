@@ -271,9 +271,9 @@ fn print_indented_message(body, msg_start, body_len) {
             if (load8(body + msg_start + mnl) == 10) { break; }
             mnl = mnl + 1;
         }
-        syscall(SYS_WRITE, STDOUT, "    ", 4);
-        syscall(SYS_WRITE, STDOUT, body + msg_start + mp, mnl - mp);
-        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        stdout_write("    ", 4);
+        stdout_write(body + msg_start + mp, mnl - mp);
+        stdout_write("\n", 1);
         mp = mnl + 1;
     }
     return 0;
@@ -346,41 +346,41 @@ fn parse_commit_body(body, body_len, out) {
 
 # Print the "commit <hex> / Author: / Date: / [Signature: ...] / blank / message" block.
 fn print_commit_header(commit_hex, info, body, body_len) {
-    syscall(SYS_WRITE, STDOUT, "commit ", 7);
-    syscall(SYS_WRITE, STDOUT, commit_hex, 64);
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    stdout_write("commit ", 7);
+    stdout_write(commit_hex, 64);
+    stdout_write("\n", 1);
 
     var pk[32];
     var vr = verify_commit_body(body, body_len, &pk);
     if (vr == 1) {
         var pk_hex = hex_encode(&pk, 32);
-        syscall(SYS_WRITE, STDOUT, "Signature: good (key ", 21);
-        syscall(SYS_WRITE, STDOUT, pk_hex, 12);
-        syscall(SYS_WRITE, STDOUT, ")\n", 2);
+        stdout_write("Signature: good (key ", 21);
+        stdout_write(pk_hex, 12);
+        stdout_write(")\n", 2);
     }
     if (vr == 0) {
         var pk_hex = hex_encode(&pk, 32);
-        syscall(SYS_WRITE, STDOUT, "Signature: BAD (key ", 20);
-        syscall(SYS_WRITE, STDOUT, pk_hex, 12);
-        syscall(SYS_WRITE, STDOUT, ")\n", 2);
+        stdout_write("Signature: BAD (key ", 20);
+        stdout_write(pk_hex, 12);
+        stdout_write(")\n", 2);
     }
 
     var ident = load64(info + 16);
     if (ident != 0) {
         var ts = load64(info + 24);
-        syscall(SYS_WRITE, STDOUT, "Author: ", 8);
+        stdout_write("Author: ", 8);
         # S-21: author identity is attacker-controlled in a cloned commit.
         # Scrub control chars so a crafted commit can't forge log lines
         # via \r\n or drive terminal-escape attacks via \x1b[.
         write_sanitized(STDOUT, ident, strlen(ident));
-        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        stdout_write("\n", 1);
         var iso = iso8601(ts);
-        syscall(SYS_WRITE, STDOUT, "Date:   ", 8);
-        syscall(SYS_WRITE, STDOUT, iso, strlen(iso));
-        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        stdout_write("Date:   ", 8);
+        stdout_write(iso, strlen(iso));
+        stdout_write("\n", 1);
     }
 
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    stdout_write("\n", 1);
     var msg_start = load64(info + 40);
     if (msg_start > 0) {
         print_indented_message(body, msg_start, body_len);
@@ -390,8 +390,8 @@ fn print_commit_header(commit_hex, info, body, body_len) {
 
 # Print a one-line summary of a commit: "<hex12> <first line of message>".
 fn print_commit_oneline(commit_hex, body, body_len, msg_start) {
-    syscall(SYS_WRITE, STDOUT, commit_hex, 12);
-    syscall(SYS_WRITE, STDOUT, " ", 1);
+    stdout_write(commit_hex, 12);
+    stdout_write(" ", 1);
     if (msg_start > 0) {
         var p = msg_start;
         while (p < body_len) {
@@ -406,10 +406,10 @@ fn print_commit_oneline(commit_hex, body, body_len, msg_start) {
         }
         var subj_len = first_nl - msg_start;
         if (subj_len > 0) {
-            syscall(SYS_WRITE, STDOUT, body + msg_start, subj_len);
+            stdout_write(body + msg_start, subj_len);
         }
     }
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    stdout_write("\n", 1);
     return 0;
 }
 
@@ -498,7 +498,7 @@ fn cmd_log() {
             print_commit_oneline(current_hex, body, body_len, load64(&info + 40));
         }
         else {
-            if (first == 0) { syscall(SYS_WRITE, STDOUT, "\n", 1); }
+            if (first == 0) { stdout_write("\n", 1); }
             first = 0;
             print_commit_header(current_hex, &info, body, body_len);
         }
@@ -625,28 +625,28 @@ fn cmd_commit() {
     }
 
     var branch = current_branch_name();
-    syscall(SYS_WRITE, STDOUT, "[", 1);
-    if (branch != 0) { syscall(SYS_WRITE, STDOUT, branch, strlen(branch)); }
-    else             { syscall(SYS_WRITE, STDOUT, "detached", 8); }
-    syscall(SYS_WRITE, STDOUT, " ", 1);
+    stdout_write("[", 1);
+    if (branch != 0) { stdout_write(branch, strlen(branch)); }
+    else             { stdout_write("detached", 8); }
+    stdout_write(" ", 1);
     if (merge_parent != 0) {
-        syscall(SYS_WRITE, STDOUT, "(merge) ", 8);
+        stdout_write("(merge) ", 8);
     }
     else {
         if (parent_hex == 0) {
-            syscall(SYS_WRITE, STDOUT, "(root-commit) ", 14);
+            stdout_write("(root-commit) ", 14);
         }
     }
-    syscall(SYS_WRITE, STDOUT, commit_hex, 12);
-    syscall(SYS_WRITE, STDOUT, "] ", 2);
+    stdout_write(commit_hex, 12);
+    stdout_write("] ", 2);
     var msg_len = strlen(message);
-    syscall(SYS_WRITE, STDOUT, message, msg_len);
+    stdout_write(message, msg_len);
     if (msg_len > 0) {
         if (load8(message + msg_len - 1) != 10) {
-            syscall(SYS_WRITE, STDOUT, "\n", 1);
+            stdout_write("\n", 1);
         }
     }
-    else { syscall(SYS_WRITE, STDOUT, "\n", 1); }
+    else { stdout_write("\n", 1); }
     return 0;
 }
 

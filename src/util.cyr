@@ -27,6 +27,43 @@ fn strnlen(s, max) {
     return max;
 }
 
+# P-17: buffered stdout. Without this, sit's command output is dozens to
+# thousands of separate syscall(SYS_WRITE, STDOUT, ...) calls — `cmd_diff`
+# on a 500-line edit emits 3000+ writes. With a single 64KB heap buffer +
+# explicit flush at command end, the same workload lands in a handful of
+# syscalls. STDERR (eprintln) stays direct so error output is immediate
+# even when the process is being killed mid-command.
+var STDOUT_BUF_SIZE = 65536;
+var _stdout_buf = 0;
+var _stdout_pos = 0;
+
+fn stdout_write(data, len) {
+    if (len <= 0) { return 0; }
+    if (_stdout_buf == 0) {
+        _stdout_buf = alloc_or_die(STDOUT_BUF_SIZE);
+    }
+    # Writes larger than the buffer go straight to the kernel after a flush
+    # of any pending bytes — no point copying into a buffer we'd just empty.
+    if (len >= STDOUT_BUF_SIZE) {
+        stdout_flush();
+        syscall(SYS_WRITE, STDOUT, data, len);
+        return 0;
+    }
+    if (_stdout_pos + len > STDOUT_BUF_SIZE) {
+        stdout_flush();
+    }
+    memcpy(_stdout_buf + _stdout_pos, data, len);
+    _stdout_pos = _stdout_pos + len;
+    return 0;
+}
+
+fn stdout_flush() {
+    if (_stdout_pos == 0) { return 0; }
+    syscall(SYS_WRITE, STDOUT, _stdout_buf, _stdout_pos);
+    _stdout_pos = 0;
+    return 0;
+}
+
 # S-17: alloc-or-die wrapper for the common case where OOM is unrecoverable
 # (no transactional rollback in sit; a half-filled buffer will be memcpy'd
 # from address 0 if alloc returns null and we don't notice). Use this at
@@ -160,26 +197,30 @@ fn sort_cstrings(vec) {
     return 0;
 }
 
-# Write a sanitized copy of `bytes[len]` to stdout, replacing ASCII control
-# chars (< 0x20 except \t, plus \x7f, plus ESC 0x1b specifically) with '?'.
-# Used (S-21) for attacker-controlled commit body fragments like Author
-# identity so a malicious commit can't emit ANSI escape sequences that
-# forge log output or manipulate the terminal.
+# Write a sanitized copy of `bytes[len]` to `fd`, replacing ASCII control
+# chars (< 0x20 except \t, plus \x7f) with '?'. Used (S-21) for attacker-
+# controlled commit body fragments like Author identity so a malicious commit
+# can't emit ANSI escape sequences that forge log output or manipulate the
+# terminal. Builds the sanitized output into a heap buffer in one pass and
+# emits via a single write — both for perf (no per-char syscall) and so the
+# STDOUT path stays in order with the surrounding stdout_write calls (P-17).
 fn write_sanitized(fd, bytes, len) {
+    if (len <= 0) { return 0; }
+    var out = alloc_or_die(len);
     var i = 0;
     while (i < len) {
         var c = load8(bytes + i) & 0xFF;
         var emit = c;
         if (c < 32) {
-            if (c == 9) { } # allow tab
-            else { emit = 63; } # '?'
+            if (c == 9) { }              # allow tab
+            else { emit = 63; }           # '?'
         }
         if (c == 127) { emit = 63; }
-        var single[1];
-        store8(&single, emit);
-        syscall(SYS_WRITE, fd, &single, 1);
+        store8(out + i, emit);
         i = i + 1;
     }
+    if (fd == STDOUT) { stdout_write(out, len); }
+    else { syscall(SYS_WRITE, fd, out, len); }
     return 0;
 }
 

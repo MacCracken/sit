@@ -80,11 +80,11 @@ fn cmd_add() {
         return 1;
     }
 
-    syscall(SYS_WRITE, STDOUT, "added ", 6);
-    syscall(SYS_WRITE, STDOUT, hex, 12);
-    syscall(SYS_WRITE, STDOUT, " ", 1);
-    syscall(SYS_WRITE, STDOUT, path, path_len);
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    stdout_write("added ", 6);
+    stdout_write(hex, 12);
+    stdout_write(" ", 1);
+    stdout_write(path, path_len);
+    stdout_write("\n", 1);
     return 0;
 }
 
@@ -368,9 +368,9 @@ fn cmd_reset() {
             return 1;
         }
         materialize_target(&hex);
-        syscall(SYS_WRITE, STDOUT, "HEAD reset --hard to ", 21);
-        syscall(SYS_WRITE, STDOUT, &hex, 12);
-        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        stdout_write("HEAD reset --hard to ", 21);
+        stdout_write(&hex, 12);
+        stdout_write("\n", 1);
         return 0;
     }
 
@@ -417,9 +417,9 @@ fn cmd_reset() {
         eprintln("sit: failed to update index");
         return 1;
     }
-    syscall(SYS_WRITE, STDOUT, "unstaged '", 10);
-    syscall(SYS_WRITE, STDOUT, path, path_len);
-    syscall(SYS_WRITE, STDOUT, "'\n", 2);
+    stdout_write("unstaged '", 10);
+    stdout_write(path, path_len);
+    stdout_write("'\n", 2);
     return 0;
 }
 
@@ -496,9 +496,9 @@ fn cmd_rm() {
         }
     }
 
-    syscall(SYS_WRITE, STDOUT, "rm '", 4);
-    syscall(SYS_WRITE, STDOUT, path, path_len);
-    syscall(SYS_WRITE, STDOUT, "'\n", 2);
+    stdout_write("rm '", 4);
+    stdout_write(path, path_len);
+    stdout_write("'\n", 2);
     return 0;
 }
 

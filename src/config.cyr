@@ -199,8 +199,8 @@ fn config_file_list(path) {
         var start = skip_ws(data, pos, stop);
         if (start < stop) {
             if (load8(data + start) != 35) {
-                syscall(SYS_WRITE, STDOUT, data + pos, le - pos);
-                if (le < len) { syscall(SYS_WRITE, STDOUT, "\n", 1); }
+                stdout_write(data + pos, le - pos);
+                if (le < len) { stdout_write("\n", 1); }
             }
         }
         pos = le + 1;
@@ -328,8 +328,8 @@ fn cmd_config() {
         if (global == 1) { val = config_file_get(path, key); }
         else             { val = config_get(key); }
         if (val == 0) { return 1; }
-        syscall(SYS_WRITE, STDOUT, val, strlen(val));
-        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        stdout_write(val, strlen(val));
+        stdout_write("\n", 1);
         return 0;
     }
 

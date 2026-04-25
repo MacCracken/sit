@@ -239,7 +239,7 @@ fn cmd_cat_file() {
     var buf = load64(&obj);
     var blen = load64(&obj + 8);
     var coff = load64(&obj + 16);
-    syscall(SYS_WRITE, STDOUT, buf + coff, blen - coff);
+    stdout_write(buf + coff, blen - coff);
     return 0;
 }
 
@@ -341,7 +341,7 @@ fn cmd_owl_file() {
     if (owl == 0) {
         eprintln("sit: owl not installed — emitting raw content");
         eprintln("sit:   (owl is pre-1.0; https://github.com/MacCracken/owl)");
-        syscall(SYS_WRITE, STDOUT, content, content_len);
+        stdout_write(content, content_len);
         if (sys_unlink(tmppath) != 0) {
             eprintln("sit: warning: failed to remove owl tempfile");
         }
@@ -505,7 +505,7 @@ fn cmd_fsck() {
 
     var db = get_object_db();
     if (db == 0) {
-        syscall(SYS_WRITE, STDOUT, "checked 0 objects, 0 bad\n", 25);
+        stdout_write("checked 0 objects, 0 bad\n", 25);
         return 0;
     }
 
@@ -557,11 +557,11 @@ fn cmd_fsck() {
         hi = hi + 1;
     }
 
-    syscall(SYS_WRITE, STDOUT, "checked ", 8);
+    stdout_write("checked ", 8);
     write_unsigned(total);
-    syscall(SYS_WRITE, STDOUT, " objects, ", 10);
+    stdout_write(" objects, ", 10);
     write_unsigned(bad);
-    syscall(SYS_WRITE, STDOUT, " bad\n", 5);
+    stdout_write(" bad\n", 5);
 
     if (bad > 0) { return 1; }
     return 0;

@@ -4,6 +4,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.8] — 2026-04-25
+
+P-17 perf release: buffered stdout. 200+ direct `syscall(SYS_WRITE, STDOUT, ...)` call sites across nine source files swapped to a single buffered `stdout_write(data, len)` helper. **No measurable bench movement on current fixtures** — the synthetic `diff-edit` is too small to show the win — but the change is structural and right. Caught and fixed a real output-ordering bug in `write_sanitized` along the way.
+
+### Performance
+
+- **P-17** — added `stdout_write(data, len)` and `stdout_flush()` helpers in `src/util.cyr` backed by a 64KB lazy-allocated heap buffer. Auto-flushes on buffer-full; large writes (≥ buffer size) flush pending bytes and go straight to the kernel without buffering. `src/main.cyr` trailer flushes before `SYS_EXIT`. STDERR (`eprintln`) stays direct so error output is immediate.
+- Bulk-replaced `syscall(SYS_WRITE, STDOUT, ` → `stdout_write(` across `diff.cyr` (54), `wire.cyr` (37), `commit.cyr` (34), `refs.cyr` (24), `sign.cyr` (22), `index.cyr` (14), `merge.cyr` (11), `object_db.cyr` (6), `config.cyr` (4). 206 sites total.
+- **`write_sanitized` rewrite**: was emitting one byte per `syscall(SYS_WRITE, fd, &single, 1)` — a buffer-bypass AND a perf footgun. Now builds the sanitized bytes into a heap buffer in one pass and emits via a single write (through `stdout_write` when fd == STDOUT, direct otherwise). Caught an output-ordering bug introduced by the bulk swap: `print_commit_header` was calling `stdout_write("Author: ", 8)` (buffered) then `write_sanitized(STDOUT, ident, ...)` (direct, unbuffered) — the unbuffered author bytes hit stdout before the buffered "Author: " prefix did. Fix in the same change.
+
+**Why the bench didn't move**: audit's "3000+ writes for a 500-line diff" estimate was for diffs with many hunks. The bench fixture is a 500-line file with ONE changed line → actual output is one hunk ≈ 30 writes ≈ 30µs at the syscall level — already under the noise floor of `diff-edit`'s 13ms total. Ad-hoc test on a 2000-line file with 1000 changes (45KB output) lands ~185ms; without buffering would be ~1000 syscalls = a few ms saved. Visible at scale, not in the synthetic bench.
+
+Structural benefit beyond wall-clock: lower system-wide syscall pressure, reduced context-switch cost, and the buffer guarantees in-order writes (which is what surfaced the `write_sanitized` ordering bug — a problem the unbuffered version had been hiding by virtue of small per-call writes mostly coalescing in the terminal).
+
+Bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.8.md`](docs/benchmarks/2026-04-25-v0.6.8.md).
+
+### Cumulative scoreboard (0.6.0 → 0.6.8)
+
+`log` **-17%**, `clone` **-32%**. Other ops within noise but trending slightly favorable across releases.
+
 ## [0.6.7] — 2026-04-25
 
 P-04 perf release: walk-reachable now caches the compressed bytes it pulled and shares them with `copy_objects`, so commits + trees aren't re-read from the source DB. **`sit clone-100commits`: −21.7%** (215.27 → 168.53 ms min, 13.64x git → 11.08x git).

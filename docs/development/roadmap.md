@@ -6,6 +6,14 @@ Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHAN
 
 ## Released
 
+### v0.6.8 — P-17: buffered stdout
+
+- 206 `syscall(SYS_WRITE, STDOUT, ...)` sites across 9 src files swapped to a single buffered `stdout_write(data, len)` helper backed by a 64KB heap buffer (`src/util.cyr`). Auto-flush on buffer-full; large writes go straight to the kernel after flushing pending bytes. `main.cyr` trailer flushes before `SYS_EXIT`. STDERR stays direct.
+- `write_sanitized` rewritten to build a sanitized copy in one heap buffer + single `stdout_write` (was emitting one byte per syscall + bypassing the buffer entirely). Caught an output-ordering bug introduced by the bulk swap (`print_commit_header` was emitting author bytes before the "Author: " prefix because `write_sanitized` was unbuffered while the surrounding writes were); fixed in the same change.
+- **No measurable bench movement** on the 100-file synthetic — the `diff-edit` fixture only emits ~30 writes per run. Real win at scale (1000+ line diffs ~ 1000+ syscalls collapsed). Structural improvement (lower syscall pressure, in-order output guarantee).
+- Cumulative 0.6.0 → 0.6.8: `log` **−17%**, `clone` **−32%**.
+- Bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.8.md`](../benchmarks/2026-04-25-v0.6.8.md).
+
 ### v0.6.7 — P-04: walk-reachable compressed-bytes cache
 
 - New `db_object_read_both(db, hex, raw_out, deco_out)` in `src/wire.cyr` returns BOTH compressed (formerly thrown away after the internal call) AND decompressed view. `db_object_read_decompressed` becomes a thin wrapper.
@@ -143,7 +151,7 @@ When any of those ship, sit can drop the corresponding workaround / get a measur
 - ~~**P-04** `walk_reachable_from_commit`~~ — **shipped in v0.6.7** (see Released above). Cached compressed bytes during the walk, shared with `copy_objects`. Final clone ratio 11.08x git (from 16.13x at v0.6.4 entry).
 - ~~**P-10 + P-18**~~ — **shipped in v0.6.6** (see Released above). Hashmap-backed `tree_find` + `three_way_path_set`. No 100-file bench movement; substantial at scale (1000-file `cmd_status` ~5ms → ~0.3ms on the tree_find piece).
 - **P-11** `sit add` index upsert without full rewrite (needs patra UPSERT; if patra doesn't have it, push on their roadmap).
-- **P-17** Buffered stdout to coalesce per-line `write(2)` syscalls (3000+ for a 500-line diff).
+- ~~**P-17** Buffered stdout~~ — **shipped in v0.6.8** (see Released above). 64KB heap buffer in `src/util.cyr`; 206 direct stdout writes routed through it. No 100-file bench movement (fixture too small); structural improvement + win at scale.
 - Re-bench after each change; gate on no regression vs. the v0.6.4 snapshot.
 
 ### ADRs to write (concurrent with v0.5.2)

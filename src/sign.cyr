@@ -241,13 +241,13 @@ fn cmd_key_generate() {
         return 1;
     }
 
-    syscall(SYS_WRITE, STDOUT, "generated ed25519 key ", 22);
-    syscall(SYS_WRITE, STDOUT, pub_hex, 12);
-    syscall(SYS_WRITE, STDOUT, "\n  private: ", 12);
-    syscall(SYS_WRITE, STDOUT, priv_path, strlen(priv_path));
-    syscall(SYS_WRITE, STDOUT, " (0600)\n  public:  ", 19);
-    syscall(SYS_WRITE, STDOUT, pub_path, strlen(pub_path));
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    stdout_write("generated ed25519 key ", 22);
+    stdout_write(pub_hex, 12);
+    stdout_write("\n  private: ", 12);
+    stdout_write(priv_path, strlen(priv_path));
+    stdout_write(" (0600)\n  public:  ", 19);
+    stdout_write(pub_path, strlen(pub_path));
+    stdout_write("\n", 1);
     return 0;
 }
 
@@ -258,8 +258,8 @@ fn cmd_key_show() {
         return 1;
     }
     var hex = hex_encode(pk, 32);
-    syscall(SYS_WRITE, STDOUT, hex, 64);
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    stdout_write(hex, 64);
+    stdout_write("\n", 1);
     return 0;
 }
 
@@ -308,24 +308,24 @@ fn cmd_verify_commit() {
     var pk[32];
     var vr = verify_commit_body(body, body_len, &pk);
     if (vr == 0 - 1) {
-        syscall(SYS_WRITE, STDOUT, "no signature on ", 16);
-        syscall(SYS_WRITE, STDOUT, &hex, 12);
-        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        stdout_write("no signature on ", 16);
+        stdout_write(&hex, 12);
+        stdout_write("\n", 1);
         return 1;
     }
     var pk_hex = hex_encode(&pk, 32);
     if (vr == 1) {
-        syscall(SYS_WRITE, STDOUT, "good signature on ", 18);
-        syscall(SYS_WRITE, STDOUT, &hex, 12);
-        syscall(SYS_WRITE, STDOUT, " (key ", 6);
-        syscall(SYS_WRITE, STDOUT, pk_hex, 64);
-        syscall(SYS_WRITE, STDOUT, ")\n", 2);
+        stdout_write("good signature on ", 18);
+        stdout_write(&hex, 12);
+        stdout_write(" (key ", 6);
+        stdout_write(pk_hex, 64);
+        stdout_write(")\n", 2);
         return 0;
     }
-    syscall(SYS_WRITE, STDOUT, "BAD signature on ", 17);
-    syscall(SYS_WRITE, STDOUT, &hex, 12);
-    syscall(SYS_WRITE, STDOUT, " (key ", 6);
-    syscall(SYS_WRITE, STDOUT, pk_hex, 64);
-    syscall(SYS_WRITE, STDOUT, ")\n", 2);
+    stdout_write("BAD signature on ", 17);
+    stdout_write(&hex, 12);
+    stdout_write(" (key ", 6);
+    stdout_write(pk_hex, 64);
+    stdout_write(")\n", 2);
     return 1;
 }

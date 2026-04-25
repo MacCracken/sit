@@ -121,18 +121,18 @@ fn push_status_item(vec, label, path) {
 
 fn print_labeled_section(title, title_len, items) {
     if (vec_len(items) == 0) { return 0; }
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
-    syscall(SYS_WRITE, STDOUT, title, title_len);
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    stdout_write("\n", 1);
+    stdout_write(title, title_len);
+    stdout_write("\n", 1);
     var si = 0;
     while (si < vec_len(items)) {
         var it = vec_get(items, si);
         var lab = load64(it);
         var pth = load64(it + 8);
-        syscall(SYS_WRITE, STDOUT, "  ", 2);
-        syscall(SYS_WRITE, STDOUT, lab, strlen(lab));
-        syscall(SYS_WRITE, STDOUT, pth, strlen(pth));
-        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        stdout_write("  ", 2);
+        stdout_write(lab, strlen(lab));
+        stdout_write(pth, strlen(pth));
+        stdout_write("\n", 1);
         si = si + 1;
     }
     return 1;
@@ -140,15 +140,15 @@ fn print_labeled_section(title, title_len, items) {
 
 fn print_name_section(title, title_len, names) {
     if (vec_len(names) == 0) { return 0; }
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
-    syscall(SYS_WRITE, STDOUT, title, title_len);
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    stdout_write("\n", 1);
+    stdout_write(title, title_len);
+    stdout_write("\n", 1);
     var si = 0;
     while (si < vec_len(names)) {
         var nm = vec_get(names, si);
-        syscall(SYS_WRITE, STDOUT, "  ", 2);
-        syscall(SYS_WRITE, STDOUT, nm, strlen(nm));
-        syscall(SYS_WRITE, STDOUT, "\n", 1);
+        stdout_write("  ", 2);
+        stdout_write(nm, strlen(nm));
+        stdout_write("\n", 1);
         si = si + 1;
     }
     return 1;
@@ -231,16 +231,16 @@ fn cmd_status() {
     }
 
     var branch = current_branch_name();
-    syscall(SYS_WRITE, STDOUT, "On branch ", 10);
-    if (branch != 0) { syscall(SYS_WRITE, STDOUT, branch, strlen(branch)); }
-    else             { syscall(SYS_WRITE, STDOUT, "(detached)", 10); }
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    stdout_write("On branch ", 10);
+    if (branch != 0) { stdout_write(branch, strlen(branch)); }
+    else             { stdout_write("(detached)", 10); }
+    stdout_write("\n", 1);
     if (read_head_ref() == 0) {
-        syscall(SYS_WRITE, STDOUT, "No commits yet\n", 15);
+        stdout_write("No commits yet\n", 15);
     }
     if (read_merge_head() != 0) {
         var msg = "Merge in progress. Resolve conflicts and commit, or run 'sit merge --abort'.\n";
-        syscall(SYS_WRITE, STDOUT, msg, strlen(msg));
+        stdout_write(msg, strlen(msg));
     }
 
     var any = 0;
@@ -249,7 +249,7 @@ fn cmd_status() {
     if (print_name_section("Untracked files:", 16, untracked) == 1)      { any = 1; }
 
     if (any == 0) {
-        syscall(SYS_WRITE, STDOUT, "\nnothing to commit, working tree clean\n", 39);
+        stdout_write("\nnothing to commit, working tree clean\n", 39);
     }
     return 0;
 }
@@ -526,7 +526,7 @@ fn hunk_ranges(hunk, out) {
 fn write_unsigned(n) {
     var buf[24];
     var digits = write_decimal(&buf, n);
-    syscall(SYS_WRITE, STDOUT, &buf, digits);
+    stdout_write(&buf, digits);
     return 0;
 }
 
@@ -535,29 +535,29 @@ fn print_hunk_header(hunk) {
     hunk_ranges(hunk, &r);
     var old_len = load64(&r + 8);
     var new_len = load64(&r + 24);
-    syscall(SYS_WRITE, STDOUT, "@@ -", 4);
+    stdout_write("@@ -", 4);
     write_unsigned(load64(&r));
     # Git convention: omit ",1" when the count is 1.
     if (old_len != 1) {
-        syscall(SYS_WRITE, STDOUT, ",", 1);
+        stdout_write(",", 1);
         write_unsigned(old_len);
     }
-    syscall(SYS_WRITE, STDOUT, " +", 2);
+    stdout_write(" +", 2);
     write_unsigned(load64(&r + 16));
     if (new_len != 1) {
-        syscall(SYS_WRITE, STDOUT, ",", 1);
+        stdout_write(",", 1);
         write_unsigned(new_len);
     }
-    syscall(SYS_WRITE, STDOUT, " @@\n", 4);
+    stdout_write(" @@\n", 4);
     return 0;
 }
 
 fn print_file_diff(path, old_buf, old_len, new_buf, new_len) {
-    syscall(SYS_WRITE, STDOUT, "--- a/", 6);
-    syscall(SYS_WRITE, STDOUT, path, strlen(path));
-    syscall(SYS_WRITE, STDOUT, "\n+++ b/", 7);
-    syscall(SYS_WRITE, STDOUT, path, strlen(path));
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    stdout_write("--- a/", 6);
+    stdout_write(path, strlen(path));
+    stdout_write("\n+++ b/", 7);
+    stdout_write(path, strlen(path));
+    stdout_write("\n", 1);
 
     var a = split_lines(old_buf, old_len);
     var b = split_lines(new_buf, new_len);
@@ -582,11 +582,11 @@ fn print_file_diff(path, old_buf, old_len, new_buf, new_len) {
             var op = vec_get(hunk, ni);
             var kind = ann_kind(op);
             var l = ann_line(op);
-            if (kind == 0) { syscall(SYS_WRITE, STDOUT, " ", 1); }
-            if (kind == 1) { syscall(SYS_WRITE, STDOUT, "-", 1); }
-            if (kind == 2) { syscall(SYS_WRITE, STDOUT, "+", 1); }
-            syscall(SYS_WRITE, STDOUT, line_ptr(l), line_len(l));
-            syscall(SYS_WRITE, STDOUT, "\n", 1);
+            if (kind == 0) { stdout_write(" ", 1); }
+            if (kind == 1) { stdout_write("-", 1); }
+            if (kind == 2) { stdout_write("+", 1); }
+            stdout_write(line_ptr(l), line_len(l));
+            stdout_write("\n", 1);
             ni = ni + 1;
         }
         h = h + 1;
@@ -619,16 +619,16 @@ fn print_file_stat(path, old_buf, old_len, new_buf, new_len, out_pair) {
     }
     store64(out_pair, ins);
     store64(out_pair + 8, del);
-    syscall(SYS_WRITE, STDOUT, " ", 1);
-    syscall(SYS_WRITE, STDOUT, path, strlen(path));
-    syscall(SYS_WRITE, STDOUT, " | +", 4);
+    stdout_write(" ", 1);
+    stdout_write(path, strlen(path));
+    stdout_write(" | +", 4);
     var nbuf[24];
     var d = write_decimal(&nbuf, ins);
-    syscall(SYS_WRITE, STDOUT, &nbuf, d);
-    syscall(SYS_WRITE, STDOUT, " -", 2);
+    stdout_write(&nbuf, d);
+    stdout_write(" -", 2);
     d = write_decimal(&nbuf, del);
-    syscall(SYS_WRITE, STDOUT, &nbuf, d);
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    stdout_write(&nbuf, d);
+    stdout_write("\n", 1);
     return 0;
 }
 
@@ -945,7 +945,7 @@ fn cmd_show() {
     }
 
     print_commit_header(&hex, &info, body, body_len);
-    syscall(SYS_WRITE, STDOUT, "\n", 1);
+    stdout_write("\n", 1);
 
     var tree_hex = load64(&info);
     var new_entries = vec_new();
@@ -1037,18 +1037,18 @@ fn cmd_show() {
         if (tot_files > 0) {
             var sbuf[24];
             var sd = write_decimal(&sbuf, tot_files);
-            syscall(SYS_WRITE, STDOUT, " ", 1);
-            syscall(SYS_WRITE, STDOUT, &sbuf, sd);
-            if (tot_files == 1) { syscall(SYS_WRITE, STDOUT, " file changed, ", 15); }
-            else                { syscall(SYS_WRITE, STDOUT, " files changed, ", 16); }
+            stdout_write(" ", 1);
+            stdout_write(&sbuf, sd);
+            if (tot_files == 1) { stdout_write(" file changed, ", 15); }
+            else                { stdout_write(" files changed, ", 16); }
             sd = write_decimal(&sbuf, tot_ins);
-            syscall(SYS_WRITE, STDOUT, &sbuf, sd);
-            if (tot_ins == 1) { syscall(SYS_WRITE, STDOUT, " insertion(+), ", 15); }
-            else              { syscall(SYS_WRITE, STDOUT, " insertions(+), ", 16); }
+            stdout_write(&sbuf, sd);
+            if (tot_ins == 1) { stdout_write(" insertion(+), ", 15); }
+            else              { stdout_write(" insertions(+), ", 16); }
             sd = write_decimal(&sbuf, tot_del);
-            syscall(SYS_WRITE, STDOUT, &sbuf, sd);
-            if (tot_del == 1) { syscall(SYS_WRITE, STDOUT, " deletion(-)\n", 13); }
-            else              { syscall(SYS_WRITE, STDOUT, " deletions(-)\n", 14); }
+            stdout_write(&sbuf, sd);
+            if (tot_del == 1) { stdout_write(" deletion(-)\n", 13); }
+            else              { stdout_write(" deletions(-)\n", 14); }
         }
     }
     return 0;
