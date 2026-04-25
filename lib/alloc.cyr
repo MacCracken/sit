@@ -53,8 +53,13 @@ fn alloc(size) {
     if (new_ptr < ptr) { return 0; }
     _heap_ptr = new_ptr;
     if (_heap_ptr > _heap_end) {
-        # Grow heap by 1MB
-        var new_end = _heap_end + 0x100000;
+        # Grow to cover _heap_ptr, rounded up to the next 1MB boundary.
+        # v5.6.34: previously stepped by exactly 0x100000 regardless of
+        # how far past _heap_end the new_ptr was, so any alloc(>1MB) near
+        # the grow point returned a pointer past the brk — SIGSEGV on
+        # first tail-write. Rounding up to a 1MB grain keeps the
+        # brk-per-alloc churn low while always mapping enough space.
+        var new_end = (_heap_ptr + 0xFFFFF) & (0 - 0x100000);
         var result = syscall(12, new_end);
         if (result < new_end) {
             # brk failed — out of memory
