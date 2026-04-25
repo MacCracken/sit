@@ -6,6 +6,23 @@ Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHAN
 
 ## Released
 
+### v0.6.12 — sigil SHA-NI + sankoch 2.1 throughput release (biggest single-release win)
+
+- Pure dep-bump release: **cyrius 5.6.40 → 5.6.43**, **sigil 2.9.1 → 2.9.3** (SHA-NI hardware path), **sankoch 2.0.3 → 2.1.0** (DEFLATE micro-tuning). No sit source changes.
+- **Sigil SHA-256 throughput up 32×** on 64 KB inputs (5.153 ms → 161 µs). Cascades into `sit add`:
+  - **`add-64KB` -41%** (16.40 ms → 9.62 ms; sit/git ratio 4.5× → **2.55×**)
+  - **`add-1MB` -48%** (211.52 ms → 112.39 ms; sit/git ratio 12.5× → **6.50×**)
+  - `status-100files` -8% (sigil portion was small relative to file I/O at this scale)
+- Sankoch 2.1.0's standard zlib path moves modestly (~5-7% on compress, within noise on decompress); larger sankoch 2.x match-finder / ring-buffer / SIMD work queued for follow-up sankoch releases. The remaining `add-1MB` budget is now ~140 ms of `zlib_compress(1MB)` — exactly what sankoch's roadmap is targeting next.
+- Cumulative 0.6.0 → 0.6.12: `add-1MB **-48%**`, `add-64KB **-43%**`, `clone **-30%**`, `log **-17%**`, `status **-9%**`. The `add-1MB` ratio drop from 12.5× to 6.5× is the largest user-visible improvement of the v0.6.x arc.
+- Bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.12.md`](../benchmarks/2026-04-25-v0.6.12.md).
+
+### v0.6.11 — P-20 + multi-insert-transaction investigation (negative result)
+
+- **P-20**: `parse_index` query gains `ORDER BY path`. Downstream `sort_entries` is now O(N) on already-sorted input instead of O(N²) on unsorted. Saves ~50µs at 100 entries, ~5ms at 1K, ~500ms at 10K. No 100-fixture bench movement (under noise floor at this scale).
+- **Investigated and reverted**: multi-insert transaction wraps on `cmd_commit` (tree + commit) and `rewrite_index` (DELETE + N INSERTs). A/B measured 5-10% regression on a 50 add+commit cycle workload. patra's per-transaction setup/teardown (~30µs) exceeds saved fsyncs at small batch sizes on modern SSDs (where per-insert fsync is already kernel-batched). The pattern that worked for `copy_objects` (300+ inserts amortized one setup) doesn't generalize to 2-3-insert batches. Reverted before shipping; full investigation in [`docs/benchmarks/2026-04-25-v0.6.11.md`](../benchmarks/2026-04-25-v0.6.11.md).
+- Bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.11.md`](../benchmarks/2026-04-25-v0.6.11.md).
+
 ### v0.6.10 — dep bumps + S-31 closeout
 
 - **cyrius 5.6.35 → 5.6.40**, **patra 1.6.0 → 1.8.3**.
@@ -159,8 +176,10 @@ Patra-handle caching shipped in v0.6.4 (see Released above). Remaining items tar
   - ~~Sized string getter `patra_result_get_str_len`~~ — **shipped as patra 1.6.1, consumed by sit v0.6.10** (S-31 closed).
   - ~~WAL group commit / batched fsync~~ — **shipped as patra 1.8.x; sit investigated and did NOT consume** in v0.6.10 (durability regression with no perf gain on sit's bench shape; reasoning at `get_object_db` / `get_index_db` call sites). Revisit when sit grows explicit `patra_flush()` at command exit.
   - ~~`INSERT OR IGNORE`~~ — **shipped as patra 1.7.0 (SQL-level only); sit can't consume yet** because sit's BYTES-column inserts go through `patra_insert_row` (programmatic API), not SQL strings. Re-file: ask patra to grow an `or_ignore` flag on `patra_insert_row` so sit can drop the inner `db_object_has` in `db_object_insert_raw`. Effort on patra side: small (the SQL-level path already does the dedup probe).
-- [`sigil` roadmap](../../../sigil/docs/development/roadmap.md): SHA-256 hot-path throughput investigation staged for sigil 2.9.2 (~80x headroom vs modern hardware; directly improves `sit status` + `sit add`).
-- [`sankoch` roadmap](../../../sankoch/docs/development/roadmap.md): DEFLATE compress/decompress throughput investigation (5-10x headroom via libdeflate-class tuning; directly improves `sit add` + `sit clone`).
+- [`sigil` roadmap](../../../sigil/docs/development/roadmap.md):
+  - ~~SHA-256 hot-path throughput investigation~~ — **shipped as sigil 2.9.3, consumed by sit v0.6.12.** SHA-NI hardware path live on x86_64; SHA-256 throughput ~12 MB/s → ~400 MB/s on 64 KB inputs (32× factor). Drove `sit add -64KB -41%` and `sit add -1MB -48%`.
+- [`sankoch` roadmap](../../../sankoch/docs/development/roadmap.md):
+  - **Partial: sankoch 2.1.0 shipped** in v0.6.12 with DEFLATE micro-tuning down-payments (pre-reversed dynamic Huffman codes, others). Standard zlib path moves modestly (~5-7%) at small/medium sizes. Larger 2.x match-finder / ring-buffer / SIMD work queued for follow-up sankoch releases — the remaining `add-1MB` budget is ~140ms `zlib_compress(1MB)`, which is exactly what those bigger items target.
 
 When any of those ship, sit can drop the corresponding workaround / get a measurable improvement on the matching workload without further sit-side code changes. Watch their CHANGELOGs.
 

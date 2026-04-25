@@ -252,7 +252,11 @@ fn parse_index() {
     var db = get_index_db();
     if (db == 0) { return 0; }
 
-    var rs = patra_query(db, "SELECT path, hash_hex FROM entries");
+    # P-20 (v0.6.11): pre-sort at the patra layer so sort_entries can fall
+    # through O(N) on the already-ordered vec. Patra supports ORDER BY since
+    # at least 1.6.0; passing it here lets every parse_index consumer skip
+    # the O(N²) insertion sort below.
+    var rs = patra_query(db, "SELECT path, hash_hex FROM entries ORDER BY path");
     if (rs == 0) { return 0; }
 
     var count = patra_result_count(rs);

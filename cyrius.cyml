@@ -5,7 +5,7 @@ description = "Sovereign version control — a Cyrius-native git replacement"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sit"
 language = "cyrius"
-cyrius = "5.6.40"
+cyrius = "5.6.43"
 
 [build]
 entry = "src/main.cyr"
@@ -49,12 +49,12 @@ modules = ["dist/sakshi.cyr"]
 
 [deps.sankoch]
 git = "https://github.com/MacCracken/sankoch.git"
-tag = "2.0.3"
+tag = "2.1.0"
 modules = ["dist/sankoch.cyr"]
 
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
-tag = "2.9.1"
+tag = "2.9.3"
 modules = ["dist/sigil.cyr"]
 
 [deps.patra]

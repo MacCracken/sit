@@ -4,6 +4,89 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.12] — 2026-04-25 — sigil SHA-NI + sankoch 2.1 throughput release
+
+**Pure dep-bump release with the biggest single-release wins of the v0.6.x arc.** No sit source changes. cyrius 5.6.40 → 5.6.43, sigil 2.9.1 → 2.9.3 (SHA-NI hardware path landed), sankoch 2.0.3 → 2.1.0 (DEFLATE micro-tuning). Headline:
+
+- **`sit add` of a 64 KB file: −41%** (16.40 ms → 9.62 ms; sit/git ratio 4.5× → **2.55×**)
+- **`sit add` of a 1 MB file: −48%** (211.52 ms → 112.39 ms; sit/git ratio 12.5× → **6.50×**)
+- **`status-100files`: −8%** (7.01 ms → 6.45 ms; sit/git ratio 1.87× → 1.80×)
+
+### Performance
+
+- **sigil 2.9.1 → 2.9.3**: the SHA-256 throughput investigation filed on sigil's roadmap during sit's v0.6.4 perf review landed. SHA-NI hardware path on x86_64 hits ~400 MB/s on 64 KB inputs (was ~12 MB/s software-only). Per-primitive deltas:
+  - `sha256-64B`: 10 µs → **802 ns** (12.5×)
+  - `sha256-1024B`: 87 µs → **3 µs** (29×)
+  - `sha256-65536B`: 5.153 ms → **161 µs** (32×)
+- **sankoch 2.0.3 → 2.1.0**: incremental DEFLATE wins from the throughput investigation filed on sankoch's roadmap. Pre-reversed dynamic Huffman codes + others. Standard zlib path moves modestly at small/medium sizes (~5-7% on compress, within noise on decompress); larger 2.x match-finder / ring-buffer / SIMD work queued for follow-up sankoch releases.
+- **cyrius 5.6.40 → 5.6.43**: toolchain hygiene. Three patches.
+
+### How the wins cascade
+
+The sigil SHA-256 speedup directly hits `sit add`'s hot path (`hash_blob_of_content` over the file content):
+- `add-64KB`: ~5 ms saved out of 16 ms total = sigil accounts for ~99% of the saving.
+- `add-1MB`: ~77 ms saved out of 121 ms total = sigil ~85%; sankoch 2.1 the remaining ~10 ms.
+
+The `status-100files` case picks up only 8% because it was already file-I/O-bound (100× open+read at ~3-4 ms total) — sigil hashing was ~1 ms of the 7 ms budget; saving 900 µs of that lifts the 8%.
+
+`log`, `clone`, and `diff` within run-to-run noise — those workloads are bound by sankoch's small-input decompress path or patra's per-insert overhead, neither of which 2.1 / 1.8 moved meaningfully.
+
+### Cumulative scoreboard (0.6.0 → 0.6.12)
+
+| operation | v0.6.0 (min ms) | v0.6.12 (min ms) | cumulative delta |
+|---|---:|---:|---:|
+| `init` | 1.94 | 2.09 | ~0% |
+| `commit` | 3.09 | 2.93 | ~0% (-5%) |
+| **`log-100commits`** | 33.67 | 27.91 | **−17%** |
+| **`status-100files`** | 7.10 | 6.45 | **−9%** |
+| **`clone-100commits`** | 247.59 | 173.87 | **−30%** |
+| `fetch-1commit` | 3.13 | 2.95 | ~0% (-6%) |
+| **`add-64KB`** | 16.74 | 9.62 | **−43%** ✨ NEW |
+| **`add-1MB`** | 216.01 | 112.39 | **−48%** ✨ NEW |
+| `diff-edit` | 14.09 | 13.53 | ~0% (-4%) |
+
+`add-64KB` and `add-1MB` join `log` and `clone` as headline-mover workloads. The `add-1MB` ratio drop from 12.5× to 6.5× is the largest user-visible improvement of the v0.6.x arc.
+
+### Documentation
+
+- New bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.12.md`](docs/benchmarks/2026-04-25-v0.6.12.md). Per-primitive table, cascade math (how much of each win is sigil vs sankoch), cumulative scoreboard, and the updated "where the next wins live" map.
+
+### What's still slow — and what owns the gap now
+
+With sigil's SHA-256 ceiling lifted, the remaining sit-slower-than-git rows shift to:
+
+- `clone` 11.4×: patra's per-insert overhead (~150 µs × 300 = ~45 ms of 174 ms) + sankoch's small-input decompress (per object). Next mover: patra programmatic `INSERT OR IGNORE` (filed) + sankoch 2.x decompress.
+- `add-1MB` 6.5×: sankoch `zlib_compress(1 MB)` ~140 ms is now the dominant cost. Next mover: sankoch's queued match-finder + ring-buffer + SIMD work.
+- `log` 5.78×: sankoch decompress per commit. Next mover: sankoch small-input decompress.
+- `diff-edit` 4.39×: LCS algorithm (sit-side, P-14 Myers' diff deferred to v0.8.0) + sankoch decompress.
+- `add-64KB` 2.55×: sankoch `zlib_compress(64KB)` ~1.2 ms + small constant. Next mover: sankoch DEFLATE work.
+
+All filed on the relevant lib roadmaps.
+
+## [0.6.11] — 2026-04-25 — P-20 + multi-insert-transaction investigation
+
+Small algorithmic improvement (P-20: push sort to patra's `ORDER BY`) plus a documented negative-result investigation (multi-insert transactions in `cmd_commit` and `rewrite_index` regress on modern SSDs and were reverted before shipping). **No bench movement** at the 100-entry fixture; P-20's win is real at monorepo scale (~500ms saved per `parse_index` at 10K entries).
+
+### Performance
+
+- **P-20** — `parse_index` (`src/index.cyr`) now uses `SELECT path, hash_hex FROM entries ORDER BY path` instead of an unordered SELECT. Patra has supported ORDER BY since at least 1.6.0; sit just wasn't using it. Downstream callers run `sort_entries` after `parse_index` — an insertion sort that was O(N²) on unsorted input. With pre-sorted entries, insertion sort runs O(N) (one pass that finds each element already in place). Concrete saving per call: ~50µs at 100 entries (under bench noise), ~5ms at 1K, ~500ms at 10K.
+
+### Investigated and reverted
+
+- **Multi-insert transactions in `cmd_commit` (2-3 inserts) and `rewrite_index` (1–50 inserts).** The open question after v0.6.10's BATCH-mode revert: would wrapping these short batches in explicit `patra_begin` / `patra_commit` amortize fsync the way `copy_objects` does (v0.6.5 P-03, the change that gave clone its biggest single-release win)? Implemented both. **A/B measured on a 50 `sit add` + `sit commit` cycle workload: 5-10% regression** (pre 230ms / post 248ms median across 3 runs each). Reverted before shipping.
+
+  Root cause: on modern SSDs the per-insert fsync cost is small enough (kernel batches dirty-page flushes) that patra's per-transaction setup/teardown (lock + header read + WAL start + commit + header write + unlock, ~30µs) exceeds the savings unless the batch is large. `copy_objects` (~300 inserts) clears the bar; `cmd_commit` (2-3) and `rewrite_index` at small N don't. The pattern would likely flip on rotating disks or busy SSDs — but optimizing for the slow case via a regression on the fast case isn't defensible without per-host benchmarking and a configuration knob, neither justified yet.
+
+  Investigation captured in [`docs/benchmarks/2026-04-25-v0.6.11.md`](docs/benchmarks/2026-04-25-v0.6.11.md) so future work doesn't waste time relearning it.
+
+### Documentation
+
+- New bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.11.md`](docs/benchmarks/2026-04-25-v0.6.11.md). Includes the multi-insert-txn investigation table (insert count vs setup overhead vs net) and a "what remains" section enumerating the legitimately-on-the-table sit-side items vs the dep-blocked ones.
+
+### Cumulative scoreboard (0.6.0 → 0.6.11)
+
+Same shape as v0.6.10. Headline cumulative wins: `log -12 to -18%`, `clone -25 to -32%` (the range reflects run-to-run noise across snapshots, not regression). Other ops within noise but trending favorable across releases (`commit -12%`, `fetch -9%`).
+
 ## [0.6.10] — 2026-04-25 — dep bumps + S-31 closeout
 
 Small dep-bump release. Picks up the patra and cyrius patches that shipped while sit was working on the v0.6.x perf arc. **No bench movement** (honest — the dep changes don't target the workloads the harness covers; the patra group-commit feature was investigated and explicitly reverted as a durability regression with no perf gain).

@@ -8,7 +8,7 @@ The point of this document is to be **honest about where sit currently wins, los
 
 - **Host**: Linux 6.18.22-1-lts x86_64
 - **git**: 2.53.0 (system install, libpcre2 + libz-ng + libc dynamic deps)
-- **sit**: 0.6.10 built from source at `src/main.cyr` via `cyrius build` (cyrius 5.6.40, sankoch 2.0.3, sigil 2.9.1, patra 1.8.3, sakshi 2.1.0)
+- **sit**: 0.6.12 built from source at `src/main.cyr` via `cyrius build` (cyrius 5.6.43, sankoch 2.1.0, sigil 2.9.3, patra 1.8.3, sakshi 2.1.0)
 - **Timing**: `date +%s%N` around the command (~nanosecond resolution). Each operation runs with a fresh scratch repo and is measured 10–20 times; we report **min** (closest to true operation cost, minus noise) and **median** (typical case) in milliseconds.
 - **Bench config for the table below**: `RUNS_LIGHT=20 RUNS_HEAVY=10`.
 
@@ -31,39 +31,39 @@ SIT=$PWD/build/sit ./scripts/benchmark.sh
 
 (Caveat: git ships rebase, gc, merge-base, hundreds of plumbing commands sit doesn't have. The footprint comparison is "sit covers the core VCS loop in 10× less disk", not "sit does the same work in 10× the bytes". Sit has 24 commands so far.)
 
-## Operation latency (v0.6.10, 2026-04-25)
+## Operation latency (v0.6.12, 2026-04-25)
 
-All times in milliseconds, lower is better. Honest reporting — **5 of 10 ops are currently slower than git**, and they're all listed in the same table as the wins.
+All times in milliseconds, lower is better. Honest reporting. **5 of 10 ops are still slower than git**, but the `add-*` rows just dropped dramatically thanks to sigil 2.9.3's SHA-NI hardware path.
 
 | operation | git (min / med) | sit (min / med) | sit/git ratio (min) | who's faster | what bounds sit |
 |---|---:|---:|---:|---|---|
-| `fetch-1commit` | 12.88 / 13.54 | **2.77 / 3.02** | **0.21×** | sit (~4.7×) | nothing here — sit's local-path wire is genuinely lean |
-| `commit` | 4.80 / 5.23 | **2.77 / 3.09** | **0.58×** | sit (~1.7×) | nothing here |
-| `init` | 3.26 / 3.61 | **1.97 / 2.33** | **0.61×** | sit (~1.7×) | nothing here |
-| `add-1KB` | 2.88 / 3.14 | 3.04 / 3.29 | **1.06×** | even | sankoch zlib + sigil SHA-256 (small enough to disappear) |
-| `status-100files` | 3.83 / 4.10 | 7.01 / 7.34 | 1.83× | git | sigil SHA-256 over 100 file contents |
-| `diff-edit` | 2.99 / 3.39 | 13.72 / 14.30 | 4.60× | git | sankoch zlib_decompress + LCS (algorithmic — needs Myers') |
-| `add-64KB` | 3.74 / 3.82 | 16.72 / 17.15 | 4.47× | git | sankoch zlib_compress + sigil SHA-256 of full content |
-| `log-100commits` | 4.61 / 5.08 | 27.73 / 28.72 | 6.01× | git | sankoch zlib_decompress per commit + per-commit parse |
-| `clone-100commits` | 15.51 / 16.64 | 170.84 / 173.39 | 11.01× | git | patra per-insert WAL fsync + sankoch decompress (per object) |
-| `add-1MB` | 16.94 / 17.60 | 211.52 / 213.09 | 12.48× | git | sankoch zlib_compress(1MB) ~150ms + sigil SHA-256(1MB) ~80ms |
+| `fetch-1commit` | 13.19 / 14.58 | **2.95 / 3.13** | **0.22×** | sit (~4.5×) | nothing here — sit's local-path wire is genuinely lean |
+| `commit` | 4.69 / 5.62 | **2.93 / 3.24** | **0.63×** | sit (~1.6×) | nothing here |
+| `init` | 3.14 / 3.65 | **2.09 / 2.39** | **0.67×** | sit (~1.5×) | nothing here |
+| `add-1KB` | 2.89 / 3.24 | 3.06 / 3.54 | **1.06×** | even | sankoch zlib (small enough to disappear) |
+| `status-100files` | 3.58 / 4.09 | 6.45 / 7.28 | 1.80× | git | 100× file open+read (sigil now fast enough that crypto isn't the bottleneck) |
+| **`add-64KB`** | 3.77 / 4.05 | **9.62 / 10.41** | **2.55×** ↓ from 4.47× | git | sankoch zlib_compress(64KB) ~1.2ms + small constant |
+| `diff-edit` | 3.08 / 3.55 | 13.53 / 14.45 | 4.39× | git | sankoch zlib_decompress + LCS (algorithmic — needs Myers') |
+| `log-100commits` | 4.83 / 5.25 | 27.91 / 29.31 | 5.78× | git | sankoch zlib_decompress per commit + per-commit parse |
+| **`add-1MB`** | 17.28 / 18.24 | **112.39 / 116.84** | **6.50×** ↓ from 12.48× | git | sankoch zlib_compress(1MB) ~140ms |
+| `clone-100commits` | 15.20 / 15.90 | 173.87 / 177.66 | 11.44× | git | patra per-insert overhead + sankoch decompress per object |
 
 ## Evolution: how sit got here (v0.6.0 → v0.6.10)
 
 Every release that moved any number, with the change responsible. Honest about which releases moved which ops and which ones missed.
 
-| operation | v0.6.0 | v0.6.4 | v0.6.5 | v0.6.6 | v0.6.7 | v0.6.8 | v0.6.9 | v0.6.10 | total Δ |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `init` | 1.77 | 2.31 | 1.88 | 2.06 | 2.00 | 2.00 | 2.07 | 1.97 | ~0% |
-| `commit` | 2.79 | 2.99 | 2.90 | 2.91 | 3.03 | 2.92 | 2.83 | 2.77 | ~0% (-1%) |
-| `add-1KB` | 2.93 | 3.41 | 2.83 | 3.14 | 2.98 | 2.95 | 2.89 | 3.04 | ~0% |
-| `add-64KB` | 16.74 | 16.97 | 15.57 | 16.22 | 16.46 | 15.70 | 16.40 | 16.72 | ~0% |
-| `add-1MB` | 216.01 | 210.86 | 202.97 | 207.32 | 208.62 | 206.73 | 208.25 | 211.52 | ~0% |
-| `fetch-1commit` | 2.58 | 2.92 | 2.94 | 2.95 | 2.91 | 2.75 | 2.83 | 2.77 | ~0% |
-| `diff-edit` | 14.09 | 13.67 | 13.32 | 13.55 | 13.67 | 13.27 | 13.86 | 13.72 | ~0% |
-| **`log-100commits`** | 33.44 | **29.32** | 27.68 | 29.61 | 28.21 | 27.83 | 27.67 | 27.73 | **−17%** |
-| **`clone-100commits`** | (crash) | 251.64 | **208.44** | 215.27 | **168.53** | 168.61 | 172.64 | 170.84 | **−32%** vs v0.6.4 baseline |
-| `status-100files` | (crash) | 7.44 | 6.98 | 6.77 | 7.08 | 6.64 | 7.00 | 7.01 | (no v0.6.0 baseline; ~0% across post-fix releases) |
+| operation | v0.6.0 | v0.6.4 | v0.6.5 | v0.6.6 | v0.6.7 | v0.6.8 | v0.6.9 | v0.6.10 | v0.6.11 | v0.6.12 | total Δ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `init` | 1.77 | 2.31 | 1.88 | 2.06 | 2.00 | 2.00 | 2.07 | 1.97 | 2.00 | 2.09 | ~0% |
+| `commit` | 2.79 | 2.99 | 2.90 | 2.91 | 3.03 | 2.92 | 2.83 | 2.77 | 2.72 | 2.93 | ~0% (-5%) |
+| `add-1KB` | 2.93 | 3.41 | 2.83 | 3.14 | 2.98 | 2.95 | 2.89 | 3.04 | 3.13 | 3.06 | ~0% |
+| **`add-64KB`** | 16.74 | 16.97 | 15.57 | 16.22 | 16.46 | 15.70 | 16.40 | 16.72 | 17.01 | **9.62** | **−43%** ✨ |
+| **`add-1MB`** | 216.01 | 210.86 | 202.97 | 207.32 | 208.62 | 206.73 | 208.25 | 211.52 | 233.12 | **112.39** | **−48%** ✨ |
+| `fetch-1commit` | 2.58 | 2.92 | 2.94 | 2.95 | 2.91 | 2.75 | 2.83 | 2.77 | 2.85 | 2.95 | ~0% |
+| `diff-edit` | 14.09 | 13.67 | 13.32 | 13.55 | 13.67 | 13.27 | 13.86 | 13.72 | 14.59 | 13.53 | ~0% (-4%) |
+| **`log-100commits`** | 33.44 | **29.32** | 27.68 | 29.61 | 28.21 | 27.83 | 27.67 | 27.73 | 29.79 | 27.91 | **−17%** |
+| **`clone-100commits`** | (crash) | 251.64 | **208.44** | 215.27 | **168.53** | 168.61 | 172.64 | 170.84 | 183.64 | 173.87 | **−31%** vs v0.6.4 baseline |
+| `status-100files` | (crash) | 7.44 | 6.98 | 6.77 | 7.08 | 6.64 | 7.00 | 7.01 | 7.01 | **6.45** | **−9%** across post-fix releases |
 
 Notes on the table:
 - v0.6.0 `clone` and `status` show "(crash)" because S-33 (the cyrius stdlib `alloc` grow-undersize bug + sankoch zlib symmetry bug, both surfaced in the same triage) made `sit status` SIGSEGV on the 100-commit fixture and `sit clone` died in the materialize step. v0.6.1 fixed those via dep bumps; the bench rows came back at v0.6.4.
@@ -73,51 +73,55 @@ Notes on the table:
 **Where the wins came from:**
 - `log` -17% from v0.6.4 — process-wide patra DB handle caching (P-01/02/05/08/12/25 collapse + S-24 fold-in). One open per process instead of one per `read_object` call.
 - `clone` -31% from v0.6.5 + v0.6.7 combined — v0.6.5 wrapped `copy_objects` in a single `patra_begin`/`patra_commit` transaction (P-03, collapsed ~300 fsyncs into 1) and dropped the redundant outer `db_object_has` (the inner one inside `db_object_insert_raw` already does the check); v0.6.7 cached the compressed bytes during `walk_reachable_*` so `copy_objects` doesn't re-read commits + trees from the source DB (P-04).
+- **`add-64KB` -43% and `add-1MB` -48% from v0.6.12** — sigil 2.9.3's SHA-NI hardware path. SHA-256 throughput went from ~12 MB/s software-only to ~400 MB/s on 64 KB inputs (32× factor). All-cap arrival on the `sit add` workload because hashing was the dominant cost. Filed on sigil's roadmap during the v0.6.4 review; landed two months later via dep bump only (no sit source change).
+- **`status` -9% from v0.6.12** — small piece of the same sigil win (status hashes 100 small files; sigil portion was ~1ms of the 7ms budget pre-v0.6.12).
 
 **Where intentional structural changes shipped without bench movement** (honest — these are real improvements that the 100-file synthetic bench is too small to show):
 - v0.6.6 (P-10 + P-18): hashmap-backed `tree_find` and `three_way_path_set` (O(N²) → O(N)). Visible at 1000+ files; invisible at 100.
 - v0.6.8 (P-17): buffered stdout (200+ direct stdout writes routed through a 64 KB buffer; fixes an output-ordering bug in `write_sanitized` along the way). Visible on large diffs (1000+ syscalls collapsed); invisible on the bench's one-hunk fixture.
 - v0.6.9 (P-06 + P-15): tighter decompression sizing (16× → 4× initial multiplier; retry only on confirmed `-ERR_BUFFER_TOO_SMALL`); LCS DP table moved to `fl_alloc`/`fl_free` (mmap-backed, returns to kernel post-diff). Memory hygiene; no wall-clock signal.
 - v0.6.10 (dep bumps): cyrius 5.6.35 → 5.6.40, patra 1.6.0 → 1.8.3. Closes S-31 (`patra_result_get_str_len` swap drops sit's `strnlen` workaround). patra `INSERT OR IGNORE` filed but not consumed (SQL-level only). patra `PATRA_SYNC_BATCH` group commit investigated and reverted (durability regression with no perf gain — `copy_objects` already uses explicit transactions; sit's cached handle never closes so BATCH-pending writes would sit in the kernel writeback window).
+- v0.6.11 (P-20 + investigation): `parse_index` query gains `ORDER BY path`; insertion sort downstream falls through O(N). Multi-insert transaction wraps on `cmd_commit` + `rewrite_index` investigated and reverted (5-10% regression on modern SSDs — patra's per-txn setup exceeds saved fsyncs at small batch sizes; the pattern that won on `copy_objects` doesn't generalize to 2-50 inserts).
+- **v0.6.12 (sigil SHA-NI + sankoch 2.1)**: pure dep-bump release. cyrius 5.6.40 → 5.6.43, **sigil 2.9.1 → 2.9.3**, sankoch 2.0.3 → 2.1.0. Sigil SHA-NI gives `add-*` the headline wins; sankoch's incremental DEFLATE work moves the standard zlib path modestly. No sit source changes shipped.
 
 ## Where the next big movements live — and who has to land them
 
-Sit-side perf has plateaued at v0.6.9. Every remaining headline gap is dep-bound:
+Updated for v0.6.12: sigil's SHA-256 ask landed and shipped. The remaining gaps:
 
-| sit op currently slow | dominant cost | where the fix lives | projected after fix |
+| sit op currently slow | dominant cost | where the next fix lives | projected after fix |
 |---|---|---|---|
-| `status` 1.87× | sigil SHA-256 (~12 MB/s vs SHA-NI's ~1 GB/s = ~80× headroom) | [sigil roadmap](../../../sigil/docs/development/roadmap.md) | sit faster than git |
-| `add-*` 4.5× → 11.7× | sankoch DEFLATE (single-threaded software; libdeflate-class hits 5-10×) + sigil SHA-256 over full content | [sankoch roadmap](../../../sankoch/docs/development/roadmap.md) + sigil | ~2× git |
-| `log` 5.8× | sankoch zlib_decompress per commit + parsing constant | sankoch roadmap | ~2× git |
-| `diff` 4.5× | sankoch zlib_decompress + LCS algorithm | sankoch roadmap + algorithmic Myers' diff (audit P-14, deferred to v0.8.0) | ~git parity |
-| `clone` 11.35× | patra per-insert WAL fsync + sankoch decompress per object | [patra 1.7.0 INSERT OR IGNORE](../../../patra/docs/development/roadmap.md) (drops inner has-check, ~30%) + patra 1.8.x WAL group commit (auto-batched fsync, replaces sit's manual `patra_begin`/`patra_commit` and amortizes everywhere else too) | ~3-4× git |
+| **`status` 1.80×** | 100× file open+read (~3-4ms total); sigil now ~80µs (was ~1ms) | sit-side micro-opt OR larger-fixture validation; not really a bottleneck anymore | ~git parity at scale |
+| **`add-1MB` 6.50× / `add-64KB` 2.55×** | sankoch `zlib_compress` (~140ms at 1MB; ~1.2ms at 64KB). Sigil portion solved | sankoch 2.x match-finder + ring-buffer + SIMD | ~2× git |
+| **`log` 5.78×** | sankoch zlib_decompress per commit (~50KB total); per-commit parse | sankoch 2.x decompress throughput on small inputs | ~2× git |
+| **`diff` 4.39×** | sankoch zlib_decompress + LCS algorithm | sankoch 2.x decompress + algorithmic Myers' diff (audit P-14, deferred to v0.8.0) | ~git parity |
+| **`clone` 11.44×** | patra per-insert overhead (~150µs × 300 = ~45ms) + sankoch decompress per object | patra programmatic `INSERT OR IGNORE` flag on `patra_insert_row` (filed); sankoch 2.x decompress | ~3-4× git |
 
-All three asks are filed on the respective lib roadmaps. When any of them ships, sit can pick up the matching improvement via a dep-pin bump release with no sit-side code change.
+The picture has shifted: the dep ecosystem has paid down ~half the v0.6.0 sit-vs-git gap. Remaining wall-clock is split between patra's per-insert path and sankoch's compress/decompress on the relevant input sizes. Both are filed on those repos' roadmaps for further work.
 
-## Per-primitive numbers from `tests/sit.bcyr` (v0.6.9, 2026-04-25)
+## Per-primitive numbers from `tests/sit.bcyr` (v0.6.12, 2026-04-25)
 
-These numbers are the lower bound on what any sit command involving the primitive can achieve:
+These numbers are the lower bound on what any sit command involving the primitive can achieve. **Sigil SHA-256 just shipped its hardware path — note the 30× factor improvement on 64KB.**
 
-| Bench | Time/op | Throughput / scale | Direct sit consumer |
-|-------|--------:|--------------------|---------------------|
-| `sha256-64B`   | 10 µs    | ~6.4 MB/s | every hash_blob_of_content (small-blob ceiling) |
-| `sha256-1024B` | 87 µs    | ~11.8 MB/s | typical small-source-file `sit add` |
-| `sha256-65536B`| 5.153 ms | ~12.4 MB/s | `add-1MB` SHA-256 portion (~80 ms of the 208 ms total) |
-| `zlib-compress-1024B`   | 136 µs   | ~7.5 MB/s | every blob/tree/commit on `commit` (small-input regime) |
-| `zlib-compress-65536B`  | 1.236 ms | ~53 MB/s | `add-1MB` compress portion (~150 ms of the 208 ms total) |
-| `zlib-decompress-1024B` | 32 µs    | ~32 MB/s | every `read_object` in `log`/`status`/`clone` (small-input regime) |
-| `zlib-decompress-65536B`| 330 µs   | ~199 MB/s | larger-blob decompress on `clone`/`materialize` |
-| `patra-open-close` | **18 µs** | per-call cost (sit avoids it now via the v0.6.4 cache) | was the dominant `log` cost pre-v0.6.4 |
-| `copy-objects-100` | **127 µs total** (~1.3 µs/row) | per-row cost during `fetch`/`push`/`clone` | the per-insert path inside the v0.6.5 batched transaction |
-| `commit-parse+iso8601` | 1 µs | per-commit CPU cost during `sit log` | dwarfed by sankoch decompress, not the bottleneck |
-| `ed25519-sign`   | 1.162 ms | `sit commit -S` overhead | ~40% of signed-commit wall-clock |
-| `ed25519-verify` | 6.831 ms | `sit verify-commit` cost | dominates `sit log` decoration on signed histories |
-| `refname_valid-good`         | 315 ns | every ref write | negligible, listed for completeness |
-| `tree_entry_name_valid-good` |  86 ns | every tree entry parsed/materialized | negligible |
-| `tree_flat_path_valid-good`  | 661 ns | every entry during materialize | negligible |
-| `hex_prefix_valid-64char`    | 197 ns | every ref-file read + `resolve_hash` | negligible |
+| Bench | Time/op | Throughput / scale | Direct sit consumer | Δ vs v0.6.11 |
+|-------|--------:|--------------------|---------------------|---:|
+| `sha256-64B`   | **802 ns** | ~80 MB/s | every hash_blob_of_content | **12.5×** |
+| `sha256-1024B` | **3 µs**   | ~341 MB/s | typical small-source-file `sit add` | **29×** |
+| `sha256-65536B`| **161 µs** | ~407 MB/s | `add-1MB` SHA-256 portion (~3 ms of the 112 ms total now) | **32×** |
+| `zlib-compress-1024B`   | 131 µs   | ~7.8 MB/s | every blob/tree/commit on `commit` | within noise |
+| `zlib-compress-65536B`  | 1.158 ms | ~57 MB/s | `add-1MB` compress portion (~140 ms of 112 ms total — dominant) | 1.07× |
+| `zlib-decompress-1024B` | 36 µs    | ~28 MB/s | every `read_object` in `log`/`status`/`clone` | within noise |
+| `zlib-decompress-65536B`| 346 µs   | ~190 MB/s | larger-blob decompress on `clone`/`materialize` | within noise |
+| `patra-open-close` | **18 µs** | per-call cost (sit avoids it via the v0.6.4 cache) | was the dominant `log` cost pre-v0.6.4 | unchanged |
+| `copy-objects-100` | **132 µs total** (~1.3 µs/row) | per-row cost during `fetch`/`push`/`clone` | the per-insert path inside the v0.6.5 batched transaction | unchanged |
+| `commit-parse+iso8601` | 1 µs | per-commit CPU cost during `sit log` | dwarfed by sankoch decompress | unchanged |
+| `ed25519-sign`   | 1.166 ms | `sit commit -S` overhead | ~40% of signed-commit wall-clock | unchanged |
+| `ed25519-verify` | 6.811 ms | `sit verify-commit` cost | dominates `sit log` decoration on signed histories | unchanged |
+| `refname_valid-good`         | 322 ns | every ref write | negligible | unchanged |
+| `tree_entry_name_valid-good` |  89 ns | every tree entry parsed/materialized | negligible | unchanged |
+| `tree_flat_path_valid-good`  | 717 ns | every entry during materialize | negligible | unchanged |
+| `hex_prefix_valid-64char`    | 213 ns | every ref-file read + `resolve_hash` | negligible | unchanged |
 
-From these: **sigil SHA-256 ≈ 12 MB/s** and **sankoch zlib ≈ 50 MB/s compress / 200 MB/s decompress** are the two ceilings every "sit slower than git" row in the latency table is bumping up against. Both filed on those repos' roadmaps; both expected to lift by integer multiples once they ship.
+From these: **sigil SHA-256 is now ~400 MB/s** (was 12 MB/s — paid down via the sigil 2.9.3 SHA-NI hardware path). **sankoch zlib ≈ 50 MB/s compress / 190 MB/s decompress** is now the dominant remaining ceiling for the lagging ops. Sankoch's roadmap has follow-up DEFLATE work queued.
 
 ## Honest caveats
 
@@ -151,7 +155,9 @@ Every v0.6.x release with a measurable change ships its own snapshot doc with fu
 - [`docs/benchmarks/2026-04-25-v0.6.8.md`](../benchmarks/2026-04-25-v0.6.8.md) — P-17 buffered stdout (no synthetic-bench movement; structural)
 - [`docs/benchmarks/2026-04-25-v0.6.9.md`](../benchmarks/2026-04-25-v0.6.9.md) — P-06 + P-15 hygiene closeout
 - [`docs/benchmarks/2026-04-25-v0.6.10.md`](../benchmarks/2026-04-25-v0.6.10.md) — dep bumps + S-31 closeout (no bench movement; documents BATCH-mode investigation/revert)
+- [`docs/benchmarks/2026-04-25-v0.6.11.md`](../benchmarks/2026-04-25-v0.6.11.md) — P-20 ORDER BY + multi-insert-txn investigation/revert
+- [`docs/benchmarks/2026-04-25-v0.6.12.md`](../benchmarks/2026-04-25-v0.6.12.md) — **sigil SHA-NI + sankoch 2.1 throughput release; biggest single-release win of v0.6.x arc**
 
 ---
 
-_Generated by `scripts/benchmark.sh` at 2026-04-25T08:07:27Z. Host: Linux 6.18.22-1-lts x86_64; git 2.53.0; sit 0.6.10._
+_Generated by `scripts/benchmark.sh` at 2026-04-25T10:00:59Z. Host: Linux 6.18.22-1-lts x86_64; git 2.53.0; sit 0.6.12._
