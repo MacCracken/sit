@@ -8,21 +8,17 @@ The name is from *smriti* (स्मृति — "that which is remembered"). T
 
 ## Status
 
-- **Version**: 0.6.0 — security hardening. All CRITICAL + HIGH findings from the 2026-04-24 P(-1) audit fixed: input validators for ref names / tree entries / hash prefixes / config values / remote URLs, local-clone symlink guards (CVE-2023-22490 class), tightened decompression caps, output escape filter for attacker-controlled identity bytes. 3 new ADRs, 101 test assertions (up from 31). Network transport shifts to v0.7.0.
-- **Language**: Cyrius (toolchain pinned in `cyrius.cyml` under `[package].cyrius`)
-- **Commands** (24): `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `reset`, `commit`, `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md)
+- **Version**: see [`VERSION`](VERSION) (single source of truth) and [`docs/development/state.md`](docs/development/state.md) for the live state snapshot (current version, dep pins, source layout, recent releases).
+- **Language**: Cyrius (toolchain pinned in [`cyrius.cyml`](cyrius.cyml) under `[package].cyrius`).
+- **Commands**: `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `reset`, `commit`, `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md).
 
 Objects are SHA-256-hashed (via [sigil](https://github.com/MacCracken/sigil)) and zlib-compressed (via [sankoch](https://github.com/MacCracken/sankoch)), stored in a [patra](https://github.com/MacCracken/patra) table with a `COL_BYTES` content column. Trees are recursive and byte-compatible with git's SHA-256 object format. Commits can be ed25519-signed via sigil. Still exploratory, post-boot — not on the AGNOS critical path.
 
 ## Size and performance
 
-| | sit | git |
-|---|---:|---:|
-| binary (primary) | **593 KB** | 4.4 MB (7.5× larger) |
-| total install footprint | **593 KB** (one static binary) | 7.4 MB across 183 `git-core` binaries (12× larger) |
-| dynamic dependencies | **none** | libpcre2, libz-ng, libc |
+sit is a single statically-linked binary with **no dynamic dependencies**. git's primary binary plus its `git-core/*` dispatch tree pull in libpcre2, libz-ng, and libc. The footprint comparison and live `git-vs-sit` numbers (where sit wins, where it loses, what bounds each lagging row, and how the picture has evolved across releases) live in [docs/development/benchmarks-git-v-sit.md](docs/development/benchmarks-git-v-sit.md). Honest reporting — slow rows are kept in plain sight.
 
-sit is **faster than git** on `init`, `commit`, `diff`, `log`, and `status` on this host (static binary, no dispatch through `git-core`). Notably slower on `add` of a large blob — sigil's software SHA-256 bottleneck. Full methodology and numbers: [docs/development/benchmarks-git-v-sit.md](docs/development/benchmarks-git-v-sit.md).
+Per-release snapshots with before/after tables and "what didn't move and why" decompositions sit under [docs/benchmarks/](docs/benchmarks/).
 
 ## Architecture
 

@@ -8,32 +8,39 @@
 
 - **Version**: 0.6.12 (read `VERSION` for the authoritative number)
 - **Cyrius toolchain**: 5.6.43 (pinned in `cyrius.cyml [package].cyrius`)
-- **Status**: **v0.6.12 is the biggest single-release win of the v0.6.x arc**, all from upstream dep bumps (no sit source changes). sigil 2.9.3's SHA-NI hardware path (filed on sigil's roadmap during the v0.6.4 perf review) moved SHA-256 throughput by ~30× on 64 KB inputs. That cascades into **`sit add -64KB` -41%** and **`sit add -1MB` -48%**. sankoch 2.1.0 contributed modest DEFLATE wins; cyrius 5.6.43 toolchain hygiene. Cumulative 0.6.0 → 0.6.12: `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%`. Remaining sit-slower-than-git rows (`clone`, `log`, `diff`, `add` at very large sizes) are bound by patra's per-insert overhead and sankoch's small-input decompress / large-input compress, both filed on those repos' roadmaps for further work. Then v0.7.0 network transport
+- **Binary**: 710 KB statically-linked, no dynamic dependencies
+- **Status**: v0.6.x perf arc shipped 13 releases (v0.6.0 through v0.6.12). Cumulative wall-clock vs v0.6.0 baseline: `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%`; other ops within run-to-run noise. Sit-side perf has plateaued; remaining headline-mover bottlenecks are dep-side (sankoch zlib throughput on small/large inputs, patra per-insert overhead) and filed on those repos' roadmaps. Two negative-result investigations during the arc (v0.6.10 BATCH mode, v0.6.11 multi-insert txn wraps) confirmed where sit-side perf hits diminishing returns. Next ship target: **v0.7.0 network transport (HTTP/SSH)**
 - **Primary target**: Linux x86_64. aarch64 cross-build is best-effort in CI
+
+### Architecture call-outs (carried across v0.6.x)
+
 - **Patra handle caching**: `get_object_db()` (object_db.cyr) and `get_index_db()` (index.cyr) memoize per-process. `object_db_open()` / `index_db_open()` still exported for the wire-protocol callers that need an explicit fresh handle for the remote-side DB (every fetch/push targets a different file)
 - **Wire transactions**: `copy_objects` (src/wire.cyr) wraps the insert loop in `patra_begin` / `patra_commit` since v0.6.5. `db_object_insert_raw` returns `1` for already-existed and `0` for actually-inserted (caller increments `copied` only on `== 0`)
-- **exec_vec envp**: empty (cyrius stdlib `lib/process.cyr` passes a NULL-only envp; no env-var inheritance in `cmd_owl_file`). Any future curated-envp shape (e.g. preserving `PATH`/`HOME`/`TERM`/`LANG` for owl UX) would be a deliberate widening
+- **Walk-reachable cache**: `walk_reachable_*` (src/wire.cyr) populates a `raw_cache` map of compressed bytes since v0.6.7; `copy_objects` reads from cache to skip the second source-DB read for commits + trees
+- **Buffered stdout**: 206 sites in src/*.cyr route through `stdout_write(data, len)` in src/util.cyr since v0.6.8; flushed in main.cyr trailer before `SYS_EXIT`. STDERR (`eprintln`) stays direct
+- **exec_vec envp**: empty (cyrius stdlib `lib/process.cyr` passes a NULL-only envp; no env-var inheritance in `cmd_owl_file`). Any future curated-envp shape would be a deliberate widening
+- **patra BATCH mode (NOT enabled)**: investigated in v0.6.10 and reverted — durability regression with no perf gain on sit's bench shape (cached handle never closes, so pending writes would sit in the kernel writeback window). Reasoning at the `get_object_db` / `get_index_db` call sites; revisit when sit grows explicit `patra_flush()` at command exit
 
 ## Source layout
 
-14 files total, 6699 lines (up from 13 files / 5972 lines in 0.5.1 — v0.6.0 added `validate.cyr` and wired call-sites across most existing modules).
+14 files total, 7013 lines (up from 13 files / 5972 lines in 0.5.1 — v0.6.0 added `validate.cyr`; v0.6.x perf + security work grew most modules).
 
 | File | Lines | Responsibility |
 |------|------:|----------------|
-| `src/main.cyr` | ~112 | `print_usage`, `main()`, dispatch, trailer |
-| `src/lib.cyr` | ~20 | include chain (domain modules; stdlib auto-includes via `cyrius.cyml`) |
-| `src/util.cyr` | ~225 | `eprintln`, `ensure_dir`, `ensure_parent_dirs`, `strnlen` (S-31, v0.6.3), `alloc_or_die` (S-17, v0.6.2), `write_decimal`, `argv_heap`, `skip_ws`, `strcmp_cstr`, `sort_cstrings`, `read_file_heap`, `write_sanitized` (S-21) |
-| `src/validate.cyr` | ~320 | **NEW in 0.6.0.** Pure validators: `hex_prefix_valid`, `refname_valid`, `tree_entry_name_valid`, `tree_flat_path_valid`, `tree_entry_mode_valid`, `config_value_valid`, `config_key_valid`, `remote_url_valid`, `path_is_symlink`, `path_lstat_kind` |
-| `src/config.cyr` | ~335 | `config_*` helpers + `cmd_config` |
-| `src/object_db.cyr` | ~568 | patra object store, `resolve_hash`, `read_object`, framing + compression, `cat-file` / `owl-file` / `fsck` (owl tempfile hardening in 0.6.0) |
-| `src/index.cyr` | ~607 | staging index + `.sitignore` + `cmd_add/rm/reset` |
-| `src/refs.cyr` | ~578 | HEAD/branch/tag/resolve + `cmd_branch/checkout/tag` (ref-name + hex validation in 0.6.0) |
-| `src/tree.cyr` | ~320 | `parse_tree`, `build_tree`, `flatten_tree` (depth-capped), entry accessors |
-| `src/diff.cyr` | ~1065 | LCS, hunks, working walker + `cmd_diff/show/status` (LCS dim pre-check in 0.6.0) |
-| `src/commit.cyr` | ~612 | builders, parsers, `cmd_commit/log` (author sanitization in 0.6.0) |
-| `src/merge.cyr` | ~682 | 3-way merge, conflict markers, `cmd_merge` |
-| `src/sign.cyr` | ~312 | ed25519 signing + `cmd_key/verify-commit` (O_EXCL in 0.6.0) |
-| `src/wire.cyr` | ~830 | remote config, reachability (depth-capped), `cmd_remote/fetch/pull/push/clone` (symlink guards + URL allowlist in 0.6.0) |
+| `src/lib.cyr` | 19 | include chain (domain modules; stdlib auto-includes via `cyrius.cyml`) |
+| `src/main.cyr` | 115 | `print_usage`, `main()`, dispatch, trailer (with `stdout_flush()` since v0.6.8) |
+| `src/util.cyr` | 238 | `eprintln`, `ensure_dir`, `ensure_parent_dirs`, `alloc_or_die` (S-17, v0.6.2), `stdout_write`/`stdout_flush` (P-17, v0.6.8), `write_decimal`, `argv_heap`, `skip_ws`, `strcmp_cstr`, `sort_cstrings`, `read_file_heap`, `write_sanitized` (S-21) |
+| `src/sign.cyr` | 331 | ed25519 signing + `cmd_key/verify-commit` (O_EXCL in 0.6.0; sitsig hex validation in v0.6.2) |
+| `src/config.cyr` | 347 | `config_*` helpers + `cmd_config` |
+| `src/tree.cyr` | 367 | `parse_tree`, `build_tree`, `flatten_tree` (depth-capped); hashmap-backed `tree_find` + `three_way_path_set` (P-10/P-18 since v0.6.6) |
+| `src/validate.cyr` | 429 | **NEW in 0.6.0.** Pure validators: `hex_prefix_valid`, `refname_valid`, `tree_entry_name_valid`, `tree_flat_path_valid`, `tree_entry_mode_valid`, `config_value_valid`, `config_key_valid`, `remote_url_valid`, `path_is_symlink`, `path_lstat_kind` |
+| `src/refs.cyr` | 578 | HEAD/branch/tag/resolve + `cmd_branch/checkout/tag` (ref-name + hex validation in 0.6.0) |
+| `src/object_db.cyr` | 602 | patra object store with `_object_db_cached` handle (v0.6.4); `resolve_hash`, `read_object`, framing + compression with v0.6.9 4× initial multiplier; `cat-file` / `owl-file` / `fsck` |
+| `src/index.cyr` | 634 | staging index + `.sitignore` + `cmd_add/rm/reset`; `_index_db_cached` (v0.6.4); `parse_index` `ORDER BY path` (P-20, v0.6.11) |
+| `src/commit.cyr` | 658 | builders, parsers, `cmd_commit/log` (author sanitization + integer-overflow guards in v0.6.0/0.6.2) |
+| `src/merge.cyr` | 694 | 3-way merge, conflict markers, `cmd_merge` (FS-mutation return checks in v0.6.2) |
+| `src/wire.cyr` | 931 | remote config, reachability (depth-capped); `cmd_remote/fetch/pull/push/clone` with `--force-absolute` gate (S-23) + walk-cache (P-04, v0.6.7) + batched transactions (P-03, v0.6.5) |
+| `src/diff.cyr` | 1070 | LCS (DP table via fl_alloc since v0.6.9), hunks, working walker + `cmd_diff/show/status` |
 
 ## Commands shipped
 
@@ -42,8 +49,8 @@
 ## Tests
 
 - **Unit**: `tests/sit.tcyr` — **101 assertions** (up from 31 in 0.5.x). Covers sigil SHA-256 known-answers, git-SHA-256 blob framing, hex encode/decode, sankoch zlib roundtrip, patra COL_BYTES small + 16KB overflow, ed25519 sign/verify roundtrip with bit-flip negatives, and the v0.6.0 validator suite: refname / tree-entry-name / tree-flat-path / hex-prefix / config-value / remote-URL positive + negative cases.
-- **Integration**: shell-level via `docs/examples/local-vcs-loop/walkthrough.sh` and CI smoke steps (init → add → commit → log → fsck, signed commit + verify, clone → push → re-clone round trip).
-- **Benchmarks / fuzz**: `tests/sit.bcyr` (sigil + sankoch primitives), `tests/sit.fcyr` (random inputs through hash / zlib / hex_decode).
+- **Integration**: shell-level via `docs/examples/local-vcs-loop/walkthrough.sh` and CI smoke steps (init → add → commit → log → fsck, signed commit + verify, clone → push → re-clone round trip; CI clone uses `--force-absolute` per S-23).
+- **Benchmarks / fuzz**: `tests/sit.bcyr` (sigil + sankoch primitives), `tests/sit.fcyr` (random inputs through hash / zlib / hex_decode). Per-release `docs/benchmarks/2026-04-25-v0.6.X.md` snapshots capture before/after numbers and the "what didn't move and why" decomposition.
 
 ## Dependencies (current pins)
 
