@@ -299,7 +299,11 @@ fn lcs_diff(a, b) {
     var stride = n2 + 1;
     var cells = (n1 + 1) * stride;
     if (cells > 16 * 1024 * 1024) { return 0; }
-    var T = alloc(cells * 8);
+    # P-15 (v0.6.9): the DP table can be up to 128 MB. fl_alloc routes large
+    # allocations through mmap directly and we fl_free below before the
+    # function returns — diff-heavy commands no longer permanently reserve
+    # the table on the bump heap for the life of the process.
+    var T = fl_alloc(cells * 8);
     if (T == 0) { return 0; }
 
     var i = 1;
@@ -378,6 +382,7 @@ fn lcs_diff(a, b) {
         vec_push(reversed, vec_get(script, k));
         k = k - 1;
     }
+    fl_free(T);
     return reversed;
 }
 

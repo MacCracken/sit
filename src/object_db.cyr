@@ -107,26 +107,27 @@ fn read_object(hex, out) {
     }
     patra_result_free(rs);
 
-    # S-08: tighten the decompression multiplier from 256× to 16× (still
-    # generous — zlib rarely exceeds ~8× on text). If the first attempt
-    # fails, retry once at the 16 MiB ceiling to cover legitimately
-    # high-ratio objects without letting an attacker force 16 MiB alloc
-    # on every object.
-    var dec_cap = blen * 16;
+    # S-08 + P-06: multiplier history is 256× (pre-audit) → 16× (S-08, v0.6.0)
+    # → 4× (P-06, v0.6.9). 4× covers the typical sit object (commits, trees,
+    # source code blobs all sit at ratio ~2-3); legitimately high-ratio
+    # outliers retry at the 16 MiB ceiling. Critically, retry only on a
+    # confirmed -ERR_BUFFER_TOO_SMALL (-2) — other negative codes mean the
+    # stream is actually corrupt and more memory won't help. Fail fast.
+    var dec_cap = blen * 4;
     if (dec_cap < 4096) { dec_cap = 4096; }
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
     var decompressed = alloc_or_die(dec_cap);
     if (decompressed == 0) { return 0 - 6; }
     var dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
-    if (dlen <= 0) {
+    if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
         if (dec_cap < 16 * 1024 * 1024) {
             dec_cap = 16 * 1024 * 1024;
             decompressed = alloc_or_die(dec_cap);
             if (decompressed == 0) { return 0 - 6; }
             dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
         }
-        if (dlen <= 0) { return 0 - 7; }
     }
+    if (dlen <= 0) { return 0 - 7; }
 
     var nul = 0;
     while (nul < dlen) {
@@ -395,6 +396,14 @@ fn get_object_db() {
     if (_object_db_cached != 0) { return _object_db_cached; }
     _object_db_cached = object_db_open();
     if (_object_db_cached == 0) { return 0; }
+    # v0.6.10 — investigated patra 1.8's BATCH sync mode here and reverted:
+    # the cache never closes the handle (fd dies with the process, no
+    # patra_close call), so BATCH-pending writes between the every-64-writes
+    # auto-flush would be lost on power loss within the kernel writeback
+    # window. `copy_objects` already wraps its hot loop in patra_begin /
+    # patra_commit (v0.6.5 P-03), which gets the same fsync amortization on
+    # the only batch-shaped write path. Stay on FULL (default) for now;
+    # revisit if/when sit grows explicit patra_flush() calls at command exit.
     object_db_migrate_from_loose(_object_db_cached);
     return _object_db_cached;
 }
@@ -441,13 +450,14 @@ fn object_db_migrate_from_loose(db) {
                         var clen = load64(&pair + 8);
 
                         # Sniff type from decompressed header for the INT column.
-                        # S-08: 16× + retry-at-ceiling, matching read_object.
-                        var dec_cap = clen * 16;
+                        # S-08 + P-06 (v0.6.9): 4× initial; retry at 16 MiB ceiling
+                        # only on confirmed -ERR_BUFFER_TOO_SMALL. Matches read_object.
+                        var dec_cap = clen * 4;
                         if (dec_cap < 4096) { dec_cap = 4096; }
                         if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
                         var decompressed = alloc_or_die(dec_cap);
                         var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
-                        if (dlen <= 0) {
+                        if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
                             if (dec_cap < 16 * 1024 * 1024) {
                                 dec_cap = 16 * 1024 * 1024;
                                 decompressed = alloc_or_die(dec_cap);

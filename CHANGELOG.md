@@ -4,6 +4,56 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.10] — 2026-04-25 — dep bumps + S-31 closeout
+
+Small dep-bump release. Picks up the patra and cyrius patches that shipped while sit was working on the v0.6.x perf arc. **No bench movement** (honest — the dep changes don't target the workloads the harness covers; the patra group-commit feature was investigated and explicitly reverted as a durability regression with no perf gain).
+
+### Changed
+
+- **cyrius 5.6.35 → 5.6.40.** Five toolchain patches. None target sit's bottlenecks; picked up for general hygiene.
+- **patra 1.6.0 → 1.8.3.** Picks up:
+  - **1.6.1 — `patra_result_get_str_len(rs, row, col)`** sized accessor (consumed: see Fixed below).
+  - **1.7.0 — `INSERT OR IGNORE INTO` SQL syntax.** **Not consumed yet.** Sit's object-store inserts go through `patra_insert_row` (the only path that handles BYTES columns), not through SQL strings. patra's `INSERT OR IGNORE` is SQL-level only; sit will pick this up when patra grows an `or_ignore` flag on the programmatic insert path.
+  - **1.8.x — WAL group commit (`PATRA_SYNC_BATCH`).** **Investigated and NOT consumed.** See "BATCH mode investigation" below.
+
+### Fixed
+
+- **S-31** — `parse_index` (`src/index.cyr`) now uses `patra_result_get_str_len(rs, i, 0)` directly instead of the v0.6.3 `strnlen(path_str, 256)` workaround. Same safety property at the read site (bound-walked within `COL_STR_SZ`), but now asked of patra's API directly. `strnlen` helper removed from `src/util.cyr` (no other consumers).
+
+### Investigated and reverted
+
+- **patra `PATRA_SYNC_BATCH` mode.** Initially set on both cached DB handles in v0.6.10's branch. Re-benched: `clone-100commits` 170.92 ms vs v0.6.9's 172.64 — within run-to-run noise. **No measurable improvement** because (a) `copy_objects` already wraps its hot loop in `patra_begin`/`patra_commit` (v0.6.5 P-03) which provides the same fsync amortization on the only batch-shaped write path, (b) the `cmd_commit` 3-insert sequence is below the every-64-writes auto-flush threshold so coalescing doesn't trigger inside a single command, (c) sit's cached handle never `patra_close`s — so BATCH-pending writes between auto-flushes would sit in the kernel writeback window with no fdatasync, lost on power loss within the window. **Net: no perf gain, real durability cost.** Reverted before shipping; the call sites are documented with the reasoning so a future release can revisit when sit grows explicit `patra_flush()` at command exit.
+
+### Documentation
+
+- New bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.10.md`](docs/benchmarks/2026-04-25-v0.6.10.md) (includes the BATCH-mode investigation writeup and the two "what we didn't do — and how to do it later" follow-up paths).
+
+### Cumulative scoreboard (0.6.0 → 0.6.10)
+
+Identical to v0.6.9's — no headline movement this release. `log -18%`, `clone -31%`. Next sit-side mover is either (a) explicit transactions + flush at exit on multi-insert commands like `cmd_commit` (small effort, optional follow-up release), or (b) wait for sigil 2.9.x SHA-256 throughput / sankoch DEFLATE throughput / patra programmatic `INSERT OR IGNORE` to ship and pick up the corresponding consumer-side improvements.
+
+## [0.6.9] — 2026-04-25 — sit-side v0.6.x perf arc closed
+
+P-06 + P-15 hygiene release. Two small items that close out the audit's perf-arc backlog. **No measurable bench movement** at the 100-file fixture (both changes are memory hygiene / edge-case, not hot-path), but they're correct and worth shipping for completeness.
+
+### Performance
+
+- **P-06 — smarter decompression sizing.** Three call sites updated (`src/object_db.cyr:read_object`, the loose-migration path, `src/wire.cyr:db_object_read_both`):
+  - Initial multiplier dropped from 16× to 4×. Most sit objects (commits, trees, source-shape blobs) decompress at ratio ~2-3× and fit; legitimately high-ratio outliers retry at the 16 MiB ceiling.
+  - Retry only on confirmed `0 - ERR_BUFFER_TOO_SMALL` (= -2 from sankoch) — other negative codes mean the stream is corrupt and more memory won't help. Fail fast on real corruption.
+  - Memory: 75% reduction in decompression-buffer alloc on objects with `blen > 1024` (real source files); the 4096-byte floor still dominates for the bench's tiny fixture objects.
+- **P-15 — LCS DP table to `fl_alloc`.** `src/diff.cyr:lcs_diff` now allocates the DP table via `fl_alloc` (mmap-direct for large allocations) and `fl_free`s before returning. Previously the table sat on the bump heap permanently for the life of the process — up to 128 MB of permanent RSS for diff-heavy commands. Now the memory goes back to the kernel after the LCS computation completes.
+
+Both changes are memory hygiene — no wall-clock signal on the synthetic bench (expected and called out in advance). Bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.9.md`](docs/benchmarks/2026-04-25-v0.6.9.md).
+
+### Final v0.6.x cumulative scoreboard
+
+`log` **-18%**, `clone` **-30%** from a half-dozen small targeted changes. Other ops within run-to-run noise (their bottlenecks are dep-side: sankoch zlib throughput, sigil SHA-256 throughput, patra WAL fsync — all filed on those repos' roadmaps).
+
+### Sit-side v0.6.x perf arc closed
+
+Every audit P-NN item that targets sit-side code is now either shipped (P-01, P-02, P-03, P-04, P-05, P-06, P-08, P-10, P-12, P-15, P-17, P-18, P-25 — and S-24 which folded into P-01) or explicitly moved out of scope to v0.7.x / v0.8.0 (P-07 bump-arena reset, P-11 sit add upsert — needs patra UPSERT, P-13 glob bucket, P-14 Myers diff algorithm, P-16 fsck --fast, P-19/P-21/P-23 micro-wins). Next ship target: **v0.7.0 network transport (HTTP/SSH)**, queued since v0.5.0 shipped local-path transport — or wait on patra 1.7.0 / 1.8.x / sigil throughput / sankoch throughput shipping and revisit perf with a fresh upstream baseline.
+
 ## [0.6.8] — 2026-04-25
 
 P-17 perf release: buffered stdout. 200+ direct `syscall(SYS_WRITE, STDOUT, ...)` call sites across nine source files swapped to a single buffered `stdout_write(data, len)` helper. **No measurable bench movement on current fixtures** — the synthetic `diff-edit` is too small to show the win — but the change is structural and right. Caught and fixed a real output-ordering bug in `write_sanitized` along the way.

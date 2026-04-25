@@ -13,20 +13,6 @@ fn eprintln(s) {
     return 0;
 }
 
-# S-31: bounded strlen for cstrings whose backing storage has a known max
-# length. Use this when the source is a fixed-size column (e.g. patra's
-# 256-byte STR slot) so a missing-NUL bug in the producer can't walk us
-# off into adjacent memory. Returns the number of bytes before the first
-# NUL OR `max`, whichever comes first.
-fn strnlen(s, max) {
-    var i = 0;
-    while (i < max) {
-        if (load8(s + i) == 0) { return i; }
-        i = i + 1;
-    }
-    return max;
-}
-
 # P-17: buffered stdout. Without this, sit's command output is dozens to
 # thousands of separate syscall(SYS_WRITE, STDOUT, ...) calls — `cmd_diff`
 # on a 500-line edit emits 3000+ writes. With a single 64KB heap buffer +

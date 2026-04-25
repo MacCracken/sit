@@ -108,6 +108,9 @@ fn get_index_db() {
     if (_index_db_cached != 0) { return _index_db_cached; }
     _index_db_cached = index_db_open();
     if (_index_db_cached == 0) { return 0; }
+    # v0.6.10 — see get_object_db (object_db.cyr) for the BATCH-mode revert
+    # rationale. Same shape: cache never closes, so BATCH-pending writes
+    # would be lost on power loss before the every-64-writes auto-flush.
     index_migrate_from_plaintext(_index_db_cached);
     return _index_db_cached;
 }
@@ -268,13 +271,12 @@ fn parse_index() {
         if (bytes != 0) {
             var entry = alloc(40);
             memcpy(entry, bytes, 32);
-            # S-31: defense-in-depth. patra's STR columns are 256 bytes wide
-            # and the writer always memsets the slot to 0 first, so today
-            # strlen would terminate inside the slot — but if patra ever
-            # ships a writer that skips the memset, an unterminated slot
-            # would walk into adjacent column / row memory. strnlen with the
-            # column width as the cap keeps us inside the slot regardless.
-            var plen = strnlen(path_str, 256);
+            # S-31 RESOLVED in v0.6.10: patra 1.6.1 shipped a sized accessor
+            # `patra_result_get_str_len` that bound-walks within the
+            # COL_STR_SZ slot. Replaces the v0.6.3 strnlen(path_str, 256)
+            # workaround — same safety property at the read site, but now
+            # asked of patra's API directly instead of guarded in sit.
+            var plen = patra_result_get_str_len(rs, i, 0);
             var p = alloc(plen + 1);
             memcpy(p, path_str, plen);
             store8(p + plen, 0);

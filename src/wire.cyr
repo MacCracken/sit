@@ -121,24 +121,24 @@ fn db_object_read_both(db, hex, raw_out, deco_out) {
     if (db_object_read_raw(db, hex, raw_out) != 0) { return 0 - 1; }
     var compressed = load64(raw_out);
     var clen = load64(raw_out + 8);
-    # S-08: 16× multiplier with one retry at the 16 MiB ceiling. Matches
-    # read_object's policy so reachability walks and local reads see the
-    # same failure modes.
-    var dec_cap = clen * 16;
+    # S-08 + P-06 (v0.6.9): 4× initial; retry at the 16 MiB ceiling only
+    # on confirmed -ERR_BUFFER_TOO_SMALL. Matches read_object's policy so
+    # reachability walks and local reads see the same failure modes.
+    var dec_cap = clen * 4;
     if (dec_cap < 4096) { dec_cap = 4096; }
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
     var decompressed = alloc(dec_cap);
     if (decompressed == 0) { return 0 - 2; }
     var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
-    if (dlen <= 0) {
+    if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
         if (dec_cap < 16 * 1024 * 1024) {
             dec_cap = 16 * 1024 * 1024;
             decompressed = alloc(dec_cap);
             if (decompressed == 0) { return 0 - 2; }
             dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
         }
-        if (dlen <= 0) { return 0 - 3; }
     }
+    if (dlen <= 0) { return 0 - 3; }
     var nul = 0;
     while (nul < dlen) {
         if (load8(decompressed + nul) == 0) { break; }

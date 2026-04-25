@@ -6,6 +6,23 @@ Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHAN
 
 ## Released
 
+### v0.6.10 — dep bumps + S-31 closeout
+
+- **cyrius 5.6.35 → 5.6.40**, **patra 1.6.0 → 1.8.3**.
+- **S-31 RESOLVED**: `parse_index` now calls `patra_result_get_str_len(rs, i, 0)` directly (patra 1.6.1 API) instead of the v0.6.3 `strnlen(s, 256)` workaround. Helper deleted.
+- **patra 1.7.0 `INSERT OR IGNORE`**: filed but not consumed (SQL-level only; sit's BYTES-column inserts use `patra_insert_row` which doesn't expose the flag).
+- **patra 1.8.x WAL group commit (`PATRA_SYNC_BATCH`)**: investigated, reverted before shipping. No measurable bench gain (`copy_objects` already uses explicit transactions; `cmd_commit` doesn't trip the every-64-writes auto-flush; cached handle never closes so BATCH-pending writes would sit in the kernel writeback window across a power loss). Reasoning documented at both `get_object_db` and `get_index_db` call sites for future revisit.
+- **No bench movement.** Cumulative 0.6.0 → 0.6.10 unchanged from v0.6.9: `log -18%`, `clone -31%`.
+- Bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.10.md`](../benchmarks/2026-04-25-v0.6.10.md).
+
+### v0.6.9 — P-06 + P-15: sit-side v0.6.x perf arc closed
+
+- **P-06 — smarter decompression sizing.** Three sites (`read_object`, loose-migration path, `db_object_read_both`): initial multiplier dropped from 16× to 4× (most sit objects fit at ratio ~2-3); retry only on confirmed `-ERR_BUFFER_TOO_SMALL` (other negative codes mean the stream is genuinely corrupt — more memory won't help, fail fast). 75% memory reduction in the decompression-buffer alloc for objects with `blen > 1024`; bench fixture's tiny objects don't show it (4096-byte floor dominates).
+- **P-15 — LCS DP table to `fl_alloc`.** `src/diff.cyr:lcs_diff` allocates via `fl_alloc` (mmap-direct for large allocs) and `fl_free`s before returning. Previously the up-to-128MB table squatted on the bump heap for the life of the process; now it goes back to the kernel after the computation. Pure memory hygiene.
+- **No synthetic-bench movement** (both items are hygiene/edge-case). Final v0.6.x cumulative scoreboard: `log` **-18%**, `clone` **-30%**.
+- Bench snapshot: [`docs/benchmarks/2026-04-25-v0.6.9.md`](../benchmarks/2026-04-25-v0.6.9.md).
+- **Sit-side v0.6.x perf arc closed.** Every P-NN audit item targeting sit-side code is shipped or explicitly out of scope (see backlog below). Next sit-side headline-mover requires upstream work — see "Waiting on dep updates" subsection.
+
 ### v0.6.8 — P-17: buffered stdout
 
 - 206 `syscall(SYS_WRITE, STDOUT, ...)` sites across 9 src files swapped to a single buffered `stdout_write(data, len)` helper backed by a 64KB heap buffer (`src/util.cyr`). Auto-flush on buffer-full; large writes go straight to the kernel after flushing pending bytes. `main.cyr` trailer flushes before `SYS_EXIT`. STDERR stays direct.
@@ -138,8 +155,11 @@ Patra-handle caching shipped in v0.6.4 (see Released above). Remaining items tar
 
 **Waiting on dep updates** (filed on each dep's roadmap 2026-04-25; sit gets bigger wins once these land but is not blocked from shipping the items below):
 
-- [`patra` roadmap](../../../patra/docs/development/roadmap.md): WAL group commit / batched fsync (would amplify P-03 below); `INSERT OR IGNORE` / `UPSERT` (would simplify P-03 + unblock P-11 cleanly); sized string getter `patra_result_get_str_len` (would let sit drop the S-31 strnlen wrapper).
-- [`sigil` roadmap](../../../sigil/docs/development/roadmap.md): SHA-256 hot-path throughput investigation (~80x headroom vs modern hardware; directly improves `sit status` + `sit add`).
+- [`patra` roadmap](../../../patra/docs/development/roadmap.md):
+  - ~~Sized string getter `patra_result_get_str_len`~~ — **shipped as patra 1.6.1, consumed by sit v0.6.10** (S-31 closed).
+  - ~~WAL group commit / batched fsync~~ — **shipped as patra 1.8.x; sit investigated and did NOT consume** in v0.6.10 (durability regression with no perf gain on sit's bench shape; reasoning at `get_object_db` / `get_index_db` call sites). Revisit when sit grows explicit `patra_flush()` at command exit.
+  - ~~`INSERT OR IGNORE`~~ — **shipped as patra 1.7.0 (SQL-level only); sit can't consume yet** because sit's BYTES-column inserts go through `patra_insert_row` (programmatic API), not SQL strings. Re-file: ask patra to grow an `or_ignore` flag on `patra_insert_row` so sit can drop the inner `db_object_has` in `db_object_insert_raw`. Effort on patra side: small (the SQL-level path already does the dedup probe).
+- [`sigil` roadmap](../../../sigil/docs/development/roadmap.md): SHA-256 hot-path throughput investigation staged for sigil 2.9.2 (~80x headroom vs modern hardware; directly improves `sit status` + `sit add`).
 - [`sankoch` roadmap](../../../sankoch/docs/development/roadmap.md): DEFLATE compress/decompress throughput investigation (5-10x headroom via libdeflate-class tuning; directly improves `sit add` + `sit clone`).
 
 When any of those ship, sit can drop the corresponding workaround / get a measurable improvement on the matching workload without further sit-side code changes. Watch their CHANGELOGs.
@@ -147,7 +167,7 @@ When any of those ship, sit can drop the corresponding workaround / get a measur
 **Sit-side items (no dep dependency, ship-ready):**
 
 - ~~**P-03** `copy_objects`~~ — **shipped in v0.6.5** (see Released above). Partial: the transaction wrap + outer has-check drop landed; the batched `WHERE hash IN (...)` pre-filter is deferred (would need 60-hash chunking per patra's 128-token / 4096-byte SQL parser limits). When patra grows `INSERT OR IGNORE` / `UPSERT`, the inner has-check goes away too.
-- **P-06** + **P-15** Smarter decompression sizing (read the framing length prefix instead of `blen * 16` + retry); route LCS DP table through `fl_alloc` / `fl_free` so diff-heavy commands don't permanently reserve bump memory. Targets diff / clone.
+- ~~**P-06** + **P-15**~~ — **shipped in v0.6.9** (see Released above). Decompression sizing tightened (4× initial, retry only on `-ERR_BUFFER_TOO_SMALL`); LCS DP table moved to `fl_alloc`/`fl_free` (mmap-backed, freed after computation).
 - ~~**P-04** `walk_reachable_from_commit`~~ — **shipped in v0.6.7** (see Released above). Cached compressed bytes during the walk, shared with `copy_objects`. Final clone ratio 11.08x git (from 16.13x at v0.6.4 entry).
 - ~~**P-10 + P-18**~~ — **shipped in v0.6.6** (see Released above). Hashmap-backed `tree_find` + `three_way_path_set`. No 100-file bench movement; substantial at scale (1000-file `cmd_status` ~5ms → ~0.3ms on the tree_find piece).
 - **P-11** `sit add` index upsert without full rewrite (needs patra UPSERT; if patra doesn't have it, push on their roadmap).
