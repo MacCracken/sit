@@ -6,9 +6,9 @@
 
 ## Current
 
-- **Version**: 0.6.0 (read `VERSION` for the authoritative number)
-- **Cyrius toolchain**: 5.6.25 (pinned in `cyrius.cyml [package].cyrius`)
-- **Status**: security hardening shipped (P(-1) audit CRITICAL + HIGH findings fixed); v0.6.1 MEDIUM batch next, then v0.6.x perf refactor, then v0.7.0 network transport
+- **Version**: 0.6.1 (read `VERSION` for the authoritative number)
+- **Cyrius toolchain**: 5.6.35 (pinned in `cyrius.cyml [package].cyrius`; bumped from 5.6.25 in v0.6.1 to pick up the upstream alloc-grow fix from cyrius 5.6.34)
+- **Status**: S-33 SIGSEGV fixed (sankoch + cyrius dep bumps; no sit source changes). Status / fsck / clone clean on the 100-commit / 100-file fixture. Security-hygiene MEDIUM batch is v0.6.2 next, then perf refactor, then v0.7.0 network transport
 - **Primary target**: Linux x86_64. aarch64 cross-build is best-effort in CI
 
 ## Source layout
@@ -47,7 +47,7 @@
 All git-tag pinned in `cyrius.cyml`. No FFI, no C, no libgit2 — see [ADR 0001](../adr/0001-no-ffi-first-party-only.md).
 
 - **sakshi** 2.1.0 — tracing, error handling
-- **sankoch** 2.0.1 — LZ4/DEFLATE/zlib/gzip
+- **sankoch** 2.0.3 — LZ4/DEFLATE/zlib/gzip (bumped from 2.0.1 in v0.6.1; 2.0.3 fixes the zlib compress/decompress symmetry bug that lost ~20% of objects on a 100-commit fixture — see [`issues/archived/2026-04-24-read-object-unreadable-at-scale.md`](issues/archived/2026-04-24-read-object-unreadable-at-scale.md))
 - **sigil** 2.9.1 — SHA-256 + ed25519 signing
 - **patra** 1.6.0 — B+ tree / WAL object store (COL_BYTES since 1.6.0)
 
@@ -71,6 +71,7 @@ All git-tag pinned in `cyrius.cyml`. No FFI, no C, no libgit2 — see [ADR 0001]
 
 | Version | Date | Summary |
 |---------|------|---------|
+| 0.6.1 | 2026-04-25 | S-33 fix release. Pure dep-pin bumps — sankoch 2.0.1 → 2.0.3 (zlib symmetry) + cyrius 5.6.25 → 5.6.35 (allocator grow defense-in-depth). Status / fsck / clone clean on 100-commit / 100-file fixture. `bench_status` + `bench_clone` re-enabled. New `docs/development/issues/` for upstream-bug writeups. |
 | 0.6.0 | 2026-04-24 | Security hardening: all CRITICAL + HIGH findings from the 2026-04-24 P(-1) audit fixed. `validate.cyr` with every input validator. Tree-entry / refname / hex / config / URL gating. Symlink guards on clone paths. Output escape filter. 101 assertions (from 31). 3 new ADRs. |
 | 0.5.1 | 2026-04-24 | File-split refactor: `src/main.cyr` → 11 topical modules via `src/lib.cyr`. Zero feature changes. |
 | 0.5.0 | 2026-04-24 | Wire protocol (local-path): `remote`, `fetch`, `pull`, `push`, `clone` + nested branch names + `sit merge -S` + `resolve_ref_name` sees `refs/remotes/*`. |

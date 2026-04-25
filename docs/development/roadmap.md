@@ -6,6 +6,13 @@ Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHAN
 
 ## Released
 
+### v0.6.1 — S-33 dep-bump release
+
+- **S-33** — `sit status` SIGSEGV on a 100-commit / 100-file repo: **resolved** by upstream dep bumps. Triage in [`issues/archived/2026-04-24-cyrius-stdlib-alloc-grow-undersize.md`](issues/archived/2026-04-24-cyrius-stdlib-alloc-grow-undersize.md) and [`issues/archived/2026-04-24-read-object-unreadable-at-scale.md`](issues/archived/2026-04-24-read-object-unreadable-at-scale.md). Two stacked upstream bugs: cyrius stdlib `alloc` grow-by-1MB undersize (caused the SIGSEGV via the 16 MiB retry alloc) + sankoch `zlib_compress` / `zlib_decompress` asymmetry (caused the retry path to fire in the first place; lost ~20% of objects on the fixture).
+- **Pin moves**: cyrius `5.6.25` → `5.6.35` (alloc grow fix landed upstream in 5.6.34), sankoch `2.0.1` → `2.0.3` (zlib symmetry restored). No sit source changes.
+- `scripts/benchmark.sh` — `bench_status` + `bench_clone` rows re-enabled, producing real numbers (`status-100files` 7.08 ms ≈ 1.8× git; `clone-100commits` 245 ms ≈ 16× git, dominated by per-call patra open per P-01).
+- New `docs/development/issues/` directory for upstream-bug writeups (see README). Lifecycle: file → triage → fix lands → archive with `— RESOLVED`. Two RESOLVED entries on day-one.
+
 ### v0.6.0 — security hardening
 
 - **P(-1) audit fixes**: validators for ref names (git `check-ref-format` grammar), tree entry names, hash prefixes, config values, remote URLs. Symlink guards on all local-clone paths (CVE-2023-22490 class). Decompression multipliers tightened 256× → 16×. Output escape filter on attacker-controlled identity bytes. Full change list in [CHANGELOG § 0.6.0](../../CHANGELOG.md#060--2026-04-24). Underlying audit at [`docs/audit/2026-04-24-audit.md`](../audit/2026-04-24-audit.md).
@@ -71,13 +78,9 @@ The local VCS loop is complete end-to-end, with ed25519 signing and a local-path
 
 ## Backlog
 
-### v0.6.1 — Security hygiene (MEDIUM batch) + S-33 `sit status` crash
+### v0.6.2 — Security hygiene (MEDIUM batch)
 
-**URGENT**: ship first.
-
-- **S-33** — `sit status` SIGSEGVs on a 100-commit / 100-file repo. Reproducible via the v0.6.0 git-vs-sit comparison bench (`scripts/benchmark.sh`). Root cause TBD; triage starts by narrowing between `list_working_files` / `read_head_tree_entries` / the per-file hash loop. Likely candidates: `alloc()` null on deep hash_file_as_blob chain, or a bump-allocator exhaustion (P-07). See [`docs/audit/2026-04-24-audit.md`](../audit/2026-04-24-audit.md#s-33-sit-status-segfault-on-multi-commit-multi-file-repos).
-
-From the audit; doesn't change behavior on the hot path but closes several defense-in-depth gaps.
+From the audit; doesn't change behavior on the hot path but closes several defense-in-depth gaps. (Was previously bundled with S-33 under v0.6.1; v0.6.1 shipped as S-33-only via dep bumps, so this batch moved down a slot.)
 
 - **S-16** Check return values on every `sys_unlink`, `file_write_all`, `sys_rmdir`, `sys_chdir` so stale tempfiles / partial materialize / stale MERGE_HEAD don't silently leave the repo in an inconsistent state.
 - **S-17** Audit every `alloc()` call site for null-check; add an `alloc_or_die` helper for the "OOM should be fatal" callers.
@@ -90,7 +93,7 @@ From the audit; doesn't change behavior on the hot path but closes several defen
 - **S-25** Delete `ensure_dirs_for`; replace caller with `ensure_parent_dirs`.
 - **S-27** `materialize_target` emits a clear error and aborts when a blob read fails, instead of silently skipping.
 
-### v0.6.2 — LOW-severity + hygiene
+### v0.6.3 — LOW-severity + hygiene
 
 - **S-28** Minimal envp for `exec_vec` (scrub `LD_*`).
 - **S-31** If patra grows a `patra_result_get_str_len` sized getter, switch to it (removes the "cstring assumed NUL-terminated" footgun).

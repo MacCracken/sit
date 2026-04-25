@@ -312,12 +312,9 @@ emit_row "$(bench_add 65536 64KB)"
 emit_row "$(bench_add 1048576 1MB)"
 emit_row "$(bench_commit)"
 emit_row "$(bench_log)"
-# bench_status and bench_clone disabled pending v0.6.1 — the 100-commit
-# fixture triggers a SIGSEGV in `sit status` (and by extension in clone's
-# materialize step). See audit backlog S-33.
-# emit_row "$(bench_status)"
+emit_row "$(bench_status)"
 emit_row "$(bench_diff)"
-# emit_row "$(bench_clone)"
+emit_row "$(bench_clone)"
 emit_row "$(bench_fetch)"
 
 echo ""

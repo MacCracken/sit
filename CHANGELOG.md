@@ -4,11 +4,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Known issues
+## [0.6.1] — 2026-04-25
 
-- **S-33**: `sit status` SIGSEGVs on repositories with ~100 commits and ~100 tracked files. Caught by the new git-vs-sit comparison bench (`scripts/benchmark.sh`); the `bench_status` and `bench_clone` rows are disabled pending the fix. Root cause likely overlaps with audit findings S-17 (alloc null-check) or P-07 (bump allocator exhaustion). **First v0.6.1 fix.**
+S-33 fix release. Pure dep-pin bumps — no sit source changes. Status, fsck, and clone now run cleanly on the 100-commit / 100-file fixture; the previously-disabled `bench_status` and `bench_clone` rows are re-enabled in `scripts/benchmark.sh`.
+
+### Fixed
+
+- **S-33** — `sit status` SIGSEGV on a 100-commit / 100-file repo. Triage surfaced two stacked upstream bugs: a cyrius stdlib `alloc` grow-by-1MB undersize that crashed any single allocation > 1 MiB (caused the SIGSEGV via `read_object`'s 16 MiB retry buffer), and a sankoch `zlib_compress` / `zlib_decompress` asymmetry that lost ~20% of objects on the same fixture (caused `read_object` to fall into the retry path in the first place). Independence proven by re-running the fixture across the cyrius bump alone — bit-for-bit identical bad-object set. Fixed by:
+  - **sankoch 2.0.1 → 2.0.3** — write/read symmetry restored. After the bump, fsck reports 300/300 objects readable on the fixture (was 247/300 with 53 unreadable). The sankoch fix alone removes the trigger for the cyrius bug in sit's hot path.
+  - **cyrius 5.6.25 → 5.6.35** — picks up the upstream allocator grow fix that landed in 5.6.34. Defense-in-depth for any future sit code that allocates > 1 MiB in a single call.
+  - Full triage and resolution narrative in [`docs/development/issues/archived/2026-04-24-cyrius-stdlib-alloc-grow-undersize.md`](docs/development/issues/archived/2026-04-24-cyrius-stdlib-alloc-grow-undersize.md) and [`docs/development/issues/archived/2026-04-24-read-object-unreadable-at-scale.md`](docs/development/issues/archived/2026-04-24-read-object-unreadable-at-scale.md).
+
+### Changed
+
+- `cyrius.cyml` — cyrius `5.6.25` → `5.6.35`, sankoch `2.0.1` → `2.0.3`. No other dep movement.
+- `scripts/benchmark.sh` — `bench_status` and `bench_clone` rows re-enabled and producing real numbers.
 
 ### Added
+
+- `docs/development/issues/` — new directory for upstream-bug writeups against deps. README sets the `YYYY-MM-DD-{dep}-{slug}.md` filename convention and the lifecycle (resolved issues move to `archived/` with a `— RESOLVED` suffix; filename stable across the move). Two issues filed and immediately archived as RESOLVED in this release: the cyrius alloc-grow bug and the sankoch object-roundtrip bug.
+- `docs/benchmarks/2026-04-25-v0.6.1.md` — first benchmark snapshot that includes `status-100files` and `clone-100commits` rows alongside the post-audit baseline.
+
+### Inherited from late v0.6.0 / v0.6.1 dev cycle
+
+(Items added between the v0.6.0 release and v0.6.1, previously listed under `[Unreleased]`.)
 
 - `scripts/benchmark.sh` — reproducible git-vs-sit bench harness. Produces a markdown table of min + median wall-clock times over 10–15 runs per operation. Updates `docs/development/benchmarks-git-v-sit.md`.
 - Five new benches in `tests/sit.bcyr`: `patra-open-close`, `copy-objects-100`, `commit-parse+iso8601`, `ed25519-sign` / `ed25519-verify`, validator throughput (`refname_valid`, `tree_entry_name_valid`, `tree_flat_path_valid`, `hex_prefix_valid`). All land in the single bench binary.
