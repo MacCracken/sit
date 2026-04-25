@@ -6,10 +6,10 @@
 
 ## Current
 
-- **Version**: 0.6.12 (read `VERSION` for the authoritative number)
-- **Cyrius toolchain**: 5.6.43 (pinned in `cyrius.cyml [package].cyrius`)
-- **Binary**: 710 KB statically-linked, no dynamic dependencies
-- **Status**: v0.6.x perf arc shipped 13 releases (v0.6.0 through v0.6.12). Cumulative wall-clock vs v0.6.0 baseline: `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%`; other ops within run-to-run noise. Sit-side perf has plateaued; remaining headline-mover bottlenecks are dep-side (sankoch zlib throughput on small/large inputs, patra per-insert overhead) and filed on those repos' roadmaps. Two negative-result investigations during the arc (v0.6.10 BATCH mode, v0.6.11 multi-insert txn wraps) confirmed where sit-side perf hits diminishing returns. Next ship target: **v0.7.0 network transport (HTTP/SSH)**
+- **Version**: 0.6.13 (read `VERSION` for the authoritative number)
+- **Cyrius toolchain**: 5.7.0 (pinned in `cyrius.cyml [package].cyrius`)
+- **Binary**: 707 KB statically-linked, no dynamic dependencies
+- **Status**: v0.6.x perf arc shipped 14 releases (v0.6.0 through v0.6.13). Cumulative wall-clock vs v0.6.0 baseline: `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%`; other ops within run-to-run noise. Sit-side perf has plateaued; remaining headline-mover bottlenecks are dep-side (sankoch zlib throughput on small/large inputs, patra per-insert overhead) and filed on those repos' roadmaps. Two negative-result investigations during the arc (v0.6.10 BATCH mode, v0.6.11 multi-insert txn wraps) confirmed where sit-side perf hits diminishing returns. v0.6.13 was a toolchain-only bump to cyrius 5.7.0 (the sandhi fold) — no source changes. Next ship target: **v0.7.0 network transport (HTTP/SSH)** — sandhi is now in stdlib (`lib/sandhi.cyr`), opt-in via inline `[deps].stdlib` when the work begins.
 - **Primary target**: Linux x86_64. aarch64 cross-build is best-effort in CI
 
 ### Architecture call-outs (carried across v0.6.x)
@@ -61,7 +61,9 @@ All git-tag pinned in `cyrius.cyml`. No FFI, no C, no libgit2 — see [ADR 0001]
 - **sigil** 2.9.3 — SHA-256 + ed25519 signing. Bumped from 2.9.1 in v0.6.12. **Picks up the SHA-NI hardware path** filed on sigil's roadmap during the v0.6.4 review. SHA-256 throughput went from ~12 MB/s software-only to ~400 MB/s on 64 KB inputs (32× factor). Drives the `sit add` headline wins
 - **patra** 1.8.3 — B+ tree / WAL object store. Bumped from 1.6.0 in v0.6.10 to pick up `patra_result_get_str_len` (1.6.1 — closes S-31). 1.7.0 `INSERT OR IGNORE` is SQL-level only (filed informally for programmatic `patra_insert_row` flag). 1.8.x WAL group commit (`PATRA_SYNC_BATCH`) investigated; not enabled — durability regression for no perf gain on sit's bench shape
 
-**Cyrius stdlib declared explicitly** in `cyrius.cyml [deps].stdlib` because 5.6.x has no transitive resolution (fix targeted for 5.7.0's `sandhi` stdlib crate). Current list: `string`, `fmt`, `alloc`, `io`, `vec`, `str`, `syscalls`, `assert`, `fs`, `args`, `chrono`, `hashmap`, `process`, `tagged`, `fnptr`, `thread`, `freelist`, `bigint`, `ct`, `keccak`, `bench`. Entries past `hashmap` exist for patra / sigil's transitive reach.
+**Cyrius stdlib declared explicitly** in `cyrius.cyml [deps].stdlib` because cyrius has no transitive stdlib resolution today (consumers must list every module the call graph reaches, including modules pulled in only via dep crates). Current list: `string`, `fmt`, `alloc`, `io`, `vec`, `str`, `syscalls`, `assert`, `fs`, `args`, `chrono`, `hashmap`, `process`, `tagged`, `fnptr`, `thread`, `freelist`, `bigint`, `ct`, `keccak`, `bench`. Entries past `hashmap` exist for patra / sigil's transitive reach.
+
+Cyrius 5.7.0 (the sandhi fold) **vendors `sandhi` v1.0.0 into stdlib** as `lib/sandhi.cyr` and deletes `lib/http_server.cyr`. Sandhi is now a stdlib member alongside `http`/`ws`/`net` — opt-in via `"sandhi"` in this list, not a separate `[deps.sandhi]` git pin. Sit has no HTTP code today and does not list `sandhi`; the v0.7.0 network-transport work is when that entry lands.
 
 ## Storage layout (sit repos on disk)
 
@@ -81,6 +83,7 @@ All git-tag pinned in `cyrius.cyml`. No FFI, no C, no libgit2 — see [ADR 0001]
 
 | Version | Date | Summary |
 |---------|------|---------|
+| 0.6.13 | 2026-04-25 | **Toolchain-only release.** cyrius 5.6.43 → 5.7.0 (the sandhi fold). Deleted orphan `lib/http_server.cyr` (zero callers; cyrius 5.7.0's downstream worklist names sit for "delete orphan only"). Build clean, 101/101 tests pass, DCE binary 707 KB (down from 710). No `[deps.sandhi]` added — sit has no HTTP code today; sandhi now bundles in stdlib as `lib/sandhi.cyr` and is opt-in via inline `[deps].stdlib` when v0.7.0 network-transport work begins. |
 | 0.6.12 | 2026-04-25 | **Biggest single-release win of the v0.6.x arc.** Pure dep bumps: cyrius 5.6.40 → 5.6.43, **sigil 2.9.1 → 2.9.3 (SHA-NI hardware path)**, sankoch 2.0.3 → 2.1.0. Sigil SHA-256 throughput 32× on 64 KB inputs (12 MB/s → ~400 MB/s). Cascades to **`add-64KB` -41%** (16.40 → 9.62 ms) and **`add-1MB` -48%** (211.52 → 112.39 ms). `status` -8%. No sit source changes. Bench snapshot at `docs/benchmarks/2026-04-25-v0.6.12.md`. |
 | 0.6.11 | 2026-04-25 | P-20: `parse_index` query gains `ORDER BY path` so downstream `sort_entries` falls through O(N) on already-sorted input (was O(N²) insertion sort). ~50µs saved per call at 100 entries; scales to ~500ms at 10K. No 100-fixture bench movement. Multi-insert transaction wraps in `cmd_commit` and `rewrite_index` investigated and reverted — 5-10% regression on modern SSDs (per-txn setup overhead exceeds saved fsyncs at small batch sizes). Bench snapshot at `docs/benchmarks/2026-04-25-v0.6.11.md`. |
 | 0.6.10 | 2026-04-25 | Dep bumps: cyrius 5.6.35 → 5.6.40, patra 1.6.0 → 1.8.3. Closes S-31 by adopting `patra_result_get_str_len` natively (removes sit's `strnlen(s, 256)` workaround). patra `PATRA_SYNC_BATCH` investigated and reverted (durability regression w/o perf gain; reasoning documented at the call sites). No bench movement. Bench snapshot at `docs/benchmarks/2026-04-25-v0.6.10.md`. |

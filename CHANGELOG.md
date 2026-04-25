@@ -4,6 +4,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.13] — 2026-04-25 — cyrius 5.7.0 (sandhi fold) toolchain bump
+
+**Toolchain-only release. No sit source changes.** Picks up cyrius 5.7.0 — "the sandhi fold" — which vendors `sandhi` v1.0.0 into the stdlib as `lib/sandhi.cyr` and deletes `lib/http_server.cyr` from the stdlib (per [sandhi ADR 0002](https://github.com/MacCracken/sandhi/blob/main/docs/adr/0002-clean-break-fold-at-cyrius-v5-7-0.md)).
+
+### Changed
+
+- **cyrius 5.6.43 → 5.7.0**: pin bumped in `cyrius.cyml`. Self-host fixpoint stable at 531,888 B; cyrius `check.sh` 26/26 green upstream.
+
+### Removed
+
+- **`lib/http_server.cyr` orphan**: a stale 15,579-byte regular-file copy of the pre-fold stdlib snapshot left over from a prior `cyrius deps` run. Sit had **zero callers** (`grep` clean across `src/` + `tests/`); deletion is the action cyrius 5.7.0's downstream worklist names for sit. `cyrius deps` under 5.7.0 does not re-resolve the file.
+
+### Sit-side impact
+
+- Build: clean. Test: 101/101 pass. DCE binary: **707 KB** (down from 710 KB — small drop from 5.7.0's stdlib reshape; not a perf claim, just an observation).
+- No runtime behavior change. No public-surface change. No dep-pin change beyond cyrius itself.
+
+### Sandhi posture
+
+Sit has no HTTP code today (`grep -E 'http|sandhi|ws' src/ tests/` clean). With 5.7.0, sandhi is **bundled in the stdlib** as `lib/sandhi.cyr` — when the v0.7.0 network-transport (HTTP/SSH) work begins, sit will opt in by adding `"sandhi"` to the inline `[deps].stdlib` list in `cyrius.cyml`. **No `[deps.sandhi]` git pin needed** (the sandhi repo entered maintenance mode at the fold; subsequent surface patches ship via cyrius releases). Deferred per "ONE change at a time" — adding a dep with no callers is premature.
+
 ## [0.6.12] — 2026-04-25 — sigil SHA-NI + sankoch 2.1 throughput release
 
 **Pure dep-bump release with the biggest single-release wins of the v0.6.x arc.** No sit source changes. cyrius 5.6.40 → 5.6.43, sigil 2.9.1 → 2.9.3 (SHA-NI hardware path landed), sankoch 2.0.3 → 2.1.0 (DEFLATE micro-tuning). Headline:
