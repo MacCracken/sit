@@ -705,45 +705,19 @@ fn fdlopen_init(state) {
     return 0 - 6;
 }
 
-# Opt-in full orchestration path (v5.5.29+). Runs the complete
-# ld.so-entry dance: mmaps helper + ld.so, constructs startup
-# stack, setjmps, jumps to ld.so entry. On success state status
-# is set to 1 and fn-pointer slots are populated; on failure
-# returns a negative error code.
+# Opt-in full orchestration path. Runs the complete ld.so-entry
+# dance: mmaps helper + ld.so, constructs startup stack, setjmps,
+# jumps to ld.so entry. On success state status is set to 1 and
+# fn-pointer slots are populated; on failure returns a negative
+# error code.
 #
-# STATUS (v5.5.29): this path is KNOWN-INCOMPLETE. Three probe
-# attempts during v5.5.29 confirmed:
-#   Attempt 1 (plain prot translation):   SIGSEGV after jmp
-#   Attempt 2 (fixed R/W/X extraction):   exit=0, no helper output
-#   Attempt 3 (added AT_UID/EUID/GID/
-#              EGID/HWCAP/SECURE/FLAGS):  exit=0, no helper output
-# The raw-write breadcrumb at the top of `programs/dlopen-helper.c
-# :: main` confirmed helper main is never reached. ld.so enters
-# its _start legitimately (no crash) but exits the process
-# cleanly (exit 0) without invoking __libc_start_main on the
-# helper. Root cause unknown — pinned to v5.5.30 with the
-# specific next steps:
-#   - Verify AT_PHDR points at a mapping ld.so can walk for
-#     PT_DYNAMIC / PT_INTERP. Dump the loaded helper memory at
-#     AT_PHDR to confirm the phdr bytes match the file.
-#   - Check whether ld.so treats AT_ENTRY == 0 as "no main" —
-#     our AT_ENTRY is non-zero so this shouldn't apply, but
-#     verify.
-#   - Explore whether ld.so needs AT_PHDR to live INSIDE a
-#     PT_LOAD segment mapped with the same-file-backed pages
-#     (vs our anon+memcpy approach). Cosmopolitan maps the
-#     file segments file-backed with mmap rather than
-#     anon+copy — may be load-bearing.
-#   - Run a side-by-side strace (on a host that has strace) of
-#     `./dlopen-helper ARG ARG` vs our jump sequence to pinpoint
-#     the first diverging syscall.
-#
-# All orchestration code (`_fdlopen_mmap_elf`, `_fdlopen_build_stack`,
-# `_fdlopen_enter_ldso`, `_fdlopen_run_loader`, `_fdlopen_cb`,
-# `_fdlopen_hex64`) is in place and individually tested —
-# probes in v5.5.29 sessions confirmed ELF mmap, stack building,
-# and the cb → dl_longjmp round-trip all work in isolation. Only
-# the ld.so-entry invocation path remains.
+# STATUS: complete since v5.5.34. The v5.5.29 attempts hit a
+# prot-bit encoding bug in `_fdlopen_mmap_elf` (PF_R / PF_X are
+# swapped relative to PROT_READ / PROT_EXEC); v5.5.34 fixed the
+# extraction and the full round-trip works — see the per-byte
+# reasoning at lines 405-413. `tests/tcyr/fdlopen.tcyr` exercises
+# the full path end-to-end (real `dlopen("libc.so.6")` →
+# `dlsym("getpid")` → `fncall0(...) == syscall(39)` round-trip).
 fn fdlopen_init_full(state) {
     if (state == 0) { return 0 - 3; }
     var i = 0;

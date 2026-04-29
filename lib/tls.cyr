@@ -1,9 +1,28 @@
-# tls.cyr — TLS client via libssl.so.3 (dynlib bridge)
+# tls.cyr — TLS client via libssl.so.3 (fdlopen bridge)
 # Usage: include "lib/tls.cyr"
 # Requires: alloc.cyr, syscalls.cyr, net.cyr, mmap.cyr, fnptr.cyr,
-#           string.cyr, dynlib.cyr
+#           string.cyr, dynlib.cyr, FDLOPEN.CYR (load-bearing as of v5.6.37)
 #
-# Loads libssl.so.3 + libcrypto.so.3 at runtime via dynlib_open.
+# **IMPORTANT (v5.6.37+):** callers MUST `include "lib/fdlopen.cyr"`
+# before `include "lib/tls.cyr"` so this file's references to
+# `fdlopen_init_full` / `fdlopen_dlopen` / `fdlopen_dlsym` resolve.
+# tls.cyr doesn't auto-include fdlopen because the preprocessor
+# output cap (1 MB expanded) is tight for programs that pull
+# in many heavy stdlib modules (e.g. `tests/tcyr/large_input.tcyr`
+# already runs at 98% of cap) — an auto-include would put them
+# over.
+#
+# Loads libssl.so.3 + libcrypto.so.3 at runtime via `fdlopen`'s
+# ld.so-bootstrapped real glibc `dlopen` + `dlsym`. This is the
+# only sound load path for libssl because libssl's internal
+# pthread init (`OPENSSL_init_ssl` → `pthread_once` → recursive
+# mutex) requires a fully-initialised glibc TCB, which only ld.so
+# can produce. A plain `dynlib_open` path loaded libssl on top of
+# cyrius's minimal `dynlib_bootstrap_tls` stub; libssl's first
+# `SSL_CTX_new` then deadlocked on a futex at TCB+0x118
+# (mutex contended-bit; same thread re-enters on a non-recursive
+# mutex because the TCB's `__kind` field reads 0 in the stub).
+# v5.6.37 fixed this by routing libssl through fdlopen.
 # SNI and system-CA peer verification enabled by default.
 #
 # Interface:
@@ -28,6 +47,18 @@ enum TlsConst {
 var _tls_inited = 0;
 var _tls_ok = 0;
 
+# fdlopen state: 256-byte scratch region holding setjmp buf + real
+# glibc fn pointers. Zeroed at first use; populated by
+# fdlopen_init_full on success.
+var _tls_fdl_state[256];
+
+# v5.6.40: libssl dlopen handle saved post-_tls_init so consumers
+# can resolve additional libssl/libcrypto symbols via tls_dlsym
+# (e.g. SSL_CTX_set_alpn_protos for ALPN negotiation, custom
+# verify cb, mTLS cert load). Set by _tls_init when dlopen
+# succeeds; 0 means tls_dlsym returns 0.
+var _tls_libssl_handle = 0;
+
 # Function pointers resolved from libssl/libcrypto
 var _fn_TLS_client_method = 0;
 var _fn_SSL_CTX_new = 0;
@@ -44,33 +75,59 @@ var _fn_SSL_read = 0;
 var _fn_SSL_shutdown = 0;
 var _fn_SSL_get_error = 0;
 
-# Lazy-init: load libssl on first use
+# Lazy-init: bootstrap real glibc via fdlopen, then dlopen libssl
+# through it. v5.6.37 rewrite — the prior dynlib_open path loaded
+# libssl on top of cyrius's minimal %fs stub, which deadlocked
+# libssl's first SSL_CTX_new on a futex at TCB+0x118 (mutex
+# contended-bit). Routing through fdlopen's ld.so-bootstrapped
+# libc makes pthread work correctly (TCB has real __kind fields,
+# DTV, stack_guard, etc.), so SSL_CTX_new no longer deadlocks and
+# SSL_connect completes the handshake.
 fn _tls_init() {
     if (_tls_inited == 1) { return 0; }
     _tls_inited = 1;
 
-    # Load libcrypto first — libssl depends on it for symbol resolution
-    var hc = dynlib_open("libcrypto.so.3");
+    # fdlopen requires ~/.cyrius/dlopen-helper (built by install.sh
+    # at toolchain install time). If the helper isn't present, TLS
+    # is unavailable; callers see tls_available()==0 and fall back
+    # to plain HTTP or error out.
+    if (fdlopen_helper_available() == 0) { return 0; }
+
+    var rc = fdlopen_init_full(&_tls_fdl_state);
+    if (rc != 0) { return 0; }
+
+    var fn_dlopen = fdlopen_dlopen(&_tls_fdl_state);
+    var fn_dlsym  = fdlopen_dlsym(&_tls_fdl_state);
+    if (fn_dlopen == 0) { return 0; }
+    if (fn_dlsym  == 0) { return 0; }
+
+    # RTLD_NOW|RTLD_GLOBAL = 0x102 — resolve all symbols now and
+    # make them visible to subsequent dlopens (libssl sees libcrypto
+    # via global search). Load libcrypto first so libssl's dyn-link
+    # against its symbols resolves without extra work.
+    var hc = fncall2(fn_dlopen, "libcrypto.so.3", 0x102);
     if (hc == 0) { return 0; }
+    var h = fncall2(fn_dlopen, "libssl.so.3", 0x102);
+    if (h  == 0) { return 0; }
+    _tls_libssl_handle = h;
 
-    var h = dynlib_open("libssl.so.3");
-    if (h == 0) { return 0; }
-
-    # Resolve all symbols via global search (spans libssl + libcrypto)
-    _fn_TLS_client_method = _dynlib_resolve_global("TLS_client_method");
-    _fn_SSL_CTX_new = _dynlib_resolve_global("SSL_CTX_new");
-    _fn_SSL_CTX_free = _dynlib_resolve_global("SSL_CTX_free");
-    _fn_SSL_CTX_set_default_verify_paths = _dynlib_resolve_global("SSL_CTX_set_default_verify_paths");
-    _fn_SSL_CTX_set_verify = _dynlib_resolve_global("SSL_CTX_set_verify");
-    _fn_SSL_new = _dynlib_resolve_global("SSL_new");
-    _fn_SSL_free = _dynlib_resolve_global("SSL_free");
-    _fn_SSL_set_fd = _dynlib_resolve_global("SSL_set_fd");
-    _fn_SSL_ctrl = _dynlib_resolve_global("SSL_ctrl");
-    _fn_SSL_connect = _dynlib_resolve_global("SSL_connect");
-    _fn_SSL_write = _dynlib_resolve_global("SSL_write");
-    _fn_SSL_read = _dynlib_resolve_global("SSL_read");
-    _fn_SSL_shutdown = _dynlib_resolve_global("SSL_shutdown");
-    _fn_SSL_get_error = _dynlib_resolve_global("SSL_get_error");
+    # Resolve symbols via real glibc dlsym, handle-scoped to libssl.
+    # SSL_* + TLS_* live in libssl; libcrypto's symbols are also
+    # reachable via libssl's dependency chain under RTLD_GLOBAL.
+    _fn_TLS_client_method                = fncall2(fn_dlsym, h, "TLS_client_method");
+    _fn_SSL_CTX_new                      = fncall2(fn_dlsym, h, "SSL_CTX_new");
+    _fn_SSL_CTX_free                     = fncall2(fn_dlsym, h, "SSL_CTX_free");
+    _fn_SSL_CTX_set_default_verify_paths = fncall2(fn_dlsym, h, "SSL_CTX_set_default_verify_paths");
+    _fn_SSL_CTX_set_verify               = fncall2(fn_dlsym, h, "SSL_CTX_set_verify");
+    _fn_SSL_new                          = fncall2(fn_dlsym, h, "SSL_new");
+    _fn_SSL_free                         = fncall2(fn_dlsym, h, "SSL_free");
+    _fn_SSL_set_fd                       = fncall2(fn_dlsym, h, "SSL_set_fd");
+    _fn_SSL_ctrl                         = fncall2(fn_dlsym, h, "SSL_ctrl");
+    _fn_SSL_connect                      = fncall2(fn_dlsym, h, "SSL_connect");
+    _fn_SSL_write                        = fncall2(fn_dlsym, h, "SSL_write");
+    _fn_SSL_read                         = fncall2(fn_dlsym, h, "SSL_read");
+    _fn_SSL_shutdown                     = fncall2(fn_dlsym, h, "SSL_shutdown");
+    _fn_SSL_get_error                    = fncall2(fn_dlsym, h, "SSL_get_error");
 
     # Minimum viable set — bail if any critical symbol missing
     if (_fn_TLS_client_method == 0) { return 0; }
@@ -92,9 +149,44 @@ fn tls_available() {
     return _tls_ok;
 }
 
-# Wrap an already-connected TCP socket in a TLS session.
-# SNI set from host. System CAs used for peer verification.
-fn tls_connect(sock, host) {
+# v5.6.40: resolve a libssl/libcrypto symbol by name via the
+# fdlopen-managed libssl handle. Lets consumers (e.g. sandhi's
+# `tls_policy/alpn.cyr`) call SSL_CTX_set_alpn_protos /
+# SSL_get0_alpn_selected / any other libssl symbol the stdlib
+# doesn't pre-resolve, without re-implementing the fdlopen
+# bootstrap. Returns 0 if _tls_init hasn't run successfully OR
+# the symbol isn't in libssl/libcrypto (RTLD_GLOBAL means
+# libcrypto symbols ARE visible via the libssl handle's search
+# under v5.6.37's loader setup).
+fn tls_dlsym(name) {
+    _tls_init();
+    if (_tls_ok == 0) { return 0; }
+    if (_tls_libssl_handle == 0) { return 0; }
+    var fn_dlsym = fdlopen_dlsym(&_tls_fdl_state);
+    if (fn_dlsym == 0) { return 0; }
+    return fncall2(fn_dlsym, _tls_libssl_handle, name);
+}
+
+# v5.6.40: wrap an already-connected TCP socket in a TLS session
+# with a caller-supplied SSL_CTX hook. The hook fires AFTER
+# SSL_CTX_new + the standard verify-path defaults, BEFORE SSL_new
+# / SSL_connect. Consumers use this to call any SSL_CTX_set_*
+# customisation: ALPN advertise (`SSL_CTX_set_alpn_protos`),
+# custom verify callback, mTLS cert/key load, alternative trust
+# store, OPENSSL_INIT options, etc.
+#
+# Hook signature: `hook_fp(hook_ctx, ssl_ctx) -> int` — non-zero
+# return aborts the connection (frees ssl_ctx and returns 0
+# from tls_connect_with_ctx_hook). hook_ctx is opaque consumer
+# state pointer; pass 0 if unused. Pass `hook_fp = 0` to skip
+# the hook entirely (matches the pre-v5.6.40 `tls_connect`
+# behavior; that function is now a 1-line wrapper).
+#
+# Filed by sandhi 2026-04-24 in
+# `sandhi/docs/issues/2026-04-24-stdlib-tls-alpn-hook.md`,
+# Option A (function-pointer hook — least invasive, most
+# flexible).
+fn tls_connect_with_ctx_hook(sock, host, hook_fp, hook_ctx) {
     _tls_init();
     if (_tls_ok == 0) { return 0; }
 
@@ -112,6 +204,18 @@ fn tls_connect(sock, host) {
     # Enable peer certificate verification
     if (_fn_SSL_CTX_set_verify != 0) {
         fncall3(_fn_SSL_CTX_set_verify, ssl_ctx, SSL_VERIFY_PEER, 0);
+    }
+
+    # v5.6.40 hook point — runs on the bare SSL_CTX with stdlib
+    # defaults already applied. Consumer can override defaults
+    # (re-call SSL_CTX_set_verify with different flags) or layer
+    # additional config (ALPN, mTLS, custom trust store).
+    if (hook_fp != 0) {
+        var hook_rc = fncall2(hook_fp, hook_ctx, ssl_ctx);
+        if (hook_rc != 0) {
+            fncall1(_fn_SSL_CTX_free, ssl_ctx);
+            return 0;
+        }
     }
 
     var ssl = fncall1(_fn_SSL_new, ssl_ctx);
@@ -140,6 +244,15 @@ fn tls_connect(sock, host) {
     store64(ctx + 8, ssl);
     store64(ctx + 16, sock);
     return ctx;
+}
+
+# Wrap an already-connected TCP socket in a TLS session.
+# SNI set from host. System CAs used for peer verification.
+# v5.6.40: thin wrapper around tls_connect_with_ctx_hook with a
+# null hook (no SSL_CTX customisation). Existing consumers see
+# byte-identical behavior; this signature is preserved.
+fn tls_connect(sock, host) {
+    return tls_connect_with_ctx_hook(sock, host, 0, 0);
 }
 
 # Write through TLS session

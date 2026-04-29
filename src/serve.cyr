@@ -1,0 +1,248 @@
+# serve.cyr — sit's HTTP daemon (v0.7.2 skeleton).
+#
+# Read-only endpoints — exposes an opened sit repo over the
+# `/sit/v1/...` wire protocol per the v0.7.x plan.
+#
+#   GET /sit/v1/capabilities  → server identity + advertised limits
+#   GET /sit/v1/refs          → all heads + tags as JSON
+#
+# Subsequent v0.7.x patches add: GET /objects/<hash> (v0.7.3),
+# POST /want batched stream (v0.7.4), POST /objects + POST /refs
+# + bearer auth (v0.7.5), TLS (v0.7.6), mTLS (v0.7.7).
+#
+# Bound to 127.0.0.1 only in v0.7.2 — listening on 0.0.0.0 / a
+# routable interface needs explicit threat-model review (auth model
+# isn't wired yet; non-loopback exposure of a no-auth read path
+# leaks ref topology).
+
+var SIT_SERVE_DEFAULT_PORT = 8484;
+var SIT_SERVE_MAX_BODY = 16777216;  # 16 MiB — advertised in capabilities
+
+# ── Ref-file reader ────────────────────────────────────────────────
+#
+# Read a ref file's content as a 64-char SHA-256 hex string. Strips
+# the trailing newline conventionally written by `write_head_ref`
+# and friends; rejects anything that doesn't pass `hex_prefix_valid`.
+# Returns 0 on any failure (so callers can skip the entry instead of
+# aborting the response).
+
+fn serve_read_ref_file(path) {
+    var pair = alloc(16);  # [data_ptr, len]
+    var rc = read_file_heap(path, pair);
+    if (rc <= 0) { return 0; }
+    var data = load64(pair);
+    var len = load64(pair + 8);
+    while (len > 0) {
+        var lc = load8(data + len - 1) & 0xFF;
+        if (lc != 10) {
+            if (lc != 13) { break; }
+        }
+        len = len - 1;
+    }
+    if (len != 64) { return 0; }
+    if (hex_prefix_valid(data, 64) == 0) { return 0; }
+    var out = alloc(65);
+    memcpy(out, data, 64);
+    store8(out + 64, 0);
+    return out;
+}
+
+# ── JSON builders ──────────────────────────────────────────────────
+#
+# Hand-rolled JSON because the response shapes are tiny and
+# entirely under our control — every field name we emit is a
+# constant, and every value either passes `refname_valid` (no
+# JSON-escapable bytes) or `hex_prefix_valid` (digits + a-f only).
+# Pulling `lib/json.cyr` here would buy nothing and add a dep
+# surface inside the hot serve loop.
+
+fn serve_build_capabilities() {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"sit\":\"0.7.2\",\"max_body\":");
+    str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
+    str_builder_add_cstr(sb, ",\"auth\":[\"none\"]}");
+    return str_data(str_builder_build(sb));
+}
+
+# Recursively walk one refs subtree (`.sit/refs/heads` or
+# `.sit/refs/tags`) appending one JSON object per ref to `sb`.
+# `prefix` is the ref namespace ("refs/heads/" / "refs/tags/");
+# `dir` is the on-disk path to the corresponding directory;
+# `first_ref_cell` is a heap-allocated i64 used as a shared "is
+# this the first entry across BOTH subtrees?" flag — toggled to
+# 0 after the first emission so subsequent entries get a leading
+# comma.
+#
+# Errors (missing dir, malformed ref content, refnames that fail
+# `refname_valid`) silently omit the entry rather than fail the
+# whole response. `sit fsck` is the right tool to surface a broken
+# ref file; `serve` should keep listing what it can.
+
+fn serve_emit_refs_subtree(sb, prefix, dir, first_ref_cell) {
+    if (file_exists(dir) != 1) { return 0; }
+    var files = vec_new();
+    dir_walk(dir, files);
+    var i = 0;
+    var dlen = strlen(dir);
+    var plen = strlen(prefix);
+    while (i < vec_len(files)) {
+        var fs_path = vec_get(files, i);
+        var fp_len = strlen(fs_path);
+        # Strip the dir prefix + leading '/' to get the in-namespace name.
+        var rel_offset = dlen;
+        if (rel_offset < fp_len) {
+            if (load8(fs_path + rel_offset) == 47) { rel_offset = rel_offset + 1; }
+        }
+        var rel_len = fp_len - rel_offset;
+        if (rel_len > 0) {
+            var name = alloc(plen + rel_len + 1);
+            memcpy(name, prefix, plen);
+            memcpy(name + plen, fs_path + rel_offset, rel_len);
+            store8(name + plen + rel_len, 0);
+            var ok_name = refname_valid(name);
+            if (ok_name == 1) {
+                var hex = serve_read_ref_file(fs_path);
+                if (hex != 0) {
+                    if (load64(first_ref_cell) == 0) { str_builder_add_cstr(sb, ","); }
+                    str_builder_add_cstr(sb, "{\"name\":\"");
+                    str_builder_add_cstr(sb, name);
+                    str_builder_add_cstr(sb, "\",\"hash\":\"");
+                    str_builder_add_cstr(sb, hex);
+                    str_builder_add_cstr(sb, "\"}");
+                    store64(first_ref_cell, 0);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn serve_build_refs() {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"refs\":[");
+    var first_cell = alloc(8);
+    store64(first_cell, 1);
+    serve_emit_refs_subtree(sb, "refs/heads/", ".sit/refs/heads", first_cell);
+    serve_emit_refs_subtree(sb, "refs/tags/",  ".sit/refs/tags",  first_cell);
+    str_builder_add_cstr(sb, "]}");
+    return str_data(str_builder_build(sb));
+}
+
+# ── Request dispatcher ─────────────────────────────────────────────
+#
+# Signature dictated by sandhi: (ctx, cfd, req_buf, req_len) → 0.
+# `ctx` is unused in v0.7.2; v0.7.5+ will pass the bearer-token
+# config + auth state through it.
+
+fn serve_handle_request(ctx, cfd, buf, n) {
+    var method = sandhi_server_get_method(buf, n);
+    var path_with_query = sandhi_server_get_path(buf, n);
+    var path = sandhi_server_path_only(path_with_query);
+
+    if (streq(method, "GET") == 1) {
+        if (streq(path, "/sit/v1/capabilities") == 1) {
+            var b1 = serve_build_capabilities();
+            sandhi_server_send_response(cfd, 200, "OK", "application/json",
+                                         b1, strlen(b1), 0);
+            return 0;
+        }
+        if (streq(path, "/sit/v1/refs") == 1) {
+            var b2 = serve_build_refs();
+            sandhi_server_send_response(cfd, 200, "OK", "application/json",
+                                         b2, strlen(b2), 0);
+            return 0;
+        }
+    }
+    sandhi_server_send_status(cfd, 404, "Not Found");
+    return 0;
+}
+
+# ── --listen parser ────────────────────────────────────────────────
+#
+# Parses "<addr>:<port>". v0.7.2 only accepts "127.0.0.1:<n>" — any
+# other address is rejected at parse time so users don't accidentally
+# expose the no-auth daemon. Writes the parsed port to *out_port and
+# returns 1 on success, 0 on any malformation.
+
+fn serve_parse_listen(arg, out_port) {
+    var alen = strlen(arg);
+    var colon = 0 - 1;
+    var i = 0;
+    var seen = 0;
+    while (i < alen) {
+        if (seen == 0) {
+            if (load8(arg + i) == 58) {
+                colon = i;
+                seen = 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (colon < 0) { return 0; }
+    if (colon != 9) { return 0; }
+    if (memeq(arg, "127.0.0.1", 9) != 1) { return 0; }
+    var port = 0;
+    var j = colon + 1;
+    var saw_digit = 0;
+    while (j < alen) {
+        var c = load8(arg + j) & 0xFF;
+        if (c < 48) { return 0; }
+        if (c > 57) { return 0; }
+        port = port * 10 + (c - 48);
+        if (port > 65535) { return 0; }
+        saw_digit = 1;
+        j = j + 1;
+    }
+    if (saw_digit == 0) { return 0; }
+    if (port < 1) { return 0; }
+    store64(out_port, port);
+    return 1;
+}
+
+# ── Top-level command ──────────────────────────────────────────────
+
+fn cmd_serve() {
+    if (argc() < 3) {
+        eprintln("usage: sit serve <repo-path> [--listen 127.0.0.1:<port>]");
+        return 1;
+    }
+    var repo_path = argv_heap(2);
+    var port = SIT_SERVE_DEFAULT_PORT;
+    var ai = 3;
+    var consumed_listen = 0;
+    while (ai < argc()) {
+        var a = argv(ai);
+        if (streq(a, "--listen") == 1) {
+            if (ai + 1 >= argc()) {
+                eprintln("sit: --listen requires an argument");
+                return 1;
+            }
+            var port_cell = alloc(8);
+            store64(port_cell, 0);
+            if (serve_parse_listen(argv(ai + 1), port_cell) != 1) {
+                eprintln("sit: --listen requires 127.0.0.1:<port> in v0.7.2");
+                return 1;
+            }
+            port = load64(port_cell);
+            consumed_listen = 1;
+            ai = ai + 2;
+        } else {
+            eprintln("sit: unknown serve option");
+            return 1;
+        }
+    }
+    # chdir into the repo so .sit/refs/* and .sit/objects.patra
+    # resolve as relative paths in every dependent helper.
+    if (syscall(SYS_CHDIR, repo_path) != 0) {
+        eprintln("sit: cannot chdir to repo path");
+        return 1;
+    }
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository at given path");
+        return 1;
+    }
+    println("sit serve listening on 127.0.0.1");
+    stdout_flush();
+    return sandhi_server_run(INADDR_LOOPBACK(), port, &serve_handle_request, 0);
+}
