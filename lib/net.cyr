@@ -116,13 +116,13 @@ fn sock_shutdown(fd, how) {
 # === Simple TCP server pattern ===
 # fn handle_client(cfd) { ... }
 # fn serve(port) {
-    #     var sfd = result_unwrap(tcp_socket());
-    #     sock_reuse(sfd);
-    #     result_unwrap(sock_bind(sfd, INADDR_ANY(), port));
-    #     result_unwrap(sock_listen(sfd, 16));
-    #     while (1 == 1) {
-        #         var cfd = result_unwrap(sock_accept(sfd));
-        #         handle_client(cfd);
-        #         sock_close(cfd);
-        #     }
-    # }
+#     var sfd = result_unwrap(tcp_socket());
+#     sock_reuse(sfd);
+#     result_unwrap(sock_bind(sfd, INADDR_ANY(), port));
+#     result_unwrap(sock_listen(sfd, 16));
+#     while (1 == 1) {
+#         var cfd = result_unwrap(sock_accept(sfd));
+#         handle_client(cfd);
+#         sock_close(cfd);
+#     }
+# }
