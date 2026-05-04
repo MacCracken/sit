@@ -4,6 +4,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-05-04 — `sit serve` skeleton (read-only HTTP) + sandhi opt-in
+
+**First feature-bearing release of the v0.7.x network-transport line.** Lights up the read-only HTTP server side of the `/sit/v1/...` wire protocol with two endpoints (`GET /sit/v1/capabilities`, `GET /sit/v1/refs`); HTTP/SSH client transports remain v0.7.3+. Toolchain jumps cyrius 5.7.1 → 5.8.51 — the v5.8.46 token-cap raise (262144 → 1048576) is what unblocks `"sandhi"` + transitive net/tls/ws/http/json in `[deps].stdlib` so a real consumer can include sandhi without overflowing the parser.
+
+### Added
+
+- **`sit serve <repo> [--listen 127.0.0.1:<port>]`** — read-only HTTP daemon binding loopback only (default port 8484). One repo per process; `chdir`s into `<repo>` before serving so all `.sit/refs/*` and `.sit/objects.patra` references resolve as relative paths. `--listen` is parse-locked to `127.0.0.1:<port>` in v0.7.2; non-loopback exposure is gated on the auth model that arrives in v0.7.6 (push + bearer) — leaking ref topology over an open interface is not a v0.7.2 trade.
+- **`GET /sit/v1/capabilities`** → `{"sit":"0.7.2","max_body":16777216,"auth":["none"]}` — server identity + advertised request-body limit + auth modes (currently anonymous-read).
+- **`GET /sit/v1/refs`** → `{"refs":[{"name":"refs/heads/<n>","hash":"<64hex>"},...]}` — every `.sit/refs/heads/*` and `.sit/refs/tags/*` entry that passes `refname_valid` and resolves to a 64-hex SHA-256 hash. Nested ref names work (e.g., `refs/heads/feature/foo` from `dir_walk` recursion). Errors (missing dir, malformed ref content, refnames that fail validation) silently omit the entry — `sit fsck` is the right tool for surfacing broken refs; `serve` keeps listing what it can.
+- **`src/serve.cyr`** (255 lines) — wired into `src/lib.cyr`. Hand-rolled JSON builders (response shapes are tiny and entirely under our control; every emitted field name is a constant; every value passes `refname_valid` or `hex_prefix_valid`). Pulling `lib/json.cyr` into the hot serve loop bought nothing for this scope and added dep surface.
+- **`cmd_serve` + usage line in `src/main.cyr`** — command count: **24 → 25**.
+
+### Changed
+
+- **cyrius 5.7.1 → 5.8.51** — single-line pin bump in `cyrius.cyml`. Spans 95+ patches across the 5.7.x and 5.8.x lines; the load-bearing changes for sit are v5.8.46 (token-cap diagnostic `needed M, cap is N` + token-cap raise 262144 → 1048576) and v5.8.39 (sandhi v1.1.0 vendored into stdlib with per-request-arena Allocator-aware `_a` verbs).
+- **`[deps].stdlib`** — added `"net"`, `"tls"`, `"ws"`, `"http"`, `"json"`, `"sandhi"`. The transitive network modules are required because cyrius has no transitive stdlib resolution today (consumers must list every module the call graph reaches). v0.7.2 only directly calls into `sandhi` (server bits) + `net` (`INADDR_LOOPBACK`); the rest are sandhi's transitive needs.
+- **`wire_transport_check` error strings** in `src/wire.cyr` synced for v0.7.2:
+  - `http`: `"http transport requires sit 0.7.2+ (this is 0.7.1)"` → `"http client transport requires sit 0.7.3+ (this is 0.7.2)"` — server-side HTTP ships in v0.7.2, but the wire.cyr path is the *client* (cmd_clone, do_fetch, cmd_push), which still requires v0.7.3+ per the existing roadmap.
+  - `https`: pointer 0.7.6+ unchanged; `"this is 0.7.1"` → `"this is 0.7.2"`.
+  - `ssh`: pointer 0.7.8+ unchanged; `"this is 0.7.1"` → `"this is 0.7.2"`.
+
+### Fixed
+
+- **`serve_read_ref_file` success-vs-error check** — `read_file_heap` returns `0` on success and negative on error, but the caller checked `if (rc <= 0) { return 0; }`, treating the success path as failure. Symptom: `/sit/v1/refs` returned `{"refs":[]}` even when refs existed on disk. Fix: `<= 0` → `< 0`. Caught during the v0.7.2 smoke test against a 4-ref fixture.
+- **`serve_emit_refs_subtree` Str/cstring boundary** — `dir_walk(path, results)` expects `path` to be a stdlib `Str` object (does `str_data(path)` internally to extract the cstring) and pushes `Str` objects into the results vec. The original code passed a raw cstring and read entries as raw cstrings, so `dir_walk` opened a garbage path and `dir_list` returned 0 entries. Fix: wrap `dir` in `str_from(dir)` at the call site; treat `vec_get(files, i)` as a `Str` and use `str_len` / `str_data` to access the bytes; materialize a cstring via `memcpy` + null-terminate when calling `serve_read_ref_file`. Every other `dir_list` caller in sit (`refs.cyr`, `object_db.cyr`, `diff.cyr`, `wire.cyr`) follows the same `str_from()` wrapping convention.
+
+### Sit-side impact
+
+- Build: clean. **127/127 tests pass.** Lint: one pre-existing >120-char warning at `src/commit.cyr:609`.
+- DCE binary: 707 KB at v0.7.0 → **1.28 MB** at v0.7.2 (+576 KB / +82%). Driven primarily by the sandhi opt-in (~10K-line stdlib member with ~620 public fns; DCE strips most but the residue is real). The token-cap raise itself is a cyrius-side memory-layout change with no consumer-binary footprint.
+- Smoke test verified end-to-end against a 4-ref fixture (3 heads including `refs/heads/feature/foo` nested form, 1 tag): `curl /sit/v1/capabilities` returned JSON 200; `curl /sit/v1/refs` returned all 4 refs with correct names + 64-hex hashes; `curl /sit/v1/bogus` returned 404; `curl -X POST /sit/v1/refs` returned 404 (read-only, GET-only as documented).
+
+### Issue archived
+
+- [`docs/development/issues/archived/2026-04-25-cyrius-fixup-table-cap.md`](docs/development/issues/archived/2026-04-25-cyrius-fixup-table-cap.md) — `— RESOLVED` at cyrius 5.8.46. Original 32,768 → 262,144 cap raise (5.7.1) was insufficient; the v5.8.46 raise to 1,048,576 was sized to the empirical M from the new `needed M, cap is N` diagnostic. The two distinct caps the issue conflated (fixup-table vs token-array) turned out to require separate handling; v5.8.46's token-array raise was the binding fix for sit.
+
+### Up next (v0.7.3)
+
+`GET /sit/v1/objects/<hash>` (server) — raw compressed bytes with `X-Sit-Type` header carrying patra `ty` — and `wire_http.cyr` (client) end-to-end fetch/clone over the v0.7.2 server. Reachability walk runs over an HTTP-backed `db_object_read_both` shim. Success gate: `sit clone http://localhost` against a 100-commit fixture, `sit fsck` clean, within 3× local-path.
+
 ## [0.7.1] — 2026-04-25 — URL scheme detection + transport dispatch stubs
 
 **First feature-bearing patch in the v0.7.x line. Pure plumbing — no transport yet.** Sets up scheme classification and per-command dispatch so `sit remote add origin http://...` succeeds today, while `sit fetch origin` and `sit clone https://...` fail with a clean per-scheme message naming the v0.7.x patch that lights each transport up.

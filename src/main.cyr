@@ -57,6 +57,7 @@ fn print_usage() {
     eprintln("  pull <remote> [<ref>]   fetch + fast-forward merge (diverged → use merge)");
     eprintln("  push <remote> [<ref>]   push HEAD's branch to a remote (fast-forward only)");
     eprintln("  clone <url> [<dir>]     init + remote add origin + fetch + checkout");
+    eprintln("  serve <repo> [--listen 127.0.0.1:<port>]  read-only HTTP daemon (sit/v1)");
     eprintln("  commit [-S] [-m] <msg>  record staged changes as a new commit (-S to sign)");
     eprintln("  log [--oneline]         show commit history from HEAD");
     eprintln("  status                  show working tree status");
@@ -95,6 +96,7 @@ fn main() {
     if (streq(cmd, "pull")     == 1) { return cmd_pull(); }
     if (streq(cmd, "push")     == 1) { return cmd_push(); }
     if (streq(cmd, "clone")    == 1) { return cmd_clone(); }
+    if (streq(cmd, "serve")    == 1) { return cmd_serve(); }
     if (streq(cmd, "commit")   == 1) { return cmd_commit(); }
     if (streq(cmd, "log")      == 1) { return cmd_log(); }
     if (streq(cmd, "status")   == 1) { return cmd_status(); }

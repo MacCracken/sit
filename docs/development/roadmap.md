@@ -1,10 +1,22 @@
 # sit Development Roadmap
 
-> **v0.7.x active.** v0.7.0 (sandhi-fold toolchain unlock — cyrius 5.7.0 + `lib/http_server.cyr` orphan deletion) shipped 2026-04-25. v0.7.1 (URL scheme detection + per-command transport dispatch — http/https/ssh URLs now validate, error on dispatch with per-scheme version pointers) shipped 2026-04-25. Network transport (HTTP server + client, then SSH) lands across v0.7.2 → v0.7.8 per the release sequence below. The v0.6.x perf arc closed at v0.6.12 (cumulative `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%`).
+> **v0.7.x active.** v0.7.0 (sandhi-fold toolchain unlock — cyrius 5.7.0 + `lib/http_server.cyr` orphan deletion) shipped 2026-04-25. v0.7.1 (URL scheme detection + per-command transport dispatch) shipped 2026-04-25. **v0.7.2 (`sit serve` skeleton — read-only HTTP server side of `/sit/v1/...`; sandhi opt-in via cyrius 5.7.1 → 5.8.51) shipped 2026-05-04**, unblocked by cyrius v5.8.46's token-array cap raise (262144 → 1048576). HTTP/SSH client transports + push + auth + TLS + mTLS land across v0.7.3 → v0.7.8 per the release sequence below. The v0.6.x perf arc closed at v0.6.12 (cumulative `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%`).
 
 Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHANGELOG.md`](../../CHANGELOG.md) for the tagged artifacts.
 
 ## Released
+
+### v0.7.2 — `sit serve` skeleton (read-only HTTP) + sandhi opt-in
+
+- **First feature-bearing release of the v0.7.x network-transport line.** Two endpoints live: `GET /sit/v1/capabilities` (server identity + advertised limits) and `GET /sit/v1/refs` (every `.sit/refs/heads/*` and `.sit/refs/tags/*` that passes `refname_valid` and resolves to a 64-hex hash; nested ref names like `refs/heads/feature/foo` work via `dir_walk` recursion). 404 on unknown paths and on POST (read-only, GET-only).
+- **`sit serve <repo> [--listen 127.0.0.1:<port>]`** — loopback-only HTTP daemon, default port 8484. One repo per process; `chdir`s into `<repo>` before serving. `--listen` is parse-locked to `127.0.0.1:<port>` in v0.7.2; non-loopback exposure is gated on the auth model that arrives in v0.7.5+ (push + bearer).
+- **`src/serve.cyr`** (255 lines) — wired into `src/lib.cyr`. Hand-rolled JSON builders; uses sandhi server primitives (`sandhi_server_run`, `sandhi_server_get_method`, `sandhi_server_get_path`, `sandhi_server_path_only`, `sandhi_server_send_response`, `sandhi_server_send_status`) + `INADDR_LOOPBACK()` from `lib/net.cyr`. `cmd_serve` + usage line in `src/main.cyr` — command count: **24 → 25**.
+- **Toolchain**: cyrius 5.7.1 → **5.8.51**. Spans 95+ patches; the load-bearing changes are v5.8.46 (token-array cap raise 262144 → 1048576, plus the `needed M, cap is N` diagnostic that sized the bump) and v5.8.39 (sandhi v1.1.0 vendored into stdlib with per-request-arena Allocator-aware `_a` verbs).
+- **Stdlib opt-in**: `[deps].stdlib` adds `"net"`, `"tls"`, `"ws"`, `"http"`, `"json"`, `"sandhi"`. Only `sandhi` (server bits) and `net` (`INADDR_LOOPBACK`) are directly called; the rest are sandhi's transitive needs (no cyrius transitive stdlib resolution today).
+- **`wire_transport_check` error strings synced** for v0.7.2: `http` → `0.7.3+` (server-side ships in 0.7.2 but the wire.cyr path is the *client*; HTTP CLIENT lands in 0.7.3 per the table below); `https` → `0.7.6+` and `ssh` → `0.7.8+` pointers unchanged; `(this is 0.7.1)` → `(this is 0.7.2)` everywhere.
+- **Two sit-side bugfixes caught in smoke** (4-ref fixture: 3 heads incl. `feature/foo` nested + 1 tag): `serve_read_ref_file` `<= 0` → `< 0` (`read_file_heap` returns `0` on success, negative on error — the original check rejected success); `serve_emit_refs_subtree` Str/cstring boundary on `dir_walk` (the function expects a `Str` object and pushes `Str` objects into the results vec; the original code passed and read raw cstrings, so the walk silently returned 0 entries). Fix wraps in `str_from(dir)` and uses `str_len`/`str_data` to read the entries; matches the pattern every other `dir_list` caller in sit (`refs.cyr`, `object_db.cyr`, `diff.cyr`, `wire.cyr`) already follows.
+- **127/127 tests pass.** DCE binary: 707 KB (v0.7.0) → **1.28 MB** (v0.7.2; +576 KB / +82%). Sandhi opt-in is the dominant driver — DCE strips most of the ~10K-line sandhi.cyr but the residue is real.
+- **2026-04-25 issue archived RESOLVED**: [`issues/archived/2026-04-25-cyrius-fixup-table-cap.md`](issues/archived/2026-04-25-cyrius-fixup-table-cap.md). Original 32,768 → 262,144 cap raise (v5.7.1) was insufficient; v5.8.46's 4× raise to 1,048,576 was sized to the empirical M from the new diagnostic. The two distinct caps the issue conflated (fixup-table vs token-array) turned out to require separate handling.
 
 ### v0.7.1 — URL scheme detection + transport dispatch stubs
 
@@ -238,7 +250,7 @@ Per the v0.7.x plan settled 2026-04-25. Each release is a small bite (CLAUDE.md 
 |---|---|---|---|
 | ~~0.7.0~~ | ✅ shipped — sandhi-fold toolchain unlock; orphan delete | — | (see Released) |
 | ~~0.7.1~~ | ✅ shipped — URL scheme detection + dispatch stubs | — | (see Released) |
-| **0.7.2** | `cmd_serve` + `GET /capabilities` + `GET /refs` (read-only). `"sandhi"` joins `[deps].stdlib` here, with `net`/`tls`/`ws`/`http`/`json` co-added (sandhi's transitive needs). | `src/serve.cyr` | `curl /sit/v1/refs` matches `find .sit/refs`; CI smoke `serve` + `curl` round trip |
+| ~~0.7.2~~ | ✅ shipped — `cmd_serve` + `GET /capabilities` + `GET /refs` (read-only); sandhi opt-in; cyrius 5.8.51 toolchain refresh | `src/serve.cyr` | (see Released — 4-ref smoke fixture verified) |
 | **0.7.3** | `GET /objects/<hash>` (server) + `wire_http.cyr` end-to-end fetch/clone (client). Reachability walk runs over an HTTP-backed `db_object_read_both` shim. | `src/wire_http.cyr` | `sit clone http://localhost` against 100-commit fixture, `sit fsck` clean, within 3× local-path |
 | **0.7.4** | `POST /want` batched object stream. Length-prefixed framing; client falls back to per-object GET if server doesn't advertise `"batch": true`. | — (frame format ADR 0006) | ≥30% clone speedup vs 0.7.3 OR revert; frame decoder fuzzed ≥10M iters |
 | **0.7.5** | Push side: `POST /objects` + `POST /refs` + bearer auth + non-ff rejection. Server rehashes uploaded objects (trust boundary). | — (auth ADR 0007) | Push round trip; bad token 401; non-ff 409; idempotent re-push |

@@ -6,10 +6,10 @@
 
 ## Current
 
-- **Version**: 0.7.1 (read `VERSION` for the authoritative number)
-- **Cyrius toolchain**: 5.7.0 (pinned in `cyrius.cyml [package].cyrius`)
-- **Binary**: 709 KB statically-linked, no dynamic dependencies
-- **Status**: **v0.7.x network-transport line — release 2 of N.** v0.7.0 was the sandhi-fold toolchain unlock; v0.7.1 adds URL scheme detection + per-command transport dispatch (pure plumbing — `sit remote add origin http://...` succeeds, `sit fetch origin` errors clean naming the upcoming v0.7.x patch). Wire protocol shape and server design settled per the planned `/sit/v1/...` JSON/REST routes (capabilities, refs, objects, want, push) with bearer-token auth and a `sit serve <path>` daemon. **Next: v0.7.2 — `sit serve` skeleton + `GET /sit/v1/capabilities` + `GET /sit/v1/refs`** (this is when `"sandhi"` lands in `[deps].stdlib` for real, alongside the network primitives sandhi needs: `net`, `tls`, `ws`, `http`, `json`). The v0.6.x perf arc remains the cumulative scoreboard against `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%` from v0.6.0 baseline.
+- **Version**: 0.7.2 (read `VERSION` for the authoritative number)
+- **Cyrius toolchain**: 5.8.51 (pinned in `cyrius.cyml [package].cyrius`)
+- **Binary**: 1.28 MB statically-linked, no dynamic dependencies (DCE; up from 707 KB at v0.7.0 — sandhi opt-in is the dominant driver)
+- **Status**: **v0.7.x network-transport line — release 3 of N.** v0.7.0 sandhi-fold toolchain unlock; v0.7.1 URL scheme detection + transport dispatch stubs; **v0.7.2 lights up `sit serve` (read-only HTTP) and brings `"sandhi"` into `[deps].stdlib` for real** (alongside transitive `net`/`tls`/`ws`/`http`/`json`). Two endpoints live: `GET /sit/v1/capabilities` and `GET /sit/v1/refs` (anonymous-read, loopback-only). Toolchain jumped 5.7.1 → 5.8.51 to pick up the v5.8.46 token-cap raise (262144 → 1048576) — the binding fix for the 2026-04-25 fixup-table-cap issue (now archived RESOLVED). **Next: v0.7.3 — `GET /sit/v1/objects/<hash>` (server) + `wire_http.cyr` (client) end-to-end fetch/clone over the v0.7.2 server**; HTTP client transport in `wire.cyr` still errors with `"http client transport requires sit 0.7.3+"`. The v0.6.x perf arc remains the cumulative scoreboard against `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%` from v0.6.0 baseline.
 - **Primary target**: Linux x86_64. aarch64 cross-build is best-effort in CI
 
 ### Architecture call-outs (carried across v0.6.x)
@@ -23,28 +23,29 @@
 
 ## Source layout
 
-14 files total, 7013 lines (up from 13 files / 5972 lines in 0.5.1 — v0.6.0 added `validate.cyr`; v0.6.x perf + security work grew most modules).
+15 files total, 7372 lines (up from 14 files / 7013 lines at v0.7.1 — v0.7.1 grew `validate.cyr` (+72) and `wire.cyr` (+29) for URL scheme detection; v0.7.2 added `serve.cyr` and grew `validate.cyr` further to 501 lines + `wire.cyr` to 960 lines).
 
 | File | Lines | Responsibility |
 |------|------:|----------------|
-| `src/lib.cyr` | 19 | include chain (domain modules; stdlib auto-includes via `cyrius.cyml`) |
-| `src/main.cyr` | 115 | `print_usage`, `main()`, dispatch, trailer (with `stdout_flush()` since v0.6.8) |
+| `src/lib.cyr` | 20 | include chain (domain modules; stdlib auto-includes via `cyrius.cyml`) |
+| `src/main.cyr` | 117 | `print_usage`, `main()`, dispatch (25 cmds since v0.7.2), trailer (with `stdout_flush()` since v0.6.8) |
 | `src/util.cyr` | 238 | `eprintln`, `ensure_dir`, `ensure_parent_dirs`, `alloc_or_die` (S-17, v0.6.2), `stdout_write`/`stdout_flush` (P-17, v0.6.8), `write_decimal`, `argv_heap`, `skip_ws`, `strcmp_cstr`, `sort_cstrings`, `read_file_heap`, `write_sanitized` (S-21) |
+| `src/serve.cyr` | 255 | **NEW in 0.7.2.** `cmd_serve` + `serve_handle_request` dispatcher; `GET /sit/v1/capabilities` + `GET /sit/v1/refs`; hand-rolled JSON; loopback-only `--listen` parser; uses sandhi server primitives (`sandhi_server_run` + helpers) |
 | `src/sign.cyr` | 331 | ed25519 signing + `cmd_key/verify-commit` (O_EXCL in 0.6.0; sitsig hex validation in v0.6.2) |
 | `src/config.cyr` | 347 | `config_*` helpers + `cmd_config` |
 | `src/tree.cyr` | 367 | `parse_tree`, `build_tree`, `flatten_tree` (depth-capped); hashmap-backed `tree_find` + `three_way_path_set` (P-10/P-18 since v0.6.6) |
-| `src/validate.cyr` | 429 | **NEW in 0.6.0.** Pure validators: `hex_prefix_valid`, `refname_valid`, `tree_entry_name_valid`, `tree_flat_path_valid`, `tree_entry_mode_valid`, `config_value_valid`, `config_key_valid`, `remote_url_valid`, `path_is_symlink`, `path_lstat_kind` |
+| `src/validate.cyr` | 501 | Pure validators: `hex_prefix_valid`, `refname_valid`, `tree_entry_name_valid`, `tree_flat_path_valid`, `tree_entry_mode_valid`, `config_value_valid`, `config_key_valid`, `remote_url_valid` (HTTP/HTTPS/SSH whitelist body since v0.7.1), `url_scheme` (v0.7.1), `url_authority_path_valid` (v0.7.1), `path_is_symlink`, `path_lstat_kind` |
 | `src/refs.cyr` | 578 | HEAD/branch/tag/resolve + `cmd_branch/checkout/tag` (ref-name + hex validation in 0.6.0) |
 | `src/object_db.cyr` | 602 | patra object store with `_object_db_cached` handle (v0.6.4); `resolve_hash`, `read_object`, framing + compression with v0.6.9 4× initial multiplier; `cat-file` / `owl-file` / `fsck` |
 | `src/index.cyr` | 634 | staging index + `.sitignore` + `cmd_add/rm/reset`; `_index_db_cached` (v0.6.4); `parse_index` `ORDER BY path` (P-20, v0.6.11) |
 | `src/commit.cyr` | 658 | builders, parsers, `cmd_commit/log` (author sanitization + integer-overflow guards in v0.6.0/0.6.2) |
 | `src/merge.cyr` | 694 | 3-way merge, conflict markers, `cmd_merge` (FS-mutation return checks in v0.6.2) |
-| `src/wire.cyr` | 931 | remote config, reachability (depth-capped); `cmd_remote/fetch/pull/push/clone` with `--force-absolute` gate (S-23) + walk-cache (P-04, v0.6.7) + batched transactions (P-03, v0.6.5) |
+| `src/wire.cyr` | 960 | remote config, reachability (depth-capped); `cmd_remote/fetch/pull/push/clone` with `--force-absolute` gate (S-23) + walk-cache (P-04, v0.6.7) + batched transactions (P-03, v0.6.5); `wire_transport_check` per-scheme dispatch since v0.7.1 (error pointers updated for v0.7.2) |
 | `src/diff.cyr` | 1070 | LCS (DP table via fl_alloc since v0.6.9), hunks, working walker + `cmd_diff/show/status` |
 
 ## Commands shipped
 
-**24 total.** `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge` (`-S`), `reset`, `commit` (`-S`), `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `log`, `status`, `diff`, `show` (`--stat`), `cat-file`, `owl-file`.
+**25 total.** `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge` (`-S`), `reset`, `commit` (`-S`), `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `log`, `status`, `diff`, `show` (`--stat`), `cat-file`, `owl-file`, `serve` (v0.7.2; loopback-only HTTP daemon, read-only `/sit/v1/{capabilities,refs}`).
 
 ## Tests
 
@@ -61,9 +62,9 @@ All git-tag pinned in `cyrius.cyml`. No FFI, no C, no libgit2 — see [ADR 0001]
 - **sigil** 2.9.3 — SHA-256 + ed25519 signing. Bumped from 2.9.1 in v0.6.12. **Picks up the SHA-NI hardware path** filed on sigil's roadmap during the v0.6.4 review. SHA-256 throughput went from ~12 MB/s software-only to ~400 MB/s on 64 KB inputs (32× factor). Drives the `sit add` headline wins
 - **patra** 1.8.3 — B+ tree / WAL object store. Bumped from 1.6.0 in v0.6.10 to pick up `patra_result_get_str_len` (1.6.1 — closes S-31). 1.7.0 `INSERT OR IGNORE` is SQL-level only (filed informally for programmatic `patra_insert_row` flag). 1.8.x WAL group commit (`PATRA_SYNC_BATCH`) investigated; not enabled — durability regression for no perf gain on sit's bench shape
 
-**Cyrius stdlib declared explicitly** in `cyrius.cyml [deps].stdlib` because cyrius has no transitive stdlib resolution today (consumers must list every module the call graph reaches, including modules pulled in only via dep crates). Current list: `string`, `fmt`, `alloc`, `io`, `vec`, `str`, `syscalls`, `assert`, `fs`, `args`, `chrono`, `hashmap`, `process`, `tagged`, `fnptr`, `thread`, `freelist`, `bigint`, `ct`, `keccak`, `bench`. Entries past `hashmap` exist for patra / sigil's transitive reach.
+**Cyrius stdlib declared explicitly** in `cyrius.cyml [deps].stdlib` because cyrius has no transitive stdlib resolution today (consumers must list every module the call graph reaches, including modules pulled in only via dep crates). Current list (v0.7.2): `string`, `fmt`, `alloc`, `io`, `vec`, `str`, `syscalls`, `assert`, `fs`, `args`, `chrono`, `hashmap`, `process`, `tagged`, `fnptr`, `thread`, `freelist`, `bigint`, `ct`, `keccak`, `bench`, **`net`, `tls`, `ws`, `http`, `json`, `sandhi`**. The last six are the v0.7.2 additions for `sit serve`; sandhi pulls `net`/`tls`/`ws`/`http`/`json` transitively. Entries past `hashmap` exist for patra / sigil's transitive reach.
 
-Cyrius 5.7.0 (the sandhi fold) **vendors `sandhi` v1.0.0 into stdlib** as `lib/sandhi.cyr` and deletes `lib/http_server.cyr`. Sandhi is now a stdlib member alongside `http`/`ws`/`net` — opt-in via `"sandhi"` in this list, not a separate `[deps.sandhi]` git pin. Sit has no HTTP code today and does not list `sandhi`; the v0.7.0 network-transport work is when that entry lands.
+Cyrius 5.7.0 (the sandhi fold) vendored `sandhi` v1.0.0 into stdlib as `lib/sandhi.cyr` and deleted `lib/http_server.cyr`; cyrius 5.8.39 re-vendored sandhi v1.1.0 with the per-request-arena Allocator-aware `_a` verbs. Sit picks up sandhi v1.1.0 at v0.7.2 via the cyrius 5.8.51 pin. Sandhi is a stdlib member, not a separate `[deps.sandhi]` git pin — opt-in is the single `"sandhi"` entry in `[deps].stdlib`. The token-array cap that previously blocked this opt-in (issue archived 2026-04-25) was raised 262144 → 1048576 in cyrius 5.8.46.
 
 ## Storage layout (sit repos on disk)
 
@@ -83,6 +84,7 @@ Cyrius 5.7.0 (the sandhi fold) **vendors `sandhi` v1.0.0 into stdlib** as `lib/s
 
 | Version | Date | Summary |
 |---------|------|---------|
+| 0.7.2 | 2026-05-04 | **`sit serve` skeleton + sandhi opt-in.** First feature-bearing release of the v0.7.x network-transport line. New `cmd_serve` + `src/serve.cyr` (255 lines) wired into `src/lib.cyr`; `GET /sit/v1/capabilities` and `GET /sit/v1/refs` live, loopback-only, read-only. Toolchain 5.7.1 → 5.8.51 picks up the v5.8.46 token-array cap raise (262144 → 1048576) that finally lets `"sandhi"` + transitive `net`/`tls`/`ws`/`http`/`json` ship in `[deps].stdlib`. Two sit-side bugs caught in smoke: `serve_read_ref_file` `<= 0` → `< 0` (`read_file_heap` returns 0 on success); `serve_emit_refs_subtree` Str/cstring boundary on `dir_walk`. Wire-transport error strings synced for v0.7.2 (http client now → 0.7.3+). 127/127 tests pass; DCE binary 1.28 MB (+576 KB vs v0.7.0; sandhi residue dominates). |
 | 0.7.1 | 2026-04-25 | **URL scheme detection + dispatch stubs.** Added `url_scheme()`, `url_authority_path_valid()`, `wire_transport_check()`. Extended `remote_url_valid()` to accept http/https/ssh URL shapes (transport not wired). `cmd_clone` / `do_fetch` / `cmd_push` dispatch on scheme; non-file schemes return clean per-scheme error naming the upcoming v0.7.x patch. **127/127 tests pass** (101 + 26 new), 10K-round fuzz clean on validators. Sandhi opt-in deferred to v0.7.2 (needs `net`/`tls`/`ws`/`http`/`json` co-add and a real caller). DCE binary 709 KB. |
 | 0.7.0 | 2026-04-25 | **v0.7.x line opener — toolchain-only unlock.** cyrius 5.6.43 → 5.7.0 (the sandhi fold; `sandhi` v1.0.0 vendored into stdlib as `lib/sandhi.cyr`, `lib/http_server.cyr` deleted from stdlib). Deleted local orphan `lib/http_server.cyr` (zero callers; cyrius 5.7.0's downstream worklist names sit for "delete orphan only"). Build clean, 101/101 tests pass, DCE binary 707 KB (down from 710). No `[deps.sandhi]` added — sit has no HTTP code today; sandhi now bundles in stdlib and is opt-in via `"sandhi"` in inline `[deps].stdlib` when feature work begins. v0.7.1 is the first feature-bearing patch in the line. |
 | 0.6.12 | 2026-04-25 | **Biggest single-release win of the v0.6.x arc.** Pure dep bumps: cyrius 5.6.40 → 5.6.43, **sigil 2.9.1 → 2.9.3 (SHA-NI hardware path)**, sankoch 2.0.3 → 2.1.0. Sigil SHA-256 throughput 32× on 64 KB inputs (12 MB/s → ~400 MB/s). Cascades to **`add-64KB` -41%** (16.40 → 9.62 ms) and **`add-1MB` -48%** (211.52 → 112.39 ms). `status` -8%. No sit source changes. Bench snapshot at `docs/benchmarks/2026-04-25-v0.6.12.md`. |

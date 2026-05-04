@@ -29,7 +29,7 @@ var SIT_SERVE_MAX_BODY = 16777216;  # 16 MiB — advertised in capabilities
 fn serve_read_ref_file(path) {
     var pair = alloc(16);  # [data_ptr, len]
     var rc = read_file_heap(path, pair);
-    if (rc <= 0) { return 0; }
+    if (rc < 0) { return 0; }
     var data = load64(pair);
     var len = load64(pair + 8);
     while (len > 0) {
@@ -80,28 +80,35 @@ fn serve_build_capabilities() {
 
 fn serve_emit_refs_subtree(sb, prefix, dir, first_ref_cell) {
     if (file_exists(dir) != 1) { return 0; }
+    # dir_walk expects a Str object (it does str_data internally) and pushes
+    # Str objects into the results vec. Convert at the boundary.
     var files = vec_new();
-    dir_walk(dir, files);
+    dir_walk(str_from(dir), files);
     var i = 0;
     var dlen = strlen(dir);
     var plen = strlen(prefix);
     while (i < vec_len(files)) {
-        var fs_path = vec_get(files, i);
-        var fp_len = strlen(fs_path);
+        var fp_str = vec_get(files, i);
+        var fp_len = str_len(fp_str);
+        var fp_data = str_data(fp_str);
         # Strip the dir prefix + leading '/' to get the in-namespace name.
         var rel_offset = dlen;
         if (rel_offset < fp_len) {
-            if (load8(fs_path + rel_offset) == 47) { rel_offset = rel_offset + 1; }
+            if (load8(fp_data + rel_offset) == 47) { rel_offset = rel_offset + 1; }
         }
         var rel_len = fp_len - rel_offset;
         if (rel_len > 0) {
             var name = alloc(plen + rel_len + 1);
             memcpy(name, prefix, plen);
-            memcpy(name + plen, fs_path + rel_offset, rel_len);
+            memcpy(name + plen, fp_data + rel_offset, rel_len);
             store8(name + plen + rel_len, 0);
             var ok_name = refname_valid(name);
             if (ok_name == 1) {
-                var hex = serve_read_ref_file(fs_path);
+                # serve_read_ref_file is cstring-based; materialize the Str.
+                var fs_cstr = alloc(fp_len + 1);
+                memcpy(fs_cstr, fp_data, fp_len);
+                store8(fs_cstr + fp_len, 0);
+                var hex = serve_read_ref_file(fs_cstr);
                 if (hex != 0) {
                     if (load64(first_ref_cell) == 0) { str_builder_add_cstr(sb, ","); }
                     str_builder_add_cstr(sb, "{\"name\":\"");

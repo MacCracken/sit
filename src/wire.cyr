@@ -24,15 +24,15 @@ fn wire_transport_check(url) {
     var s = url_scheme(url);
     if (s == URL_SCHEME_FILE) { return 0; }
     if (s == URL_SCHEME_HTTP) {
-        eprintln("sit: http transport requires sit 0.7.2+ (this is 0.7.1)");
+        eprintln("sit: http client transport requires sit 0.7.3+ (this is 0.7.2)");
         return 1;
     }
     if (s == URL_SCHEME_HTTPS) {
-        eprintln("sit: https transport requires sit 0.7.6+ (this is 0.7.1)");
+        eprintln("sit: https transport requires sit 0.7.6+ (this is 0.7.2)");
         return 1;
     }
     if (s == URL_SCHEME_SSH) {
-        eprintln("sit: ssh transport requires sit 0.7.8+ (this is 0.7.1)");
+        eprintln("sit: ssh transport requires sit 0.7.8+ (this is 0.7.2)");
         return 1;
     }
     eprintln("sit: unrecognized URL scheme");
