@@ -40,6 +40,12 @@ stdlib = [
     "ct",
     "keccak",
     "bench",
+    "net",
+    "tls",
+    "ws",
+    "http",
+    "json",
+    "sandhi",
 ]
 
 [deps.sakshi]
