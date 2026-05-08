@@ -27,7 +27,9 @@ fn wire_transport_check_readable(url) {
     if (s == URL_SCHEME_FILE) { return 0; }
     if (s == URL_SCHEME_HTTP) { return 0; }   # v0.7.3
     if (s == URL_SCHEME_HTTPS) {
-        eprintln("sit: https transport requires sit 0.7.6+");
+        # Per ADR 0007: HTTPS is not in the v0.7.x roadmap. No libssl,
+        # no libcrypto, no exception.
+        eprintln("sit: https transport requires first-party Cyrius TLS (see ADR 0007)");
         return 1;
     }
     if (s == URL_SCHEME_SSH) {
@@ -41,12 +43,12 @@ fn wire_transport_check_readable(url) {
 fn wire_transport_check_writable(url) {
     var s = url_scheme(url);
     if (s == URL_SCHEME_FILE) { return 0; }
-    if (s == URL_SCHEME_HTTP) {
-        eprintln("sit: push over http requires sit 0.7.5+");
-        return 1;
-    }
+    if (s == URL_SCHEME_HTTP) { return 0; }   # v0.7.6
     if (s == URL_SCHEME_HTTPS) {
-        eprintln("sit: https transport requires sit 0.7.6+");
+        # Per ADR 0007: HTTPS is not in the v0.7.x roadmap. No libssl,
+        # no libcrypto, no exception. Until a first-party Cyrius TLS
+        # exists, sit's encrypted-over-internet path is SSH (v0.7.8).
+        eprintln("sit: https transport requires first-party Cyrius TLS (see ADR 0007)");
         return 1;
     }
     if (s == URL_SCHEME_SSH) {
@@ -1224,7 +1226,6 @@ fn cmd_push() {
         return 1;
     }
     if (wire_transport_check_writable(url) != 0) { return 1; }
-    var repo_path = remote_normalize(url);
 
     var local_tip = read_head_ref();
     if (local_tip == 0) {
@@ -1239,6 +1240,13 @@ fn cmd_push() {
         return 1;
     }
 
+    var s = url_scheme(url);
+    if (s == URL_SCHEME_HTTP) {
+        return _do_push_http(name, branch, url, src_db, local_tip);
+    }
+
+    # File:// + bare path push (the v0.7.5-and-prior path).
+    var repo_path = remote_normalize(url);
     var dst_db = remote_objects_open(repo_path);
     if (dst_db == 0) {
         eprintln("sit: cannot open remote object db");
@@ -1258,10 +1266,9 @@ fn cmd_push() {
     var seen = map_new();
     var hashes = vec_new();
     # P-04 (v0.6.7): raw_cache shared between walk and copy.
-    # v0.7.5: phased walker. Push is local→remote; remote is currently
-    # always file:// (push over http is gated until v0.7.6+) so the
-    # batch hooks are no-ops here, but using phased keeps the codepath
-    # identical to do_fetch for when push grows http transport.
+    # v0.7.5: phased walker. Push is local→remote; over file:// the
+    # batch hooks are no-ops, but using phased keeps the file://
+    # codepath identical in shape to do_fetch + the http push path.
     var raw_cache = map_new();
     var src = obj_src_for_db(src_db);
     walk_reachable_phased(src, local_tip, hashes, seen, raw_cache);
@@ -1274,6 +1281,129 @@ fn cmd_push() {
         return 1;
     }
 
+    _print_push_summary(branch, name, local_tip, copied);
+    return 0;
+}
+
+# v0.7.6 push over http. Walks reachable objects from local_tip,
+# POSTs each to /sit/v1/objects/<hex> (server rehashes — trust
+# boundary), then POSTs the new tip to /sit/v1/refs/<refname>.
+# Pre-flight: read remote refs to detect non-FF before sending any
+# objects (saves a round-trip-per-object on a doomed push).
+fn _do_push_http(name, branch, url, src_db, local_tip) {
+    var http = wire_http_open(url);
+    if (http == 0) { return 1; }
+
+    # Probe capabilities once to learn batch + auth posture. The probe
+    # is also what populates the handle's batch_supported / requires_auth
+    # flags. Discard the return; we consult the flags directly so the
+    # auth-only case (server advertises bearer but not batch) doesn't
+    # accidentally short-circuit auth loading.
+    http_remote_check_batch(http);
+    if (_http_remote_requires_auth(http) == 1) {
+        var tok = _wire_http_load_client_token();
+        if (tok == 0) {
+            wire_http_close(http);
+            eprintln("sit: server requires bearer auth but ~/.sit/serve.token is missing or unreadable");
+            return 1;
+        }
+        _http_remote_set_token(http, tok);
+    }
+
+    # FF preflight via GET /sit/v1/refs. resolve_branch returns 0 if
+    # the branch doesn't exist on the remote (initial push).
+    var remote_tip = http_remote_resolve_branch(http, branch);
+    if (remote_tip != 0) {
+        if (is_ancestor_in_db(src_db, remote_tip, local_tip) == 0) {
+            wire_http_close(http);
+            eprintln("sit: non-fast-forward push rejected (remote has diverged)");
+            return 1;
+        }
+        if (streq(remote_tip, local_tip) == 1) {
+            # Already up-to-date. Skip the work entirely.
+            wire_http_close(http);
+            stdout_write("everything up-to-date\n", 22);
+            return 0;
+        }
+    }
+
+    # Walk reachable objects from local_tip — same shape as fetch but
+    # the source is local (OBJ_SRC_DB, batch is no-op).
+    var seen = map_new();
+    var hashes = vec_new();
+    var raw_cache = map_new();
+    var src = obj_src_for_db(src_db);
+    walk_reachable_phased(src, local_tip, hashes, seen, raw_cache);
+
+    # Push each object. The server idempotently returns 200 for
+    # already-present hashes (per ADR 0006's spirit; serve_handle_put_object
+    # mirrors db_object_insert_raw's already-present semantics) and
+    # 201 for fresh inserts. Both are success; non-2xx stops the push.
+    var n = vec_len(hashes);
+    var i = 0;
+    var pushed = 0;
+    while (i < n) {
+        var hex = vec_get(hashes, i);
+        # Pull the {compressed, clen, ty} 24-byte struct: cache hit
+        # for commits + trees that walk_reachable visited; fallback
+        # to db_object_read_raw for blobs.
+        var raw[24];
+        var got = 0;
+        if (raw_cache != 0) {
+            var cached = map_get(raw_cache, hex);
+            if (cached != 0) {
+                memcpy(&raw, cached, 24);
+                got = 1;
+            }
+        }
+        if (got == 0) {
+            if (db_object_read_raw(src_db, hex, &raw) == 0) { got = 1; }
+        }
+        if (got == 0) {
+            wire_http_close(http);
+            eprintln("sit: failed to read local object during push");
+            return 1;
+        }
+        var compressed = load64(&raw);
+        var clen = load64(&raw + 8);
+        var ty = load64(&raw + 16);
+        # Returns: 1 = newly inserted (201), 0 = already present (200),
+        # -1 = server rejected. Count only fresh inserts in the summary
+        # so the user sees how much actually moved.
+        var rc = http_remote_push_object(http, hex, ty, compressed, clen);
+        if (rc < 0) {
+            wire_http_close(http);
+            eprintln("sit: server rejected object during push");
+            return 1;
+        }
+        if (rc == 1) { pushed = pushed + 1; }
+        i = i + 1;
+    }
+
+    # Update the ref. refs/heads/<branch> is the only push target the
+    # server accepts for the v0.7.6 surface (refs/tags/* is technically
+    # accepted but immutable; sit push only ships heads).
+    var bl = strlen(branch);
+    var rname = alloc(11 + bl + 1);
+    memcpy(rname, "refs/heads/", 11);
+    memcpy(rname + 11, branch, bl);
+    store8(rname + 11 + bl, 0);
+    var ref_rc = http_remote_push_ref(http, rname, local_tip);
+    wire_http_close(http);
+    if (ref_rc == 1) {
+        eprintln("sit: server rejected ref update (non-fast-forward)");
+        return 1;
+    }
+    if (ref_rc != 0) {
+        eprintln("sit: server rejected ref update");
+        return 1;
+    }
+
+    _print_push_summary(branch, name, local_tip, pushed);
+    return 0;
+}
+
+fn _print_push_summary(branch, name, local_tip, copied) {
     stdout_write("pushed ", 7);
     stdout_write(branch, strlen(branch));
     stdout_write(" -> ", 4);

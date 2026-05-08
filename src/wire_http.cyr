@@ -47,17 +47,23 @@ var WIRE_HTTP_INITIAL_BUF = 65536;
 # sit objects (~5 KiB compressed × 256 = ~1.3 MiB).
 var WIRE_HTTP_BATCH_CHUNK = 256;
 
-# http_remote handle layout (32 bytes):
+# http_remote handle layout (48 bytes):
 #   0..8   : host addr packed-int IPv4 (network byte order, sock_connect-ready)
 #   8..16  : port (TCP)
 #   16..24 : batch_probed (0 = not yet, 1 = capabilities GET completed)
 #   24..32 : batch_supported (0/1, only meaningful if batch_probed == 1)
+#   32..40 : server_requires_auth (0 = anonymous OK, 1 = bearer required;
+#            populated alongside batch_supported by the capabilities probe)
+#   40..48 : auth_token cstring pointer (0 = none loaded; non-zero pointer
+#            sent as "Authorization: Bearer <token>\r\n" on every POST)
 fn _http_remote_alloc(addr, port) {
-    var h = alloc(32);
+    var h = alloc(48);
     store64(h,      addr);
     store64(h +  8, port);
     store64(h + 16, 0);
     store64(h + 24, 0);
+    store64(h + 32, 0);
+    store64(h + 40, 0);
     return h;
 }
 
@@ -67,6 +73,10 @@ fn _http_remote_probed(h)        { return load64(h + 16); }
 fn _http_remote_set_probed(h, v) { store64(h + 16, v); return 0; }
 fn _http_remote_batch(h)         { return load64(h + 24); }
 fn _http_remote_set_batch(h, v)  { store64(h + 24, v); return 0; }
+fn _http_remote_set_requires_auth(h, v) { store64(h + 32, v); return 0; }
+fn _http_remote_requires_auth(h) { return load64(h + 32); }
+fn _http_remote_token(h)         { return load64(h + 40); }
+fn _http_remote_set_token(h, t)  { store64(h + 40, t); return 0; }
 
 # Parse an http:// URL into (host_addr, port). Returns the handle
 # pointer on success, 0 on any failure. v0.7.3 accepts:
@@ -380,11 +390,15 @@ fn _wire_http_post(h, sub_path, body, body_len, out_quad) {
     }
 
     # Request line + framing headers. body_len rendered as decimal
-    # via write_decimal (src/util.cyr).
+    # via write_decimal (src/util.cyr). Authorization header injected
+    # if the handle has a token loaded (v0.7.6 bearer auth).
     var sp_len = strlen(sub_path);
     var clen_buf[24];
     var clen_digits = write_decimal(&clen_buf, body_len);
-    var hdr_cap = 128 + sp_len + clen_digits;
+    var token = _http_remote_token(h);
+    var tlen = 0;
+    if (token != 0) { tlen = strlen(token); }
+    var hdr_cap = 128 + sp_len + clen_digits + tlen + 32;
     var hdr = alloc(hdr_cap);
     var pos = 0;
     memcpy(hdr + pos, "POST ", 5); pos = pos + 5;
@@ -392,7 +406,13 @@ fn _wire_http_post(h, sub_path, body, body_len, out_quad) {
     memcpy(hdr + pos, " HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/octet-stream\r\nContent-Length: ", 84);
     pos = pos + 84;
     memcpy(hdr + pos, &clen_buf, clen_digits); pos = pos + clen_digits;
-    memcpy(hdr + pos, "\r\nConnection: close\r\n\r\n", 23); pos = pos + 23;
+    memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
+    if (token != 0) {
+        memcpy(hdr + pos, "Authorization: Bearer ", 22); pos = pos + 22;
+        memcpy(hdr + pos, token, tlen); pos = pos + tlen;
+        memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
+    }
+    memcpy(hdr + pos, "Connection: close\r\n\r\n", 21); pos = pos + 21;
     sock_send(fd, hdr, pos);
     if (body_len > 0) { sock_send(fd, body, body_len); }
 
@@ -496,6 +516,7 @@ fn http_remote_check_batch(h) {
     if (_http_remote_probed(h) == 1) { return _http_remote_batch(h); }
     _http_remote_set_probed(h, 1);
     _http_remote_set_batch(h, 0);
+    _http_remote_set_requires_auth(h, 0);
 
     var quad[48];
     if (_wire_http_request(h, "/sit/v1/capabilities", &quad) != 0) { return 0; }
@@ -506,18 +527,76 @@ fn http_remote_check_batch(h) {
     }
     var body = load64(&quad);
     var blen = load64(&quad + 8);
-    var found = 0;
+    var found_batch = 0;
+    var found_auth_bearer = 0;
     var i = 0;
-    while (i + 12 < blen) {
+    while (i + 17 < blen) {
         if (memeq(body + i, "\"batch\":true", 12) == 1) {
-            found = 1;
-            i = blen;
+            found_batch = 1;
+            i = i + 12;
         }
-        else { i = i + 1; }
+        else {
+            if (memeq(body + i, "\"auth\":[\"bearer\"", 16) == 1) {
+                found_auth_bearer = 1;
+                i = i + 16;
+            }
+            else { i = i + 1; }
+        }
     }
     _wire_http_response_free(&quad);
-    if (found == 1) { _http_remote_set_batch(h, 1); return 1; }
+    if (found_auth_bearer == 1) { _http_remote_set_requires_auth(h, 1); }
+    if (found_batch == 1) { _http_remote_set_batch(h, 1); return 1; }
     return 0;
+}
+
+# Load a serve.token from disk in the same format the server's
+# `_serve_load_token` accepts (16+ chars, no control bytes,
+# trailing-whitespace stripped). Used by cmd_push when the server's
+# capabilities advertise `"auth":["bearer"]`. Path is
+# `~/.sit/serve.token` by convention; clients can override with
+# `--token` on cmd_push (plumbed through wire_http_open variants
+# in a follow-on patch — v0.7.6 ships the default-path-only shape).
+#
+# Returns the heap-owned cstring on success, 0 on any failure.
+# Callers must error out on 0 if the server requires bearer; sit
+# never silently sends an empty Authorization header.
+
+fn _wire_http_load_client_token() {
+    var home = getenv("HOME");
+    if (home == 0) { return 0; }
+    var hl = strlen(home);
+    var p = alloc(hl + 18);
+    memcpy(p, home, hl);
+    memcpy(p + hl, "/.sit/serve.token", 17);
+    store8(p + hl + 17, 0);
+    if (file_exists(p) != 1) { return 0; }
+    var pair[16];
+    if (read_file_heap(p, &pair) != 0) { return 0; }
+    var data = load64(&pair);
+    var len = load64(&pair + 8);
+    var stripping = 1;
+    while (stripping == 1) {
+        stripping = 0;
+        if (len > 0) {
+            var lc = load8(data + len - 1) & 0xFF;
+            if (lc == 10) { len = len - 1; stripping = 1; }
+            if (lc == 13) { len = len - 1; stripping = 1; }
+            if (lc == 32) { len = len - 1; stripping = 1; }
+            if (lc == 9)  { len = len - 1; stripping = 1; }
+        }
+    }
+    if (len < 16) { return 0; }
+    var i = 0;
+    while (i < len) {
+        var c = load8(data + i) & 0xFF;
+        if (c < 33)   { return 0; }   # control + space → reject
+        if (c == 127) { return 0; }
+        i = i + 1;
+    }
+    var tok = alloc(len + 1);
+    memcpy(tok, data, len);
+    store8(tok + len, 0);
+    return tok;
 }
 
 # ── /sit/v1/want batched object fetch (v0.7.4) ─────────────────────
@@ -865,5 +944,202 @@ fn http_remote_read_both(h, hex, raw_out, deco_out) {
     store64(deco_out,      decompressed);
     store64(deco_out +  8, dlen);
     store64(deco_out + 16, nul + 1);
+    return 0;
+}
+
+# ── Push primitives (v0.7.6) ───────────────────────────────────────
+#
+# `http_remote_push_object` uploads one compressed sit object via
+# POST /sit/v1/objects/<hex> with the patra type code in an
+# X-Sit-Type request header. The server rehashes the decompressed
+# payload (sigil) and refuses with 400 if the claimed hex doesn't
+# match. Idempotent on the wire — the server returns 201 Created
+# for a fresh insert, 200 OK if the object was already present.
+# Both are success from the client's POV; non-2xx is failure.
+#
+# Returns 0 on 200/201; -1 on any other status, network failure,
+# or response framing failure. Caller can stop the push immediately
+# on -1 (per-object retry isn't worth the complexity at v0.7.6).
+#
+# Lifetime: `compressed` must live until the call returns. The
+# bytes are sent as the request body verbatim — sit's bump-heap
+# allocations are program-lifetime so this is automatically true
+# for anything walked out of the local objects.patra.
+
+fn http_remote_push_object(h, hex, ty, compressed, clen) {
+    if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
+    if (ty < 0) { return 0 - 1; }
+    if (ty > 2) { return 0 - 1; }
+    if (clen <= 0) { return 0 - 1; }
+
+    var sub = alloc(16 + 64 + 1);
+    memcpy(sub, "/sit/v1/objects/", 16);
+    memcpy(sub + 16, hex, 64);
+    store8(sub + 16 + 64, 0);
+
+    # Build the X-Sit-Type extra header. Same shape as the GET handler
+    # emits on the response side (server-side serve_handle_object).
+    var ty_buf[24];
+    var ty_digits = write_decimal(&ty_buf, ty);
+    var hdr = alloc(16 + ty_digits + 4);
+    memcpy(hdr, "X-Sit-Type: ", 12);
+    memcpy(hdr + 12, &ty_buf, ty_digits);
+    store8(hdr + 12 + ty_digits, 13);
+    store8(hdr + 12 + ty_digits + 1, 10);
+    store8(hdr + 12 + ty_digits + 2, 0);
+
+    var quad[48];
+    var rc = _wire_http_post_xhdr(h, sub, compressed, clen, hdr, &quad);
+    if (rc != 0) { return 0 - 1; }
+    var status = load64(&quad + 16);
+    _wire_http_response_free(&quad);
+    if (status == 201) { return 1; }   # newly inserted
+    if (status == 200) { return 0; }   # already present (idempotent)
+    return 0 - 1;
+}
+
+# `http_remote_push_ref(h, refname, hex)` updates a single ref via
+# POST /sit/v1/refs/<refname>. Body is the new 64-hex tip + `\n`.
+# Server fast-forward gates the update for refs/heads/* and refuses
+# with 409 if the new tip isn't a descendant of the existing tip;
+# refs/tags/* are immutable on the server (any non-equal update
+# also returns 409). 400 means the server rejected the request
+# shape (bad refname, bad hex, tip not in objects DB).
+#
+# Returns:
+#   0  — success (200 OK)
+#   1  — non-FF (409 Conflict)
+#   -1 — any other failure (400, 401, network, etc.)
+
+fn http_remote_push_ref(h, refname, hex) {
+    if (refname_valid(refname) == 0) { return 0 - 1; }
+    if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
+
+    var rl = strlen(refname);
+    var sub = alloc(13 + rl + 1);
+    memcpy(sub, "/sit/v1/refs/", 13);
+    memcpy(sub + 13, refname, rl);
+    store8(sub + 13 + rl, 0);
+
+    var body = alloc(65);
+    memcpy(body, hex, 64);
+    store8(body + 64, 10);
+
+    var quad[48];
+    var rc = _wire_http_post(h, sub, body, 65, &quad);
+    if (rc != 0) { return 0 - 1; }
+    var status = load64(&quad + 16);
+    _wire_http_response_free(&quad);
+    if (status == 200) { return 0; }
+    if (status == 409) { return 1; }
+    return 0 - 1;
+}
+
+# Variant of `_wire_http_post` that also injects an extra request
+# header (e.g. `X-Sit-Type: 2\r\n` for /objects). Identical recv
+# loop + response parsing; only the request-line build differs.
+# Public-ish since `http_remote_push_object` is its only caller and
+# the X-Sit-Type ride-along is specific to the /objects endpoint;
+# kept as a separate function rather than threading a generic
+# `extra_headers` arg through every call site.
+
+fn _wire_http_post_xhdr(h, sub_path, body, body_len, extra_hdr, out_quad) {
+    var fd_r = tcp_socket();
+    if (is_err_result(fd_r) == 1) {
+        eprintln("sit: tcp_socket failed");
+        return 0 - 1;
+    }
+    var fd = payload(fd_r);
+    var c_r = sock_connect(fd, _http_remote_addr(h), _http_remote_port(h));
+    if (is_err_result(c_r) == 1) {
+        sys_close(fd);
+        eprintln("sit: sock_connect failed (is sit serve running?)");
+        return 0 - 1;
+    }
+
+    var sp_len = strlen(sub_path);
+    var clen_buf[24];
+    var clen_digits = write_decimal(&clen_buf, body_len);
+    var ehl = 0;
+    if (extra_hdr != 0) { ehl = strlen(extra_hdr); }
+    var token = _http_remote_token(h);
+    var tlen = 0;
+    if (token != 0) { tlen = strlen(token); }
+    var hdr_cap = 128 + sp_len + clen_digits + ehl + tlen + 32;
+    var hdr = alloc(hdr_cap);
+    var pos = 0;
+    memcpy(hdr + pos, "POST ", 5); pos = pos + 5;
+    memcpy(hdr + pos, sub_path, sp_len); pos = pos + sp_len;
+    memcpy(hdr + pos, " HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/octet-stream\r\nContent-Length: ", 84);
+    pos = pos + 84;
+    memcpy(hdr + pos, &clen_buf, clen_digits); pos = pos + clen_digits;
+    memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
+    if (ehl > 0) { memcpy(hdr + pos, extra_hdr, ehl); pos = pos + ehl; }
+    if (token != 0) {
+        memcpy(hdr + pos, "Authorization: Bearer ", 22); pos = pos + 22;
+        memcpy(hdr + pos, token, tlen); pos = pos + tlen;
+        memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
+    }
+    memcpy(hdr + pos, "Connection: close\r\n\r\n", 21); pos = pos + 21;
+    sock_send(fd, hdr, pos);
+    if (body_len > 0) { sock_send(fd, body, body_len); }
+
+    var cap = WIRE_HTTP_INITIAL_BUF;
+    var buf = fl_alloc(cap);
+    if (buf == 0) { sys_close(fd); return 0 - 1; }
+    var used = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        if (used == cap) {
+            if (cap >= WIRE_HTTP_MAX_BODY) { fl_free(buf, cap); sys_close(fd); return 0 - 1; }
+            var new_cap = cap * 2;
+            if (new_cap > WIRE_HTTP_MAX_BODY) { new_cap = WIRE_HTTP_MAX_BODY; }
+            var new_buf = fl_alloc(new_cap);
+            if (new_buf == 0) { fl_free(buf, cap); sys_close(fd); return 0 - 1; }
+            memcpy(new_buf, buf, used);
+            fl_free(buf, cap);
+            buf = new_buf;
+            cap = new_cap;
+        }
+        var rd_r = sock_recv(fd, buf + used, cap - used);
+        if (is_err_result(rd_r) == 1) { rgo = 0; }
+        else {
+            var n = payload(rd_r);
+            if (n <= 0) { rgo = 0; }
+            else { used = used + n; }
+        }
+    }
+    sys_close(fd);
+
+    var status = 0;
+    if (used >= 12) {
+        if (memeq(buf, "HTTP/1.", 7) == 1) {
+            status = (load8(buf + 9) - 48) * 100
+                   + (load8(buf + 10) - 48) * 10
+                   + (load8(buf + 11) - 48);
+        }
+    }
+    var i = 0;
+    var body_off = 0 - 1;
+    while (i + 3 < used) {
+        if (load8(buf + i) == 13) {
+            if (load8(buf + i + 1) == 10) {
+                if (load8(buf + i + 2) == 13) {
+                    if (load8(buf + i + 3) == 10) {
+                        body_off = i + 4;
+                        i = used;
+                    }
+                }
+            }
+        }
+        if (i < used) { i = i + 1; }
+    }
+    if (body_off < 0) { fl_free(buf, cap); return 0 - 1; }
+    store64(out_quad,      buf + body_off);
+    store64(out_quad +  8, used - body_off);
+    store64(out_quad + 16, status);
+    store64(out_quad + 24, 0 - 1);
+    store64(out_quad + 32, buf);
+    store64(out_quad + 40, cap);
     return 0;
 }

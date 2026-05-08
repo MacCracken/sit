@@ -142,6 +142,84 @@ jobs:
           cd "$CLONE"
           test "$(cat a)" = "hello-http" || { echo "http clone content wrong"; exit 1; }
           "$GITHUB_WORKSPACE/build/sit" fsck
+
+      - name: Smoke — http push + bearer auth (v0.7.6)
+        run: |
+          export HOME=$GITHUB_WORKSPACE/ci-home
+          export SIT_AUTHOR_NAME="CI Runner"
+          export SIT_AUTHOR_EMAIL="ci@example.com"
+          PORT=18486
+
+          # Generate a 32-hex serve token. Refuse to start --require-auth
+          # if the token is < 16 chars or perms aren't 0600 (matches
+          # _serve_load_token's invariants).
+          mkdir -p "$HOME/.sit"
+          head -c 16 /dev/urandom | xxd -p -c 32 | tr -d '\n' > "$HOME/.sit/serve.token"
+          chmod 600 "$HOME/.sit/serve.token"
+
+          # Empty target the client will push to.
+          ORIG=$(mktemp -d)
+          (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" init)
+
+          # Auth-required serve.
+          "$GITHUB_WORKSPACE/build/sit" serve "$ORIG" --listen 127.0.0.1:$PORT --require-auth &
+          SERVE_PID=$!
+          trap 'kill $SERVE_PID 2>/dev/null || true' EXIT
+
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1; then break; fi
+            sleep 0.5
+          done
+          if ! (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1; then
+            echo "sit serve --require-auth never came up on 127.0.0.1:$PORT"
+            exit 1
+          fi
+
+          # Capabilities should advertise bearer.
+          BODY=$(curl -s "http://127.0.0.1:$PORT/sit/v1/capabilities")
+          echo "  capabilities: $BODY"
+          echo "$BODY" | grep -q '"auth":\["bearer"\]' || { echo "expected bearer in capabilities"; exit 1; }
+
+          # POST without Authorization → 401.
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "X-Sit-Type: 0" --data-binary "x" "http://127.0.0.1:$PORT/sit/v1/objects/0000000000000000000000000000000000000000000000000000000000000000")
+          test "$STATUS" = "401" || { echo "expected 401 without auth, got $STATUS"; exit 1; }
+
+          # Set up the client repo with two commits and push.
+          SRC=$(mktemp -d)
+          (cd "$SRC" && \
+            "$GITHUB_WORKSPACE/build/sit" init && \
+            echo line1 > readme.md && "$GITHUB_WORKSPACE/build/sit" add readme.md && "$GITHUB_WORKSPACE/build/sit" commit -m "first" && \
+            echo line2 >> readme.md && "$GITHUB_WORKSPACE/build/sit" add readme.md && "$GITHUB_WORKSPACE/build/sit" commit -m "second" && \
+            "$GITHUB_WORKSPACE/build/sit" remote add origin "http://127.0.0.1:$PORT" && \
+            "$GITHUB_WORKSPACE/build/sit" push origin main)
+
+          # Verify target ref + log.
+          CLIENT_TIP=$(cd "$SRC" && "$GITHUB_WORKSPACE/build/sit" log | awk '/^commit /{print $2; exit}')
+          TARGET_TIP=$(cat "$ORIG/.sit/refs/heads/main" | tr -d '\n')
+          test "$CLIENT_TIP" = "$TARGET_TIP" || { echo "target ref mismatch: client=$CLIENT_TIP target=$TARGET_TIP"; exit 1; }
+          (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" fsck)
+          (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" log --oneline | wc -l) | grep -qx "2" || { echo "expected 2 commits on target"; exit 1; }
+
+          # Re-push with no new commits → "everything up-to-date" (no objects sent).
+          PUSH_OUT=$(cd "$SRC" && "$GITHUB_WORKSPACE/build/sit" push origin main 2>&1)
+          echo "  re-push: $PUSH_OUT"
+          echo "$PUSH_OUT" | grep -q "everything up-to-date" || { echo "expected up-to-date message"; exit 1; }
+
+          # Anonymous read still works against an auth-required server.
+          ANON_CLONE=$(mktemp -d)/anon
+          "$GITHUB_WORKSPACE/build/sit" clone --force-absolute "http://127.0.0.1:$PORT" "$ANON_CLONE"
+          test "$(cat $ANON_CLONE/readme.md | head -1)" = "line1" || { echo "anonymous clone content wrong"; exit 1; }
+
+          # Client without ~/.sit/serve.token → push fails cleanly.
+          mv "$HOME/.sit/serve.token" "$HOME/.sit/serve.token.bak"
+          (cd "$SRC" && \
+            echo line3 >> readme.md && "$GITHUB_WORKSPACE/build/sit" add readme.md && "$GITHUB_WORKSPACE/build/sit" commit -m "third" && \
+            ! "$GITHUB_WORKSPACE/build/sit" push origin main 2>&1 | tee /tmp/no-token.out
+          )
+          grep -q "server requires bearer auth" /tmp/no-token.out || { echo "expected token-missing error"; exit 1; }
+          mv "$HOME/.sit/serve.token.bak" "$HOME/.sit/serve.token"
+
+          echo "http push + bearer auth smoke ok"
           echo "http wire smoke ok"
 
   docs:

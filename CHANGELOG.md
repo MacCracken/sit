@@ -4,6 +4,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.6] — 2026-05-08 — HTTP push + bearer auth + ADR 0007 (no libssl, ever)
+
+**Closes the symmetric round trip over HTTP.** `sit push origin main` works against `sit serve` over `http://...`; the server rehashes every uploaded object before storing (sigil), bearer auth via `~/.sit/serve.token` (0600) gates writes when `--require-auth` is set; reads stay anonymous. The load-bearing decision is in [ADR 0007](docs/adr/0007-network-transport-security.md): sit's no-FFI thesis is non-negotiable. **HTTPS via libssl will not ship.** Until first-party Cyrius TLS exists, sit's encrypted-over-internet transport is SSH (v0.7.7); HTTP remains loopback / private-network / behind-tunnel.
+
+### Added
+
+- **[ADR 0007](docs/adr/0007-network-transport-security.md) — Network transport security: SSH or first-party only.** Documents the principle: no libssl, no libcrypto, no exception. The fdlopen-via-stdlib path that other sit consumers might take (loading libssl.so.3 dynamically through `lib/tls.cyr`) punches the same FFI hole [ADR 0001](docs/adr/0001-no-ffi-first-party-only.md) explicitly forbids; carving an exception establishes the pattern for the next "we really need this" library and ends sit's no-C thesis. Five alternatives (libssl-via-fdlopen, exception-ADR, port-TLS-to-Cyrius, sigil-payload-encryption, plain-HTTP-no-auth) considered + rejected with full reasoning. SSH is the canonical encrypted-over-internet path; bearer auth gates loopback HTTP without claiming security it doesn't deliver.
+- **`POST /sit/v1/objects/<hex>`** in `src/serve.cyr` — accepts a single zlib-compressed sit object via the request body with `X-Sit-Type: <int>` header carrying the patra type code. **Server rehashes every uploaded object** via `_serve_rehash_and_insert`: decompress, verify the type-prefix on the framed payload matches the claimed `X-Sit-Type`, run sigil's `hash_data` over the full `<type> <len>\0<content>` frame, byte-compare against the claimed hex in the URL. Mismatch on any field → 400. Match → `db_object_insert_raw` with the original compressed bytes; 201 Created on actual insert, 200 OK if the hash was already present (idempotent retry-safe). The rehash is the single trust boundary for client→server data; CLAUDE.md's "SHA-256 roundtrips belong in fsck, not the hot path" applies to fetch + clone (where source is already trusted), not to push.
+- **`POST /sit/v1/refs/<refname>`** — fast-forward update for a single ref. Body is the new 64-hex tip optionally followed by `\n`. Refs in `refs/heads/*` get FF-gated via `is_ancestor_in_db`; `refs/tags/*` are immutable on the server (any non-equal update returns 409 Conflict); `refs/remotes/*` rejected at the namespace check (server has no business carrying a client's remote-tracking entries). The new tip must already be in `objects.patra` — push clients are expected to upload all reachable objects before the ref update, and the existence check is a cheap defence against accidentally pointing a ref at an unknown hash.
+- **Bearer auth** — `--require-auth` flag in `cmd_serve` reads `~/.sit/serve.token` at startup (or `--token <path>`). Strict perm check: file must be exactly mode `0600`, ≥ 16 chars, no control bytes (NUL, CR, LF, TAB, space, < 32, 127). Server refuses to start if any check fails — auth posture is "strictly enforced or absent," never silent fall-through. POST handlers consult `_serve_auth_ok(buf, n)` which validates `Authorization: Bearer <token>` against the loaded token using a constant-time compare across `max(presented_len, token_len)` bytes (so timing doesn't leak how much of the prefix the attacker got right). Capabilities advertise `"auth":["bearer"]` when `--require-auth` is set, `"auth":["none"]` otherwise. GET endpoints (capabilities, refs, objects, /want — the last is read-shaped batch fetch) stay anonymous in both modes; the auth gate is on writes only.
+- **`http_remote_push_object(h, hex, ty, compressed, clen)`** in `src/wire_http.cyr` — POSTs one object via `_wire_http_post_xhdr` (variant of `_wire_http_post` that injects `X-Sit-Type: <int>` plus the optional Authorization header). Returns `1` on 201/Created (newly inserted), `0` on 200/OK (already present), `-1` on any other status. Caller (`_do_push_http`) counts only fresh inserts in the summary so the user sees actual movement.
+- **`http_remote_push_ref(h, refname, hex)`** — POSTs the new ref tip; returns `0` on 200, `1` on 409 (non-FF), `-1` on any other failure. Refname pre-validated via `refname_valid` before the URL is built.
+- **`_wire_http_load_client_token()`** — reads `~/.sit/serve.token` from the client side using the same format the server enforces (≥ 16 chars, no control bytes, trailing-whitespace stripped). Called by `_do_push_http` only when capabilities advertise `"auth":["bearer"]`; sit never silently sends an empty Authorization header.
+- **`_do_push_http(name, branch, url, src_db, local_tip)`** — HTTP push pipeline. Probe capabilities, load token if server requires bearer, FF preflight via `http_remote_resolve_branch`, walk reachable via `walk_reachable_phased`, POST each object, POST the ref. "everything up-to-date" short-circuit when `remote_tip == local_tip`.
+- **CI smoke step**: `.github/workflows/ci.yml` gains "http push + bearer auth (v0.7.6)" — generates a 0600 token, asserts capabilities advertise bearer, asserts 401 on no-auth POST, runs full push + verify, asserts "everything up-to-date" on re-push, asserts anonymous clone still works against the auth-required server, asserts client without token fails with the documented error message.
+
+### Changed
+
+- **`cmd_push`** branches on URL scheme. `URL_SCHEME_FILE` keeps the v0.7.5 `walk_reachable_phased` + `copy_objects` shape (file:// remote DB); `URL_SCHEME_HTTP` calls `_do_push_http`. Common summary helper `_print_push_summary` extracted.
+- **`wire_transport_check_writable`**: drops the `"push over http requires sit 0.7.5+"` gate (push over HTTP now ships); HTTPS error message updated to point at ADR 0007 ("https transport requires first-party Cyrius TLS").
+- **`wire_transport_check_readable`**: HTTPS error message likewise updated to the ADR 0007 framing — consistent with the writable shape.
+- **`http_remote handle layout`** extended 32 → 48 bytes: adds `server_requires_auth` (populated by `http_remote_check_batch` from the capabilities `"auth"` field) and `auth_token` (cstring pointer). `_wire_http_post` and `_wire_http_post_xhdr` inject `Authorization: Bearer <token>` whenever the handle's token is set.
+- **`http_remote_check_batch`**: also detects `"auth":["bearer"]` in capabilities and stamps the handle accordingly. Unchanged callers see the same return shape (0 = no batch, 1 = batch supported); auth is queried separately via `_http_remote_requires_auth`.
+- **`serve_build_capabilities`**: emits `"auth":["bearer"]` when `--require-auth`, `"auth":["none"]` otherwise. Adds `"push":true` flag (unconditional — the endpoint exists at v0.7.6+; clients can capability-gate without probing).
+- **`cmd_serve` usage line**: documents `--require-auth` and `--token <path>`. `--listen` error message updated to point at ADR 0007 for non-loopback exposure ("non-loopback waits on first-party TLS, ADR 0007").
+
+### Sit-side impact
+
+- Build: clean. **127/127 tests pass.** Lint: only the pre-existing >120-char warning at `src/commit.cyr:609`.
+- DCE binary: **1.30 MB** x86_64 (essentially flat from v0.7.5; ~+170 lines net of new server/client code, mostly offset by the new path being live where v0.7.5's scaffolding was DCE-stripped).
+- aarch64 cross-build: **1.43 MB** ELF, clean.
+- End-to-end smoke verified: capabilities advertise bearer when --require-auth; 401 on no-auth POST; 401 on wrong token; helpful client-side error when `~/.sit/serve.token` missing; push succeeds with correct token (3 objects, fsck clean, log byte-identical to source); anonymous clone from auth-required server works (read stays open); file:// wire smoke (clone → push → re-clone) clean — no regression.
+
+### Trust boundary recap
+
+| Operation | Trust | Mechanism |
+|---|---|---|
+| `fetch` / `clone` (server → client) | Server is trusted source; client doesn't re-hash | `sit fsck` post-clone is the canonical SHA-256 roundtrip per CLAUDE.md |
+| `push` (client → server) | Client is **untrusted**; server rehashes every object | `_serve_rehash_and_insert` runs sigil's `hash_data` against every claimed hex; mismatch → 400 before any DB write |
+| Auth | Bearer token, constant-time compare, 0600 perm enforced | Local-process-snoop defence on loopback; not a substitute for TLS over the open internet (per ADR 0007) |
+
+### Issue archived
+
+(none this release)
+
+### Up next (v0.7.7)
+
+SSH transport — `ssh user@host -- sit serve --stdio`, length-prefixed framing on stdin/stdout. `src/wire_ssh.cyr` implements the client-side spawn-via-`exec_vec`; `cmd_serve --stdio` adds the stdio mode. SSH process owns the encryption + authentication; sit's wire travels over its stdin/stdout. **No crypto in sit's address space, no library link** — the SSH binary is consumed as a process boundary, not an FFI dep. Heavy fuzz on URL parser for CVE-2017-1000117 host-component injection (rejecting `ssh://-oProxyCommand=...` shaped URLs pre-`exec_vec`).
+
 ## [0.7.5] — 2026-05-08 — Walk-side phasing + cache-aware tree walk + frame-decoder fuzz
 
 **Realises the v0.7.4 protocol scaffolding into actual clone speedup.** The phased reachability walker collects every tree referenced by the commit chain in phase 1, batch-prefetches them via `POST /sit/v1/want` in phase 2, and walks each from the local `raw_cache` in phase 3. The tree walker is now cache-aware: a hit decompresses cached compressed bytes directly instead of going back to the transport. End result on a 100-commit / 100-file fixture: **13% loopback speedup (213 → 185 ms)**; projected **42% at 1 ms RTT, 51% at 2 ms, 59% at 5 ms** — comfortably exceeding the v0.7.5 ≥30%-at-realistic-RTT gate. The frame-decoder fuzz target lands alongside, hardening the wire's parse surface against adversarial bytes.
@@ -63,10 +112,6 @@ First cut of the phasing batched the trees in phase 2 into `raw_cache` but `obj_
 ### Issue archived
 
 (none this release)
-
-### Up next (v0.7.6)
-
-TLS — `https://`, `--tls --cert --key`, system trust + `--insecure` for dev. The push-side endpoints (`POST /objects` + `POST /refs` + bearer auth + non-ff rejection) that were originally scoped to v0.7.5 land alongside or after TLS so bearer tokens never travel in clear. Exact slotting (TLS-then-push, or both bundled) is a v0.7.6-time decision based on the size of the TLS cut against the test surface area for `sandhi_tls_*`.
 
 ## [0.7.4] — 2026-05-08 — `POST /sit/v1/want` protocol scaffold (no perf change)
 

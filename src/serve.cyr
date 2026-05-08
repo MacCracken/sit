@@ -27,6 +27,20 @@ var SIT_SERVE_MAX_BODY = 16777216;  # 16 MiB — advertised in capabilities
 # ample headroom for HTTP headers. See ADR 0006.
 var SIT_WANT_MAX_COUNT = 512;
 
+# v0.7.6: bearer auth. ~/.sit/serve.token is the canonical path;
+# operators may pin a different file with --token. Token must be
+# 16+ hex chars (64-bit minimum entropy assuming random-hex input)
+# and the file must be 0600 — anything else is a config bug we
+# refuse to start with rather than silently accept a weaker posture.
+# `_serve_token` is the loaded value; `_serve_require_auth` is 1
+# when --require-auth was set on the command line. POST handlers
+# consult both before doing any DB work; GET endpoints stay
+# anonymous (the per-ADR-0007 deployment surface assumes loopback
+# anyway, so anonymous read is a feature, not a vulnerability).
+var SIT_TOKEN_MIN_LEN = 16;
+var _serve_require_auth = 0;
+var _serve_token = 0;
+
 # ── Ref-file reader ────────────────────────────────────────────────
 #
 # Read a ref file's content as a 64-char SHA-256 hex string. Strips
@@ -70,11 +84,18 @@ fn serve_build_capabilities() {
     # The "sit" string identifies the wire-protocol release line
     # the server promises. It bumps in lockstep with VERSION at
     # each tag.
-    str_builder_add_cstr(sb, "{\"sit\":\"0.7.5\",\"max_body\":");
+    str_builder_add_cstr(sb, "{\"sit\":\"0.7.6\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
-    str_builder_add_cstr(sb, ",\"auth\":[\"none\"],\"objects\":true,\"batch\":true,\"batch_max\":");
+    str_builder_add_cstr(sb, ",\"auth\":[");
+    if (_serve_require_auth == 1) {
+        str_builder_add_cstr(sb, "\"bearer\"");
+    }
+    else {
+        str_builder_add_cstr(sb, "\"none\"");
+    }
+    str_builder_add_cstr(sb, "],\"objects\":true,\"batch\":true,\"batch_max\":");
     str_builder_add_int(sb, SIT_WANT_MAX_COUNT);
-    str_builder_add_cstr(sb, "}");
+    str_builder_add_cstr(sb, ",\"push\":true}");
     return str_data(str_builder_build(sb));
 }
 
@@ -370,6 +391,391 @@ fn serve_handle_want(cfd, buf, n) {
     return 0;
 }
 
+# ── Bearer auth (v0.7.6) ──────────────────────────────────────────
+#
+# `_serve_load_token(path)` — read a token file from disk. Returns
+# the heap-allocated cstring on success, 0 on any failure (missing
+# file, wrong perms, too-short content, embedded NUL/control bytes).
+# Caller (cmd_serve) refuses to start the server if 0 is returned
+# so the auth posture is "strictly enforced or absent" — never a
+# silent fall-through to no-auth.
+#
+# Perm check: must be 0600 exactly. fstat via newfstatat (validate.cyr's
+# AT_FDCWD shape). Stricter than git's "<= 0600" — sit's token file
+# has no legitimate group/world-readable use, so any wider mode is
+# a configuration mistake worth refusing.
+fn _serve_load_token(path) {
+    if (path_is_symlink(path) == 1) {
+        eprintln("sit: refusing to follow symlink for serve token");
+        return 0;
+    }
+    var stbuf[144];
+    var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, 0);
+    if (rc < 0) {
+        eprintln("sit: cannot stat serve token");
+        return 0;
+    }
+    var mode = load32(&stbuf + 24);
+    var perm = mode & 0xFFF;
+    if (perm != 384) {        # 0600 octal = 384 decimal
+        eprintln("sit: serve token file must be mode 0600");
+        return 0;
+    }
+    var pair[16];
+    if (read_file_heap(path, &pair) != 0) {
+        eprintln("sit: failed to read serve token");
+        return 0;
+    }
+    var data = load64(&pair);
+    var len = load64(&pair + 8);
+    # Strip trailing whitespace (trailing newline from `echo` is the
+    # canonical form). Flag-driven loop because Cyrius's `break` in
+    # while-with-var is unreliable per CLAUDE.md.
+    var stripping = 1;
+    while (stripping == 1) {
+        stripping = 0;
+        if (len > 0) {
+            var lc = load8(data + len - 1) & 0xFF;
+            if (lc == 10) { len = len - 1; stripping = 1; }
+            if (lc == 13) { len = len - 1; stripping = 1; }
+            if (lc == 32) { len = len - 1; stripping = 1; }
+            if (lc == 9)  { len = len - 1; stripping = 1; }
+        }
+    }
+
+    if (len < SIT_TOKEN_MIN_LEN) {
+        eprintln("sit: serve token shorter than 16 chars — generate a stronger one");
+        return 0;
+    }
+    # Reject control bytes / NUL inside the token; tokens travel via
+    # an HTTP header so CR/LF would smuggle headers.
+    var i = 0;
+    while (i < len) {
+        var c = load8(data + i) & 0xFF;
+        if (c == 0)  { eprintln("sit: serve token contains NUL"); return 0; }
+        if (c == 10) { eprintln("sit: serve token contains LF"); return 0; }
+        if (c == 13) { eprintln("sit: serve token contains CR"); return 0; }
+        if (c == 32) { eprintln("sit: serve token contains space"); return 0; }
+        if (c == 9)  { eprintln("sit: serve token contains TAB"); return 0; }
+        if (c < 32)  { eprintln("sit: serve token contains control byte"); return 0; }
+        if (c == 127) { eprintln("sit: serve token contains DEL"); return 0; }
+        i = i + 1;
+    }
+    var tok = alloc(len + 1);
+    memcpy(tok, data, len);
+    store8(tok + len, 0);
+    return tok;
+}
+
+# Returns 1 if the request carries a valid `Authorization: Bearer <token>`
+# header that constant-time-equals the loaded `_serve_token`. Returns 0
+# otherwise. Consulted by POST handlers when `_serve_require_auth == 1`.
+# Constant-time comparison: walk the full minimum length even on a length
+# mismatch so the timing doesn't reveal the prefix the attacker got right.
+fn _serve_auth_ok(buf, n) {
+    if (_serve_require_auth == 0) { return 1; }
+    if (_serve_token == 0) { return 0; }
+    var hdr = sandhi_server_find_header(buf, n, "Authorization");
+    if (hdr == 0) { return 0; }
+    # Expect literal "Bearer " prefix (case-sensitive, matching git's
+    # http.extraHeader convention). Eight bytes including the space.
+    var hlen = strlen(hdr);
+    if (hlen <= 7) { return 0; }
+    if (memeq(hdr, "Bearer ", 7) == 0) { return 0; }
+    var presented = hdr + 7;
+    var plen = hlen - 7;
+    var tlen = strlen(_serve_token);
+    # Constant-time compare across max(plen, tlen) — works even when
+    # lengths differ. Mismatch-flag accumulates via OR across all bytes.
+    var max_len = plen;
+    if (tlen > max_len) { max_len = tlen; }
+    var mismatch = 0;
+    if (plen != tlen) { mismatch = 1; }
+    var ci = 0;
+    while (ci < max_len) {
+        var pc = 0;
+        var tc = 0;
+        if (ci < plen) { pc = load8(presented + ci) & 0xFF; }
+        if (ci < tlen) { tc = load8(_serve_token + ci) & 0xFF; }
+        if ((pc ^ tc) != 0) { mismatch = 1; }
+        ci = ci + 1;
+    }
+    if (mismatch == 0) { return 1; }
+    return 0;
+}
+
+# ── /sit/v1/objects/<hash> POST handler (v0.7.6) ──────────────────
+#
+# Accepts a single compressed sit object from a pushing client.
+# Trust boundary: the server REHASHES every uploaded object. The
+# claimed hex in the URL must match the SHA-256 of the decompressed
+# content (in its full `<type> <len>\0<content>` framed form, the
+# same shape that `write_typed_object` hashes locally). The X-Sit-
+# Type request header must also agree with the type prefix on the
+# decompressed body. Either mismatch → 400.
+#
+# The rehash is the only place sit pays SHA-256 cost on the wire
+# path (CLAUDE.md "SHA-256 roundtrips belong in fsck, not the hot
+# path") — but accepted-from-the-network bytes are precisely the
+# point where the trust boundary lives. fetch + clone copy raw
+# compressed bytes from a server we already trust; push has no such
+# upstream trust and must verify what the client claims to be
+# uploading.
+#
+# Returns: 201 Created on success (object stored); 200 OK if already
+# present (idempotent); 400 on any validation failure (hex format,
+# ty range, body framing, hash mismatch, type-prefix mismatch);
+# 401/403 from the caller-side auth wrapper if not authenticated;
+# 500 on DB / OOM. Body of any error response is empty (don't leak
+# which validation step failed — the caller can compare locally).
+
+fn _serve_rehash_and_insert(cfd, hex, claimed_ty, compressed, clen) {
+    # Decompress to verify framing + recompute hash. _decompress_raw_into
+    # (src/wire.cyr) handles the 4×-initial / 16 MiB-ceiling sizing
+    # mirror of db_object_read_both. raw[24] = {compressed, clen, ty}.
+    var raw[24];
+    store64(&raw,      compressed);
+    store64(&raw +  8, clen);
+    store64(&raw + 16, claimed_ty);
+    var deco[24];
+    if (_decompress_raw_into(&raw, &deco) != 0) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    var dbuf = load64(&deco);
+    var dlen = load64(&deco + 8);
+    var coff = load64(&deco + 16);
+
+    # Verify the decompressed framing's type matches the claimed ty.
+    # `coff - 1` is the index of the NUL; the type-string runs from
+    # 0 to the first space (which must be at coff - 1 - <digits>).
+    if (coff < 5) { sandhi_server_send_status(cfd, 400, "Bad Request"); return 0; }
+    var sp = 0;
+    var found_sp = 0;
+    while (sp < coff) {
+        if (load8(dbuf + sp) == 32) { found_sp = 1; sp = coff; }
+        else { sp = sp + 1; }
+    }
+    if (found_sp == 0) { sandhi_server_send_status(cfd, 400, "Bad Request"); return 0; }
+    # Recompute sp as the actual space index.
+    sp = 0;
+    while (sp < coff) {
+        if (load8(dbuf + sp) == 32) { break; }
+        sp = sp + 1;
+    }
+    var declared_ty = type_code_of(dbuf, sp);
+    if (declared_ty < 0) { sandhi_server_send_status(cfd, 400, "Bad Request"); return 0; }
+    if (declared_ty != claimed_ty) { sandhi_server_send_status(cfd, 400, "Bad Request"); return 0; }
+
+    # Recompute the hash over the full framed bytes (type + space +
+    # decimal-len + NUL + content) — what write_typed_object uses to
+    # compute the canonical sit hash for any new object. hash_data
+    # returns a heap-owned cstring of 64 lowercase hex chars.
+    var actual_hex = hash_data(dbuf, dlen);
+    if (actual_hex == 0) { sandhi_server_send_status(cfd, 500, "Internal Server Error"); return 0; }
+    if (memeq(actual_hex, hex, 64) == 0) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+
+    # Hash matches. Insert the original compressed bytes. db_object_insert_raw
+    # returns 0 on actual insert, 1 on already-present, negative on error.
+    var db = get_object_db();
+    if (db == 0) { sandhi_server_send_status(cfd, 500, "Internal Server Error"); return 0; }
+    var rc = db_object_insert_raw(db, hex, claimed_ty, compressed, clen);
+    if (rc < 0) { sandhi_server_send_status(cfd, 500, "Internal Server Error"); return 0; }
+    if (rc == 1) { sandhi_server_send_status(cfd, 200, "OK"); return 0; }
+    sandhi_server_send_status(cfd, 201, "Created");
+    return 0;
+}
+
+fn serve_handle_put_object(cfd, path, buf, n) {
+    var plen = strlen(path);
+    if (plen != SIT_OBJECT_PATH_PREFIX_LEN + 64) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    var hex = path + SIT_OBJECT_PATH_PREFIX_LEN;
+    if (hex_prefix_valid(hex, 64) == 0) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    var ty_hdr = sandhi_server_find_header(buf, n, "X-Sit-Type");
+    if (ty_hdr == 0) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    # Parse decimal int from header value. Accept exactly one of "0", "1", "2".
+    var ty_len = strlen(ty_hdr);
+    if (ty_len != 1) { sandhi_server_send_status(cfd, 400, "Bad Request"); return 0; }
+    var ty_c = load8(ty_hdr);
+    if (ty_c < 48) { sandhi_server_send_status(cfd, 400, "Bad Request"); return 0; }
+    if (ty_c > 50) { sandhi_server_send_status(cfd, 400, "Bad Request"); return 0; }
+    var ty = ty_c - 48;
+
+    var body_off = sandhi_server_body_offset(buf, n);
+    if (body_off < 0) { sandhi_server_send_status(cfd, 400, "Bad Request"); return 0; }
+    var clen = sandhi_server_content_length(buf, n);
+    if (clen <= 0) { sandhi_server_send_status(cfd, 411, "Length Required"); return 0; }
+    if (clen > SIT_SERVE_MAX_BODY) { sandhi_server_send_status(cfd, 413, "Payload Too Large"); return 0; }
+    if (body_off + clen > n) { sandhi_server_send_status(cfd, 400, "Bad Request"); return 0; }
+
+    var compressed = buf + body_off;
+    return _serve_rehash_and_insert(cfd, hex, ty, compressed, clen);
+}
+
+# ── /sit/v1/refs/<name> POST handler (v0.7.6) ─────────────────────
+#
+# Updates a single ref. Path tail is the ref name (without the
+# `refs/heads/` or `refs/tags/` prefix that GET /refs returns —
+# clients pass the namespace); body is the new 64-hex tip optionally
+# followed by `\n`. Refs in `refs/remotes/...` are server-side
+# state that clients can't directly write — refused with 400.
+#
+# Fast-forward gate: if the ref already exists, the new tip must be
+# a descendant of the current tip. Non-FF returns 409 Conflict.
+# Refs that don't exist yet are created (initial push).
+#
+# The new tip's commit must already be in objects.patra — push
+# clients are expected to upload all reachable objects before the
+# ref update. We don't transitively walk to verify completeness
+# (that's the client's job per ADR 0006's protocol shape); we DO
+# require the tip to exist locally, which is a cheap defense
+# against accidentally pointing a ref at a hash the server has
+# never seen.
+
+var SIT_REF_PUT_PREFIX = "/sit/v1/refs/";
+var SIT_REF_PUT_PREFIX_LEN = 13;
+
+fn serve_handle_put_ref(cfd, path, buf, n) {
+    var plen = strlen(path);
+    if (plen <= SIT_REF_PUT_PREFIX_LEN) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    var rname_start = path + SIT_REF_PUT_PREFIX_LEN;
+    var rname_len = plen - SIT_REF_PUT_PREFIX_LEN;
+    # Materialize as a cstring for refname_valid.
+    var rname = alloc(rname_len + 1);
+    memcpy(rname, rname_start, rname_len);
+    store8(rname + rname_len, 0);
+    if (refname_valid(rname) == 0) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    # Refuse refs/remotes/* — those are local state for tracking other
+    # remotes; they have no meaning on the server side and would let a
+    # malicious client smuggle a fake remote-tracking entry.
+    if (rname_len >= 12) {
+        if (memeq(rname, "refs/remotes/", 13) == 1) {
+            sandhi_server_send_status(cfd, 400, "Bad Request");
+            return 0;
+        }
+    }
+    # Restrict v0.7.6 to refs/heads/* and refs/tags/* explicitly. Other
+    # namespaces (refs/notes/*, refs/keep/*) aren't part of sit's wire
+    # vocabulary today.
+    var is_head = 0;
+    var is_tag = 0;
+    if (rname_len > 11) { if (memeq(rname, "refs/heads/", 11) == 1) { is_head = 1; } }
+    if (rname_len > 10) { if (memeq(rname, "refs/tags/",  10) == 1) { is_tag  = 1; } }
+    if (is_head == 0) {
+        if (is_tag == 0) {
+            sandhi_server_send_status(cfd, 400, "Bad Request");
+            return 0;
+        }
+    }
+
+    var body_off = sandhi_server_body_offset(buf, n);
+    if (body_off < 0) { sandhi_server_send_status(cfd, 400, "Bad Request"); return 0; }
+    var clen = sandhi_server_content_length(buf, n);
+    # Body must be exactly 64 hex chars, optionally followed by '\n'.
+    if (clen != 64) {
+        if (clen != 65) {
+            sandhi_server_send_status(cfd, 400, "Bad Request");
+            return 0;
+        }
+    }
+    if (body_off + clen > n) { sandhi_server_send_status(cfd, 400, "Bad Request"); return 0; }
+    var body = buf + body_off;
+    if (hex_prefix_valid(body, 64) == 0) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    if (clen == 65) {
+        if (load8(body + 64) != 10) {
+            sandhi_server_send_status(cfd, 400, "Bad Request");
+            return 0;
+        }
+    }
+    var new_hex = alloc(65);
+    memcpy(new_hex, body, 64);
+    store8(new_hex + 64, 0);
+
+    # The new tip must already be in objects.patra (pushed by the
+    # client via /sit/v1/objects before this call). No transitive
+    # check.
+    var db = get_object_db();
+    if (db == 0) { sandhi_server_send_status(cfd, 500, "Internal Server Error"); return 0; }
+    if (db_object_has(db, new_hex) == 0) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+
+    # Build the on-disk path: ".sit/<rname>". rname already
+    # passed refname_valid so no traversal possible.
+    var disk_path = alloc(rname_len + 6);
+    memcpy(disk_path, ".sit/", 5);
+    memcpy(disk_path + 5, rname, rname_len);
+    store8(disk_path + 5 + rname_len, 0);
+
+    # Existing tip? FF check via is_ancestor_in_db.
+    if (file_exists(disk_path) == 1) {
+        # Refuse to follow a symlink on the ref file itself (S-04).
+        if (path_is_symlink(disk_path) == 1) {
+            sandhi_server_send_status(cfd, 500, "Internal Server Error");
+            return 0;
+        }
+        var rbuf = alloc(128);
+        var nr = file_read_all(disk_path, rbuf, 128);
+        if (nr < 64) { sandhi_server_send_status(cfd, 500, "Internal Server Error"); return 0; }
+        if (hex_prefix_valid(rbuf, 64) == 0) { sandhi_server_send_status(cfd, 500, "Internal Server Error"); return 0; }
+        var cur = alloc(65);
+        memcpy(cur, rbuf, 64);
+        store8(cur + 64, 0);
+        if (memeq(cur, new_hex, 64) == 1) {
+            # No-op update — tip already at the new hex.
+            sandhi_server_send_status(cfd, 200, "OK");
+            return 0;
+        }
+        # Heads must be FF; tags are immutable (any update — including
+        # the same value — is a no-op above; a different value is
+        # refused).
+        if (is_tag == 1) {
+            sandhi_server_send_status(cfd, 409, "Conflict");
+            return 0;
+        }
+        if (is_ancestor_in_db(db, cur, new_hex) == 0) {
+            sandhi_server_send_status(cfd, 409, "Conflict");
+            return 0;
+        }
+    }
+
+    # Write atomically (write to .tmp then rename). file_write_all
+    # already does a single write call — for sit's ref file size
+    # (65 bytes) that's atomic on every Linux fs the workflow targets.
+    var wbuf = alloc(66);
+    memcpy(wbuf, new_hex, 64);
+    store8(wbuf + 64, 10);
+    ensure_parent_dirs(disk_path);
+    if (file_write_all(disk_path, wbuf, 65) < 0) {
+        sandhi_server_send_status(cfd, 500, "Internal Server Error");
+        return 0;
+    }
+    sandhi_server_send_status(cfd, 200, "OK");
+    return 0;
+}
+
 # ── Request dispatcher ─────────────────────────────────────────────
 #
 # Signature dictated by sandhi: (ctx, cfd, req_buf, req_len) → 0.
@@ -405,8 +811,36 @@ fn serve_handle_request(ctx, cfd, buf, n) {
         }
     }
     if (streq(method, "POST") == 1) {
+        # /want is read-shaped (bulk fetch) so it stays anonymous in
+        # both auth modes. /objects + /refs (push) are auth-gated when
+        # --require-auth is set.
         if (streq(path, "/sit/v1/want") == 1) {
             return serve_handle_want(cfd, buf, n);
+        }
+        var plen3 = strlen(path);
+        var is_put_object = 0;
+        var is_put_ref = 0;
+        if (plen3 >= SIT_OBJECT_PATH_PREFIX_LEN) {
+            if (memeq(path, SIT_OBJECT_PATH_PREFIX,
+                      SIT_OBJECT_PATH_PREFIX_LEN) == 1) { is_put_object = 1; }
+        }
+        if (plen3 >= SIT_REF_PUT_PREFIX_LEN) {
+            if (memeq(path, SIT_REF_PUT_PREFIX,
+                      SIT_REF_PUT_PREFIX_LEN) == 1) { is_put_ref = 1; }
+        }
+        if (is_put_object == 1) {
+            if (_serve_auth_ok(buf, n) == 0) {
+                sandhi_server_send_status(cfd, 401, "Unauthorized");
+                return 0;
+            }
+            return serve_handle_put_object(cfd, path, buf, n);
+        }
+        if (is_put_ref == 1) {
+            if (_serve_auth_ok(buf, n) == 0) {
+                sandhi_server_send_status(cfd, 401, "Unauthorized");
+                return 0;
+            }
+            return serve_handle_put_ref(cfd, path, buf, n);
         }
     }
     sandhi_server_send_status(cfd, 404, "Not Found");
@@ -460,13 +894,14 @@ fn serve_parse_listen(arg, out_port) {
 
 fn cmd_serve() {
     if (argc() < 3) {
-        eprintln("usage: sit serve <repo-path> [--listen 127.0.0.1:<port>]");
+        eprintln("usage: sit serve <repo-path> [--listen 127.0.0.1:<port>] [--require-auth] [--token <path>]");
         return 1;
     }
     var repo_path = argv_heap(2);
     var port = SIT_SERVE_DEFAULT_PORT;
+    var token_path = "~/.sit/serve.token";   # default; overridable via --token
+    var custom_token_path = 0;
     var ai = 3;
-    var consumed_listen = 0;
     while (ai < argc()) {
         var a = argv(ai);
         if (streq(a, "--listen") == 1) {
@@ -477,17 +912,60 @@ fn cmd_serve() {
             var port_cell = alloc(8);
             store64(port_cell, 0);
             if (serve_parse_listen(argv(ai + 1), port_cell) != 1) {
-                eprintln("sit: --listen requires 127.0.0.1:<port> (non-loopback unlocks in v0.7.5)");
+                eprintln("sit: --listen requires 127.0.0.1:<port> (non-loopback waits on first-party TLS, ADR 0007)");
                 return 1;
             }
             port = load64(port_cell);
-            consumed_listen = 1;
             ai = ai + 2;
-        } else {
-            eprintln("sit: unknown serve option");
+        }
+        else {
+            if (streq(a, "--require-auth") == 1) {
+                _serve_require_auth = 1;
+                ai = ai + 1;
+            }
+            else {
+                if (streq(a, "--token") == 1) {
+                    if (ai + 1 >= argc()) {
+                        eprintln("sit: --token requires a path argument");
+                        return 1;
+                    }
+                    token_path = argv_heap(ai + 1);
+                    custom_token_path = 1;
+                    ai = ai + 2;
+                }
+                else {
+                    eprintln("sit: unknown serve option");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    # If --require-auth: load the token before chdir'ing into the repo
+    # (default token path is ~/.sit/serve.token, which is HOME-relative,
+    # not repo-relative). Refuse to start if the token doesn't load —
+    # the auth posture is "strictly enforced or absent" per ADR 0007.
+    if (_serve_require_auth == 1) {
+        var resolved = token_path;
+        if (custom_token_path == 0) {
+            var home = getenv("HOME");
+            if (home == 0) {
+                eprintln("sit: $HOME not set; pass --token <path> explicitly");
+                return 1;
+            }
+            var hl = strlen(home);
+            resolved = alloc(hl + 18);
+            memcpy(resolved, home, hl);
+            memcpy(resolved + hl, "/.sit/serve.token", 17);
+            store8(resolved + hl + 17, 0);
+        }
+        _serve_token = _serve_load_token(resolved);
+        if (_serve_token == 0) {
+            eprintln("sit: --require-auth set but token failed to load — refusing to start");
             return 1;
         }
     }
+
     # chdir into the repo so .sit/refs/* and .sit/objects.patra
     # resolve as relative paths in every dependent helper.
     if (syscall(SYS_CHDIR, repo_path) != 0) {
@@ -498,7 +976,12 @@ fn cmd_serve() {
         eprintln("sit: not a sit repository at given path");
         return 1;
     }
-    println("sit serve listening on 127.0.0.1");
+    if (_serve_require_auth == 1) {
+        println("sit serve listening on 127.0.0.1 (auth: bearer)");
+    }
+    else {
+        println("sit serve listening on 127.0.0.1 (auth: none)");
+    }
     stdout_flush();
     return sandhi_server_run(INADDR_LOOPBACK(), port, &serve_handle_request, 0);
 }
