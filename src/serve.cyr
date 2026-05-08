@@ -20,6 +20,12 @@
 
 var SIT_SERVE_DEFAULT_PORT = 8484;
 var SIT_SERVE_MAX_BODY = 16777216;  # 16 MiB — advertised in capabilities
+# v0.7.4: cap on the count field of a single POST /want body. The
+# binding constraint is sandhi's per-process HSV_REQ_BUF_SIZE = 64 KiB
+# request buffer; pinning to 512 keeps the request body ≤ 32 KiB
+# even with the full 8-byte count + 512×64-byte hashes, leaving
+# ample headroom for HTTP headers. See ADR 0006.
+var SIT_WANT_MAX_COUNT = 512;
 
 # ── Ref-file reader ────────────────────────────────────────────────
 #
@@ -66,7 +72,9 @@ fn serve_build_capabilities() {
     # each tag.
     str_builder_add_cstr(sb, "{\"sit\":\"0.7.3\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
-    str_builder_add_cstr(sb, ",\"auth\":[\"none\"],\"objects\":true}");
+    str_builder_add_cstr(sb, ",\"auth\":[\"none\"],\"objects\":true,\"batch\":true,\"batch_max\":");
+    str_builder_add_int(sb, SIT_WANT_MAX_COUNT);
+    str_builder_add_cstr(sb, "}");
     return str_data(str_builder_build(sb));
 }
 
@@ -220,6 +228,148 @@ fn serve_handle_object(cfd, path) {
     return 0;
 }
 
+# ── /sit/v1/want batched object stream (v0.7.4) ────────────────────
+#
+# Request body shape (per ADR 0006):
+#   8 bytes  : count (i64 LE)
+#   count*64 : ASCII hex hashes
+#
+# Response body: concatenation of per-object frames:
+#   64 bytes : ASCII hex hash
+#    8 bytes : ty (i64 LE) — 0=blob, 1=tree, 2=commit
+#    8 bytes : clen (i64 LE) — compressed payload length
+#    clen B  : zlib-compressed object content
+#
+# Hashes the server doesn't have are silently omitted from the
+# response. The client compares response frame count to the request
+# count to detect missing objects (and fall back to per-object GET
+# for those, or report failure to the user).
+#
+# Validation: any malformed input → 400. Body length must equal
+# 8 + count*64 exactly; count must fit in [0, SIT_WANT_MAX_COUNT];
+# every 64-byte hash slot must pass hex_prefix_valid before any DB
+# lookup. Endianness: native LE on x86_64/aarch64 — load64/store64
+# do the right thing without explicit byteswaps.
+
+fn serve_handle_want(cfd, buf, n) {
+    var body_off = sandhi_server_body_offset(buf, n);
+    if (body_off < 0) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    var clen = sandhi_server_content_length(buf, n);
+    if (clen <= 0) {
+        sandhi_server_send_status(cfd, 411, "Length Required");
+        return 0;
+    }
+    if (clen < 8) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    if (body_off + clen > n) {
+        # sandhi_server_recv_request reads until full body; if we land
+        # here the request was malformed at the framing layer.
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    var body = buf + body_off;
+    var count = load64(body);
+    if (count < 0) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    if (count > SIT_WANT_MAX_COUNT) {
+        sandhi_server_send_status(cfd, 413, "Payload Too Large");
+        return 0;
+    }
+    var expected_clen = 8 + count * 64;
+    if (clen != expected_clen) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+
+    # Pre-validate every hash before any DB work — keeps the failure
+    # mode "all 400 or full success", no half-emitted response.
+    var i = 0;
+    while (i < count) {
+        if (hex_prefix_valid(body + 8 + i * 64, 64) == 0) {
+            sandhi_server_send_status(cfd, 400, "Bad Request");
+            return 0;
+        }
+        i = i + 1;
+    }
+
+    var db = get_object_db();
+    if (db == 0) {
+        sandhi_server_send_status(cfd, 500, "Internal Server Error");
+        return 0;
+    }
+
+    # Build the response stream into a growing fl_alloc buffer.
+    var resp_cap = 65536;
+    var resp = fl_alloc(resp_cap);
+    if (resp == 0) {
+        sandhi_server_send_status(cfd, 500, "Internal Server Error");
+        return 0;
+    }
+    var resp_used = 0;
+    i = 0;
+    while (i < count) {
+        var hex = body + 8 + i * 64;
+        var raw[24];
+        if (db_object_read_raw(db, hex, &raw) == 0) {
+            var compressed = load64(&raw);
+            var obj_clen = load64(&raw + 8);
+            var ty = load64(&raw + 16);
+            if (obj_clen > 0) {
+                var frame_len = 64 + 8 + 8 + obj_clen;
+                # Grow response buffer if needed.
+                var grow_done = 0;
+                while (grow_done == 0) {
+                    grow_done = 1;
+                    if (resp_used + frame_len > resp_cap) {
+                        var new_cap = resp_cap * 2;
+                        if (new_cap > SIT_SERVE_MAX_BODY) {
+                            new_cap = SIT_SERVE_MAX_BODY;
+                        }
+                        if (resp_used + frame_len > new_cap) {
+                            # Already at the ceiling and it still
+                            # doesn't fit — refuse rather than
+                            # serve a truncated stream.
+                            fl_free(resp, resp_cap);
+                            sandhi_server_send_status(cfd, 413, "Payload Too Large");
+                            return 0;
+                        }
+                        var new_resp = fl_alloc(new_cap);
+                        if (new_resp == 0) {
+                            fl_free(resp, resp_cap);
+                            sandhi_server_send_status(cfd, 500, "Internal Server Error");
+                            return 0;
+                        }
+                        memcpy(new_resp, resp, resp_used);
+                        fl_free(resp, resp_cap);
+                        resp = new_resp;
+                        resp_cap = new_cap;
+                        if (resp_used + frame_len > resp_cap) { grow_done = 0; }
+                    }
+                }
+                memcpy(resp + resp_used, hex, 64);
+                store64(resp + resp_used + 64, ty);
+                store64(resp + resp_used + 72, obj_clen);
+                memcpy(resp + resp_used + 80, compressed, obj_clen);
+                resp_used = resp_used + frame_len;
+            }
+        }
+        # else: object missing from this DB — silently omit.
+        i = i + 1;
+    }
+
+    sandhi_server_send_response(cfd, 200, "OK", "application/octet-stream",
+                                 resp, resp_used, 0);
+    fl_free(resp, resp_cap);
+    return 0;
+}
+
 # ── Request dispatcher ─────────────────────────────────────────────
 #
 # Signature dictated by sandhi: (ctx, cfd, req_buf, req_len) → 0.
@@ -252,6 +402,11 @@ fn serve_handle_request(ctx, cfd, buf, n) {
                       SIT_OBJECT_PATH_PREFIX_LEN) == 1) {
                 return serve_handle_object(cfd, path);
             }
+        }
+    }
+    if (streq(method, "POST") == 1) {
+        if (streq(path, "/sit/v1/want") == 1) {
+            return serve_handle_want(cfd, buf, n);
         }
     }
     sandhi_server_send_status(cfd, 404, "Not Found");

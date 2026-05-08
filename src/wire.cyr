@@ -267,6 +267,55 @@ fn obj_src_read_both(src, hex, raw_out, deco_out) {
     return 0 - 99;
 }
 
+# v0.7.4 batch-prefetch — for HTTP sources that advertise batch
+# support, pull every cache-miss hex in `hashes` via POST /sit/v1/want
+# and stuff the results into raw_cache. Subsequent copy_objects loop
+# iterations then hit the cache instead of paying for one GET per
+# object. No-op for OBJ_SRC_DB (local DB doesn't benefit from batch
+# at this layer; patra's `WHERE hash IN (...)` batching is filed
+# separately on the patra roadmap).
+#
+# Best-effort: batch failures (server doesn't support it after all,
+# malformed frame stream, network blip) demote to per-object fallback
+# — copy_objects's existing obj_src_read_raw call covers anything
+# that didn't make it into the cache. So a partial / failing batch
+# still yields a correct clone, just slower.
+fn obj_src_batch_prefetch(src, hashes, raw_cache) {
+    if (raw_cache == 0) { return 0; }
+    if (obj_src_kind(src) != OBJ_SRC_HTTP) { return 0; }
+    var h = obj_src_payload(src);
+    if (http_remote_check_batch(h) != 1) { return 0; }
+
+    # Walk hashes, collect every cache-miss into a per-call vec.
+    # Send in WIRE_HTTP_BATCH_CHUNK-sized POSTs.
+    var misses = vec_new();
+    var n = vec_len(hashes);
+    var i = 0;
+    while (i < n) {
+        var hex = vec_get(hashes, i);
+        if (map_has(raw_cache, hex) == 0) {
+            vec_push(misses, hex);
+        }
+        i = i + 1;
+    }
+
+    var m = vec_len(misses);
+    var off = 0;
+    while (off < m) {
+        var chunk = WIRE_HTTP_BATCH_CHUNK;
+        if (off + chunk > m) { chunk = m - off; }
+        var rc = http_remote_read_batch(h, misses, off, chunk, raw_cache);
+        if (rc < 0) {
+            # Stop trying — per-object fallback covers the rest.
+            off = m;
+        }
+        else {
+            off = off + chunk;
+        }
+    }
+    return 0;
+}
+
 # Walk every object reachable from `root_commit_hex` in `src` (an obj_src) and
 # append each object's hex hash to `out`. Uses `seen` (map_new) for dedup.
 # S-14: depth cap via module-level counter; same limit as flatten_tree.
@@ -398,6 +447,14 @@ fn copy_objects(src, dst_db, hashes, raw_cache) {
     # entirely. For blobs (walk doesn't visit them) the cache misses and we
     # fall back to db_object_read_raw. raw_cache may be 0 for callers that
     # don't have a walk to draw from.
+    #
+    # v0.7.4: `obj_src_batch_prefetch` exists but is intentionally NOT called
+    # here. On the loopback bench fixture batching only the blobs (what the
+    # walk's cache leaves missing) saves ~15 ms — well below the v0.7.4
+    # ≥30%-or-revert gate. The headline win requires also batching the walk's
+    # tree reads, which is a separate refactor scoped for v0.7.5+. The
+    # protocol primitive (POST /sit/v1/want + client functions) is shipped
+    # as scaffolding so v0.7.5 can plumb it in without re-doing wire work.
     patra_begin(dst_db);
     while (i < n) {
         var hex = vec_get(hashes, i);

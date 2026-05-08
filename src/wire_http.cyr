@@ -40,18 +40,33 @@
 var WIRE_HTTP_MAX_BODY = 16 * 1024 * 1024;
 var WIRE_HTTP_INITIAL_BUF = 65536;
 
-# http_remote handle layout (16 bytes):
-#   0..8  : host addr packed-int IPv4 (network byte order, sock_connect-ready)
-#   8..16 : port (TCP)
+# v0.7.4 batch sizing — chunk size for POST /sit/v1/want. Server
+# pins SIT_WANT_MAX_COUNT = 512 (sandhi's HSV_REQ_BUF_SIZE = 64 KiB
+# is the binding constraint). 256 leaves headroom and keeps the
+# response body comfortably under WIRE_HTTP_MAX_BODY for typical
+# sit objects (~5 KiB compressed × 256 = ~1.3 MiB).
+var WIRE_HTTP_BATCH_CHUNK = 256;
+
+# http_remote handle layout (32 bytes):
+#   0..8   : host addr packed-int IPv4 (network byte order, sock_connect-ready)
+#   8..16  : port (TCP)
+#   16..24 : batch_probed (0 = not yet, 1 = capabilities GET completed)
+#   24..32 : batch_supported (0/1, only meaningful if batch_probed == 1)
 fn _http_remote_alloc(addr, port) {
-    var h = alloc(16);
-    store64(h, addr);
-    store64(h + 8, port);
+    var h = alloc(32);
+    store64(h,      addr);
+    store64(h +  8, port);
+    store64(h + 16, 0);
+    store64(h + 24, 0);
     return h;
 }
 
-fn _http_remote_addr(h) { return load64(h); }
-fn _http_remote_port(h) { return load64(h + 8); }
+fn _http_remote_addr(h)  { return load64(h); }
+fn _http_remote_port(h)  { return load64(h + 8); }
+fn _http_remote_probed(h)        { return load64(h + 16); }
+fn _http_remote_set_probed(h, v) { store64(h + 16, v); return 0; }
+fn _http_remote_batch(h)         { return load64(h + 24); }
+fn _http_remote_set_batch(h, v)  { store64(h + 24, v); return 0; }
 
 # Parse an http:// URL into (host_addr, port). Returns the handle
 # pointer on success, 0 on any failure. v0.7.3 accepts:
@@ -335,6 +350,299 @@ fn _wire_http_response_free(out_quad) {
     var cap = load64(out_quad + 40);
     if (buf != 0) { fl_free(buf, cap); }
     return 0;
+}
+
+# POST variant of _wire_http_request: same response-parsing shape,
+# different request-build path. Sends a fixed-shape body with
+# Content-Type: application/octet-stream + Content-Length. Used
+# for /sit/v1/want in v0.7.4. Out-quad layout matches GET.
+#
+# v0.7.4 status: the function is currently dead code (no caller —
+# DCE strips it from the binary). It ships as scaffolding so v0.7.5
+# can plumb walk-side batching in without re-doing wire work. The
+# v0.7.4 client stays on per-object GET because batching only the
+# blobs (the slice walk_reachable's cache misses) saves only ~7%
+# on loopback — well under the v0.7.4 ≥30% gate. See ADR 0006 for
+# the wire format and v0.7.4 CHANGELOG entry for the gate analysis.
+
+fn _wire_http_post(h, sub_path, body, body_len, out_quad) {
+    var fd_r = tcp_socket();
+    if (is_err_result(fd_r) == 1) {
+        eprintln("sit: tcp_socket failed");
+        return 0 - 1;
+    }
+    var fd = payload(fd_r);
+    var c_r = sock_connect(fd, _http_remote_addr(h), _http_remote_port(h));
+    if (is_err_result(c_r) == 1) {
+        sys_close(fd);
+        eprintln("sit: sock_connect failed (is sit serve running?)");
+        return 0 - 1;
+    }
+
+    # Request line + framing headers. body_len rendered as decimal
+    # via write_decimal (src/util.cyr).
+    var sp_len = strlen(sub_path);
+    var clen_buf[24];
+    var clen_digits = write_decimal(&clen_buf, body_len);
+    var hdr_cap = 128 + sp_len + clen_digits;
+    var hdr = alloc(hdr_cap);
+    var pos = 0;
+    memcpy(hdr + pos, "POST ", 5); pos = pos + 5;
+    memcpy(hdr + pos, sub_path, sp_len); pos = pos + sp_len;
+    memcpy(hdr + pos, " HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/octet-stream\r\nContent-Length: ", 84);
+    pos = pos + 84;
+    memcpy(hdr + pos, &clen_buf, clen_digits); pos = pos + clen_digits;
+    memcpy(hdr + pos, "\r\nConnection: close\r\n\r\n", 23); pos = pos + 23;
+    sock_send(fd, hdr, pos);
+    if (body_len > 0) { sock_send(fd, body, body_len); }
+
+    # Response read — identical loop to _wire_http_request.
+    var cap = WIRE_HTTP_INITIAL_BUF;
+    var buf = fl_alloc(cap);
+    if (buf == 0) {
+        sys_close(fd);
+        eprintln("sit: out of memory allocating http recv buffer");
+        return 0 - 1;
+    }
+    var used = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        if (used == cap) {
+            if (cap >= WIRE_HTTP_MAX_BODY) {
+                fl_free(buf, cap);
+                sys_close(fd);
+                eprintln("sit: http response exceeds 16 MiB cap");
+                return 0 - 1;
+            }
+            var new_cap = cap * 2;
+            if (new_cap > WIRE_HTTP_MAX_BODY) { new_cap = WIRE_HTTP_MAX_BODY; }
+            var new_buf = fl_alloc(new_cap);
+            if (new_buf == 0) {
+                fl_free(buf, cap);
+                sys_close(fd);
+                eprintln("sit: out of memory growing http recv buffer");
+                return 0 - 1;
+            }
+            memcpy(new_buf, buf, used);
+            fl_free(buf, cap);
+            buf = new_buf;
+            cap = new_cap;
+        }
+        var rd_r = sock_recv(fd, buf + used, cap - used);
+        if (is_err_result(rd_r) == 1) { rgo = 0; }
+        else {
+            var n = payload(rd_r);
+            if (n <= 0) { rgo = 0; }
+            else { used = used + n; }
+        }
+    }
+    sys_close(fd);
+
+    # Status + body parse — identical to GET path. ty is N/A here
+    # (the X-Sit-Type header doesn't apply to /want responses;
+    # frames carry their own ty).
+    var status = 0;
+    if (used >= 12) {
+        if (memeq(buf, "HTTP/1.", 7) == 1) {
+            status = (load8(buf + 9) - 48) * 100
+                   + (load8(buf + 10) - 48) * 10
+                   + (load8(buf + 11) - 48);
+        }
+    }
+    var i = 0;
+    var body_off = 0 - 1;
+    while (i + 3 < used) {
+        if (load8(buf + i) == 13) {
+            if (load8(buf + i + 1) == 10) {
+                if (load8(buf + i + 2) == 13) {
+                    if (load8(buf + i + 3) == 10) {
+                        body_off = i + 4;
+                        i = used;
+                    }
+                }
+            }
+        }
+        if (i < used) { i = i + 1; }
+    }
+    if (body_off < 0) {
+        fl_free(buf, cap);
+        eprintln("sit: malformed http response (no header terminator)");
+        return 0 - 1;
+    }
+
+    store64(out_quad,      buf + body_off);
+    store64(out_quad +  8, used - body_off);
+    store64(out_quad + 16, status);
+    store64(out_quad + 24, 0 - 1);   # ty: not applicable for POST responses
+    store64(out_quad + 32, buf);
+    store64(out_quad + 40, cap);
+    return 0;
+}
+
+# ── Capabilities probe (v0.7.4) ────────────────────────────────────
+#
+# One-time GET /sit/v1/capabilities; record whether the server
+# advertises "batch":true. Idempotent — the handle's batch_probed
+# flag short-circuits subsequent calls. Fail-closed: any error
+# (network, parse, missing field) → batch=0. The caller then falls
+# back to per-object GET, which is the v0.7.3 path.
+#
+# Parsing is hand-rolled because the response shape is small,
+# entirely under our control, and pulling lib/json.cyr's parser
+# into the cap-probe critical path buys nothing. Looks for the
+# byte sequence `"batch":true` anywhere in the body.
+
+fn http_remote_check_batch(h) {
+    if (_http_remote_probed(h) == 1) { return _http_remote_batch(h); }
+    _http_remote_set_probed(h, 1);
+    _http_remote_set_batch(h, 0);
+
+    var quad[48];
+    if (_wire_http_request(h, "/sit/v1/capabilities", &quad) != 0) { return 0; }
+    var status = load64(&quad + 16);
+    if (status != 200) {
+        _wire_http_response_free(&quad);
+        return 0;
+    }
+    var body = load64(&quad);
+    var blen = load64(&quad + 8);
+    var found = 0;
+    var i = 0;
+    while (i + 12 < blen) {
+        if (memeq(body + i, "\"batch\":true", 12) == 1) {
+            found = 1;
+            i = blen;
+        }
+        else { i = i + 1; }
+    }
+    _wire_http_response_free(&quad);
+    if (found == 1) { _http_remote_set_batch(h, 1); return 1; }
+    return 0;
+}
+
+# ── /sit/v1/want batched object fetch (v0.7.4) ─────────────────────
+#
+# Build the request body per ADR 0006: i64 LE count, then count
+# 64-byte ASCII hex hashes. Send POST /sit/v1/want. Walk the
+# response stream, decode each frame, and cache-insert the
+# {compressed, clen, ty} triple keyed by hash.
+#
+# Hashes the server didn't have are silently absent from the
+# response — the cache miss persists and the existing copy_objects
+# fallback (per-object GET via obj_src_read_raw) handles them. So
+# a partial response is safe; the worst case is one round trip
+# wasted before falling back.
+#
+# Frame validation:
+#   * hex passes hex_prefix_valid (rejects non-hex bytes; flips an
+#     attacker server's chance of getting a corrupt key into the
+#     local DB to 0)
+#   * ty is one of {0, 1, 2}; anything else stops the parse
+#     mid-stream (return -1)
+#   * clen is positive and the declared frame fits in the body
+#     remaining; otherwise stop the parse
+#
+# Returns the count of frames successfully cached (≤ count
+# requested), or -1 on framing failure. Server malformed responses
+# fail loudly rather than silently — they signal a wire-protocol
+# violation that the user should know about.
+
+fn http_remote_read_batch(h, hashes, start_idx, count, raw_cache) {
+    if (count <= 0) { return 0; }
+
+    # Build request body: 8-byte count + count*64 hashes. Allocated
+    # via fl_alloc since the size is bounded (count <= ~512 → ≤ 32 KiB).
+    var body_len = 8 + count * 64;
+    var body = fl_alloc(body_len);
+    if (body == 0) {
+        eprintln("sit: out of memory building batch request");
+        return 0 - 1;
+    }
+    store64(body, count);
+    var bi = 0;
+    while (bi < count) {
+        var hex = vec_get(hashes, start_idx + bi);
+        memcpy(body + 8 + bi * 64, hex, 64);
+        bi = bi + 1;
+    }
+
+    var quad[48];
+    var post_rc = _wire_http_post(h, "/sit/v1/want", body, body_len, &quad);
+    fl_free(body, body_len);
+    if (post_rc != 0) { return 0 - 1; }
+
+    var status = load64(&quad + 16);
+    if (status != 200) {
+        _wire_http_response_free(&quad);
+        if (status == 404) {
+            # Server doesn't actually implement /want despite the
+            # capability flag — disable batch on this handle so
+            # subsequent calls fall back without retrying.
+            _http_remote_set_batch(h, 0);
+        }
+        return 0 - 1;
+    }
+
+    var resp = load64(&quad);
+    var rlen = load64(&quad + 8);
+    var off = 0;
+    var cached = 0;
+    var failed = 0;
+    while (off < rlen) {
+        if (failed == 1) { off = rlen; }
+        else {
+            # Each frame is at least 80 bytes (64 hex + 8 ty + 8 clen).
+            if (off + 80 > rlen) { failed = 1; }
+            else {
+                var hex = resp + off;
+                if (hex_prefix_valid(hex, 64) == 0) { failed = 1; }
+                else {
+                    var ty = load64(resp + off + 64);
+                    var clen = load64(resp + off + 72);
+                    if (ty < 0) { failed = 1; }
+                    else {
+                        if (ty > 2) { failed = 1; }
+                        else {
+                            if (clen <= 0) { failed = 1; }
+                            else {
+                                if (clen > WIRE_HTTP_MAX_BODY) { failed = 1; }
+                                else {
+                                    if (off + 80 + clen > rlen) { failed = 1; }
+                                    else {
+                                        # Copy compressed bytes out of the
+                                        # response buffer (which gets fl_freed
+                                        # on return) into a fresh heap alloc.
+                                        # Matches db_object_read_raw lifetime.
+                                        var compressed = alloc(clen);
+                                        memcpy(compressed, resp + off + 80, clen);
+                                        var raw[24];
+                                        store64(&raw,      compressed);
+                                        store64(&raw +  8, clen);
+                                        store64(&raw + 16, ty);
+                                        # Use a heap-owned hex copy as the
+                                        # cache key so it outlives the
+                                        # response buffer's fl_free.
+                                        var key = alloc(65);
+                                        memcpy(key, hex, 64);
+                                        store8(key + 64, 0);
+                                        _walk_cache_insert(raw_cache, key, &raw);
+                                        cached = cached + 1;
+                                        off = off + 80 + clen;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    _wire_http_response_free(&quad);
+    if (failed == 1) {
+        eprintln("sit: malformed /sit/v1/want frame stream");
+        return 0 - 1;
+    }
+    return cached;
 }
 
 # ── /sit/v1/refs JSON parser ───────────────────────────────────────
