@@ -4,6 +4,48 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.3] — 2026-05-08 — HTTP client transport (fetch + clone over `http://`)
+
+**Closes the v0.7.x server/client read-only round trip.** v0.7.2 lit up `sit serve` with `/sit/v1/capabilities` + `/sit/v1/refs`; v0.7.3 adds the third read endpoint (`GET /sit/v1/objects/<hash>`), introduces the client-side HTTP transport in a new module, and wires fetch / clone over `http://` URLs end-to-end. Push, https, and ssh stay gated for the later patches that own them (v0.7.5 / v0.7.6 / v0.7.8). Toolchain bumps cyrius 5.8.51 → 5.9.37 — picks up the cc5_aarch64 cap-propagation fix that was filed during the v0.7.2 release run, restoring aarch64 cross-builds without the best-effort swallow.
+
+### Added
+
+- **`GET /sit/v1/objects/<hash>`** in `src/serve.cyr` — returns the raw compressed bytes of the object addressed by 64-hex SHA-256, with the patra type code on an `X-Sit-Type: <int>` response header so clients can persist the row without re-deriving from the decompressed body. Validates the path tail through `hex_prefix_valid` before any DB lookup. 400 on short / non-hex tails; 404 on missing rows or read errors (status mapping deliberately conflates the two so the response doesn't leak whether a hash *could have* existed); 413 if a stored object exceeds the advertised `max_body`. No retry / range semantics in v0.7.3 — bodies ship in one shot under the 16 MiB ceiling that matches `db_object_read_both`'s decompression cap.
+- **`src/wire_http.cyr`** (470 lines) — sit-side HTTP/1.0 client built directly on `lib/net.cyr` socket primitives. Why not stdlib `http_get` / `http_get_a`: both hard-cap the response body at 64 KiB, which is too small for sit's compressed objects (a 1 MiB blob with low entropy compresses to ~300 KiB). The client grows its recv buffer 64 KiB → 16 MiB via `fl_alloc` (kernel-mmap-backed; freed after each request). Public surface: `wire_http_open(url)` parses URL into a 16-byte handle (host packed as int + port); `http_remote_read_refs(h, out)` parses the v0.7.2 refs JSON into `{name, hex}` pairs, validating each through `refname_valid` + `hex_prefix_valid` at the trust boundary; `http_remote_read_raw(h, hex, out)` fetches a single object, validates the X-Sit-Type ∈ {0,1,2}, and copies the compressed bytes out of the recv buffer into a heap allocation matching `db_object_read_raw`'s lifetime contract; `http_remote_read_both` mirrors `db_object_read_both` (4× initial / 16 MiB ceiling decompression policy) so the two transports have identical failure modes.
+- **`obj_src` abstraction** in `src/wire.cyr` — 16-byte tagged handle (`OBJ_SRC_DB` = 0 / `OBJ_SRC_HTTP` = 1 + payload pointer). `obj_src_for_db(db)` and `obj_src_for_http(handle)` constructors; `obj_src_read_raw` / `obj_src_read_both` dispatchers. `walk_reachable_tree` / `walk_reachable_from_commit` / `copy_objects` now take `obj_src` instead of a raw `src_db` patra pointer, so the reachability walk runs unchanged over either transport (the roadmap's "HTTP-backed `db_object_read_both` shim").
+- **`wire_transport_check_readable`** + **`wire_transport_check_writable`** — split from the v0.7.1 single-shape `wire_transport_check`. `cmd_clone` and `do_fetch` use `_readable` (file:// + http accepted); `cmd_push` uses `_writable` (still rejects http with `"push over http requires sit 0.7.5+"`). https/ssh stay gated everywhere with their original v0.7.6 / v0.7.8 pointers.
+- **CI smoke step** — `.github/workflows/ci.yml` gains a new "http transport (sit serve + http clone + fsck)" step that fires alongside the existing file:// wire smoke. Starts `sit serve` loopback on port 18484, waits up to 5 s for `/dev/tcp/127.0.0.1/18484` to come up, clones via `http://`, asserts content + `sit fsck` clean, kills the daemon via an EXIT trap.
+
+### Changed
+
+- **cyrius 5.8.51 → 5.9.37** — single-line pin bump in `cyrius.cyml`. Drives the cc5_aarch64 cap-propagation fix (filed 2026-05-04) and brings the stdlib lib/ tree to its post-v5.9.x shape (the stale lib/ from earlier toolchains is what surfaced the `agnosys.cyr:806 SYS_LANDLOCK_CREATE_RULESET` build break before re-resolving deps).
+- **`do_fetch`** in `src/wire.cyr` — refactored to branch on URL scheme. file:// + bare paths still call `remote_objects_open` for the patra source; `http://` URLs call `wire_http_open` and resolve the branch via `http_remote_resolve_branch`. The walk + copy pipeline downstream is transport-independent (consumes an `obj_src`). The shared `raw_cache` (P-04, v0.6.7) carries over identically — compressed bytes are bytes regardless of where they came from.
+- **`cmd_clone`** target-derive — file:// + bare paths still take the last path segment; `http://` URLs take the host (port + path stripped), so `sit clone http://127.0.0.1:18484` derives `127.0.0.1` as the default target. Pass `<dir>` explicitly when cloning multiple http remotes from the same host.
+- **`serve_build_capabilities`** — `"sit"` field bumped to `0.7.3`; new boolean `"objects":true` advertises the new endpoint so future clients can capability-gate without probing.
+
+### Sit-side impact
+
+- Build: clean. **127/127 tests pass.** Lint: only the pre-existing >120-char warning at `src/commit.cyr:609`. DCE binary: 1.30 MB.
+- aarch64 cross-build now succeeds end-to-end without the workflow's best-effort swallow firing — `cc5_aarch64` grew 438896 → 449624 bytes under cyrius 5.9.37, and `cyrius build --aarch64 src/main.cyr build/sit-aarch64` produces a 1.45 MB statically-linked aarch64 ELF.
+- End-to-end smoke against a 100-commit / 100-file fixture: `sit clone http://127.0.0.1:18484` succeeds, `sit fsck` reports `300 objects, 0 bad`, `sit log --oneline` byte-identical to a `file://` clone of the same fixture. **Wall time 211 ms (http) vs 167 ms (file) = 1.26× — well under the v0.7.3 success gate of 3×.**
+
+### Security posture (v0.7.3 surface only)
+
+- Hash trust boundary unchanged: client does **not** re-hash incoming objects. The compressed bytes land in the local objects.patra under the requested hex key; `sit fsck` is the canonical roundtrip per CLAUDE.md ("SHA-256 roundtrips belong in fsck, not the hot path"). Identical model to file:// clone.
+- URL parser rejects empty host / port, port out of range (>65535 or <1), base paths beyond "" or "/", hosts that aren't a numeric IPv4 literal or the "localhost" string. Loopback-only — full DNS resolution is queued for v0.7.4.
+- Server-side path tail validated through `hex_prefix_valid` before any DB lookup. The hex is single-quoted into the SQL on the server side as a defence in depth on top of the validator.
+- Body cap 16 MiB on both ends. X-Sit-Type clamped to {0, 1, 2} (blob / tree / commit) on the client; unknown types refused before DB write.
+- HTTP **not** offered for `cmd_push` — the writable-check still rejects with the v0.7.5+ pointer. https / ssh remain gated. MITM protection arrives with TLS in v0.7.6; until then `http://` is dev / trusted-network only.
+- `Host:` request header hardcoded `127.0.0.1` — defensible for the loopback-only scope; will need to use the parsed host when v0.7.4+ unlocks non-loopback resolution.
+
+### Issue archived
+
+- [`docs/development/issues/archived/2026-05-04-cyrius-cc5-aarch64-token-cap-not-propagated.md`](docs/development/issues/archived/2026-05-04-cyrius-cc5-aarch64-token-cap-not-propagated.md) — `— RESOLVED` at cyrius 5.9.37. cc5_aarch64 grew 438896 → 449624 bytes (+10728); the pre-5.8.46 `error: token limit exceeded (262144)` diagnostic is gone; `cyrius build --aarch64` produces a real binary on sit at v0.7.2 without firing the workflow's best-effort swallow. The consumer-side workaround in `.github/workflows/release.yml` is no longer load-bearing for sit but stays in place as a defence against future aarch64 backend regressions.
+
+### Up next (v0.7.4)
+
+`POST /want` batched object stream — length-prefixed framing, server bundles multiple compressed objects per request, client falls back to per-object `GET` if the server doesn't advertise `"batch":true`. Success gate: ≥30% clone speedup vs 0.7.3 OR revert; frame decoder fuzzed ≥10M iterations.
+
 ## [0.7.2] — 2026-05-04 — `sit serve` skeleton (read-only HTTP) + sandhi opt-in
 
 **First feature-bearing release of the v0.7.x network-transport line.** Lights up the read-only HTTP server side of the `/sit/v1/...` wire protocol with two endpoints (`GET /sit/v1/capabilities`, `GET /sit/v1/refs`); HTTP/SSH client transports remain v0.7.3+. Toolchain jumps cyrius 5.7.1 → 5.8.51 — the v5.8.46 token-cap raise (262144 → 1048576) is what unblocks `"sandhi"` + transitive net/tls/ws/http/json in `[deps].stdlib` so a real consumer can include sandhi without overflowing the parser.
@@ -39,10 +81,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Issue archived
 
 - [`docs/development/issues/archived/2026-04-25-cyrius-fixup-table-cap.md`](docs/development/issues/archived/2026-04-25-cyrius-fixup-table-cap.md) — `— RESOLVED` at cyrius 5.8.46. Original 32,768 → 262,144 cap raise (5.7.1) was insufficient; the v5.8.46 raise to 1,048,576 was sized to the empirical M from the new `needed M, cap is N` diagnostic. The two distinct caps the issue conflated (fixup-table vs token-array) turned out to require separate handling; v5.8.46's token-array raise was the binding fix for sit.
-
-### Up next (v0.7.3)
-
-`GET /sit/v1/objects/<hash>` (server) — raw compressed bytes with `X-Sit-Type` header carrying patra `ty` — and `wire_http.cyr` (client) end-to-end fetch/clone over the v0.7.2 server. Reachability walk runs over an HTTP-backed `db_object_read_both` shim. Success gate: `sit clone http://localhost` against a 100-commit fixture, `sit fsck` clean, within 3× local-path.
 
 ## [0.7.1] — 2026-04-25 — URL scheme detection + transport dispatch stubs
 

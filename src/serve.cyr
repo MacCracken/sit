@@ -13,10 +13,10 @@
 # POST /objects + POST /refs + bearer auth (v0.7.5), TLS (v0.7.6),
 # mTLS (v0.7.7).
 #
-# Bound to 127.0.0.1 only in v0.7.2 — listening on 0.0.0.0 / a
-# routable interface needs explicit threat-model review (auth model
-# isn't wired yet; non-loopback exposure of a no-auth read path
-# leaks ref topology).
+# Bound to 127.0.0.1 only — listening on 0.0.0.0 / a routable
+# interface needs explicit threat-model review (auth model isn't
+# wired yet; non-loopback exposure of a no-auth read path leaks
+# ref topology + object content). Bearer auth lands in v0.7.5.
 
 var SIT_SERVE_DEFAULT_PORT = 8484;
 var SIT_SERVE_MAX_BODY = 16777216;  # 16 MiB — advertised in capabilities
@@ -63,9 +63,8 @@ fn serve_build_capabilities() {
     var sb = str_builder_new();
     # The "sit" string identifies the wire-protocol release line
     # the server promises. It bumps in lockstep with VERSION at
-    # tag time — flipped from "0.7.2" alongside VERSION/CHANGELOG
-    # when the v0.7.3 tag ships.
-    str_builder_add_cstr(sb, "{\"sit\":\"0.7.2\",\"max_body\":");
+    # each tag.
+    str_builder_add_cstr(sb, "{\"sit\":\"0.7.3\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[\"none\"],\"objects\":true}");
     return str_data(str_builder_build(sb));
@@ -261,10 +260,11 @@ fn serve_handle_request(ctx, cfd, buf, n) {
 
 # ── --listen parser ────────────────────────────────────────────────
 #
-# Parses "<addr>:<port>". v0.7.2 only accepts "127.0.0.1:<n>" — any
-# other address is rejected at parse time so users don't accidentally
-# expose the no-auth daemon. Writes the parsed port to *out_port and
-# returns 1 on success, 0 on any malformation.
+# Parses "<addr>:<port>". Only "127.0.0.1:<n>" is accepted today —
+# any other address is rejected at parse time so users don't
+# accidentally expose the no-auth daemon. Non-loopback exposure
+# unlocks alongside bearer auth in v0.7.5. Writes the parsed port
+# to *out_port and returns 1 on success, 0 on any malformation.
 
 fn serve_parse_listen(arg, out_port) {
     var alen = strlen(arg);
@@ -322,7 +322,7 @@ fn cmd_serve() {
             var port_cell = alloc(8);
             store64(port_cell, 0);
             if (serve_parse_listen(argv(ai + 1), port_cell) != 1) {
-                eprintln("sit: --listen requires 127.0.0.1:<port> in v0.7.2");
+                eprintln("sit: --listen requires 127.0.0.1:<port> (non-loopback unlocks in v0.7.5)");
                 return 1;
             }
             port = load64(port_cell);
