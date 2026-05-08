@@ -212,11 +212,22 @@ jobs:
 
           # Client without ~/.sit/serve.token → push fails cleanly.
           mv "$HOME/.sit/serve.token" "$HOME/.sit/serve.token.bak"
-          (cd "$SRC" && \
-            echo line3 >> readme.md && "$GITHUB_WORKSPACE/build/sit" add readme.md && "$GITHUB_WORKSPACE/build/sit" commit -m "third" && \
-            ! "$GITHUB_WORKSPACE/build/sit" push origin main 2>&1 | tee /tmp/no-token.out
-          )
-          grep -q "server requires bearer auth" /tmp/no-token.out || { echo "expected token-missing error"; exit 1; }
+          cd "$SRC"
+          echo line3 >> readme.md
+          "$GITHUB_WORKSPACE/build/sit" add readme.md
+          "$GITHUB_WORKSPACE/build/sit" commit -m "third"
+          # Capture push output + rc explicitly. `set +e` around the failing
+          # call so the workflow's default `set -e` doesn't abort before we
+          # can assert on the failure shape. Don't use `! cmd | tee` — with
+          # pipefail off, the `!` inverts tee's exit code (always 0), not
+          # push's, and a passing test reads as a failed step.
+          set +e
+          "$GITHUB_WORKSPACE/build/sit" push origin main > /tmp/no-token.out 2>&1
+          PUSH_RC=$?
+          set -e
+          cat /tmp/no-token.out
+          test "$PUSH_RC" -ne 0 || { echo "expected push to fail when token missing"; exit 1; }
+          grep -q "server requires bearer auth" /tmp/no-token.out || { echo "expected token-missing error message"; exit 1; }
           mv "$HOME/.sit/serve.token.bak" "$HOME/.sit/serve.token"
 
           echo "http push + bearer auth smoke ok"
