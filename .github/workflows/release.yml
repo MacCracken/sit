@@ -58,8 +58,18 @@ jobs:
       - name: Cross-build aarch64 (best-effort)
         run: |
           if [ -x "$HOME/.cyrius/bin/cc5_aarch64" ]; then
-            cyrius build --aarch64 src/main.cyr build/sit-aarch64
-            echo "sit aarch64: $(wc -c < build/sit-aarch64) bytes"
+            # "Best-effort" means: if the cross-build fails, skip the aarch64
+            # artifact and still ship x86_64. Today (v0.7.2) it fails on
+            # SYS_OPEN — patra/agnosys/yukti use it as a bare constant which
+            # doesn't exist in the aarch64 syscall table (aarch64 has no
+            # `open` syscall, only `openat`). Tracked in
+            # docs/development/issues/2026-05-04-aarch64-sys-open-undefined.md.
+            if cyrius build --aarch64 src/main.cyr build/sit-aarch64; then
+              echo "sit aarch64: $(wc -c < build/sit-aarch64) bytes"
+            else
+              echo "::warning::aarch64 cross-build failed — see docs/development/issues/2026-05-04-aarch64-sys-open-undefined.md; shipping x86_64 only"
+              rm -f build/sit-aarch64
+            fi
           else
             echo "::warning::cc5_aarch64 not shipped with this Cyrius — aarch64 binary skipped"
           fi
