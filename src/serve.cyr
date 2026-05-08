@@ -70,7 +70,7 @@ fn serve_build_capabilities() {
     # The "sit" string identifies the wire-protocol release line
     # the server promises. It bumps in lockstep with VERSION at
     # each tag.
-    str_builder_add_cstr(sb, "{\"sit\":\"0.7.4\",\"max_body\":");
+    str_builder_add_cstr(sb, "{\"sit\":\"0.7.5\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[\"none\"],\"objects\":true,\"batch\":true,\"batch_max\":");
     str_builder_add_int(sb, SIT_WANT_MAX_COUNT);

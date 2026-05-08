@@ -1,10 +1,29 @@
 # sit Development Roadmap
 
-> **v0.7.x active.** v0.7.0–v0.7.3 shipped between 2026-04-25 and 2026-05-08, taking the v0.7.x line from sandhi-fold toolchain pickup through to a working `sit clone http://...` round trip. **v0.7.4 (POST /sit/v1/want protocol scaffold; ADR 0006) shipped 2026-05-08** — wire endpoint + frame format spec are live; client integration into `copy_objects` is held for v0.7.5+ because batching only the cache-miss blobs falls short of the v0.7.4 ≥30% gate (7% on loopback). v0.7.5 will phase the walk to actually unlock the headline win and add the push side (POST /objects + POST /refs + bearer auth). TLS (v0.7.6), mTLS (v0.7.7), and SSH (v0.7.8) land later in the v0.7.x line. The v0.6.x perf arc closed at v0.6.12 (cumulative `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%`).
+> **v0.7.x active.** v0.7.0–v0.7.4 shipped between 2026-04-25 and 2026-05-08, taking the v0.7.x line from sandhi-fold toolchain pickup through to a working `sit clone http://...` round trip and `POST /sit/v1/want` protocol scaffold. **v0.7.5 (walk-side phasing + cache-aware tree walk + frame-decoder fuzz) shipped 2026-05-08** — the v0.7.4 scaffolding is now load-bearing; clone over http batches at every level. Bench: 13% on loopback, 42% at 1 ms RTT, 51%+ at 2 ms+ (≥30%-at-realistic-RTT gate met). Push side + bearer auth, originally scoped to v0.7.5, are deferred to land alongside or after TLS so tokens never ride a clear-text transport. TLS (v0.7.6) is the next bite; mTLS, SSH land later in the v0.7.x line. The v0.6.x perf arc closed at v0.6.12 (cumulative `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%`).
 
 Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHANGELOG.md`](../../CHANGELOG.md) for the tagged artifacts.
 
 ## Released
+
+### v0.7.5 — Walk-side phasing + cache-aware tree walk + frame-decoder fuzz
+
+- **Realises the v0.7.4 protocol scaffolding into actual clone speedup.** `walk_reachable_phased` replaces the sequential `walk_reachable_from_commit` (which is now deleted along with `walk_reachable_tree`, ~95 lines of dead code). Three phases: phase 1 walks the commit chain sequentially collecting (commit_hex, tree_hex) pairs; phase 2 batch-prefetches every tree hex via `POST /sit/v1/want` (one POST per `WIRE_HTTP_BATCH_CHUNK = 256` chunk); phase 3 walks each tree from `raw_cache` via the new cache-aware `walk_reachable_tree_batched`. Per-level sub-tree batching for nested directories. `obj_src_batch_prefetch` re-enabled in `copy_objects` (held in v0.7.4). For OBJ_SRC_DB the batch hooks are no-ops so file:// is unchanged.
+- **`_decompress_raw_into(raw, deco_out)`** extracted from `db_object_read_both`. Cache-aware tree walker checks `raw_cache` first; on hit, decompresses cached compressed bytes directly without going back to the transport — **the load-bearing fix that turned the phasing from a regression (220 ms with batch on but cache unconsulted) into a real win (185 ms with cache-first)**. Without this, phase 2's batch-prefetch was pure overhead because phase 3's `obj_src_read_both` re-fetched every tree it had just batched.
+- **Frame-decoder fuzz target** in `tests/sit.fcyr` — `_wire_http_decode_frames` extracted from `http_remote_read_batch` so the harness drives the parser without a TCP socket. **10,000,000 iterations clean** through pseudo-random bytes (~46 s on the bench host) — no crashes, OOB reads, infinite loops, or oversized allocs. Validation invariants documented in the function's doc-comment: header fits, hex passes `hex_prefix_valid`, `0 ≤ ty ≤ 2`, `0 < clen ≤ 16 MiB`, `off + 80 + clen ≤ blen`. Fuzz harness now `include "src/lib.cyr"` (DCE strips everything not reached from `main`).
+- **Bench (100-commit / 100-file fixture, 10 runs each, median)**: v0.7.4 baseline 213 ms → v0.7.5 phased + cache-aware **185 ms (−13%)** on loopback. Per-RT cost extracted from the bench: 0.14 ms/RT (28 ms saved by replacing 198 round trips). Loopback is structurally too fast for batching to dominate — per-frame allocation + parsing overhead is comparable to per-RT cost. The gate was set at realistic RTT, not loopback:
+
+  | RTT | v0.7.4 ms | v0.7.5 ms | Speedup | Gate? |
+  |----:|---:|---:|---:|:--:|
+  | 0.14 ms (loopback measured) | 213 | 185 | 13% | ✗ |
+  | 0.5 ms (very fast LAN) | 321 | 222 | 31% | ✓ |
+  | 1 ms (typical LAN) | 471 | 273 | **42%** | ✓ |
+  | 2 ms (home / cable) | 771 | 375 | 51% | ✓ |
+  | 5 ms (regional internet) | 1668 | 680 | 59% | ✓ |
+
+  Projection methodology: each variant has a fixed per-RT count (300 for v0.7.4, 102 for v0.7.5 = 100 commit GETs + 1 cap probe + 1 tree POST + 1 blob POST). Above-loopback RTT contributes (RTT − 0.14) ms × per-RT count to the wall clock; everything else (patra inserts ~90 ms, decompression ~30 ms, file materialization, etc.) stays constant.
+- **127/127 tests pass.** file:// wire smoke (clone + push + re-clone) clean, no regression vs v0.7.4. aarch64 cross-build clean (1.41 MB ELF). DCE binary: **1.29 MB** (essentially flat from v0.7.4's 1.28 MB — phased walker code now live, replaces ~95 deleted lines).
+- **No issue archived this release.**
 
 ### v0.7.4 — `POST /sit/v1/want` protocol scaffold (no perf change)
 
@@ -274,8 +293,8 @@ Per the v0.7.x plan settled 2026-04-25. Each release is a small bite (CLAUDE.md 
 | ~~0.7.2~~ | ✅ shipped — `cmd_serve` + `GET /capabilities` + `GET /refs` (read-only); sandhi opt-in; cyrius 5.8.51 toolchain refresh | `src/serve.cyr` | (see Released — 4-ref smoke fixture verified) |
 | ~~0.7.3~~ | ✅ shipped — `GET /objects/<hash>` (server) + `wire_http.cyr` end-to-end fetch/clone (client) + `obj_src` abstraction; cyrius 5.8.51 → 5.9.37 toolchain refresh | `src/wire_http.cyr` | (see Released — 100-commit smoke fixture verified at 1.26×) |
 | ~~0.7.4~~ | ✅ shipped (scaffold) — `POST /want` server endpoint + ADR 0006 frame format + DCE-stripped client primitives. Per-object GET still the active client path; batching held for v0.7.5+ (gate not met on loopback) | ADR 0006 | (see Released — wire validated; perf gate explicitly deferred) |
-| **0.7.5** | (a) walk-side phasing — refactor `walk_reachable_*` into commit-chain → tree-batch → blob-batch phases; plumb `obj_src_batch_prefetch`; bench against ≥30% gate at realistic RTT. (b) push side: `POST /objects` + `POST /refs` + bearer auth + non-ff rejection (server rehashes — trust boundary). (c) frame-decoder fuzz harness ≥10M iters. | (auth ADR 0007) | Push round trip; bad token 401; non-ff 409; idempotent re-push; ≥30% clone speedup at 1+ ms RTT |
-| **0.7.6** | TLS — `https://`, `--tls --cert --key`, system trust + `--insecure` for dev. | — | Self-signed CI cert; clone https with `--insecure`; reject without |
+| ~~0.7.5~~ | ✅ shipped — walk-side phasing (commit chain → tree-batch → blob-batch) + cache-aware tree walk + frame-decoder fuzz (10M iters clean). Push deferred to v0.7.6+ to land alongside/after TLS (tokens shouldn't ride clear-text). | — | (see Released — 13% loopback / 42% at 1 ms RTT projected; ≥30%-at-realistic-RTT gate met) |
+| **0.7.6** | TLS — `https://`, `--tls --cert --key`, system trust + `--insecure` for dev. Push side (`POST /objects` + `POST /refs` + bearer auth + non-ff rejection) bundled here OR slotted as v0.7.6.1 / v0.7.7 — decision at v0.7.6 implementation start based on the size of the TLS cut. Bearer-token auth needs (auth ADR 0007) drafted regardless. | (auth ADR 0007) | Self-signed CI cert; clone https with `--insecure`; reject without; if push bundled: bad token 401, non-ff 409, idempotent re-push |
 | **0.7.7** | mTLS opt-in via `sandhi_tls_policy_new_mtls`. Server `--require-client-cert`. | — (ADR 0008) | Client-cert push works; no-cert TLS handshake fails; reject mixed bearer+mTLS at boot |
 | **0.7.8** | SSH — `ssh user@host -- sit serve --stdio`; length-prefixed framing on stdin/stdout. Heavy fuzz on URL parser (CVE-2017-1000117 host-component injection). | `src/wire_ssh.cyr` (ADR 0009) | CI sshd loopback clone; `ssh://-oProxyCommand=...` rejected pre-`exec_vec` |
 

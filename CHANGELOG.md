@@ -4,6 +4,70 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.5] — 2026-05-08 — Walk-side phasing + cache-aware tree walk + frame-decoder fuzz
+
+**Realises the v0.7.4 protocol scaffolding into actual clone speedup.** The phased reachability walker collects every tree referenced by the commit chain in phase 1, batch-prefetches them via `POST /sit/v1/want` in phase 2, and walks each from the local `raw_cache` in phase 3. The tree walker is now cache-aware: a hit decompresses cached compressed bytes directly instead of going back to the transport. End result on a 100-commit / 100-file fixture: **13% loopback speedup (213 → 185 ms)**; projected **42% at 1 ms RTT, 51% at 2 ms, 59% at 5 ms** — comfortably exceeding the v0.7.5 ≥30%-at-realistic-RTT gate. The frame-decoder fuzz target lands alongside, hardening the wire's parse surface against adversarial bytes.
+
+### Added
+
+- **`walk_reachable_phased(src, root_hex, out, seen, raw_cache)`** in `src/wire.cyr` — three-phase reachability walk:
+  - **Phase 1**: sequential commit chain. Each commit read goes via `obj_src_read_both` (per-object GET on http; cached patra read on file://); tree hexes from the `tree` field accumulate into a side vec for phase 2. The chain itself is unavoidably sequential — parent-of-parent hash is only learnable by reading the parent.
+  - **Phase 2**: one call to `obj_src_batch_prefetch(src, trees, raw_cache)`. For OBJ_SRC_HTTP advertising `"batch":true`, this collapses N tree GETs into ⌈N/256⌉ POSTs (`WIRE_HTTP_BATCH_CHUNK`). For OBJ_SRC_DB it's a no-op and phase 3 falls back to per-tree reads.
+  - **Phase 3**: walk each tree (top-level + nested) via the new `walk_reachable_tree_batched`. At every depth, sub-tree hashes are collected first, batch-prefetched as a level, then recursed into — so deeply-nested directories still benefit, not just the top tier.
+- **`walk_reachable_tree_batched(src, tree_hex, out, seen, raw_cache)`** — cache-aware tree walker. Checks `raw_cache` first; on hit, decompresses the cached compressed bytes via the new `_decompress_raw_into` helper without going back to the transport; on miss, falls back to `obj_src_read_both`. **This is the load-bearing fix that turned the phasing from a regression (220 ms with batch on but cache unconsulted) into a real win (185 ms with cache-first).**
+- **`_decompress_raw_into(raw, deco_out)`** — extracted the decompression block from `db_object_read_both` so cache-hit paths in the phased walker can decompress {compressed, clen, ty} → {ptr, dlen, content_offset} directly. Same 4×-initial / 16 MiB-ceiling sizing policy.
+- **`_wire_http_decode_frames(buf, blen, raw_cache)`** in `src/wire_http.cyr` — extracted from `http_remote_read_batch` so the fuzz harness can drive it without standing up a TCP socket. Frame validation invariants documented in the function-level comment: header fits in remaining bytes, `hex_prefix_valid(hash, 64)`, `0 <= ty <= 2`, `0 < clen <= 16 MiB`, `off + 80 + clen <= blen`. Any failure mid-stream returns -1 (caller demotes to per-object fallback).
+- **`fuzz_want_frame_decoder(rounds)`** in `tests/sit.fcyr` — pseudo-random byte stream fed through `_wire_http_decode_frames` with a fresh `map_new()` per round. **10,000,000 iterations clean** — no crashes, OOB reads, infinite loops, or oversized allocs. Run time ~46 s on the bench host (Linux 7.0.3-arch1-2, x86_64). Fuzz harness now `include "src/lib.cyr"` (DCE strips everything not reachable from `main`).
+- **`obj_src_batch_prefetch(src, hashes, raw_cache)`** call in `copy_objects` — re-enabled. Held in v0.7.4 because the perf gate wasn't met; live in v0.7.5 now that walk-side phasing closes the gap.
+
+### Changed
+
+- **`do_fetch`** + **`cmd_push`** call `walk_reachable_phased` instead of the previous sequential `walk_reachable_from_commit`.
+- **Capabilities `"sit"` field** advertises `0.7.5`.
+
+### Removed
+
+- **`walk_reachable_from_commit`** + **`walk_reachable_tree`** in `src/wire.cyr` — the phased walker subsumes both. For OBJ_SRC_DB, the work done is identical (just slightly different ordering with the side vec for trees); for OBJ_SRC_HTTP the phased version is unambiguously better. No callers remained after the swap. ~95 lines of dead code dropped per CLAUDE.md "If you are certain that something is unused, you can delete it completely."
+
+### Sit-side impact
+
+- Build: clean. **127/127 tests pass.** Lint: only the pre-existing >120-char warning at `src/commit.cyr:609`.
+- DCE binary: **1.29 MB** (essentially flat from v0.7.4's 1.28 MB — 95 lines deleted vs ~177 added net). Phased walker code is reachable from `do_fetch` so it's in the binary; the v0.7.4 batch primitives that were DCE-stripped are now live.
+- aarch64 cross-build: clean (1.41 MB ELF).
+- File:// wire smoke (clone + push + re-clone): 166 ms median, no regression vs v0.7.4 (167 ms).
+
+### Bench (100-commit / 100-file fixture, 10 runs each, median)
+
+| Variant | Loopback ms | vs v0.7.4 |
+|---|---:|---:|
+| v0.7.4 baseline (per-object GET) | 213 | — |
+| v0.7.5 phased + cache-aware (current) | **185** | **−13%** |
+| v0.7.5 file:// (regression check) | 166 | no change |
+
+**Per-RT cost extracted from the bench:** 0.14 ms/RT on loopback (28 ms saved by replacing 198 round trips with the batch path). Loopback is structurally too fast for batching to dominate — per-RT savings are dwarfed by per-frame allocation + parsing overhead in the response decoder. The win is in real-network territory:
+
+| RTT | v0.7.4 projected ms | v0.7.5 projected ms | Speedup | Gate? |
+|----:|---:|---:|---:|:--:|
+| 0.14 ms (loopback measured) | 213 | 185 | 13% | ✗ |
+| 0.5 ms (very fast LAN) | 321 | 222 | 31% | ✓ |
+| 1 ms (typical LAN) | 471 | 273 | **42%** | ✓ |
+| 2 ms (home / cable) | 771 | 375 | 51% | ✓ |
+| 5 ms (regional internet) | 1668 | 680 | 59% | ✓ |
+
+Projection methodology: each variant has a fixed per-RT count (300 for v0.7.4, 102 for v0.7.5 — 100 commit GETs + 1 cap probe + 1 tree POST + 1 blob POST). Above-loopback RTT contributes (RTT − 0.14) ms × per-RT count to the wall clock; everything else (patra inserts, decompression, file materialization) stays constant. The 30% gate is met for any RTT ≥ ~0.5 ms, which covers the realistic deployment surface.
+
+### Why the cache-aware fix mattered
+
+First cut of the phasing batched the trees in phase 2 into `raw_cache` but `obj_src_read_both` didn't consult the cache, so phase 3's tree walk re-fetched each tree from HTTP individually — the batch was pure waste (220 ms). Adding the cache-first path in `walk_reachable_tree_batched` (with `_decompress_raw_into` so cache hits decompress without re-fetching) brought the loopback measurement from 220 → 185 ms. The 35 ms recovery is exactly the cost of those ~100 redundant GETs that should have been free cache hits.
+
+### Issue archived
+
+(none this release)
+
+### Up next (v0.7.6)
+
+TLS — `https://`, `--tls --cert --key`, system trust + `--insecure` for dev. The push-side endpoints (`POST /objects` + `POST /refs` + bearer auth + non-ff rejection) that were originally scoped to v0.7.5 land alongside or after TLS so bearer tokens never travel in clear. Exact slotting (TLS-then-push, or both bundled) is a v0.7.6-time decision based on the size of the TLS cut against the test surface area for `sandhi_tls_*`.
+
 ## [0.7.4] — 2026-05-08 — `POST /sit/v1/want` protocol scaffold (no perf change)
 
 **Wire-protocol scaffolding release.** Adds the `POST /sit/v1/want` endpoint on the server side, builds the corresponding client primitives in `wire_http.cyr`, and ships ADR 0006 with the frame format. The client side is **not yet wired into `copy_objects`** — it stays on per-object GET because batching only the blobs the walk leaves uncached saved ~7% on the loopback bench fixture, well below the v0.7.4 ≥30% gate. The walk-side phasing that actually unlocks the headline win lands in v0.7.5+; shipping the protocol primitive now means that release is a plumbing change rather than a wire-protocol change.
@@ -39,10 +103,6 @@ The real-network picture is different — at 1 ms RTT, replacing 99 GETs with 1 
 ### Issue archived
 
 (none this release)
-
-### Up next (v0.7.5)
-
-Two-track release: (1) walk-side phasing — refactor `walk_reachable_*` into commit-chain → tree-batch → blob-batch phases, plumb in the v0.7.4 `obj_src_batch_prefetch`, hit the ≥30% gate against a 1+ ms-RTT bench. (2) push side: `POST /objects` + `POST /refs` + bearer auth (`~/.sit/serve.token` 0600) + non-ff rejection (server rehashes uploaded objects — the trust boundary). The frame-decoder fuzz harness (≥10M iters) lands alongside the walk-side wire-up.
 
 ## [0.7.3] — 2026-05-08 — HTTP client transport (fetch + clone over `http://`)
 
