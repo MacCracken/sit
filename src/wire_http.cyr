@@ -1,0 +1,530 @@
+# wire_http.cyr — HTTP transport (client side).
+#
+# v0.7.3 — read-only fetch / clone over `http://...` URLs that
+# resolve to a `sit serve` process speaking the `/sit/v1/...` wire
+# protocol.
+#
+# Why we don't reach for stdlib `http_get` / `http_get_a`:
+#   * Both hard-cap the response body at 64 KiB. Sit's compressed
+#     objects routinely exceed that (a 1 MiB blob with low entropy
+#     compresses to ~300 KiB), so the cap is a hard blocker.
+#   * `_http_parse_url` parses host as a cstring then hands it to
+#     `sock_connect(fd, addr, port)` which expects a packed-int
+#     IPv4 — works only by accident for raw IP literals.
+# This module talks directly to lib/net.cyr socket primitives so
+# we can grow the recv buffer to sit's 16 MiB ceiling and resolve
+# host strings deliberately. When stdlib http_get grows past 64KB
+# (filed informally), wire_http_request can switch back.
+#
+# Out of scope for v0.7.3 (deferred to v0.7.x patches that
+# explicitly call them out):
+#   * keep-alive / pipelined requests (every request opens a fresh
+#     TCP socket; HTTP/1.0 + `Connection: close`)
+#   * non-loopback host resolution (anything other than "127.0.0.1"
+#     literal or "localhost" rewrite) — DNS is queued for v0.7.4
+#   * https / TLS (v0.7.6) — `wire_http_open` rejects https://
+#     URLs explicitly to keep the dispatch error well-formed
+#   * push-side endpoints — POST /objects + POST /refs are v0.7.5
+#
+# Hash trust boundary: the client does NOT re-hash incoming
+# objects. The compressed bytes are persisted into the local
+# objects.patra under the requested hex key; `sit fsck` is the
+# canonical roundtrip per CLAUDE.md ("SHA-256 roundtrips belong in
+# fsck, not the hot path"). Identical to the local-clone trust
+# model where the source patra DB is similarly trusted.
+
+# Maximum response body the client will accept on any single
+# /sit/v1/* request. Matches db_object_read_both's decompression
+# ceiling so the failure modes line up: anything that can fit
+# through local read can fit through HTTP read.
+var WIRE_HTTP_MAX_BODY = 16 * 1024 * 1024;
+var WIRE_HTTP_INITIAL_BUF = 65536;
+
+# http_remote handle layout (16 bytes):
+#   0..8  : host addr packed-int IPv4 (network byte order, sock_connect-ready)
+#   8..16 : port (TCP)
+fn _http_remote_alloc(addr, port) {
+    var h = alloc(16);
+    store64(h, addr);
+    store64(h + 8, port);
+    return h;
+}
+
+fn _http_remote_addr(h) { return load64(h); }
+fn _http_remote_port(h) { return load64(h + 8); }
+
+# Parse an http:// URL into (host_addr, port). Returns the handle
+# pointer on success, 0 on any failure. v0.7.3 accepts:
+#
+#   http://127.0.0.1[:port][/]
+#   http://localhost[:port][/]
+#
+# Anything else (a different host, a non-trivial path) is rejected
+# with an eprintln so the user gets a precise message.
+
+fn wire_http_open(url) {
+    var s = url_scheme(url);
+    if (s != URL_SCHEME_HTTP) {
+        eprintln("sit: wire_http_open expected http:// URL");
+        return 0;
+    }
+    var ulen = strlen(url);
+    var p = 7;  # past "http://"
+    var host_start = p;
+    while (p < ulen) {
+        var c = load8(url + p);
+        if (c == 58) { break; }   # ':'
+        if (c == 47) { break; }   # '/'
+        p = p + 1;
+    }
+    var host_len = p - host_start;
+    if (host_len == 0) {
+        eprintln("sit: empty host in http URL");
+        return 0;
+    }
+    var host = alloc(host_len + 1);
+    memcpy(host, url + host_start, host_len);
+    store8(host + host_len, 0);
+
+    var port = 80;
+    if (p < ulen) {
+        if (load8(url + p) == 58) {
+            p = p + 1;
+            var port_start = p;
+            while (p < ulen) {
+                var c2 = load8(url + p);
+                if (c2 < 48) { break; }
+                if (c2 > 57) { break; }
+                p = p + 1;
+            }
+            if (p == port_start) {
+                eprintln("sit: empty port in http URL");
+                return 0;
+            }
+            port = 0;
+            var pi = port_start;
+            while (pi < p) {
+                port = port * 10 + (load8(url + pi) - 48);
+                if (port > 65535) {
+                    eprintln("sit: port out of range in http URL");
+                    return 0;
+                }
+                pi = pi + 1;
+            }
+            if (port < 1) {
+                eprintln("sit: port out of range in http URL");
+                return 0;
+            }
+        }
+    }
+
+    # v0.7.3 path component: only "" or "/" accepted. A non-trivial
+    # base path (e.g. http://host/repos/foo) needs server-side
+    # routing changes — deferred. Refusing here keeps the surface
+    # honest instead of silently appending /sit/v1/* to user input.
+    if (p < ulen) {
+        var path_len = ulen - p;
+        if (path_len > 1) {
+            eprintln("sit: http base paths are not supported in v0.7.3 (use http://host:port)");
+            return 0;
+        }
+        if (load8(url + p) != 47) {
+            eprintln("sit: malformed http URL (expected ':' or '/' after host)");
+            return 0;
+        }
+    }
+
+    # Host resolution: numeric IPv4 literal first, then "localhost"
+    # shortcut — the v0.7.3 success gate is loopback only.
+    var addr = sandhi_net_parse_ipv4(host);
+    if (addr < 0) {
+        if (streq(host, "localhost") == 1) {
+            addr = INADDR_LOOPBACK();
+        }
+        else {
+            eprintln("sit: host resolution requires a numeric IPv4 literal or 'localhost' in v0.7.3");
+            return 0;
+        }
+    }
+
+    return _http_remote_alloc(addr, port);
+}
+
+fn wire_http_close(h) {
+    # No persistent socket today — every request is one-shot.
+    # Hook for v0.7.4+ keep-alive cleanup.
+    return 0;
+}
+
+# ── Low-level request loop ─────────────────────────────────────────
+#
+# Issue `GET <sub_path> HTTP/1.0` against the handle and collect the
+# whole response into a freelist-backed buffer. `out_quad` (32 bytes)
+# is filled on return:
+#   0..8  : body pointer (into the same alloc as the rest of the
+#           response — DO NOT fl_free until the caller is done with
+#           the body bytes; caller calls _wire_http_response_free)
+#   8..16 : body length
+#  16..24 : status code (HTTP "NNN" — 0 on parse failure)
+#  24..32 : X-Sit-Type integer value (-1 if header absent)
+#
+# The buffer pointer is stashed at out_quad[32..40] so caller can
+# fl_free it after consuming the body. (40-byte caller buffer.)
+#
+# Returns 0 on success (where success means "we got a response we
+# could parse", not "status was 2xx"), -1 on socket errors.
+
+fn _wire_http_request(h, sub_path, out_quad) {
+    var fd_r = tcp_socket();
+    if (is_err_result(fd_r) == 1) {
+        eprintln("sit: tcp_socket failed");
+        return 0 - 1;
+    }
+    var fd = payload(fd_r);
+    var c_r = sock_connect(fd, _http_remote_addr(h), _http_remote_port(h));
+    if (is_err_result(c_r) == 1) {
+        sys_close(fd);
+        eprintln("sit: sock_connect failed (is sit serve running?)");
+        return 0 - 1;
+    }
+
+    # Build "GET <path> HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".
+    # Host: literal "127.0.0.1" — RFC 7230 allows any host so long as the
+    # server doesn't vhost on it; sit serve doesn't, so this is fine.
+    var sp_len = strlen(sub_path);
+    var req_cap = 64 + sp_len;
+    var req = alloc(req_cap);
+    var pos = 0;
+    memcpy(req + pos, "GET ", 4); pos = pos + 4;
+    memcpy(req + pos, sub_path, sp_len); pos = pos + sp_len;
+    memcpy(req + pos, " HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", 49);
+    pos = pos + 49;
+    sock_send(fd, req, pos);
+
+    # Recv loop with growing fl_alloc buffer.
+    var cap = WIRE_HTTP_INITIAL_BUF;
+    var buf = fl_alloc(cap);
+    if (buf == 0) {
+        sys_close(fd);
+        eprintln("sit: out of memory allocating http recv buffer");
+        return 0 - 1;
+    }
+    var used = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        if (used == cap) {
+            if (cap >= WIRE_HTTP_MAX_BODY) {
+                # Body cap reached. Treat as a parse failure rather than
+                # silently truncating. Server should not have shipped > 16 MiB.
+                fl_free(buf, cap);
+                sys_close(fd);
+                eprintln("sit: http response exceeds 16 MiB cap");
+                return 0 - 1;
+            }
+            var new_cap = cap * 2;
+            if (new_cap > WIRE_HTTP_MAX_BODY) { new_cap = WIRE_HTTP_MAX_BODY; }
+            var new_buf = fl_alloc(new_cap);
+            if (new_buf == 0) {
+                fl_free(buf, cap);
+                sys_close(fd);
+                eprintln("sit: out of memory growing http recv buffer");
+                return 0 - 1;
+            }
+            memcpy(new_buf, buf, used);
+            fl_free(buf, cap);
+            buf = new_buf;
+            cap = new_cap;
+        }
+        var rd_r = sock_recv(fd, buf + used, cap - used);
+        if (is_err_result(rd_r) == 1) { rgo = 0; }
+        else {
+            var n = payload(rd_r);
+            if (n <= 0) { rgo = 0; }
+            else { used = used + n; }
+        }
+    }
+    sys_close(fd);
+
+    # Parse status line: "HTTP/1.x SSS ..."
+    var status = 0;
+    if (used >= 12) {
+        if (memeq(buf, "HTTP/1.", 7) == 1) {
+            status = (load8(buf + 9) - 48) * 100
+                   + (load8(buf + 10) - 48) * 10
+                   + (load8(buf + 11) - 48);
+        }
+    }
+
+    # Walk headers. Identify body start (after \r\n\r\n) and X-Sit-Type
+    # if present. Header name compare is case-sensitive; sandhi emits
+    # the canonical "X-Sit-Type:" form.
+    var i = 0;
+    var body_off = 0 - 1;
+    var ty = 0 - 1;
+    while (i + 3 < used) {
+        if (load8(buf + i) == 13) {
+            if (load8(buf + i + 1) == 10) {
+                if (load8(buf + i + 2) == 13) {
+                    if (load8(buf + i + 3) == 10) {
+                        body_off = i + 4;
+                        i = used;  # break the outer loop
+                    }
+                }
+            }
+        }
+        if (i < used) {
+            # Header-line probe: if buf[i..i+11] is "X-Sit-Type:" record
+            # the integer value that follows (skipping spaces). Done in
+            # the same pass to avoid a second walk.
+            if (i + 11 < used) {
+                if (memeq(buf + i, "X-Sit-Type:", 11) == 1) {
+                    # Skip OWS (sandhi emits exactly one space after the
+                    # colon; we tolerate either 0x20 or 0x09 in case a
+                    # future intermediary normalises differently).
+                    var hp = i + 11;
+                    var skipping = 1;
+                    while (skipping == 1) {
+                        skipping = 0;
+                        if (hp < used) {
+                            var hc = load8(buf + hp);
+                            if (hc == 32) { hp = hp + 1; skipping = 1; }
+                            if (hc == 9)  { hp = hp + 1; skipping = 1; }
+                        }
+                    }
+                    var v = 0;
+                    var saw = 0;
+                    var collecting = 1;
+                    while (collecting == 1) {
+                        collecting = 0;
+                        if (hp < used) {
+                            var d = load8(buf + hp) & 0xFF;
+                            if (d >= 48) {
+                                if (d <= 57) {
+                                    v = v * 10 + (d - 48);
+                                    saw = 1;
+                                    hp = hp + 1;
+                                    collecting = 1;
+                                }
+                            }
+                        }
+                    }
+                    if (saw == 1) { ty = v; }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    if (body_off < 0) {
+        fl_free(buf, cap);
+        eprintln("sit: malformed http response (no header terminator)");
+        return 0 - 1;
+    }
+
+    store64(out_quad,      buf + body_off);
+    store64(out_quad +  8, used - body_off);
+    store64(out_quad + 16, status);
+    store64(out_quad + 24, ty);
+    store64(out_quad + 32, buf);
+    store64(out_quad + 40, cap);
+    return 0;
+}
+
+fn _wire_http_response_free(out_quad) {
+    var buf = load64(out_quad + 32);
+    var cap = load64(out_quad + 40);
+    if (buf != 0) { fl_free(buf, cap); }
+    return 0;
+}
+
+# ── /sit/v1/refs JSON parser ───────────────────────────────────────
+#
+# Body shape (per serve_build_refs):
+#   {"refs":[{"name":"...","hash":"..."}, ...]}
+#
+# Hand-rolled parser: scan for "name":"..." then "hash":"...".
+# refname_valid + hex_prefix_valid gate every value before it
+# enters anything path- or DB-shaped. Out vec is populated with
+# alternating heap cstrings: name0, hex0, name1, hex1, ...
+#
+# Returns -1 on parse failure, 0 otherwise (zero entries is valid).
+
+fn _wire_http_parse_refs(body, blen, out_pairs) {
+    var i = 0;
+    while (i < blen) {
+        # Find the next `"name":"`.
+        if (i + 8 < blen) {
+            if (memeq(body + i, "\"name\":\"", 8) == 1) {
+                var name_start = i + 8;
+                var name_end = name_start;
+                while (name_end < blen) {
+                    if (load8(body + name_end) == 34) { break; }  # "
+                    if (load8(body + name_end) == 92) { return 0 - 1; }  # backslash — refname doesn't need escaping
+                    name_end = name_end + 1;
+                }
+                if (name_end >= blen) { return 0 - 1; }
+                var nlen = name_end - name_start;
+                # Look forward for the matching "hash":"<64hex>".
+                var j = name_end;
+                while (j + 8 < blen) {
+                    if (memeq(body + j, "\"hash\":\"", 8) == 1) { break; }
+                    j = j + 1;
+                }
+                if (j + 8 >= blen) { return 0 - 1; }
+                var hash_start = j + 8;
+                if (hash_start + 64 > blen) { return 0 - 1; }
+                if (load8(body + hash_start + 64) != 34) { return 0 - 1; }
+                # Validate name + hash.
+                var name = alloc(nlen + 1);
+                memcpy(name, body + name_start, nlen);
+                store8(name + nlen, 0);
+                if (refname_valid(name) == 0) { return 0 - 1; }
+                if (hex_prefix_valid(body + hash_start, 64) == 0) { return 0 - 1; }
+                var hex = alloc(65);
+                memcpy(hex, body + hash_start, 64);
+                store8(hex + 64, 0);
+                vec_push(out_pairs, name);
+                vec_push(out_pairs, hex);
+                i = hash_start + 65;
+            }
+            else {
+                i = i + 1;
+            }
+        }
+        else {
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+fn http_remote_read_refs(h, out_pairs) {
+    var quad[48];
+    if (_wire_http_request(h, "/sit/v1/refs", &quad) != 0) { return 0 - 1; }
+    var status = load64(&quad + 16);
+    if (status != 200) {
+        _wire_http_response_free(&quad);
+        eprintln("sit: GET /sit/v1/refs returned non-200");
+        return 0 - 1;
+    }
+    var body = load64(&quad);
+    var blen = load64(&quad + 8);
+    var rc = _wire_http_parse_refs(body, blen, out_pairs);
+    _wire_http_response_free(&quad);
+    if (rc != 0) {
+        eprintln("sit: malformed /sit/v1/refs JSON");
+        return 0 - 1;
+    }
+    return 0;
+}
+
+# Look up `branch_name` in the refs vec. Returns the hex cstring or 0.
+fn http_remote_resolve_branch(h, branch) {
+    # `branch` is "main", "feature/foo", etc.; the server emits
+    # "refs/heads/<branch>". Compose the wanted name once.
+    var blen = strlen(branch);
+    var want = alloc(11 + blen + 1);
+    memcpy(want, "refs/heads/", 11);
+    memcpy(want + 11, branch, blen);
+    store8(want + 11 + blen, 0);
+
+    var pairs = vec_new();
+    if (http_remote_read_refs(h, pairs) != 0) { return 0; }
+    var n = vec_len(pairs);
+    var i = 0;
+    while (i + 1 < n) {
+        var name = vec_get(pairs, i);
+        if (streq(name, want) == 1) { return vec_get(pairs, i + 1); }
+        i = i + 2;
+    }
+    return 0;
+}
+
+# ── Object fetch ───────────────────────────────────────────────────
+#
+# Issue GET /sit/v1/objects/<hex>; populate raw_out with
+# {compressed_ptr@0, clen@8, ty@16}. The compressed bytes are
+# COPIED out of the response buffer (which is fl_freed before
+# return) into a fresh heap allocation owned by the caller —
+# matches db_object_read_raw's lifetime contract so callers can
+# treat the two interchangeably.
+#
+# Returns 0 on success, negative on any failure.
+
+fn http_remote_read_raw(h, hex, raw_out) {
+    if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
+    var sub = alloc(16 + 64 + 1);
+    memcpy(sub, "/sit/v1/objects/", 16);
+    memcpy(sub + 16, hex, 64);
+    store8(sub + 16 + 64, 0);
+
+    var quad[48];
+    if (_wire_http_request(h, sub, &quad) != 0) { return 0 - 2; }
+    var status = load64(&quad + 16);
+    var ty = load64(&quad + 24);
+    if (status != 200) {
+        _wire_http_response_free(&quad);
+        return 0 - 3;
+    }
+    if (ty < 0) {
+        _wire_http_response_free(&quad);
+        eprintln("sit: server response missing X-Sit-Type header");
+        return 0 - 4;
+    }
+    if (ty > 2) {
+        # 0=blob, 1=tree, 2=commit. Unknown types should never reach
+        # the local DB — refuse before we'd have to migrate later.
+        _wire_http_response_free(&quad);
+        eprintln("sit: server returned unrecognized X-Sit-Type");
+        return 0 - 5;
+    }
+    var body = load64(&quad);
+    var blen = load64(&quad + 8);
+    if (blen <= 0) {
+        _wire_http_response_free(&quad);
+        return 0 - 6;
+    }
+    var compressed = alloc(blen);
+    memcpy(compressed, body, blen);
+    _wire_http_response_free(&quad);
+    store64(raw_out,      compressed);
+    store64(raw_out +  8, blen);
+    store64(raw_out + 16, ty);
+    return 0;
+}
+
+# Mirror of db_object_read_both for HTTP: read raw, then decompress
+# with the same 4×-initial / 16 MiB-ceiling sizing policy so
+# walk_reachable_* sees identical failure modes regardless of
+# transport.
+
+fn http_remote_read_both(h, hex, raw_out, deco_out) {
+    if (http_remote_read_raw(h, hex, raw_out) != 0) { return 0 - 1; }
+    var compressed = load64(raw_out);
+    var clen = load64(raw_out + 8);
+    var dec_cap = clen * 4;
+    if (dec_cap < 4096) { dec_cap = 4096; }
+    if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
+    var decompressed = alloc(dec_cap);
+    if (decompressed == 0) { return 0 - 2; }
+    var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+    if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
+        if (dec_cap < 16 * 1024 * 1024) {
+            dec_cap = 16 * 1024 * 1024;
+            decompressed = alloc(dec_cap);
+            if (decompressed == 0) { return 0 - 2; }
+            dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+        }
+    }
+    if (dlen <= 0) { return 0 - 3; }
+    var nul = 0;
+    while (nul < dlen) {
+        if (load8(decompressed + nul) == 0) { break; }
+        nul = nul + 1;
+    }
+    if (nul >= dlen) { return 0 - 4; }
+    store64(deco_out,      decompressed);
+    store64(deco_out +  8, dlen);
+    store64(deco_out + 16, nul + 1);
+    return 0;
+}

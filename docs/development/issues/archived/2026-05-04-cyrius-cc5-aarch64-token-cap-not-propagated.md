@@ -1,4 +1,16 @@
-# cc5_aarch64 binary not rebuilt with v5.8.46 token-cap raise — aarch64 cross-build still capped at 262144
+# cc5_aarch64 binary not rebuilt with v5.8.46 token-cap raise — aarch64 cross-build still capped at 262144 — RESOLVED
+
+## Resolution
+
+**Fixed in cyrius 5.9.37** (verified 2026-05-08 during sit's 5.8.51 → 5.9.37 toolchain bump).
+
+`cc5_aarch64` size: **438896 bytes** (5.8.46 – 5.8.52, byte-identical) → **449624 bytes** in 5.9.37 (+10728 / +2.4%). The growth mirrors cc5 (x86_64)'s ~40K growth at v5.8.46 — proportionally smaller because the aarch64 emit backend is less code than the x86_64 backend, but the proof-of-rebuild signal is there.
+
+`cyrius build --aarch64 src/main.cyr build/sit-aarch64` now produces a 1.45 MB statically-linked aarch64 ELF on sit at v0.7.2 + cyrius 5.9.37. The pre-5.8.46 `error: token limit exceeded (262144)` diagnostic is gone; build ends `OK`. Trailing advisories about `fdlopen_helper_available` / `fdlopen_init_full` / `fdlopen_dlopen` / `fdlopen_dlsym` / `base64_encode` are unrelated — uncalled symbols from sandhi's transitive surface, no impact on the produced binary.
+
+The consumer-side workaround in `.github/workflows/release.yml` (best-effort aarch64 swallowing) is no longer load-bearing for sit but remains in place as defense against future aarch64 backend regressions.
+
+---
 
 **Discovered:** 2026-05-04 during sit v0.7.2 release run.
 **Severity:** Medium — aarch64 cross-build fails; x86_64 still ships. sit's CLAUDE.md flags aarch64 as "best-effort in CI" so this isn't a hard regression, but every aarch64 user runs unsupported until the cross compiler picks up the cap raise.

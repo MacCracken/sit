@@ -111,6 +111,39 @@ jobs:
           test "$(cat b)" = "world" || { echo "second clone didn't pick up the pushed commit"; exit 1; }
           echo "wire smoke ok"
 
+      - name: Smoke — http transport (sit serve + http clone + fsck)
+        run: |
+          export HOME=$GITHUB_WORKSPACE/ci-home
+          export SIT_AUTHOR_NAME="CI Runner"
+          export SIT_AUTHOR_EMAIL="ci@example.com"
+          PORT=18484
+          ORIG=$(mktemp -d)
+          (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" init && echo hello-http > a && "$GITHUB_WORKSPACE/build/sit" add a && "$GITHUB_WORKSPACE/build/sit" commit -m "http-root")
+
+          # Start sit serve loopback-bound; trap on EXIT so an unexpected
+          # earlier failure still tears the daemon down.
+          "$GITHUB_WORKSPACE/build/sit" serve "$ORIG" --listen 127.0.0.1:$PORT &
+          SERVE_PID=$!
+          trap 'kill $SERVE_PID 2>/dev/null || true' EXIT
+
+          # Wait up to 5s for the listener to come up.
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1; then break; fi
+            sleep 0.5
+          done
+          if ! (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1; then
+            echo "sit serve never came up on 127.0.0.1:$PORT"
+            exit 1
+          fi
+
+          # Clone via http://, mirroring the file:// smoke shape.
+          CLONE=$(mktemp -d)/http-repo
+          "$GITHUB_WORKSPACE/build/sit" clone --force-absolute http://127.0.0.1:$PORT "$CLONE"
+          cd "$CLONE"
+          test "$(cat a)" = "hello-http" || { echo "http clone content wrong"; exit 1; }
+          "$GITHUB_WORKSPACE/build/sit" fsck
+          echo "http wire smoke ok"
+
   docs:
     name: Documentation
     runs-on: ubuntu-latest

@@ -1,14 +1,17 @@
-# serve.cyr — sit's HTTP daemon (v0.7.2 skeleton).
+# serve.cyr — sit's HTTP daemon.
 #
 # Read-only endpoints — exposes an opened sit repo over the
 # `/sit/v1/...` wire protocol per the v0.7.x plan.
 #
-#   GET /sit/v1/capabilities  → server identity + advertised limits
-#   GET /sit/v1/refs          → all heads + tags as JSON
+#   GET /sit/v1/capabilities    → server identity + advertised limits
+#   GET /sit/v1/refs            → all heads + tags as JSON
+#   GET /sit/v1/objects/<hash>  → raw compressed object bytes;
+#                                 X-Sit-Type: <patra-ty> header
+#                                 carries the type code
 #
-# Subsequent v0.7.x patches add: GET /objects/<hash> (v0.7.3),
-# POST /want batched stream (v0.7.4), POST /objects + POST /refs
-# + bearer auth (v0.7.5), TLS (v0.7.6), mTLS (v0.7.7).
+# Subsequent v0.7.x patches add: POST /want batched stream (v0.7.4),
+# POST /objects + POST /refs + bearer auth (v0.7.5), TLS (v0.7.6),
+# mTLS (v0.7.7).
 #
 # Bound to 127.0.0.1 only in v0.7.2 — listening on 0.0.0.0 / a
 # routable interface needs explicit threat-model review (auth model
@@ -58,9 +61,13 @@ fn serve_read_ref_file(path) {
 
 fn serve_build_capabilities() {
     var sb = str_builder_new();
+    # The "sit" string identifies the wire-protocol release line
+    # the server promises. It bumps in lockstep with VERSION at
+    # tag time — flipped from "0.7.2" alongside VERSION/CHANGELOG
+    # when the v0.7.3 tag ships.
     str_builder_add_cstr(sb, "{\"sit\":\"0.7.2\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
-    str_builder_add_cstr(sb, ",\"auth\":[\"none\"]}");
+    str_builder_add_cstr(sb, ",\"auth\":[\"none\"],\"objects\":true}");
     return str_data(str_builder_build(sb));
 }
 
@@ -136,10 +143,88 @@ fn serve_build_refs() {
     return str_data(str_builder_build(sb));
 }
 
+# ── /sit/v1/objects/<hash> handler ────────────────────────────────
+#
+# Returns the raw compressed bytes of an object addressed by its
+# 64-hex SHA-256. The patra type code rides on an X-Sit-Type
+# response header so the client can persist it in its local
+# objects.patra without re-deriving from the decompressed body.
+#
+# The request hash is validated as 64-hex via hex_prefix_valid
+# before any DB lookup — we won't hand attacker-controlled bytes
+# to a string-concatenated SQL statement, even though
+# db_object_read_raw embeds it inside single quotes (the validator
+# is the trust boundary; the SQL shape is a defence in depth).
+#
+# 400 if the path tail isn't 64 hex chars; 404 if the object isn't
+# present; 200 with the compressed bytes otherwise. No retry/range
+# semantics in v0.7.3 — the body is sent in one shot under the
+# advertised SIT_SERVE_MAX_BODY ceiling. Decompression bombs are
+# not a serve concern: the bytes are the bytes the repo already
+# stores, and the server-side store has already accepted them.
+
+var SIT_OBJECT_PATH_PREFIX = "/sit/v1/objects/";
+var SIT_OBJECT_PATH_PREFIX_LEN = 16;
+
+fn serve_handle_object(cfd, path) {
+    var plen = strlen(path);
+    if (plen != SIT_OBJECT_PATH_PREFIX_LEN + 64) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    var hex = path + SIT_OBJECT_PATH_PREFIX_LEN;
+    if (hex_prefix_valid(hex, 64) == 0) {
+        sandhi_server_send_status(cfd, 400, "Bad Request");
+        return 0;
+    }
+    var db = get_object_db();
+    if (db == 0) {
+        sandhi_server_send_status(cfd, 500, "Internal Server Error");
+        return 0;
+    }
+    # db_object_read_raw is in wire.cyr; out layout is
+    # {compressed_ptr@0, clen@8, ty@16}. Returns 0 on success,
+    # negative on missing/error — we map both to 404 so we don't
+    # leak whether the row missed vs the read error'd.
+    var raw[24];
+    if (db_object_read_raw(db, hex, &raw) != 0) {
+        sandhi_server_send_status(cfd, 404, "Not Found");
+        return 0;
+    }
+    var compressed = load64(&raw);
+    var clen = load64(&raw + 8);
+    var ty = load64(&raw + 16);
+    if (clen <= 0) {
+        sandhi_server_send_status(cfd, 404, "Not Found");
+        return 0;
+    }
+    if (clen > SIT_SERVE_MAX_BODY) {
+        # An object larger than the advertised cap means the repo
+        # has accreted state newer than this server promises to
+        # serve. Refuse rather than misadvertise.
+        sandhi_server_send_status(cfd, 413, "Payload Too Large");
+        return 0;
+    }
+    # Build "X-Sit-Type: <int>\r\n" — sandhi appends extra_headers
+    # verbatim to the response, so the trailing CRLF is on us.
+    var ty_buf[24];
+    var ty_digits = write_decimal(&ty_buf, ty);
+    var hdr_len = 13 + ty_digits + 2;
+    var hdr = alloc(hdr_len + 1);
+    memcpy(hdr, "X-Sit-Type: ", 12);
+    memcpy(hdr + 12, &ty_buf, ty_digits);
+    store8(hdr + 12 + ty_digits, 13);
+    store8(hdr + 12 + ty_digits + 1, 10);
+    store8(hdr + 12 + ty_digits + 2, 0);
+    sandhi_server_send_response(cfd, 200, "OK", "application/octet-stream",
+                                 compressed, clen, hdr);
+    return 0;
+}
+
 # ── Request dispatcher ─────────────────────────────────────────────
 #
 # Signature dictated by sandhi: (ctx, cfd, req_buf, req_len) → 0.
-# `ctx` is unused in v0.7.2; v0.7.5+ will pass the bearer-token
+# `ctx` is unused in v0.7.3; v0.7.5+ will pass the bearer-token
 # config + auth state through it.
 
 fn serve_handle_request(ctx, cfd, buf, n) {
@@ -159,6 +244,15 @@ fn serve_handle_request(ctx, cfd, buf, n) {
             sandhi_server_send_response(cfd, 200, "OK", "application/json",
                                          b2, strlen(b2), 0);
             return 0;
+        }
+        # /sit/v1/objects/<64-hex>: prefix-match (path is the path-only
+        # form, query string already stripped by sandhi_server_path_only).
+        var plen = strlen(path);
+        if (plen >= SIT_OBJECT_PATH_PREFIX_LEN) {
+            if (memeq(path, SIT_OBJECT_PATH_PREFIX,
+                      SIT_OBJECT_PATH_PREFIX_LEN) == 1) {
+                return serve_handle_object(cfd, path);
+            }
         }
     }
     sandhi_server_send_status(cfd, 404, "Not Found");
