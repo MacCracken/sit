@@ -4,6 +4,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.4] — 2026-05-08 — `POST /sit/v1/want` protocol scaffold (no perf change)
+
+**Wire-protocol scaffolding release.** Adds the `POST /sit/v1/want` endpoint on the server side, builds the corresponding client primitives in `wire_http.cyr`, and ships ADR 0006 with the frame format. The client side is **not yet wired into `copy_objects`** — it stays on per-object GET because batching only the blobs the walk leaves uncached saved ~7% on the loopback bench fixture, well below the v0.7.4 ≥30% gate. The walk-side phasing that actually unlocks the headline win lands in v0.7.5+; shipping the protocol primitive now means that release is a plumbing change rather than a wire-protocol change.
+
+### Added
+
+- **`POST /sit/v1/want`** in `src/serve.cyr` — accepts a fixed-shape request body (`[8B i64 LE count][count × 64-byte ASCII hex hashes]`), validates length math, count cap (`SIT_WANT_MAX_COUNT = 512`), and every hash through `hex_prefix_valid` before any DB lookup. Walks the requested hashes, looks each up via `db_object_read_raw`, and emits a length-prefixed concatenation of frames `[64 hex][8B i64 LE ty][8B i64 LE clen][clen bytes compressed]`. Hashes the server doesn't have are silently omitted (clients detect via short-count). Status mapping: 200 happy path, 400 on length / hash format mismatch, 411 on missing Content-Length, 413 on count over cap or response over `SIT_SERVE_MAX_BODY`, 500 on DB / OOM. Body comes via sandhi's `sandhi_server_recv_request` which reads until full Content-Length, so handlers see the complete request.
+- **`serve_build_capabilities`** advertises `"batch":true,"batch_max":512` so clients can capability-gate without probing the endpoint.
+- **`docs/adr/0006-batched-want-frame-format.md`** — pins the request + response wire shape, the endianness call (LE — native on x86_64 / aarch64, no per-read byteswaps), the trust boundary (server doesn't recompress; client doesn't re-hash; `sit fsck` is the canonical roundtrip per CLAUDE.md), and the alternatives considered (binary 32B hashes, JSON envelope, multipart, NBO ints, magic-byte resync) with rejection reasoning.
+- **Client primitives in `src/wire_http.cyr`** (DCE'd in v0.7.4 — scaffolding for v0.7.5):
+  - `_wire_http_post(h, sub_path, body, body_len, out_quad)` — POST variant of `_wire_http_request`. Same growing-fl_alloc recv buffer (64 KiB → 16 MiB), same status + body parser, just different request-line build.
+  - `http_remote_check_batch(h)` — one-time GET `/sit/v1/capabilities` with handle-cached result; lazy probe (only fires if a caller explicitly asks); fail-closed on any error.
+  - `http_remote_read_batch(h, hashes, start_idx, count, raw_cache)` — issues `POST /sit/v1/want` with the chunk, walks the response stream with full bounds checking on every frame field (hex format via `hex_prefix_valid`, `ty` ∈ {0,1,2}, `clen > 0` and within remaining body), copies compressed bytes out to fresh heap allocs matching `db_object_read_raw`'s lifetime contract, cache-inserts via `_walk_cache_insert`. Malformed frame stream stops parsing and returns -1 (caller demotes to per-object fallback).
+  - **Handle layout extended** from 16 → 32 bytes: adds `batch_probed` + `batch_supported` flags so the cap probe runs once per fetch.
+- **`obj_src_batch_prefetch`** in `src/wire.cyr` (also DCE'd) — dispatcher that scans `hashes` for cache misses, chunks at `WIRE_HTTP_BATCH_CHUNK = 256`, and pumps each chunk through `http_remote_read_batch`. No-op for `OBJ_SRC_DB`.
+
+### Changed
+
+- **Capabilities response shape** evolves additively (clients keyed on existence of `"batch":true` rather than wire-protocol version).
+
+### Sit-side impact
+
+- Build: clean. **127/127 tests pass.** Lint: only the pre-existing >120-char warning at `src/commit.cyr:609`.
+- DCE binary: **1.28 MB** (vs 1.30 MB at v0.7.3 — slightly smaller because more of the v0.7.4 code is currently DCE-stripped scaffolding than v0.7.3 added in live functions).
+- End-to-end smoke: `sit clone http://127.0.0.1:8484` still works against a 100-commit fixture (`sit fsck` reports 300/300 clean), 213 ms median (10 runs) — byte-identical to v0.7.3 since the client path is unchanged. Server-side `/want` validated via curl: 200 happy path; 411 on zero-length body; 400 on count/length mismatch; 400 on non-hex hash; 413 on count > 512.
+
+### Why not 30% on loopback
+
+The roadmap success gate was "≥30% clone speedup vs 0.7.3 OR revert; frame decoder fuzzed ≥10M iters." With the batch wired into `copy_objects`, the measured speedup on the 100-commit / 100-file fixture was **7%** (213 ms → 198 ms median, 10 runs). The blob batch saves ~15 ms; the remaining 198 ms is dominated by the walk's 200 sequential GETs for commits + trees (~30 ms total at ~0.15 ms/loopback-RT) and patra's batched-but-still-load-bearing object inserts (~90 ms — the v0.6.5 transaction-wrap floor). Per the gate, the perf-affecting integration is held; the wire surface and primitives ship as scaffolding so v0.7.5 can extend.
+
+The real-network picture is different — at 1 ms RTT, replacing 99 GETs with 1 POST saves ~99 ms, comfortably exceeding 30%. Loopback understates the win. v0.7.5 will measure this with realistic latency injection.
+
+### Issue archived
+
+(none this release)
+
+### Up next (v0.7.5)
+
+Two-track release: (1) walk-side phasing — refactor `walk_reachable_*` into commit-chain → tree-batch → blob-batch phases, plumb in the v0.7.4 `obj_src_batch_prefetch`, hit the ≥30% gate against a 1+ ms-RTT bench. (2) push side: `POST /objects` + `POST /refs` + bearer auth (`~/.sit/serve.token` 0600) + non-ff rejection (server rehashes uploaded objects — the trust boundary). The frame-decoder fuzz harness (≥10M iters) lands alongside the walk-side wire-up.
+
 ## [0.7.3] — 2026-05-08 — HTTP client transport (fetch + clone over `http://`)
 
 **Closes the v0.7.x server/client read-only round trip.** v0.7.2 lit up `sit serve` with `/sit/v1/capabilities` + `/sit/v1/refs`; v0.7.3 adds the third read endpoint (`GET /sit/v1/objects/<hash>`), introduces the client-side HTTP transport in a new module, and wires fetch / clone over `http://` URLs end-to-end. Push, https, and ssh stay gated for the later patches that own them (v0.7.5 / v0.7.6 / v0.7.8). Toolchain bumps cyrius 5.8.51 → 5.9.37 — picks up the cc5_aarch64 cap-propagation fix that was filed during the v0.7.2 release run, restoring aarch64 cross-builds without the best-effort swallow.
@@ -41,10 +81,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Issue archived
 
 - [`docs/development/issues/archived/2026-05-04-cyrius-cc5-aarch64-token-cap-not-propagated.md`](docs/development/issues/archived/2026-05-04-cyrius-cc5-aarch64-token-cap-not-propagated.md) — `— RESOLVED` at cyrius 5.9.37. cc5_aarch64 grew 438896 → 449624 bytes (+10728); the pre-5.8.46 `error: token limit exceeded (262144)` diagnostic is gone; `cyrius build --aarch64` produces a real binary on sit at v0.7.2 without firing the workflow's best-effort swallow. The consumer-side workaround in `.github/workflows/release.yml` is no longer load-bearing for sit but stays in place as a defence against future aarch64 backend regressions.
-
-### Up next (v0.7.4)
-
-`POST /want` batched object stream — length-prefixed framing, server bundles multiple compressed objects per request, client falls back to per-object `GET` if the server doesn't advertise `"batch":true`. Success gate: ≥30% clone speedup vs 0.7.3 OR revert; frame decoder fuzzed ≥10M iterations.
 
 ## [0.7.2] — 2026-05-04 — `sit serve` skeleton (read-only HTTP) + sandhi opt-in
 
