@@ -1,11 +1,15 @@
 # sit — fuzz harness
 # Pokes random/adversarial bytes at the primitives that parse untrusted data
-# (zlib frames in object files, tree/commit bodies from disk). Confirms no
-# crash on malformed input.
+# (zlib frames in object files, tree/commit bodies from disk, /sit/v1/want
+# response frames). Confirms no crash on malformed input.
 #
 # v0.7.1: add validate.cyr include for url_scheme + remote_url_valid fuzzing.
+# v0.7.5: include src/lib.cyr to reach `_wire_http_decode_frames` for the
+#   `/sit/v1/want` frame-decoder fuzz target. Pulls in the whole sit surface
+#   (cmd_*, serve, etc.) but DCE strips everything not reachable from the
+#   fuzz `main()`.
 # Stdlib + deps are auto-included via cyrius.cyml.
-include "src/validate.cyr"
+include "src/lib.cyr"
 
 fn fill_pseudo_random(buf, len, seed) {
     var s = seed;
@@ -99,6 +103,39 @@ fn fuzz_url_validators(rounds) {
     return 0;
 }
 
+# v0.7.5 — fuzz the `/sit/v1/want` response-frame decoder.
+# Adversarial pseudo-random bytes go through `_wire_http_decode_frames`;
+# the parser must terminate cleanly (returns 0 or -1) on every input
+# without OOB reads, infinite loops, or oversized allocs. The decoder
+# is the single trust boundary for compressed-bytes-from-the-wire and
+# every byte of its input is attacker-controlled when an http remote
+# is in use, so 10M+ iterations are warranted (per ADR 0006 success
+# gate). Each round draws a fresh size in [0, 4096] — exercises both
+# "frame fits" (rare, mostly empty cache) and "frame doesn't fit"
+# (common, parser must reject without alloc'ing the bogus payload
+# size). Buffer sizes >= 80 occasionally produce a syntactically
+# complete header followed by a clen large enough to extend past
+# the buffer; the parser must reject those instead of reading OOB.
+fn fuzz_want_frame_decoder(rounds) {
+    var buf_cap = 4096;
+    var input = alloc(buf_cap);
+    var seed = 0xfa57b047;
+    var i = 0;
+    while (i < rounds) {
+        var size = seed & 0xFFF;  # 0..4095
+        if (size > buf_cap) { size = buf_cap; }
+        fill_pseudo_random(input, size, seed);
+        # Use a fresh map per round to keep the parser path pristine —
+        # collisions in the cache key space don't crash but they
+        # waste memory across millions of iterations.
+        var cache = map_new();
+        _wire_http_decode_frames(input, size, cache);
+        seed = seed * 1664525 + 1013904223;
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn main() {
     alloc_init();
     println("fuzz: zlib_decompress (10000 rounds)");
@@ -109,6 +146,8 @@ fn main() {
     if (fuzz_hex_decode(10000) != 0) { return 1; }
     println("fuzz: url_validators (10000 rounds)");
     if (fuzz_url_validators(10000) != 0) { return 1; }
+    println("fuzz: want_frame_decoder (10000000 rounds)");
+    if (fuzz_want_frame_decoder(10000000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

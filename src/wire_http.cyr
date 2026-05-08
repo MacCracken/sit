@@ -585,20 +585,62 @@ fn http_remote_read_batch(h, hashes, start_idx, count, raw_cache) {
 
     var resp = load64(&quad);
     var rlen = load64(&quad + 8);
+    var cached = _wire_http_decode_frames(resp, rlen, raw_cache);
+    _wire_http_response_free(&quad);
+    if (cached < 0) {
+        eprintln("sit: malformed /sit/v1/want frame stream");
+        return 0 - 1;
+    }
+    return cached;
+}
+
+# ── Frame stream decoder (v0.7.5) ──────────────────────────────────
+#
+# Walks a `buf[0..blen]` byte stream of `[64 hex][8B i64 LE ty][8B
+# i64 LE clen][clen bytes compressed]` frames per ADR 0006. For each
+# successfully-validated frame, copies the compressed payload to a
+# fresh heap alloc (lifetime-detached from `buf`) and inserts a
+# {compressed, clen, ty} entry into `raw_cache` keyed by the hex
+# string.
+#
+# Validation per frame (any failure → return -1; the caller then
+# treats the whole batch as failed and falls back to per-object GET):
+#   * `off + 80 <= blen` — header fits in remaining bytes
+#   * `hex_prefix_valid(hex, 64)` — hash slot is 64 ASCII hex chars
+#   * `ty >= 0 && ty <= 2` — known patra type code (0=blob, 1=tree,
+#     2=commit). Negative ty also rules out the wraparound case where
+#     a malicious server tried to smuggle a >2^63-byte payload via
+#     i64 underflow.
+#   * `clen > 0` — empty payload is meaningless and lets a malicious
+#     stream advance `off` by exactly 80 in a tight loop
+#   * `clen <= WIRE_HTTP_MAX_BODY` — bounds the alloc + matches the
+#     db_object_read_both decompression ceiling
+#   * `off + 80 + clen <= blen` — payload fits in remaining bytes
+#
+# This function is the v0.7.5 fuzz target. Adversarial bytes go in;
+# the parser must terminate on every input without OOB reads, infinite
+# loops, or oversized allocs. Pulled out of http_remote_read_batch
+# specifically so tests/sit.fcyr can drive it without standing up
+# a TCP socket.
+#
+# Returns the count of successfully-cached frames (>= 0) on a
+# well-formed stream, or -1 on any validation failure mid-stream.
+# A buffer of length 0 returns 0 (zero frames is valid).
+
+fn _wire_http_decode_frames(buf, blen, raw_cache) {
     var off = 0;
     var cached = 0;
     var failed = 0;
-    while (off < rlen) {
-        if (failed == 1) { off = rlen; }
+    while (off < blen) {
+        if (failed == 1) { off = blen; }
         else {
-            # Each frame is at least 80 bytes (64 hex + 8 ty + 8 clen).
-            if (off + 80 > rlen) { failed = 1; }
+            if (off + 80 > blen) { failed = 1; }
             else {
-                var hex = resp + off;
+                var hex = buf + off;
                 if (hex_prefix_valid(hex, 64) == 0) { failed = 1; }
                 else {
-                    var ty = load64(resp + off + 64);
-                    var clen = load64(resp + off + 72);
+                    var ty = load64(buf + off + 64);
+                    var clen = load64(buf + off + 72);
                     if (ty < 0) { failed = 1; }
                     else {
                         if (ty > 2) { failed = 1; }
@@ -607,21 +649,14 @@ fn http_remote_read_batch(h, hashes, start_idx, count, raw_cache) {
                             else {
                                 if (clen > WIRE_HTTP_MAX_BODY) { failed = 1; }
                                 else {
-                                    if (off + 80 + clen > rlen) { failed = 1; }
+                                    if (off + 80 + clen > blen) { failed = 1; }
                                     else {
-                                        # Copy compressed bytes out of the
-                                        # response buffer (which gets fl_freed
-                                        # on return) into a fresh heap alloc.
-                                        # Matches db_object_read_raw lifetime.
                                         var compressed = alloc(clen);
-                                        memcpy(compressed, resp + off + 80, clen);
+                                        memcpy(compressed, buf + off + 80, clen);
                                         var raw[24];
                                         store64(&raw,      compressed);
                                         store64(&raw +  8, clen);
                                         store64(&raw + 16, ty);
-                                        # Use a heap-owned hex copy as the
-                                        # cache key so it outlives the
-                                        # response buffer's fl_free.
                                         var key = alloc(65);
                                         memcpy(key, hex, 64);
                                         store8(key + 64, 0);
@@ -637,11 +672,7 @@ fn http_remote_read_batch(h, hashes, start_idx, count, raw_cache) {
             }
         }
     }
-    _wire_http_response_free(&quad);
-    if (failed == 1) {
-        eprintln("sit: malformed /sit/v1/want frame stream");
-        return 0 - 1;
-    }
+    if (failed == 1) { return 0 - 1; }
     return cached;
 }
 

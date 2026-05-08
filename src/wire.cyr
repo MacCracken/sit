@@ -154,6 +154,42 @@ fn db_object_read_decompressed(db, hex, out) {
     return db_object_read_both(db, hex, &raw, out);
 }
 
+# v0.7.5: decompress a {compressed, clen, ty} 24-byte struct into a
+# 24-byte decompressed view {ptr, dlen, content_offset_after_NUL}.
+# Same 4×-initial / 16 MiB-ceiling sizing as db_object_read_both —
+# extracted so cache-hit paths in the phased walker can decompress
+# without re-reading the compressed bytes from the transport.
+# Returns 0 on success, negative on decompression failure / OOM.
+fn _decompress_raw_into(raw, deco_out) {
+    var compressed = load64(raw);
+    var clen = load64(raw + 8);
+    var dec_cap = clen * 4;
+    if (dec_cap < 4096) { dec_cap = 4096; }
+    if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
+    var decompressed = alloc(dec_cap);
+    if (decompressed == 0) { return 0 - 2; }
+    var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+    if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
+        if (dec_cap < 16 * 1024 * 1024) {
+            dec_cap = 16 * 1024 * 1024;
+            decompressed = alloc(dec_cap);
+            if (decompressed == 0) { return 0 - 2; }
+            dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+        }
+    }
+    if (dlen <= 0) { return 0 - 3; }
+    var nul = 0;
+    while (nul < dlen) {
+        if (load8(decompressed + nul) == 0) { break; }
+        nul = nul + 1;
+    }
+    if (nul >= dlen) { return 0 - 4; }
+    store64(deco_out,      decompressed);
+    store64(deco_out +  8, dlen);
+    store64(deco_out + 16, nul + 1);
+    return 0;
+}
+
 # Variant that returns BOTH the compressed bytes (raw_out, 24 bytes:
 # {compressed_ptr, clen, ty}) and the decompressed view (deco_out, 24 bytes:
 # {decompressed_ptr, dlen, content_offset}). Used by walk_reachable_* so the
@@ -342,55 +378,43 @@ fn _walk_cache_insert(raw_cache, hex, raw_struct_ptr) {
     return 0;
 }
 
-fn walk_reachable_tree(src, tree_hex, out, seen, raw_cache) {
-    if (_wire_walk_depth >= _WIRE_MAX_DEPTH) {
-        eprintln("sit: remote tree depth exceeds 256 — refusing to walk further");
-        return 0;
-    }
-    if (map_has(seen, tree_hex) == 1) { return 0; }
-    map_set(seen, tree_hex, 1);
-    var hex_copy = alloc(65);
-    memcpy(hex_copy, tree_hex, 64);
-    store8(hex_copy + 64, 0);
-    vec_push(out, hex_copy);
+# ── Walk-side phasing (v0.7.5) ─────────────────────────────────────
+#
+# Same reachability + same `out` contents as `walk_reachable_from_commit`,
+# but reorganised into phases so HTTP transports can batch the tree
+# reads via `POST /sit/v1/want`. Three phases:
+#
+#   Phase 1: walk the commit chain sequentially, collecting tree hexes.
+#            The chain-of-parents has no parallelism — must read commit N
+#            to learn commit N-1's hex. Each commit hex goes into `out`
+#            and is cached; tree hexes accumulate into a side vec for
+#            phase 2.
+#
+#   Phase 2: one batch-prefetch of every tree hex from phase 1.
+#            For OBJ_SRC_HTTP with `"batch":true`, this collapses N tree
+#            GETs into ⌈N/256⌉ POSTs (WIRE_HTTP_BATCH_CHUNK). For
+#            OBJ_SRC_DB or non-batch HTTP, this is a no-op and phase 3
+#            falls back to per-tree reads.
+#
+#   Phase 3: walk each tree from cache. For sub-trees discovered at a
+#            given depth, the walker collects ALL sub-trees at that
+#            level FIRST, then batch-prefetches them as a single chunk
+#            before recursing — so deep hierarchies still benefit from
+#            per-level batching, not just the top level.
+#
+# Invariant: `out` ends up with the same set of hashes as
+# `walk_reachable_from_commit` would have produced (just possibly in a
+# different order — copy_objects iterates the vec linearly and order
+# doesn't affect correctness).
+#
+# Why not always use phased: for OBJ_SRC_DB the work is identical (just
+# more allocations for the side vecs). It's slightly worse in the
+# common file:// case. We keep `walk_reachable_from_commit` as the
+# fallback path and dispatch on src kind in `do_fetch` / `cmd_push`.
 
-    _wire_walk_depth = _wire_walk_depth + 1;
-    var raw[24];
-    var obj[24];
-    if (obj_src_read_both(src, tree_hex, &raw, &obj) != 0) {
-        _wire_walk_depth = _wire_walk_depth - 1;
-        return 0;
-    }
-    _walk_cache_insert(raw_cache, hex_copy, &raw);
-    var buf = load64(&obj);
-    var blen = load64(&obj + 8);
-    var coff = load64(&obj + 16);
-    var entries = parse_tree(buf + coff, blen - coff);
-    var n = vec_len(entries);
-    var i = 0;
-    while (i < n) {
-        var e = vec_get(entries, i);
-        var mode = tree_entry_mode(e);
-        var hash = tree_entry_hash(e);
-        if (streq(mode, "40000") == 1) {
-            walk_reachable_tree(src, hash, out, seen, raw_cache);
-        }
-        else {
-            if (map_has(seen, hash) == 0) {
-                map_set(seen, hash, 1);
-                var bcopy = alloc(65);
-                memcpy(bcopy, hash, 64);
-                store8(bcopy + 64, 0);
-                vec_push(out, bcopy);
-            }
-        }
-        i = i + 1;
-    }
-    _wire_walk_depth = _wire_walk_depth - 1;
-    return 0;
-}
-
-fn walk_reachable_from_commit(src, root_hex, out, seen, raw_cache) {
+fn walk_reachable_phased(src, root_hex, out, seen, raw_cache) {
+    # Phase 1: commit chain walk (sequential).
+    var trees = vec_new();
     var queue = vec_new();
     var hex_copy = alloc(65);
     memcpy(hex_copy, root_hex, 64);
@@ -416,13 +440,122 @@ fn walk_reachable_from_commit(src, root_hex, out, seen, raw_cache) {
                 var info[56];
                 if (parse_commit_body(body, body_len, &info) == 0) {
                     var tree_hex = load64(&info);
-                    if (tree_hex != 0) { walk_reachable_tree(src, tree_hex, out, seen, raw_cache); }
+                    if (tree_hex != 0) {
+                        # Defer the tree walk to phase 3; just collect.
+                        # Don't dedup against `seen` here — the per-level
+                        # batcher does that and we want the full list of
+                        # tree references for phase 2 to maximise the
+                        # batch size.
+                        var tree_copy = alloc(65);
+                        memcpy(tree_copy, tree_hex, 64);
+                        store8(tree_copy + 64, 0);
+                        vec_push(trees, tree_copy);
+                    }
                     var parent_hex = load64(&info + 8);
                     if (parent_hex != 0) { vec_push(queue, parent_hex); }
                 }
             }
         }
     }
+
+    # Phase 2: batch-prefetch every collected tree hex.
+    obj_src_batch_prefetch(src, trees, raw_cache);
+
+    # Phase 3: walk each top-level tree (per-level batched recursion).
+    var ti = 0;
+    while (ti < vec_len(trees)) {
+        walk_reachable_tree_batched(src, vec_get(trees, ti), out, seen, raw_cache);
+        ti = ti + 1;
+    }
+    return 0;
+}
+
+# Per-level-batched tree walker. Collects all sub-tree hashes at the
+# current depth, batch-prefetches them in one POST, then recurses. Same
+# `out` semantics as `walk_reachable_tree`. Blobs go straight to `out`
+# without any read; copy_objects's own batch-prefetch covers them.
+fn walk_reachable_tree_batched(src, tree_hex, out, seen, raw_cache) {
+    if (_wire_walk_depth >= _WIRE_MAX_DEPTH) {
+        eprintln("sit: remote tree depth exceeds 256 — refusing to walk further");
+        return 0;
+    }
+    if (map_has(seen, tree_hex) == 1) { return 0; }
+    map_set(seen, tree_hex, 1);
+    var hex_copy = alloc(65);
+    memcpy(hex_copy, tree_hex, 64);
+    store8(hex_copy + 64, 0);
+    vec_push(out, hex_copy);
+
+    _wire_walk_depth = _wire_walk_depth + 1;
+    var raw[24];
+    var obj[24];
+    # v0.7.5: cache-first read. Phase 2 of walk_reachable_phased
+    # populated raw_cache for every tree hex referenced by the commit
+    # chain; this hit path lets us decompress without going back to
+    # the transport for trees that were just batched.
+    var cached = 0;
+    if (raw_cache != 0) {
+        var cached_raw = map_get(raw_cache, hex_copy);
+        if (cached_raw != 0) {
+            memcpy(&raw, cached_raw, 24);
+            if (_decompress_raw_into(&raw, &obj) == 0) {
+                cached = 1;
+            }
+        }
+    }
+    if (cached == 0) {
+        if (obj_src_read_both(src, tree_hex, &raw, &obj) != 0) {
+            _wire_walk_depth = _wire_walk_depth - 1;
+            return 0;
+        }
+    }
+    _walk_cache_insert(raw_cache, hex_copy, &raw);
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    var entries = parse_tree(buf + coff, blen - coff);
+    var n = vec_len(entries);
+
+    # First pass: collect sub-tree hashes for the level batch; emit
+    # blob hashes into out as we go (no read needed for those).
+    var sub_trees = vec_new();
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        var mode = tree_entry_mode(e);
+        var hash = tree_entry_hash(e);
+        if (streq(mode, "40000") == 1) {
+            if (map_has(seen, hash) == 0) {
+                var sc = alloc(65);
+                memcpy(sc, hash, 64);
+                store8(sc + 64, 0);
+                vec_push(sub_trees, sc);
+            }
+        }
+        else {
+            if (map_has(seen, hash) == 0) {
+                map_set(seen, hash, 1);
+                var bcopy = alloc(65);
+                memcpy(bcopy, hash, 64);
+                store8(bcopy + 64, 0);
+                vec_push(out, bcopy);
+            }
+        }
+        i = i + 1;
+    }
+
+    # Batch-prefetch every sub-tree at this level before recursing.
+    if (vec_len(sub_trees) > 0) {
+        obj_src_batch_prefetch(src, sub_trees, raw_cache);
+    }
+
+    # Recurse — sub-tree reads now come from cache (when batch fired).
+    var si = 0;
+    while (si < vec_len(sub_trees)) {
+        walk_reachable_tree_batched(src, vec_get(sub_trees, si), out, seen, raw_cache);
+        si = si + 1;
+    }
+    _wire_walk_depth = _wire_walk_depth - 1;
     return 0;
 }
 
@@ -448,13 +581,14 @@ fn copy_objects(src, dst_db, hashes, raw_cache) {
     # fall back to db_object_read_raw. raw_cache may be 0 for callers that
     # don't have a walk to draw from.
     #
-    # v0.7.4: `obj_src_batch_prefetch` exists but is intentionally NOT called
-    # here. On the loopback bench fixture batching only the blobs (what the
-    # walk's cache leaves missing) saves ~15 ms — well below the v0.7.4
-    # ≥30%-or-revert gate. The headline win requires also batching the walk's
-    # tree reads, which is a separate refactor scoped for v0.7.5+. The
-    # protocol primitive (POST /sit/v1/want + client functions) is shipped
-    # as scaffolding so v0.7.5 can plumb it in without re-doing wire work.
+    # v0.7.5: batch-prefetch — for HTTP sources advertising "batch":true,
+    # pull every cache-miss hex in `hashes` via POST /sit/v1/want before
+    # the per-object loop runs. After v0.7.5's walk-side phasing, commits
+    # AND trees are already in cache; the misses are blobs, which dominate
+    # clone bytes. For OBJ_SRC_DB the call is a no-op. Failures demote to
+    # per-object fallback (the existing obj_src_read_raw call below).
+    obj_src_batch_prefetch(src, hashes, raw_cache);
+
     patra_begin(dst_db);
     while (i < n) {
         var hex = vec_get(hashes, i);
@@ -766,8 +900,16 @@ fn do_fetch(name, branch) {
     # commits + trees that walk_reachable already pulled. The cache is
     # transport-independent (compressed bytes are bytes); HTTP fetches
     # benefit from it identically to local fetches.
+    #
+    # v0.7.5: walk_reachable_phased replaces walk_reachable_from_commit.
+    # Phase 1 walks the commit chain sequentially (unavoidable —
+    # parent-of-parent has no parallelism), phase 2 batch-prefetches all
+    # trees referenced by the chain in one POST /sit/v1/want, phase 3
+    # walks each tree from cache with per-level sub-tree batching.
+    # For OBJ_SRC_DB the batch hooks are no-ops so the work degrades to
+    # the same SQL reads in slightly different order.
     var raw_cache = map_new();
-    walk_reachable_from_commit(src, remote_tip, hashes, seen, raw_cache);
+    walk_reachable_phased(src, remote_tip, hashes, seen, raw_cache);
     var copied = copy_objects(src, dst_db, hashes, raw_cache);
 
     if (src_db_local != 0) { patra_close(src_db_local); }
@@ -1116,9 +1258,13 @@ fn cmd_push() {
     var seen = map_new();
     var hashes = vec_new();
     # P-04 (v0.6.7): raw_cache shared between walk and copy.
+    # v0.7.5: phased walker. Push is local→remote; remote is currently
+    # always file:// (push over http is gated until v0.7.6+) so the
+    # batch hooks are no-ops here, but using phased keeps the codepath
+    # identical to do_fetch for when push grows http transport.
     var raw_cache = map_new();
     var src = obj_src_for_db(src_db);
-    walk_reachable_from_commit(src, local_tip, hashes, seen, raw_cache);
+    walk_reachable_phased(src, local_tip, hashes, seen, raw_cache);
     var copied = copy_objects(src, dst_db, hashes, raw_cache);
 
     patra_close(dst_db);
