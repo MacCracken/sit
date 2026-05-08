@@ -365,6 +365,20 @@ fn str_builder_add_cstr(sb, cstr) {
     return 0;
 }
 
+# v5.9.37: append a single byte to the string builder. Pairs with
+# the new lexer char-literal token (`'X'` → NUMBER X) so consumers
+# can write `str_builder_putc(sb, '[');` instead of needing to
+# stash a one-byte cstring. Required by agnosys 1.1.12 verbatim
+# repro (the original filing's spec uses this shape).
+fn str_builder_putc(sb, ch) {
+    _sb_grow(sb, 1);
+    var buf = load64(sb);
+    var len = load64(sb + 8);
+    store8(buf + len, ch & 0xFF);
+    store64(sb + 8, len + 1);
+    return 0;
+}
+
 # v5.8.43 — Allocator-as-first-arg variant of str_builder_add_int.
 fn str_builder_add_int_a(a, sb, n) {
     var tmp[24];
