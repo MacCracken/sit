@@ -36,7 +36,7 @@ enum WsState {
 # +24 flags    (FIN, RSV, etc.)
 
 # Create WebSocket handle from connected socket
-fn ws_new(fd) {
+fn ws_new(fd): i64 {
     var ws = alloc(32);
     store64(ws, fd);
     store64(ws + 8, WS_CONNECTING);
@@ -46,13 +46,13 @@ fn ws_new(fd) {
 }
 
 # Get socket fd from WebSocket handle
-fn ws_fd(ws) { return load64(ws); }
+fn ws_fd(ws): i64 { return load64(ws); }
 
 # Get WebSocket connection state
-fn ws_state(ws) { return load64(ws + 8); }
+fn ws_state(ws): i64 { return load64(ws + 8); }
 
 # Generate 4-byte mask key from /dev/urandom
-fn _ws_gen_mask(ws) {
+fn _ws_gen_mask(ws): i64 {
     var mask[4];
     var fd = syscall(2, "/dev/urandom", 0, 0);
     if (fd >= 0) {
@@ -64,7 +64,7 @@ fn _ws_gen_mask(ws) {
 }
 
 # Build WebSocket upgrade request
-fn _ws_handshake_request(path, host, key_out) {
+fn _ws_handshake_request(path, host, key_out): i64 {
     # Generate 16-byte random key, base64 encode
     var raw[16];
     var fd = syscall(2, "/dev/urandom", 0, 0);
@@ -95,7 +95,7 @@ fn _ws_handshake_request(path, host, key_out) {
 }
 
 # Perform WebSocket handshake on connected socket
-fn ws_connect(sock, path, host) {
+fn ws_connect(sock, path, host): i64 {
     var ws = ws_new(sock);
     var key[32];
     var req = _ws_handshake_request(path, host, &key);
@@ -119,7 +119,7 @@ fn ws_connect(sock, path, host) {
 }
 
 # Send a WebSocket frame
-fn _ws_send_frame(ws, opcode, data, len) {
+fn _ws_send_frame(ws, opcode, data, len): i64 {
     if (ws_state(ws) != WS_OPEN) { return 0 - 1; }
     var fd = ws_fd(ws);
     var hdr[14];
@@ -174,23 +174,23 @@ fn _ws_send_frame(ws, opcode, data, len) {
 }
 
 # Send text message
-fn ws_send_text(ws, msg) {
+fn ws_send_text(ws, msg): i64 {
     return _ws_send_frame(ws, WS_OP_TEXT, msg, strlen(msg));
 }
 
 # Send binary message
-fn ws_send_binary(ws, data, len) {
+fn ws_send_binary(ws, data, len): i64 {
     return _ws_send_frame(ws, WS_OP_BINARY, data, len);
 }
 
 # Send ping
-fn ws_ping(ws) {
+fn ws_ping(ws): i64 {
     return _ws_send_frame(ws, WS_OP_PING, "", 0);
 }
 
 # Receive a WebSocket frame, returns payload pointer (caller must check opcode)
 # Sets opcode_out to the frame opcode
-fn ws_recv_frame(ws, opcode_out, len_out) {
+fn ws_recv_frame(ws, opcode_out, len_out): i64 {
     if (ws_state(ws) != WS_OPEN) { return 0; }
     var fd = ws_fd(ws);
     var hdr[2];
@@ -256,7 +256,7 @@ fn ws_recv_frame(ws, opcode_out, len_out) {
 }
 
 # Receive text message (convenience — returns string or 0)
-fn ws_recv(ws) {
+fn ws_recv(ws): i64 {
     var opcode[1];
     var len[1];
     var data = ws_recv_frame(ws, &opcode, &len);
@@ -267,7 +267,7 @@ fn ws_recv(ws) {
 }
 
 # Close WebSocket connection
-fn ws_close(ws) {
+fn ws_close(ws): i64 {
     if (ws_state(ws) == WS_OPEN) {
         _ws_send_frame(ws, WS_OP_CLOSE, "", 0);
         store64(ws + 8, WS_CLOSING);

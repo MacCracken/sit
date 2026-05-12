@@ -26,7 +26,7 @@
 # Follows the keccak.team compact reference; rho+pi uses the 24-element
 # cycle walk rather than a flat offset table, which keeps the function
 # under one screen.
-fn _keccak_f1600(state) {
+fn _keccak_f1600(state): i64 {
     # Round constants (FIPS 202 §3.2.5 / Algorithm 5). Initialised at the
     # top of every call; 24 × 8 = 192 bytes of locals — cheap.
     var rc[192];
@@ -145,7 +145,7 @@ fn _keccak_f1600(state) {
 # Pad last block with (domain, 0, ..., 0, 0x80). For SHAKE-128 /
 # SHAKE-256 the domain byte is 0x1F (per FIPS 202 §B.2). The final
 # 0x80 flips the high bit of the block's last byte (multi-rate pad).
-fn _keccak_absorb(state, data, datalen, rate_bytes, domain) {
+fn _keccak_absorb(state, data, datalen, rate_bytes, domain): i64 {
     var pos = 0;
     # Full-block absorbs
     while (datalen - pos >= rate_bytes) {
@@ -176,7 +176,7 @@ fn _keccak_absorb(state, data, datalen, rate_bytes, domain) {
 
 # Squeeze phase: copy rate bytes from state to output, permute,
 # repeat until outlen bytes emitted.
-fn _keccak_squeeze(state, out, outlen, rate_bytes) {
+fn _keccak_squeeze(state, out, outlen, rate_bytes): i64 {
     var pos = 0;
     while (pos < outlen) {
         var chunk = outlen - pos;
@@ -193,7 +193,7 @@ fn _keccak_squeeze(state, out, outlen, rate_bytes) {
 }
 
 # SHAKE-128: rate 168 bytes, XOF output of arbitrary length.
-fn shake128(msg, msglen, out, outlen) {
+fn shake128(msg, msglen, out, outlen): i64 {
     var state[200];
     memset(&state, 0, 200);
     _keccak_absorb(&state, msg, msglen, 168, 0x1F);
@@ -202,7 +202,7 @@ fn shake128(msg, msglen, out, outlen) {
 }
 
 # SHAKE-256: rate 136 bytes, XOF output of arbitrary length.
-fn shake256(msg, msglen, out, outlen) {
+fn shake256(msg, msglen, out, outlen): i64 {
     var state[200];
     memset(&state, 0, 200);
     _keccak_absorb(&state, msg, msglen, 136, 0x1F);

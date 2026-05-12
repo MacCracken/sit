@@ -3,7 +3,7 @@
 # All functions take raw pointers (addresses from &var or &buf).
 
 # Length of null-terminated string (word-at-a-time, portable)
-fn strlen(s) {
+fn strlen(s): i64 {
     # Byte-at-a-time until 8-byte aligned
     var n: i64 = 0;
     while ((s + n) & 7 != 0) {
@@ -111,6 +111,18 @@ fn print_num(n: i64) {
 fn println(s) {
     var len = strlen(s);
     syscall(1, 1, s, len);
+    syscall(1, 1, "\n", 1);
+    return 0;
+}
+
+# v5.10.5 overload-dispatch target: `println(n: i64)` routes
+# here via PARSE_FNCALL when the arg is i64-typed (annotated
+# `: i64` local/global, or the result of an `: i64`-annotated
+# fn call like `strlen(...)`). Body is `print_num` + newline —
+# gives the dispatch a concrete symbol to land on. Mirrors
+# the v5.10.3 `println_str` pattern.
+fn println_int(n: i64) {
+    print_num(n);
     syscall(1, 1, "\n", 1);
     return 0;
 }

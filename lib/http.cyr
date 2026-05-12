@@ -47,7 +47,7 @@ var HTTP_ERROR = 0 - 1;
 # against embedded NULs and stray tabs/spaces that would split the
 # request line. Returning 0 (instead of aborting the process) lets
 # caller-side code treat bad URLs as a normal error path.
-fn _http_parse_url(url) {
+fn _http_parse_url(url): i64 {
     # Validate: reject CR, LF, NUL-before-end, and any byte < 0x20
     # or == 0x7F in the host portion. Walk the whole URL first so
     # malformed input can't corrupt the downstream parse.
@@ -95,7 +95,7 @@ fn _http_parse_url(url) {
 }
 
 # Build HTTP/1.0 request string
-fn _http_build_request(method, host, path) {
+fn _http_build_request(method, host, path): i64 {
     var buf = alloc(2048);
     var pos = 0;
     # Method + path
@@ -114,7 +114,7 @@ fn _http_build_request(method, host, path) {
 
 # v5.8.36 — Allocator-as-first-arg variant of _http_parse_response.
 # Allocates the 32-byte response struct via `a`. Returns 0 on OOM.
-fn _http_parse_response_a(a, buf, len) {
+fn _http_parse_response_a(a, buf, len): i64 {
     var result = alloc_via(a, 32);
     if (result == 0) { return 0; }
     store64(result, 0);
@@ -145,7 +145,7 @@ fn _http_parse_response_a(a, buf, len) {
 }
 
 # Parse HTTP response: extract status code and body
-fn _http_parse_response(buf, len) {
+fn _http_parse_response(buf, len): i64 {
     var result = alloc(32);
     store64(result, 0);
     store64(result + 8, 0);
@@ -180,7 +180,7 @@ fn _http_parse_response(buf, len) {
 # On malformed or unsafe URL (CRLF injection, empty host, out-of-range
 # port, embedded whitespace), returns a response with status ==
 # HTTP_ERROR so callers can fail fast without a separate validator.
-fn http_get(url) {
+fn http_get(url): i64 {
     var parsed = _http_parse_url(url);
     if (parsed == 0) {
         var bad = alloc(24);
@@ -230,7 +230,7 @@ fn http_get(url) {
 # in resp.status. Bad URL → Err(HttpBadUrl); net.cyr Err in
 # tcp_socket / sock_connect → Err(HttpNetErr); 2xx response →
 # Ok(resp); non-2xx → Err(HttpNon2xx).
-fn http_get_r(url) {
+fn http_get_r(url) : Result {
     var parsed = _http_parse_url(url);
     if (parsed == 0) { return Err(HttpBadUrl); }
     var host = load64(parsed);
@@ -276,7 +276,7 @@ fn http_get_r(url) {
 #   var resp = http_get_a(req_arena, "http://x.org/y");
 #   ... use resp.status / resp.body ...
 #   reset_via(req_arena);                          # frees recv buf + resp
-fn http_get_a(a, url) {
+fn http_get_a(a, url): i64 {
     var parsed = _http_parse_url(url);
     if (parsed == 0) {
         var bad = alloc_via(a, 24);
@@ -325,8 +325,8 @@ fn http_get_a(a, url) {
 }
 
 # Get status code from response
-fn http_status(resp) { return load64(resp); }
+fn http_status(resp) : i64 { return load64(resp); }
 # Get body pointer from response
-fn http_body(resp) { return load64(resp + 8); }
+fn http_body(resp) : i64 { return load64(resp + 8); }
 # Get body length from response
-fn http_body_len(resp) { return load64(resp + 16); }
+fn http_body_len(resp) : i64 { return load64(resp + 16); }

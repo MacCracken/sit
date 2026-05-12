@@ -16,7 +16,7 @@
 
 # Branchless select: returns `a` if cond == 0, `b` if cond == 1.
 # Undefined for cond outside {0, 1}.
-fn ct_select(cond, a, b) {
+fn ct_select(cond, a, b): i64 {
     var mask = 0 - cond;
     return a ^ (mask & (a ^ b));
 }
@@ -42,7 +42,7 @@ fn ct_select(cond, a, b) {
 # in sigil's source, so it's dropped entirely — callers using a
 # 32-byte fixed compare can write `ct_eq_bytes(a, b, 32)`
 # directly.
-fn ct_eq_bytes(a, b, n) {
+fn ct_eq_bytes(a, b, n): i64 {
     var acc = 0;
     var i = 0;
     while (i < n) {
@@ -72,7 +72,7 @@ fn ct_eq_bytes(a, b, n) {
 # `ct_eq_bytes_lens` (suffix flags the dual-length variant)
 # rather than bare `ct_eq` to avoid the scalar-vs-buffer
 # ambiguity flagged in agnosys's 2026-05-06 filing.
-fn ct_eq_bytes_lens(a, a_len, b, b_len) {
+fn ct_eq_bytes_lens(a, a_len, b, b_len): i64 {
     if (a_len != b_len) { return 0; }
     return ct_eq_bytes(a, b, a_len);
 }
