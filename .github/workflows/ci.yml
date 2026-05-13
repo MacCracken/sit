@@ -293,7 +293,9 @@ jobs:
           echo "  push: $PUSH_OUT"
           ORIG_TIP=$(cat "$ORIG/.sit/refs/heads/main" | tr -d '\n')
           test "$CLONE_TIP" = "$ORIG_TIP" || { echo "origin tip mismatch after ssh push: clone=$CLONE_TIP orig=$ORIG_TIP"; exit 1; }
-          (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" log --oneline | wc -l) | grep -qx "2" || { echo "expected 2 commits on origin after ssh push"; exit 1; }
+          # ORIG's HEAD is detached (v0.8.4 setup), so `sit log` defaults
+          # to "no commits yet". Pass `main` explicitly to walk the branch.
+          (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" log main --oneline | wc -l) | grep -qx "2" || { echo "expected 2 commits on origin after ssh push"; exit 1; }
 
           # Re-push with no new commits → "everything up-to-date".
           RE_PUSH_OUT=$(cd "$CLONE" && "$GITHUB_WORKSPACE/build/sit" push origin main 2>&1)
@@ -303,7 +305,7 @@ jobs:
           # Non-FF rejection: rewind the clone's ref to the parent and
           # commit a divergent change. Push must fail with the
           # non-fast-forward error and leave origin's ref intact.
-          PARENT=$(cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" log | grep '^commit ' | tail -1 | awk '{print $2}')
+          PARENT=$(cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" log main | grep '^commit ' | tail -1 | awk '{print $2}')
           (cd "$CLONE" && \
             echo "$PARENT" > .sit/refs/heads/main && \
             echo "divergent" > b.txt && \
@@ -464,7 +466,8 @@ jobs:
 
           cd "$ORIG"
           test "$(cat .sit/refs/heads/main | tr -d '\n')" = "$CLONE_TIP" || { echo "origin ref not updated"; exit 1; }
-          "$GITHUB_WORKSPACE/build/sit" log | grep -q "$CLONE_TIP" || { echo "origin log missing new commit"; exit 1; }
+          # ORIG's HEAD is detached (v0.8.4 setup); walk main explicitly.
+          "$GITHUB_WORKSPACE/build/sit" log main | grep -q "$CLONE_TIP" || { echo "origin log missing new commit"; exit 1; }
 
           # 3) pull into a second clone demonstrates the full round trip
           SECOND=$(mktemp -d)/second
@@ -560,7 +563,7 @@ jobs:
           TARGET_TIP=$(cat "$ORIG/.sit/refs/heads/main" | tr -d '\n')
           test "$CLIENT_TIP" = "$TARGET_TIP" || { echo "target ref mismatch: client=$CLIENT_TIP target=$TARGET_TIP"; exit 1; }
           (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" fsck)
-          (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" log --oneline | wc -l) | grep -qx "2" || { echo "expected 2 commits on target"; exit 1; }
+          (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" log main --oneline | wc -l) | grep -qx "2" || { echo "expected 2 commits on target"; exit 1; }
 
           # Re-push with no new commits → "everything up-to-date" (no objects sent).
           PUSH_OUT=$(cd "$SRC" && "$GITHUB_WORKSPACE/build/sit" push origin main 2>&1)
