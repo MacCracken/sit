@@ -86,7 +86,7 @@ fn serve_build_capabilities() {
     # each tag.
     # TODO: derive from VERSION at build time. Manually bumped each
     # release; closeout pass before tagging asserts the literal matches.
-    str_builder_add_cstr(sb, "{\"sit\":\"0.8.3\",\"max_body\":");
+    str_builder_add_cstr(sb, "{\"sit\":\"0.8.4\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[");
     if (_serve_require_auth == 1) {
@@ -685,6 +685,43 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
         if (is_tag == 0) {
             sandhi_server_send_status(cfd, 400, "Bad Request");
             return 0;
+        }
+    }
+
+    # v0.8.4: denyCurrentBranch. Mirrors git's default behavior — refuse
+    # pushes whose target branch is the server's checked-out HEAD. Pushing
+    # to the checked-out branch silently advances the ref while leaving the
+    # working tree stale, which surprises anyone editing on the remote.
+    # 423 Locked distinguishes this from 409 Conflict (non-FF) on the wire
+    # so the client can surface the right error.
+    #
+    # Only matters for refs/heads/* — tags don't have a "checked-out"
+    # concept. Detached HEAD (HEAD content is a raw hash, not "ref:") makes
+    # read_head_ref_path return 0, so the check no-ops in that state.
+    #
+    # Initial pushes to empty remotes: if the target ref file doesn't
+    # exist yet, allow — matches git's denyCurrentBranch behavior.
+    # First push to a fresh remote is the canonical way to bootstrap.
+    # The existence check happens against the on-disk ref path which we
+    # compute below; mirror that compute here so the bypass is precise.
+    if (is_head == 1) {
+        var server_head = read_head_ref_path();
+        if (server_head != 0) {
+            if (streq(server_head, rname) == 1) {
+                # Probe the on-disk ref to gate the bypass. Same path
+                # shape used by the FF check below; ensure_parent_dirs
+                # happens at write time so this read is safe pre-write.
+                var probe_path = alloc(rname_len + 6);
+                memcpy(probe_path, ".sit/", 5);
+                memcpy(probe_path + 5, rname, rname_len);
+                store8(probe_path + 5 + rname_len, 0);
+                if (file_exists(probe_path) == 1) {
+                    var msg = "refusing to update checked-out branch (denyCurrentBranch)\n";
+                    sandhi_server_send_response(cfd, 423, "Locked", "text/plain",
+                                                 msg, strlen(msg), 0);
+                    return 0;
+                }
+            }
         }
     }
 

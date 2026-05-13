@@ -146,6 +146,11 @@ jobs:
             printf "hello\nworld\n" > a.txt && \
             "$GITHUB_WORKSPACE/build/sit" add a.txt && \
             "$GITHUB_WORKSPACE/build/sit" commit -m "ssh-test-root")
+          # v0.8.4: detach ORIG's HEAD so the v0.8.3 ssh-push smoke
+          # (further down) isn't caught by denyCurrentBranch. A SECOND
+          # `Smoke — denyCurrentBranch` step asserts the check fires
+          # when HEAD IS on the pushed branch.
+          cp "$ORIG/.sit/refs/heads/main" "$ORIG/.sit/HEAD"
 
           # ── Bring up loopback sshd ────────────────────────────────────
           # User-owned sshd config + host key + authorized_keys; runs on
@@ -326,7 +331,45 @@ jobs:
           test ! -e /tmp/PWNED || { echo "CVE-2017-1000117 defense breached!"; exit 1; }
           grep -qE "invalid|unsupported|malformed|leading-dash" /tmp/cve.out || { echo "expected user-facing error on malformed URL:"; cat /tmp/cve.out; exit 1; }
 
-          echo "ssh clone + CVE-2017-1000117 defense smoke ok"
+          # ── denyCurrentBranch (v0.8.4) ───────────────────────────────
+          # Build a SECOND origin whose HEAD is ATTACHED to main + has
+          # an initial commit (so the ref file exists). Push from a
+          # fresh clone — must be REJECTED with the documented error,
+          # origin's ref unchanged. Then detach HEAD and assert the
+          # same push now succeeds.
+          DCB_ORIG=$(mktemp -d)
+          (cd "$DCB_ORIG" && \
+            "$GITHUB_WORKSPACE/build/sit" init && \
+            echo dcb-seed > a.txt && \
+            "$GITHUB_WORKSPACE/build/sit" add a.txt && \
+            "$GITHUB_WORKSPACE/build/sit" commit -m "dcb-seed")
+          DCB_ORIG_TIP=$(cat "$DCB_ORIG/.sit/refs/heads/main" | tr -d '\n')
+          # HEAD already attached to main (sit init default) and ref
+          # exists (we just committed) — denyCurrentBranch should fire.
+
+          DCB_CLONE=$(mktemp -d)/dcb
+          "$GITHUB_WORKSPACE/build/sit" clone --force-absolute "ssh://$USER@127.0.0.1:22422$DCB_ORIG" "$DCB_CLONE"
+          (cd "$DCB_CLONE" && \
+            echo dcb-edit >> a.txt && \
+            "$GITHUB_WORKSPACE/build/sit" add a.txt && \
+            "$GITHUB_WORKSPACE/build/sit" commit -m "dcb-edit")
+          set +e
+          DCB_OUT=$(cd "$DCB_CLONE" && "$GITHUB_WORKSPACE/build/sit" push origin main 2>&1)
+          DCB_RC=$?
+          set -e
+          test "$DCB_RC" -ne 0 || { echo "expected denyCurrentBranch push to fail"; echo "$DCB_OUT"; exit 1; }
+          echo "$DCB_OUT" | grep -q "denyCurrentBranch" || { echo "expected denyCurrentBranch error message"; echo "$DCB_OUT"; exit 1; }
+          DCB_ORIG_AFTER=$(cat "$DCB_ORIG/.sit/refs/heads/main" | tr -d '\n')
+          test "$DCB_ORIG_AFTER" = "$DCB_ORIG_TIP" || { echo "denyCurrentBranch: origin tip changed despite rejection"; exit 1; }
+          echo "  denyCurrentBranch rejection ok"
+
+          # Detach HEAD on the origin, retry push — must succeed now.
+          cp "$DCB_ORIG/.sit/refs/heads/main" "$DCB_ORIG/.sit/HEAD"
+          DCB_OUT2=$(cd "$DCB_CLONE" && "$GITHUB_WORKSPACE/build/sit" push origin main 2>&1)
+          echo "  detached-HEAD push: $DCB_OUT2"
+          echo "$DCB_OUT2" | grep -q "pushed main" || { echo "detached-HEAD push should succeed: $DCB_OUT2"; exit 1; }
+
+          echo "ssh clone + CVE-2017-1000117 defense + denyCurrentBranch smoke ok"
 
       - name: Smoke — diff -U<N> context width (v0.8.1)
         # cmd_diff and cmd_show parse -U<N> and thread the context
@@ -398,6 +441,11 @@ jobs:
           export SIT_AUTHOR_EMAIL="ci@example.com"
           ORIG=$(mktemp -d)
           (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" init && echo hello > a && "$GITHUB_WORKSPACE/build/sit" add a && "$GITHUB_WORKSPACE/build/sit" commit -m "origin-root")
+          # v0.8.4: detach ORIG's HEAD so subsequent pushes-to-main aren't
+          # caught by denyCurrentBranch. A "real" server-shaped remote
+          # would either be bare or have a non-current branch checked
+          # out; detached HEAD is the simplest stand-in for both.
+          cp "$ORIG/.sit/refs/heads/main" "$ORIG/.sit/HEAD"
 
           # 1) clone picks up origin's single commit
           # mktemp -d returns absolute paths, so --force-absolute is required (S-23)

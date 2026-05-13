@@ -893,9 +893,11 @@ fn ssh_remote_push_object(h, hex, ty, compressed, clen) {
 # POST a single ref's new tip via /sit/v1/refs/<refname>. Body is the
 # 64-hex hash + LF. Server FF-gates refs/heads/* via is_ancestor_in_db,
 # treats refs/tags/* as immutable, refuses refs/remotes/* always (per
-# v0.7.6). Return convention matches http_remote_push_ref:
+# v0.7.6), and (v0.8.4) refuses updates to its own checked-out branch
+# with 423 Locked. Return convention matches http_remote_push_ref:
 #   0  — success (HTTP 200)
 #   1  — non-FF rejection (HTTP 409 Conflict)
+#   2  — denyCurrentBranch (HTTP 423 Locked) — v0.8.4
 #   -1 — any other failure (400, 401, 5xx, transport)
 fn ssh_remote_push_ref(h, refname, hex) {
     if (refname_valid(refname) == 0) { return 0 - 1; }
@@ -916,5 +918,6 @@ fn ssh_remote_push_ref(h, refname, hex) {
     if (status < 0) { return 0 - 1; }
     if (status == 200) { return 0; }
     if (status == 409) { return 1; }
+    if (status == 423) { return 2; }
     return 0 - 1;
 }

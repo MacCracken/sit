@@ -4,6 +4,53 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.4] — 2026-05-13 — `denyCurrentBranch` default refuse + HTTPS/mTLS slots blocked upstream
+
+**Closes the v0.7.6 documented footgun.** Pushes to a remote whose `HEAD` is the same branch are now refused by default — mirrors git's `receive.denyCurrentBranch=refuse`. Previously, `sit push` silently advanced the remote's `refs/heads/<branch>` while leaving its working tree stale, surprising whoever was editing on the remote side. **All three transports** (file://, http://, ssh://) gate the same way.
+
+**Upstream block surfaced for HTTPS/mTLS.** Verified during v0.8.4 prep: sandhi's `tls_policy/` is libssl-via-fdlopen at the transport layer (composes `lib/tls.cyr`'s FFI bridge); consuming it from sit would punch [ADR 0007](docs/adr/0007-network-transport-security.md)'s no-libssl wall. Filed upstream at [`docs/development/issues/2026-05-13-sandhi-first-party-tls-surface-needed.md`](docs/development/issues/2026-05-13-sandhi-first-party-tls-surface-needed.md). v0.8.4 and v0.8.5 slots (originally HTTPS + mTLS) re-targeted to `denyCurrentBranch` + `sit fsck` reachability; HTTPS/mTLS slot in when the upstream gate clears.
+
+### Added
+
+- **Server-side `denyCurrentBranch` check** in `src/serve.cyr`'s `serve_handle_put_ref` (right after the namespace check, before the FF gate). When the incoming refname matches the server's checked-out HEAD branch (read via `read_head_ref_path`) AND the ref already exists (so it's not an initial push to an empty remote), respond `423 Locked` with body `"refusing to update checked-out branch (denyCurrentBranch)"`. 423 distinguishes this from 409 Conflict (non-FF) on the wire so the client can surface the right error.
+- **`_remote_current_branch(repo_path)`** helper in `src/wire.cyr` — reads `<repo_path>/.sit/HEAD`, returns the branch name if it's a symbolic ref ("ref: refs/heads/<name>"), or 0 for detached HEAD / unreadable. Used by the file:// push path to enforce the same denyCurrentBranch gate as the http:// / ssh:// path.
+- **CI smoke step extension** in the SSH smoke block: build a SECOND origin with HEAD attached to main + an initial commit; clone, second commit, push — assert REJECTED with the `denyCurrentBranch` message and origin's ref unchanged. Then detach HEAD on origin and assert the same push now succeeds.
+- **Cross-repo issue** at `docs/development/issues/2026-05-13-sandhi-first-party-tls-surface-needed.md` documenting the HTTPS/mTLS upstream block — sandhi's `tls_policy` wraps libssl-via-fdlopen (verified against sandhi 1.3.4 + cyrius 5.11.34); sit can't consume it without violating ADR 0007. Three proposed fixes (cyrius `lib/tls.cyr` becomes first-party; sandhi grows a parallel native surface; ADR 0007 amendment). User carries upstream.
+
+### Changed
+
+- **`http_remote_push_ref` / `ssh_remote_push_ref` return convention**: gained a third success code:
+  - `0` — HTTP 200 (success)
+  - `1` — HTTP 409 (non-fast-forward)
+  - `2` — HTTP 423 (denyCurrentBranch) — **new in v0.8.4**
+  - `-1` — any other failure
+- **`_do_push_http` / `_do_push_ssh`** surface the new return code as a distinct user-visible message:
+  - `1` → `"sit: server rejected ref update (non-fast-forward)"`
+  - `2` → `"sit: server refuses to update its checked-out branch (denyCurrentBranch)"`
+  - other → `"sit: server rejected ref update"`
+- **File:// push path** (`cmd_push` else-arm) gains the same `denyCurrentBranch` check before the FF check; emits the user-facing message `"sit: remote refuses to update its checked-out branch (denyCurrentBranch)"`.
+- **CI smoke: file:// wire smoke, ssh:// smoke, http:// push smoke** all detach ORIG's HEAD right after setup (`cp .sit/refs/heads/main .sit/HEAD`) so the existing assertions that push to main still succeed. A "real server-shaped remote" is either bare or has a non-current branch checked out; detached HEAD is the simplest stand-in for both.
+- **Capabilities banner version literal** (`src/serve.cyr:87`) bumped `0.8.3` → `0.8.4`.
+
+### Fixed
+
+- **v0.7.6 documented footgun**: `sit push` no longer silently advances a remote's `refs/heads/<branch>` while leaving its working tree stale. Push to a checked-out branch fails loudly at the server with a clear error; the operator either detaches HEAD on the remote, points HEAD at a different branch, or accepts the rejection. Initial pushes to an empty remote (no ref file yet) still succeed, matching git's behavior.
+
+### Sit-side impact
+
+- Build: clean. DCE binary 1.36 MB (essentially flat from v0.8.3 — denyCurrentBranch is ~25 lines server-side + ~30 lines in wire.cyr's file:// arm + the helper).
+- Tests: 127/127 pass. Lint clean. Fuzz: 6 harnesses, all `fuzz: no crashes`.
+- End-to-end verified locally across all three transports:
+  - file:// push to checked-out branch → REJECTED with denyCurrentBranch message
+  - ssh:// push to checked-out branch → REJECTED (different message body, same outcome)
+  - Detached-HEAD origin → push succeeds
+  - Empty remote with HEAD on main → initial push succeeds (bypass)
+- Known-footgun-tracked: this is the first item from the v0.7.6 "Known footguns" list to land a fix.
+
+### Cross-repo issue filed (carry upstream)
+
+- [`docs/development/issues/2026-05-13-sandhi-first-party-tls-surface-needed.md`](docs/development/issues/2026-05-13-sandhi-first-party-tls-surface-needed.md) — High severity. Blocks sit's HTTPS (was v0.8.4) and mTLS (was v0.8.5) roadmap slots. Sandhi's `tls_policy/` wraps stdlib `lib/tls.cyr` which is libssl-via-fdlopen; ADR 0007 forbids consumption. Three fix paths documented; preference: cyrius `lib/tls.cyr` becomes first-party Cyrius.
+
 ## [0.8.3] — 2026-05-13 — Push over SSH
 
 **Closes the v0.8.2 read-only gap.** `sit push origin main` works over `ssh://` URLs:

@@ -1032,6 +1032,7 @@ fn http_remote_push_ref(h, refname, hex) {
     _wire_http_response_free(&quad);
     if (status == 200) { return 0; }
     if (status == 409) { return 1; }
+    if (status == 423) { return 2; }            # v0.8.4 denyCurrentBranch
     return 0 - 1;
 }
 
