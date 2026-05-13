@@ -4,6 +4,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-05-13 — SSH transport (`ssh://`), read-only
+
+**Closes ADR 0007's encrypted-over-internet gap on the read side.** Sit clones and fetches over `ssh://` work end-to-end:
+
+```sh
+sit clone ssh://user@host/path/to/repo
+sit fetch origin   # if origin was added with an ssh:// URL
+```
+
+SSH owns the encryption + auth handshake; sit's wire is the same HTTP/1.1 it speaks over TCP, riding the SSH-managed stdin/stdout pipes. Process boundary, not FFI — sit consumes the `ssh` binary, no crypto in sit's address space, no library link. Matches git's `ssh://` design. Push over SSH lands in v0.8.3+ — it mirrors the v0.7.6 HTTP push pipeline but over the persistent stdio session.
+
+### Added
+
+- **`sit serve --stdio`** mode in `src/serve.cyr` (~80 lines). Reads HTTP/1.1 requests from STDIN, writes responses to STDOUT, no TCP socket. Pipelining-safe via `_stdio_recv_request` — preserves any trailing bytes from request N that belong to request N+1 (memcpy carryover to front of buffer, parse on next iteration). Reuses sandhi's `sandhi_server_recv_request` / `sandhi_server_send_response` directly since `sock_send` / `sock_recv` are just `sys_write` / `sys_read` (see `lib/net.cyr`) — they work unchanged on pipe fds.
+- **`src/wire_ssh.cyr`** (~530 lines). Spawns `ssh user@host -- sit serve <repo-path> --stdio` via raw `sys_execve` (after walking `$PATH` to find ssh's absolute path; raw execve has no PATH lookup). Bidirectional pipes via `sys_pipe` × 2. Public surface mirrors `wire_http.cyr`'s shape: `wire_ssh_open`, `wire_ssh_close`, `ssh_remote_read_refs`, `ssh_remote_resolve_branch`, `ssh_remote_read_raw`, `ssh_remote_read_both`. Capabilities probe at open time surfaces ssh-config / auth failures as clean errors rather than mid-clone confusion.
+- **`obj_src` extension**: `OBJ_SRC_SSH = 2` tag + `obj_src_for_ssh(handle)` constructor; `obj_src_read_raw` / `obj_src_read_both` dispatch to the SSH path. `walk_reachable_*` and `copy_objects` are transport-agnostic — the same code paths that handled file:// and http:// now handle ssh:// without modification.
+- **`do_fetch` SSH branch**: third arm alongside file:// and http://. Calls `wire_ssh_open(url)` → `ssh_remote_resolve_branch(handle, branch)` → fold into `obj_src_for_ssh` → standard walk + copy. Closes `wire_ssh_close(ssh_handle)` on every exit path.
+- **[ADR 0008 — SSH transport: process boundary, not FFI](docs/adr/0008-ssh-transport.md)**: documents the architecture choice (fork+exec on the system's `ssh`, not libssh-link), the CVE-2017-1000117 three-layer defense, the env-curation rationale (only `HOME` / `USER` / `LOGNAME` / `SSH_AUTH_SOCK` / `TERM` / `PATH` cross the trust boundary), the SSH-handshake-amortization via one-session-many-requests, and the four rejected alternatives (libssh2 link, native Cyrius SSH, libssh-via-fdlopen, no-SSH-just-wait-for-HTTPS).
+- **CI `Smoke — ssh clone (v0.8.2)` step** in `.github/workflows/ci.yml`. Stands up a loopback `sshd` on `127.0.0.1:22422` with a passphrase-less ed25519 key, exposes the built `sit` binary on `/usr/local/bin/sit`, configures the client's `~/.ssh/config` for the `sit-test` host alias, runs `sit clone ssh://sit-test<repo-path>`, asserts content matches and `sit fsck` is clean. Plus: asserts `sit clone ssh://-oProxyCommand=touch+/tmp/PWNED/host/repo` exits non-zero before any exec and `/tmp/PWNED` is never created (CVE-2017-1000117 defense).
+- **`fuzz_ssh_url_parser` harness** in `tests/sit.fcyr` (100,000 rounds). Drives pseudo-random bytes through `_ssh_parse_url`. Exercises leading-dash rejection (CVE-2017-1000117 class), the user@host `@` separator, the host:port colon detection, and general malformed-input survival. Clean — no crashes / OOB reads / infinite loops.
+
+### Changed
+
+- **CVE-2017-1000117 three-layer defense.** (1) `remote_url_valid` (v0.7.1) whitelists URL body characters; (2) `_ssh_parse_url` (new in v0.8.2) explicitly rejects any user / host / first-path-segment component starting with `-`; (3) the spawned `ssh` argv includes the `--` sentinel between flags and positional args, so even a hypothetical leading-dash byte slipping through both prior layers couldn't be interpreted as an ssh option. `sys_execve` builds argv from explicit elements with no shell interpolation — no path for metacharacter injection either.
+- **`wire_transport_check_readable`** accepts `URL_SCHEME_SSH` (was rejected with `"requires sit 0.7.8+"` pointer). **`wire_transport_check_writable`** still rejects SSH with `"push over ssh requires sit 0.8.3+ (read-only ssh is available now)"` — push over SSH is the next slot.
+- **Capabilities banner version literal** (`src/serve.cyr:87`) bumped `0.7.6` → `0.8.2`. Still hardcoded; tracked as a closeout-time check until a derive-from-VERSION mechanism lands.
+
+### Sit-side impact
+
+- Build: clean on `cyrius build src/main.cyr build/sit`; DCE binary **1.36 MB** x86_64, up from v0.8.1's 1.30 MB. Growth concentrated in `src/wire_ssh.cyr` (~530 lines) + the `--stdio` dispatch in `serve.cyr` (~80 lines).
+- Tests: 127/127 pass. Lint clean. Fuzz: 6 harnesses (added `ssh_url_parser`), all `fuzz: no crashes`.
+- End-to-end smoke verified locally: `sit clone ssh://localhost/tmp/<fixture>` succeeds, `cat <clone>/a.txt` returns the seed repo's content, `sit fsck` clean (0 bad), 3 objects copied over a single ssh session.
+
+### Downstream
+
+- Owl's `src/vcs.cyr` library-call swap (the v0.8.1 work) continues to work unchanged — `sit_diff_path` is repo-local; SSH only affects clone/fetch.
+- Sit consumers that want encrypted-over-internet clones can now use `ssh://` URLs everywhere `http://` worked before, with no sit-side config changes. Identity selection happens via `~/.ssh/config` (`IdentityFile` / `IdentitiesOnly`) — standard ssh ergonomics.
+
+### Out of scope (queued for v0.8.3+)
+
+- **Push over SSH** — same pipeline as the v0.7.6 HTTP push but layered onto the persistent stdio session. Server-side `_serve_run_stdio` already handles POST methods via the existing dispatch.
+- **`/sit/v1/want` batching over SSH** — `obj_src_batch_prefetch` is a no-op for `OBJ_SRC_SSH` today. The win is smaller over SSH (no per-request handshake) but still real on high-RTT links; queued.
+- **mTLS** — depends on first-party Cyrius TLS in sandhi, blocked at the sandhi level for now.
+
+### Known footguns (tracked)
+
+- **Capabilities-version literal drift**: `src/serve.cyr:87`'s `"sit":"0.8.2"` is bumped by hand each release. Closeout pass before tag asserts the literal matches `VERSION`. A future cleanup release (likely alongside an automation pass) wires this to the version constant.
+- **Remote PATH dependency**: the SSH client invokes `sit` on the remote without a path. Production consumers need `sit` on the remote shell's non-interactive PATH (just like git users need `git-upload-pack`). The CI smoke uses `/usr/local/bin/sit` symlink; documented in ADR 0008 and the SSH troubleshooting guide.
+
 ## [0.8.1] — 2026-05-13 — Library export (`dist/sit.cyr`) + diff primitive cleanup (owl-blocker resolved)
 
 **Closes owl's library-call swap precondition.** Sit is now consumable as a Cyrius dep:

@@ -136,6 +136,37 @@ fn fuzz_want_frame_decoder(rounds) {
     return 0;
 }
 
+# Drive pseudo-random bytes through _ssh_parse_url. The parser is the
+# load-bearing CVE-2017-1000117 defense (rejects user / host / path
+# components starting with `-`). Verifies the parser survives malformed
+# input without OOB-reads or infinite loops — every byte sequence
+# either returns a parsed handle or 0. Particularly exercises the
+# leading-dash rejection, the user@host @-separator, and host:port
+# colon detection.
+fn fuzz_ssh_url_parser(rounds) {
+    var buf_cap = 256;
+    var input = alloc(buf_cap + 1);
+    memcpy(input, "ssh://", 6);
+    var u_cell = alloc(8);
+    var h_cell = alloc(8);
+    var p_cell = alloc(8);
+    var path_cell = alloc(8);
+    var seed = 0x55534831;
+    var i = 0;
+    while (i < rounds) {
+        var size = (seed & 0xFF) + 6;
+        if (size > buf_cap) { size = buf_cap; }
+        fill_pseudo_random(input + 6, size - 6, seed);
+        store8(input + size, 0);
+        store64(u_cell, 0); store64(h_cell, 0);
+        store64(p_cell, 0); store64(path_cell, 0);
+        _ssh_parse_url(input, u_cell, h_cell, p_cell, path_cell);
+        seed = seed * 1664525 + 1013904223;
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn main() {
     alloc_init();
     println("fuzz: zlib_decompress (10000 rounds)");
@@ -146,6 +177,8 @@ fn main() {
     if (fuzz_hex_decode(10000) != 0) { return 1; }
     println("fuzz: url_validators (10000 rounds)");
     if (fuzz_url_validators(10000) != 0) { return 1; }
+    println("fuzz: ssh_url_parser (100000 rounds)");
+    if (fuzz_ssh_url_parser(100000) != 0) { return 1; }
     println("fuzz: want_frame_decoder (10000000 rounds)");
     if (fuzz_want_frame_decoder(10000000) != 0) { return 1; }
     println("fuzz: no crashes");

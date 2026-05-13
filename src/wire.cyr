@@ -15,9 +15,10 @@ fn remote_url(name) {
     return config_get(key);
 }
 
-# Transport dispatch — split into read / write since http unlocks
-# in two separate v0.7.x patches: read in 0.7.3 (fetch/clone),
-# write in 0.7.5 (push). https + ssh are still gated everywhere.
+# Transport dispatch — split into read / write since http unlocks in
+# two separate v0.7.x patches: read in 0.7.3 (fetch/clone), write in
+# 0.7.6 (push). SSH unlocks read-side in v0.8.2; SSH push lands in a
+# follow-on. HTTPS is blocked on first-party Cyrius TLS (ADR 0007).
 # Caller pattern:
 #   if (wire_transport_check_readable(url) != 0) { return 1; }
 #   if (wire_transport_check_writable(url) != 0) { return 1; }
@@ -26,14 +27,12 @@ fn wire_transport_check_readable(url) {
     var s = url_scheme(url);
     if (s == URL_SCHEME_FILE) { return 0; }
     if (s == URL_SCHEME_HTTP) { return 0; }   # v0.7.3
+    if (s == URL_SCHEME_SSH)  { return 0; }   # v0.8.2
     if (s == URL_SCHEME_HTTPS) {
-        # Per ADR 0007: HTTPS is not in the v0.7.x roadmap. No libssl,
-        # no libcrypto, no exception.
+        # Per ADR 0007: HTTPS is not in the v0.7.x / v0.8.x near-term
+        # roadmap. No libssl, no libcrypto, no exception. First-party
+        # Cyrius TLS via sandhi unblocks in v0.8.3+.
         eprintln("sit: https transport requires first-party Cyrius TLS (see ADR 0007)");
-        return 1;
-    }
-    if (s == URL_SCHEME_SSH) {
-        eprintln("sit: ssh transport requires sit 0.7.8+");
         return 1;
     }
     eprintln("sit: unrecognized URL scheme");
@@ -45,14 +44,15 @@ fn wire_transport_check_writable(url) {
     if (s == URL_SCHEME_FILE) { return 0; }
     if (s == URL_SCHEME_HTTP) { return 0; }   # v0.7.6
     if (s == URL_SCHEME_HTTPS) {
-        # Per ADR 0007: HTTPS is not in the v0.7.x roadmap. No libssl,
-        # no libcrypto, no exception. Until a first-party Cyrius TLS
-        # exists, sit's encrypted-over-internet path is SSH (v0.7.8).
+        # Per ADR 0007: HTTPS is not in the near-term roadmap.
         eprintln("sit: https transport requires first-party Cyrius TLS (see ADR 0007)");
         return 1;
     }
     if (s == URL_SCHEME_SSH) {
-        eprintln("sit: ssh transport requires sit 0.7.8+");
+        # v0.8.2 ships read-only SSH (clone/fetch). Push over SSH
+        # follows in v0.8.2.x — mirror of the v0.7.6 HTTP push pipeline
+        # but layered onto the persistent stdio session.
+        eprintln("sit: push over ssh requires sit 0.8.3+ (read-only ssh is available now)");
         return 1;
     }
     eprintln("sit: unrecognized URL scheme");
@@ -273,6 +273,7 @@ fn db_object_insert_raw(db, hex, type_code, compressed, clen) {
 
 var OBJ_SRC_DB = 0;
 var OBJ_SRC_HTTP = 1;
+var OBJ_SRC_SSH = 2;
 
 fn obj_src_for_db(db) {
     var s = alloc(16);
@@ -288,6 +289,13 @@ fn obj_src_for_http(handle) {
     return s;
 }
 
+fn obj_src_for_ssh(handle) {
+    var s = alloc(16);
+    store64(s, OBJ_SRC_SSH);
+    store64(s + 8, handle);
+    return s;
+}
+
 fn obj_src_kind(s) { return load64(s); }
 fn obj_src_payload(s) { return load64(s + 8); }
 
@@ -295,6 +303,7 @@ fn obj_src_read_raw(src, hex, raw_out) {
     var k = obj_src_kind(src);
     if (k == OBJ_SRC_DB)   { return db_object_read_raw(obj_src_payload(src), hex, raw_out); }
     if (k == OBJ_SRC_HTTP) { return http_remote_read_raw(obj_src_payload(src), hex, raw_out); }
+    if (k == OBJ_SRC_SSH)  { return ssh_remote_read_raw(obj_src_payload(src), hex, raw_out); }
     return 0 - 99;
 }
 
@@ -302,6 +311,7 @@ fn obj_src_read_both(src, hex, raw_out, deco_out) {
     var k = obj_src_kind(src);
     if (k == OBJ_SRC_DB)   { return db_object_read_both(obj_src_payload(src), hex, raw_out, deco_out); }
     if (k == OBJ_SRC_HTTP) { return http_remote_read_both(obj_src_payload(src), hex, raw_out, deco_out); }
+    if (k == OBJ_SRC_SSH)  { return ssh_remote_read_both(obj_src_payload(src), hex, raw_out, deco_out); }
     return 0 - 99;
 }
 
@@ -866,6 +876,7 @@ fn do_fetch(name, branch) {
     var src = 0;
     var src_db_local = 0;
     var http_handle = 0;
+    var ssh_handle = 0;
     var remote_tip = 0;
 
     if (s == URL_SCHEME_FILE) {
@@ -883,17 +894,33 @@ fn do_fetch(name, branch) {
         src = obj_src_for_db(src_db_local);
     }
     else {
-        # URL_SCHEME_HTTP — the readable-check already gated everything
-        # else (remote_url_valid + scheme dispatch).
-        http_handle = wire_http_open(url);
-        if (http_handle == 0) { return 0; }
-        remote_tip = http_remote_resolve_branch(http_handle, branch);
-        if (remote_tip == 0) {
-            wire_http_close(http_handle);
-            eprintln("sit: remote has no such branch");
-            return 0;
+        if (s == URL_SCHEME_HTTP) {
+            http_handle = wire_http_open(url);
+            if (http_handle == 0) { return 0; }
+            remote_tip = http_remote_resolve_branch(http_handle, branch);
+            if (remote_tip == 0) {
+                wire_http_close(http_handle);
+                eprintln("sit: remote has no such branch");
+                return 0;
+            }
+            src = obj_src_for_http(http_handle);
         }
-        src = obj_src_for_http(http_handle);
+        else {
+            # URL_SCHEME_SSH — spawns `ssh user@host -- sit serve <path>
+            # --stdio` and tunnels the same HTTP/1.1 wire over the
+            # SSH-managed stdin/stdout. v0.8.2 read-only; push lives
+            # in v0.8.3+. The readable-check already gated everything
+            # else upstream.
+            ssh_handle = wire_ssh_open(url);
+            if (ssh_handle == 0) { return 0; }
+            remote_tip = ssh_remote_resolve_branch(ssh_handle, branch);
+            if (remote_tip == 0) {
+                wire_ssh_close(ssh_handle);
+                eprintln("sit: remote has no such branch");
+                return 0;
+            }
+            src = obj_src_for_ssh(ssh_handle);
+        }
     }
 
     var seen = map_new();
@@ -916,6 +943,7 @@ fn do_fetch(name, branch) {
 
     if (src_db_local != 0) { patra_close(src_db_local); }
     if (http_handle != 0)  { wire_http_close(http_handle); }
+    if (ssh_handle != 0)   { wire_ssh_close(ssh_handle); }
 
     # S-16: a write_remote_tracking failure leaves origin/<branch> stale,
     # which silently desyncs subsequent fetches (FF logic compares against
