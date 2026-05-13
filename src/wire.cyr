@@ -43,16 +43,10 @@ fn wire_transport_check_writable(url) {
     var s = url_scheme(url);
     if (s == URL_SCHEME_FILE) { return 0; }
     if (s == URL_SCHEME_HTTP) { return 0; }   # v0.7.6
+    if (s == URL_SCHEME_SSH)  { return 0; }   # v0.8.3
     if (s == URL_SCHEME_HTTPS) {
         # Per ADR 0007: HTTPS is not in the near-term roadmap.
         eprintln("sit: https transport requires first-party Cyrius TLS (see ADR 0007)");
-        return 1;
-    }
-    if (s == URL_SCHEME_SSH) {
-        # v0.8.2 ships read-only SSH (clone/fetch). Push over SSH
-        # follows in v0.8.2.x — mirror of the v0.7.6 HTTP push pipeline
-        # but layered onto the persistent stdio session.
-        eprintln("sit: push over ssh requires sit 0.8.3+ (read-only ssh is available now)");
         return 1;
     }
     eprintln("sit: unrecognized URL scheme");
@@ -1272,6 +1266,9 @@ fn cmd_push() {
     if (s == URL_SCHEME_HTTP) {
         return _do_push_http(name, branch, url, src_db, local_tip);
     }
+    if (s == URL_SCHEME_SSH) {
+        return _do_push_ssh(name, branch, url, src_db, local_tip);
+    }
 
     # File:// + bare path push (the v0.7.5-and-prior path).
     var repo_path = remote_normalize(url);
@@ -1443,6 +1440,107 @@ fn _print_push_summary(branch, name, local_tip, copied) {
     stdout_write(" (", 2);
     stdout_write(&nbuf, d);
     stdout_write(" new objects)\n", 14);
+    return 0;
+}
+
+# v0.8.3 push over ssh. Same pipeline as _do_push_http but layered
+# onto v0.8.2's persistent stdio session — wire_ssh_open spawns
+# `ssh user@host -- sit serve <repo> --stdio` once and pipelines
+# capabilities / refs / per-object POST / ref POST through the
+# single SSH-encrypted pipe.
+#
+# Bearer auth: skipped in v0.8.3. SSH already authenticates the
+# user end-to-end via key exchange + authorized_keys, so an extra
+# server-side `--require-auth` token doesn't add a meaningful
+# trust boundary for the canonical case. _ssh_handle_auth_token
+# returns 0 today; if a v0.8.3.x patch wires belt-and-suspenders
+# auth, _wire_ssh_post_xhdr will inject Authorization headers as
+# soon as the handle has a token loaded — no caller-side change.
+fn _do_push_ssh(name, branch, url, src_db, local_tip) {
+    var sh = wire_ssh_open(url);
+    if (sh == 0) { return 1; }
+
+    # FF preflight via /sit/v1/refs over the same SSH pipe.
+    # resolve_branch returns 0 if the branch doesn't exist on the
+    # remote (initial push).
+    var remote_tip = ssh_remote_resolve_branch(sh, branch);
+    if (remote_tip != 0) {
+        if (is_ancestor_in_db(src_db, remote_tip, local_tip) == 0) {
+            wire_ssh_close(sh);
+            eprintln("sit: non-fast-forward push rejected (remote has diverged)");
+            return 1;
+        }
+        if (streq(remote_tip, local_tip) == 1) {
+            wire_ssh_close(sh);
+            stdout_write("everything up-to-date\n", 22);
+            return 0;
+        }
+    }
+
+    # Walk reachable objects from local_tip — source is local
+    # (OBJ_SRC_DB), so phased's batch hooks are no-ops.
+    var seen = map_new();
+    var hashes = vec_new();
+    var raw_cache = map_new();
+    var src = obj_src_for_db(src_db);
+    walk_reachable_phased(src, local_tip, hashes, seen, raw_cache);
+
+    var n = vec_len(hashes);
+    var i = 0;
+    var pushed = 0;
+    while (i < n) {
+        var hex = vec_get(hashes, i);
+        var raw[24];
+        var got = 0;
+        if (raw_cache != 0) {
+            var cached = map_get(raw_cache, hex);
+            if (cached != 0) {
+                memcpy(&raw, cached, 24);
+                got = 1;
+            }
+        }
+        if (got == 0) {
+            if (db_object_read_raw(src_db, hex, &raw) == 0) { got = 1; }
+        }
+        if (got == 0) {
+            wire_ssh_close(sh);
+            eprintln("sit: failed to read local object during push");
+            return 1;
+        }
+        var compressed = load64(&raw);
+        var clen = load64(&raw + 8);
+        var ty = load64(&raw + 16);
+        # rc: 1 = newly inserted (201), 0 = already present (200),
+        # -1 = server rejected. Count only fresh inserts.
+        var rc = ssh_remote_push_object(sh, hex, ty, compressed, clen);
+        if (rc < 0) {
+            wire_ssh_close(sh);
+            eprintln("sit: server rejected object during push");
+            return 1;
+        }
+        if (rc == 1) { pushed = pushed + 1; }
+        i = i + 1;
+    }
+
+    # Update the ref. Same shape as HTTP push — refs/heads/<branch>
+    # only; refs/tags/* and refs/remotes/* are server-side gated.
+    var bl = strlen(branch);
+    var rname = alloc(11 + bl + 1);
+    memcpy(rname, "refs/heads/", 11);
+    memcpy(rname + 11, branch, bl);
+    store8(rname + 11 + bl, 0);
+    var ref_rc = ssh_remote_push_ref(sh, rname, local_tip);
+    wire_ssh_close(sh);
+    if (ref_rc == 1) {
+        eprintln("sit: server rejected ref update (non-fast-forward)");
+        return 1;
+    }
+    if (ref_rc != 0) {
+        eprintln("sit: server rejected ref update");
+        return 1;
+    }
+
+    _print_push_summary(branch, name, local_tip, pushed);
     return 0;
 }
 

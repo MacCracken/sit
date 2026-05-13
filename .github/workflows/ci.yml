@@ -275,6 +275,45 @@ jobs:
           test "$(head -1 $CLONE/a.txt)" = "hello" || { echo "ssh clone content wrong:"; cat "$CLONE/a.txt"; exit 1; }
           (cd "$CLONE" && "$GITHUB_WORKSPACE/build/sit" fsck) | grep -q "0 bad" || { echo "ssh clone fsck failed"; exit 1; }
 
+          # ── Push via ssh:// (v0.8.3) ─────────────────────────────────
+          # Add a second commit in the clone, push back over the same
+          # ssh:// remote, assert origin advances and the new commit
+          # appears in origin's log.
+          (cd "$CLONE" && \
+            echo "second-line" >> a.txt && \
+            "$GITHUB_WORKSPACE/build/sit" add a.txt && \
+            "$GITHUB_WORKSPACE/build/sit" commit -m "ssh-push-second")
+          CLONE_TIP=$(cd "$CLONE" && "$GITHUB_WORKSPACE/build/sit" log | awk '/^commit /{print $2; exit}')
+          PUSH_OUT=$(cd "$CLONE" && "$GITHUB_WORKSPACE/build/sit" push origin main 2>&1)
+          echo "  push: $PUSH_OUT"
+          ORIG_TIP=$(cat "$ORIG/.sit/refs/heads/main" | tr -d '\n')
+          test "$CLONE_TIP" = "$ORIG_TIP" || { echo "origin tip mismatch after ssh push: clone=$CLONE_TIP orig=$ORIG_TIP"; exit 1; }
+          (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" log --oneline | wc -l) | grep -qx "2" || { echo "expected 2 commits on origin after ssh push"; exit 1; }
+
+          # Re-push with no new commits → "everything up-to-date".
+          RE_PUSH_OUT=$(cd "$CLONE" && "$GITHUB_WORKSPACE/build/sit" push origin main 2>&1)
+          echo "  re-push: $RE_PUSH_OUT"
+          echo "$RE_PUSH_OUT" | grep -q "everything up-to-date" || { echo "expected up-to-date on re-push"; exit 1; }
+
+          # Non-FF rejection: rewind the clone's ref to the parent and
+          # commit a divergent change. Push must fail with the
+          # non-fast-forward error and leave origin's ref intact.
+          PARENT=$(cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" log | grep '^commit ' | tail -1 | awk '{print $2}')
+          (cd "$CLONE" && \
+            echo "$PARENT" > .sit/refs/heads/main && \
+            echo "divergent" > b.txt && \
+            "$GITHUB_WORKSPACE/build/sit" add b.txt && \
+            "$GITHUB_WORKSPACE/build/sit" commit -m "ssh-push-divergent")
+          set +e
+          NONFF_OUT=$(cd "$CLONE" && "$GITHUB_WORKSPACE/build/sit" push origin main 2>&1)
+          NONFF_RC=$?
+          set -e
+          test "$NONFF_RC" -ne 0 || { echo "expected non-FF push to fail"; echo "$NONFF_OUT"; exit 1; }
+          echo "$NONFF_OUT" | grep -q "non-fast-forward" || { echo "expected non-FF error message"; echo "$NONFF_OUT"; exit 1; }
+          ORIG_AFTER=$(cat "$ORIG/.sit/refs/heads/main" | tr -d '\n')
+          test "$ORIG_AFTER" = "$ORIG_TIP" || { echo "origin tip changed despite rejection: was=$ORIG_TIP now=$ORIG_AFTER"; exit 1; }
+          echo "  non-FF rejection ok (origin tip unchanged)"
+
           # ── CVE-2017-1000117 class: leading-dash hostname rejected ───
           # Must fail BEFORE any exec; no /tmp/PWNED side-effect, no
           # ssh invocation. `set +e` so we can capture the rc; otherwise

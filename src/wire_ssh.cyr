@@ -46,6 +46,16 @@ fn _ssh_set_read_fd(h, v)     { store64(h + 16, v); }
 fn _ssh_set_batch_known(h, v) { store64(h + 24, v); }
 fn _ssh_set_carry(h, v)       { store64(h + 32, v); }
 
+# v0.8.3: bearer-token slot reserved but always 0 in this release.
+# SSH authenticates the user end-to-end at session open, so an extra
+# bearer-token on top is redundant for the canonical use case. The
+# accessor exists because _wire_ssh_post_xhdr already mirrors the
+# HTTP shape (which DOES inject bearer auth); leaving the if-token
+# branch DCE-callable now keeps the code reviewable when a v0.8.3.x
+# patch wires up belt-and-suspenders auth (server has --require-auth
+# AND clients must present a bearer over the encrypted SSH channel).
+fn _ssh_handle_auth_token(h) { return 0; }
+
 # ── URL parsing ────────────────────────────────────────────────────
 #
 # ssh://[user@]host[:port]/<repo-path>
@@ -445,7 +455,72 @@ fn _wire_ssh_request(h, sub_path, out_body) {
         eprintln("sit: write to ssh stdin failed");
         return 0 - 1;
     }
+    return _wire_ssh_recv_response(rfd, out_body);
+}
 
+# Send a POST request over the persistent ssh pipe and receive one
+# response. `body` / `body_len` are the request payload (typically a
+# compressed sit object or a ref hex); `extra_hdr` is an optional
+# already-formatted header block (e.g. "X-Sit-Type: 1\r\n") or 0 to
+# omit. The handle's auth_token (if loaded) is injected as
+# "Authorization: Bearer <token>". Returns the HTTP status code; on
+# transport failure returns -1 (caller treats negative as fatal).
+fn _wire_ssh_post_xhdr(h, sub_path, body, body_len, extra_hdr, out_body) {
+    var wfd = _ssh_handle_write_fd(h);
+    var rfd = _ssh_handle_read_fd(h);
+
+    var sp_len = strlen(sub_path);
+    var clen_buf[24];
+    var clen_digits = write_decimal(&clen_buf, body_len);
+    var ehl = 0;
+    if (extra_hdr != 0) { ehl = strlen(extra_hdr); }
+    var token = _ssh_handle_auth_token(h);
+    var tlen = 0;
+    if (token != 0) { tlen = strlen(token); }
+
+    # Header block. Mirrors wire_http.cyr's _wire_http_post_xhdr but
+    # speaks HTTP/1.1 over the persistent ssh pipe (no Connection:
+    # close — that would tell the server to end the session after this
+    # one response, defeating the whole point of pipelining).
+    var hdr_cap = 128 + sp_len + clen_digits + ehl + tlen + 32;
+    var hdr = alloc(hdr_cap);
+    var pos = 0;
+    memcpy(hdr + pos, "POST ", 5); pos = pos + 5;
+    memcpy(hdr + pos, sub_path, sp_len); pos = pos + sp_len;
+    # 78 bytes: " HTTP/1.1\r\nHost: ssh\r\nContent-Type: application/octet-stream\r\nContent-Length: "
+    memcpy(hdr + pos, " HTTP/1.1\r\nHost: ssh\r\nContent-Type: application/octet-stream\r\nContent-Length: ", 78);
+    pos = pos + 78;
+    memcpy(hdr + pos, &clen_buf, clen_digits); pos = pos + clen_digits;
+    memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
+    if (ehl > 0) { memcpy(hdr + pos, extra_hdr, ehl); pos = pos + ehl; }
+    if (token != 0) {
+        memcpy(hdr + pos, "Authorization: Bearer ", 22); pos = pos + 22;
+        memcpy(hdr + pos, token, tlen); pos = pos + tlen;
+        memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
+    }
+    memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
+
+    var sw1 = sock_send(wfd, hdr, pos);
+    if (is_err_result(sw1) == 1) {
+        eprintln("sit: write to ssh stdin failed");
+        return 0 - 1;
+    }
+    if (body_len > 0) {
+        var sw2 = sock_send(wfd, body, body_len);
+        if (is_err_result(sw2) == 1) {
+            eprintln("sit: write of POST body to ssh stdin failed");
+            return 0 - 1;
+        }
+    }
+    return _wire_ssh_recv_response(rfd, out_body);
+}
+
+# Read one HTTP/1.1 response from the ssh stdout pipe and write
+# (body_buf, body_len, x_sit_type) into `out_body`. Returns the HTTP
+# status code on success, -1 on transport failure. Shared between
+# _wire_ssh_request (GET) and _wire_ssh_post_xhdr (POST) so the
+# response-parse logic lives in one place.
+fn _wire_ssh_recv_response(rfd, out_body) {
     # Recv loop with growing fl_alloc buffer. Mirrors wire_http.cyr's
     # shape, but reads from the ssh stdout pipe instead of a socket and
     # stops at the first response boundary (Content-Length satisfied)
@@ -766,4 +841,80 @@ fn ssh_remote_read_raw(h, hex, raw_out) {
 fn ssh_remote_read_both(h, hex, raw_out, deco_out) {
     if (ssh_remote_read_raw(h, hex, raw_out) != 0) { return 0 - 1; }
     return _decompress_raw_into(raw_out, deco_out);
+}
+
+# ── Push helpers (v0.8.3) ──────────────────────────────────────────
+#
+# Same shape as wire_http.cyr's http_remote_push_object /
+# http_remote_push_ref but use the persistent ssh pipe via
+# _wire_ssh_post_xhdr instead of a fresh TCP socket. Server-side
+# handlers (serve_handle_put_object / serve_handle_put_ref) are
+# transport-agnostic — they consume buf+n the same way the GET
+# handlers do, so once the request reaches them over the SSH pipe
+# the existing v0.7.6 rehash-verify + FF-gate logic runs unchanged.
+
+# POST one object's compressed bytes via /sit/v1/objects/<hex>. Server
+# rehashes via sigil before insert (the trust boundary for client →
+# server data per v0.7.6 / ADR 0007 / ADR 0008). Return convention
+# matches http_remote_push_object:
+#   1  — newly inserted (HTTP 201)
+#   0  — already present (HTTP 200, idempotent retry-safe)
+#   -1 — transport error, validation rejection, 401, server 5xx
+fn ssh_remote_push_object(h, hex, ty, compressed, clen) {
+    if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
+    if (ty < 0) { return 0 - 1; }
+    if (ty > 2) { return 0 - 1; }
+    if (clen <= 0) { return 0 - 1; }
+
+    var sub = alloc(16 + 64 + 1);
+    memcpy(sub, "/sit/v1/objects/", 16);
+    memcpy(sub + 16, hex, 64);
+    store8(sub + 16 + 64, 0);
+
+    # X-Sit-Type extra header — same shape the GET handler emits on
+    # the response side; lets the server skip its own type sniff.
+    var ty_buf[24];
+    var ty_digits = write_decimal(&ty_buf, ty);
+    var hdr = alloc(16 + ty_digits + 4);
+    memcpy(hdr, "X-Sit-Type: ", 12);
+    memcpy(hdr + 12, &ty_buf, ty_digits);
+    store8(hdr + 12 + ty_digits, 13);          # \r
+    store8(hdr + 12 + ty_digits + 1, 10);      # \n
+    store8(hdr + 12 + ty_digits + 2, 0);
+
+    var resp[24]; store64(&resp, 0); store64(&resp + 8, 0); store64(&resp + 16, 0);
+    var status = _wire_ssh_post_xhdr(h, sub, compressed, clen, hdr, &resp);
+    if (status < 0) { return 0 - 1; }
+    if (status == 201) { return 1; }
+    if (status == 200) { return 0; }
+    return 0 - 1;
+}
+
+# POST a single ref's new tip via /sit/v1/refs/<refname>. Body is the
+# 64-hex hash + LF. Server FF-gates refs/heads/* via is_ancestor_in_db,
+# treats refs/tags/* as immutable, refuses refs/remotes/* always (per
+# v0.7.6). Return convention matches http_remote_push_ref:
+#   0  — success (HTTP 200)
+#   1  — non-FF rejection (HTTP 409 Conflict)
+#   -1 — any other failure (400, 401, 5xx, transport)
+fn ssh_remote_push_ref(h, refname, hex) {
+    if (refname_valid(refname) == 0) { return 0 - 1; }
+    if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
+
+    var rl = strlen(refname);
+    var sub = alloc(13 + rl + 1);
+    memcpy(sub, "/sit/v1/refs/", 13);
+    memcpy(sub + 13, refname, rl);
+    store8(sub + 13 + rl, 0);
+
+    var body = alloc(65);
+    memcpy(body, hex, 64);
+    store8(body + 64, 10);                     # trailing LF (server tolerant)
+
+    var resp[24]; store64(&resp, 0); store64(&resp + 8, 0); store64(&resp + 16, 0);
+    var status = _wire_ssh_post_xhdr(h, sub, body, 65, 0, &resp);
+    if (status < 0) { return 0 - 1; }
+    if (status == 200) { return 0; }
+    if (status == 409) { return 1; }
+    return 0 - 1;
 }

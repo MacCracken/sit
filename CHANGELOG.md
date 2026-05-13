@@ -4,6 +4,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.3] — 2026-05-13 — Push over SSH
+
+**Closes the v0.8.2 read-only gap.** `sit push origin main` works over `ssh://` URLs:
+
+```sh
+sit clone ssh://user@host/path/to/repo
+# edit, add, commit
+sit push origin main   # ← works as of 0.8.3
+```
+
+Mirrors the v0.7.6 HTTP push pipeline (capabilities probe → FF preflight → walk reachable → per-object POST → ref POST → up-to-date short-circuit), but layered onto v0.8.2's persistent SSH stdio session. One ssh handshake per push, many HTTP/1.1 requests through the same pipe. Server-side handlers (`POST /sit/v1/objects/<hex>` rehash-verify + `POST /sit/v1/refs/<refname>` FF gate, both shipped in v0.7.6) are transport-agnostic — they consume `buf+n` the same way over a TCP socket or the stdio pipe — so the entire trust-boundary story (sigil rehash on every uploaded object, FF gate on every ref update) carries over unchanged from HTTP.
+
+### Added
+
+- **`_wire_ssh_post_xhdr(h, sub_path, body, body_len, extra_hdr, out_body)`** in `src/wire_ssh.cyr`: send a POST request over the persistent ssh pipe with an arbitrary extra header (used for `X-Sit-Type` on object pushes). Speaks HTTP/1.1 with no `Connection: close` — the ssh session lives across requests, so signaling close after each POST would defeat pipelining.
+- **`_wire_ssh_recv_response(rfd, out_body)`** extracted from `_wire_ssh_request` so GET and POST share the response-parse logic in one place (status-line + `\r\n\r\n` body-offset + Content-Length + X-Sit-Type extraction + body-copy).
+- **`ssh_remote_push_object(h, hex, ty, compressed, clen)`**: POST one compressed object via `/sit/v1/objects/<hex>` with the `X-Sit-Type: <ty>\r\n` extra header. Returns `1` for newly-inserted (HTTP 201), `0` for already-present (HTTP 200, idempotent retry-safe), `-1` for any failure. Same shape as `http_remote_push_object`.
+- **`ssh_remote_push_ref(h, refname, hex)`**: POST the new tip via `/sit/v1/refs/<refname>` with body `<64-hex>\n`. Returns `0` for HTTP 200, `1` for HTTP 409 (non-FF conflict), `-1` for any other failure. Same shape as `http_remote_push_ref`.
+- **`_do_push_ssh(name, branch, url, src_db, local_tip)`** in `src/wire.cyr`: full SSH push pipeline. Mirrors `_do_push_http` — capabilities probe (via `wire_ssh_open`) → FF preflight via `ssh_remote_resolve_branch` → walk reachable + raw-cache → per-object POST → ref POST → "everything up-to-date" short-circuit when `remote_tip == local_tip`. Counts only fresh inserts (201) in the summary, not idempotent already-present (200).
+- **`_ssh_handle_auth_token(h)` stub** returning 0. Bearer-auth on top of SSH is reserved for a v0.8.3.x patch — SSH already authenticates the user end-to-end via key exchange + authorized_keys, so an extra server-side `--require-auth` token doesn't add a meaningful trust boundary for the canonical case. `_wire_ssh_post_xhdr` already injects `Authorization: Bearer <token>` headers when the handle has a token loaded; flipping that on is one accessor away.
+- **CI smoke step extended** (`Smoke — ssh clone (v0.8.2)` retitled in spirit): after the v0.8.2 clone + CVE injection assertions, the step now runs a full ssh push round trip — clone, second commit, push, assert origin advances + log shows the new commit. Plus a re-push asserting "everything up-to-date" and a non-FF rejection (rewind clone to parent, divergent commit, push must fail with the non-fast-forward error and leave origin's ref intact).
+
+### Changed
+
+- **`wire_transport_check_writable`** now accepts `URL_SCHEME_SSH`. The v0.8.2 placeholder error (`"push over ssh requires sit 0.8.3+ (read-only ssh is available now)"`) is gone — push over ssh is live.
+- **`cmd_push` URL-scheme dispatch** gains a third arm: `URL_SCHEME_SSH` → `_do_push_ssh`. The HTTP and file:// branches are unchanged.
+- **Capabilities banner version literal** (`src/serve.cyr:87`) bumped `0.8.2` → `0.8.3`. Same closeout-time check until a derive-from-VERSION mechanism lands.
+
+### Fixed
+
+- (none — v0.8.3 is purely additive over v0.8.2.)
+
+### Sit-side impact
+
+- Build: clean. DCE binary 1.36 MB (essentially flat from v0.8.2 — DCE strips the unused `_ssh_handle_auth_token` branch in the post path; `_do_push_ssh` was DCE-reachable from `cmd_push` and added ~140 lines net).
+- Tests: 127/127 pass. Lint clean. Fuzz: 6 harnesses, all `fuzz: no crashes`.
+- End-to-end smoke verified locally: clone → second-commit → push → origin advanced; re-push → "everything up-to-date"; rewind + divergent commit → push fails with non-fast-forward error and origin's ref unchanged.
+
+### Downstream
+
+- Any consumer that wants encrypted-over-internet push can now use `ssh://` everywhere `http://` worked before, without sit-side config. Auth + key selection happens via standard ssh ergonomics (`~/.ssh/config` `IdentityFile` / `IdentitiesOnly`).
+
+### Out of scope (queued for v0.8.4+)
+
+- **HTTPS via sandhi first-party Cyrius TLS** — next slot. Sandhi's TLS arc shipped in v1.3.2+; sit-side wire-up pending a sandhi-consumable surface review (gate prerequisite per ADR 0007: verify it's first-party Cyrius, not a libssl-via-fdlopen shim).
+- **mTLS** — builds on HTTPS in v0.8.4.
+- **Bearer auth over SSH** (belt-and-suspenders) — the `_wire_ssh_post_xhdr` code path already supports it; just needs the handle to learn the token from capabilities + load `~/.sit/serve.token`. Slot whenever a consumer asks.
+- **`/sit/v1/want` batching over SSH** — same `obj_src_batch_prefetch` no-op for `OBJ_SRC_SSH` as in v0.8.2. The win is smaller over SSH (no per-request handshake) but still real on high-RTT links.
+
 ## [0.8.2] — 2026-05-13 — SSH transport (`ssh://`), read-only
 
 **Closes ADR 0007's encrypted-over-internet gap on the read side.** Sit clones and fetches over `ssh://` work end-to-end:
