@@ -32,28 +32,24 @@ jobs:
           echo "Version verified: $TAG (cyrius.cyml pulls from VERSION via \${file:VERSION})"
 
       - name: Install Cyrius toolchain
+        # Modern pattern (sigil / sandhi / 5.11.x consumers): pipe the
+        # upstream install.sh — handles $HOME/.cyrius/versions/$VER/{bin,lib},
+        # flat symlinks, $HOME/.cyrius/current. See ci.yml for rationale.
         run: |
           CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')}"
           echo "Installing Cyrius $CYRIUS_VERSION"
-          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          # Version-pinned layout required by cyrius 5.11.x for stdlib
-          # resolution. See ci.yml install step for the full rationale.
-          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib" "$HOME/.cyrius/versions/$CYRIUS_VERSION/lib"
-          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
-          cp "$CYRIUS_DIR/scripts/cyrius" "$HOME/.cyrius/bin/cyrius" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/versions/$CYRIUS_VERSION/lib/" 2>/dev/null || true
-          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
-          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
-          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="${CYRIUS_VERSION}" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+          echo "CYRIUS_HOME=$HOME/.cyrius" >> "$GITHUB_ENV"
 
       - name: Resolve deps
-        # Stdlib from $HOME/.cyrius/versions/$VER/lib via `cyrius update`;
-        # [deps.X] git crates via `cyrius deps`.
+        # Two-step: cp stdlib from install.sh's $HOME/.cyrius/lib into the
+        # project ./lib/ (where cc5's preprocessor reads from), then add
+        # [deps.X] git crates via `cyrius deps`. See ci.yml for rationale.
         run: |
-          cyrius update
+          mkdir -p lib
+          cp -rL "$HOME/.cyrius/lib/"* lib/
           cyrius deps
 
       - name: Build x86_64

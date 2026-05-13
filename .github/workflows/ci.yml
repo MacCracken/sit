@@ -19,34 +19,33 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Cyrius toolchain
+        # Modern pattern (sigil / sandhi / 5.11.x consumers): pipe the
+        # upstream install.sh which lays out $HOME/.cyrius/versions/$VER/
+        # {bin,lib} plus the flat $HOME/.cyrius/{bin,lib} symlinks and
+        # the $HOME/.cyrius/current pointer. Replaces the previous
+        # hand-rolled extract that landed stdlib at the wrong path for
+        # cyrius 5.11.x's version-pinned resolution.
         run: |
           CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')}"
           echo "Installing Cyrius $CYRIUS_VERSION"
-          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          # Two layouts: flat ($HOME/.cyrius/{bin,lib}) for backward-compat,
-          # and version-pinned ($HOME/.cyrius/versions/$CYRIUS_VERSION/lib)
-          # which is where cyrius 5.11.x looks for stdlib when ./lib/ is
-          # absent. Without the latter, `cyrius update` has no source dir
-          # to pull from and the build fails with "cannot read ./lib/X.cyr".
-          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib" "$HOME/.cyrius/versions/$CYRIUS_VERSION/lib"
-          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
-          cp "$CYRIUS_DIR/scripts/cyrius" "$HOME/.cyrius/bin/cyrius" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/versions/$CYRIUS_VERSION/lib/" 2>/dev/null || true
-          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
-          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
-          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="${CYRIUS_VERSION}" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+          echo "CYRIUS_HOME=$HOME/.cyrius" >> "$GITHUB_ENV"
 
       - name: Resolve dependencies
-        # `cyrius deps` resolves [deps.X] git crates (sakshi/sankoch/sigil/
-        # patra) into lib/. `cyrius update` then populates lib/ from the
-        # version-pinned stdlib snapshot ($HOME/.cyrius/versions/$VER/lib).
-        # Both needed because [deps].stdlib entries aren't git-fetched —
-        # they ship with the toolchain.
+        # Two-step resolution under cyrius 5.11.x:
+        #   1. Stdlib (the [deps].stdlib array) — install.sh laid these out
+        #      at $HOME/.cyrius/versions/$VER/lib/ and symlinked them to
+        #      $HOME/.cyrius/lib. cc5's preprocessor reads from ./lib/
+        #      specifically, so we cp -rL the stdlib into the project lib/.
+        #      `cyrius update` would also work but is fragile across CI
+        #      $HOME shapes; the direct cp is exactly what the build needs.
+        #   2. `cyrius deps` resolves [deps.X] git crates (sakshi/sankoch/
+        #      sigil/patra) into lib/ alongside the stdlib.
         run: |
-          cyrius update
+          mkdir -p lib
+          cp -rL "$HOME/.cyrius/lib/"* lib/
           cyrius deps
 
       - name: Build
