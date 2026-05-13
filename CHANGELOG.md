@@ -4,6 +4,63 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-05-12 — Line opener: cyrius 5.11.34 toolchain refresh + dep major bumps + CI lint/fuzz
+
+**Minor-line opener.** Toolchain + dep refresh + small CI / repo-hygiene wins; no new feature work. v0.7.6 shipped 2026-05-08; the v0.7.x line ended there ahead of the v0.7.7 (`dist/sit.cyr` lib export + diff cleanup) and v0.7.8 (SSH) slots, which now move into the v0.8.x slot table. The cap raise (cyrius v5.11.33, `PP_IFDEF_PASS` 2 MB → 8 MB) was the load-bearing precondition for this bump — sit-on-stock-`[deps].stdlib` expansion measured 2,099,593 bytes against the prior 2 MB cap mid-investigation, blocking the move forward until the cyrius side widened. Issue filed + resolved same-day: [`cyrius/.../archived/2026-05-12-pp-2mb-cap-blocks-sit-on-sandhi-fold.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/archived/2026-05-12-pp-2mb-cap-blocks-sit-on-sandhi-fold.md). No sit source changes other than one cosmetic lint fix.
+
+### Toolchain
+
+- **cyrius `5.9.37` → `5.11.34`.** Spans 100+ patches across the v5.10.x and v5.11.x lines. Load-bearing pickups: **v5.10.x SLOT 19** transitive `[deps]` include (sit can simplify its stdlib list when sandhi exposes the right transitive edges), **v5.10.21 / .27 / .34** the TLS 1.3 0-RTT primitive trio sandhi v1.3.2 composes (only relevant once sit consumes Cyrius-native TLS — currently sandhi-side only), **v5.11.0 onward** the `: i64` return-type annotation surface (sandhi's v1.3.4 ran a mechanical sed pass; sit's annotation pass is queued for a follow-on v0.8.x patch, not this release), and **v5.11.33** the cap raise. v5.11.29 / .30 / .31 / .32 / .34 are the ELF section-header table fixes (`e_shoff = 0` on every emitter path; `readelf -S` / `objdump -d` / IDE indexers now see real section info on every sit binary).
+
+### Dep bumps
+
+| dep | pin | from → to | notes |
+|---|---|---|---|
+| sakshi | `2.2.4` | 2.1.0 → 2.2.4 | annotation pass + CI/release fixes; no public-surface impact for sit |
+| sankoch | `2.2.5` | 2.1.0 → 2.2.5 | annotation pass + CI/release fixes; the larger 2.x match-finder / ring-buffer / SIMD work queued upstream is still pending — `add-1MB`'s `zlib_compress` floor is unmoved |
+| sigil | `3.1.1` | 2.9.3 → 3.1.1 | **major bump.** sigil 3.0.0 retired `ct_eq` in favor of cyrius stdlib `ct_eq_bytes_lens` (paired with cyrius v5.9.20's lift); `TRUST_COMMUNITY` enum slot 2 retired (kept unassigned for ABI); `-D SIGIL_BATCH_PARALLEL` cmdline flag retired. **Audit clean** — sit calls `hash_data` / `hex_encode` / `hex_decode` / ed25519 verbs only; none of the retired surfaces touched |
+| patra | `1.9.4` | 1.8.3 → 1.9.4 | patch-line bumps; no public-surface impact for sit |
+
+### Added
+
+- **`.gitignore`**: `/lib/`, `/src/lib/`, `/cyrius.lock` added. `lib/` is a build artifact populated by `cyrius update` (stdlib snapshot) + `cyrius deps` ([deps.X] git crates); `src/lib/` is a compiler scratch directory cc5 5.11.x creates adjacent to the entry point; `cyrius.lock` is `cyrius deps` output. None belong in tracked source. Mirrors the sandhi / cyim convention.
+- **CI `Lint` step** (`.github/workflows/ci.yml`): runs `cyrius lint` per `src/*.cyr` with the 120-char rule whitelisted (cosmetic divider lines); hard-fails on any other warning. Matches the cyim CI shape.
+- **CI `Fuzz` step**: runs `cyrius run tests/sit.fcyr` (sit keeps the single-file harness layout rather than cyim's `fuzz/*.fcyr` discovery shape). Bounded harnesses: `sigil hash_data` (5K rounds), `sankoch zlib_decompress` (10K), `hex_decode` (10K), URL validators (10K), `want_frame_decoder` (10M). Total ~60s on the bench host.
+
+### Changed
+
+- **`git rm --cached`** on 40 `lib/*.cyr` files + `cyrius.lock` — these were tracked from a pre-`.gitignore` era; new `.gitignore` entries now exclude them. Build artifacts only; no source loss.
+- **CI install step** (both `ci.yml` and `release.yml`) creates `$HOME/.cyrius/versions/$CYRIUS_VERSION/lib/` alongside the existing flat `$HOME/.cyrius/lib/`. cyrius 5.11.x resolves stdlib from the version-pinned path; without it, `cyrius update` had no source dir to pull from and the build failed with `cannot read ./lib/X.cyr` against the toolchain-shipped stdlib modules.
+- **CI "Resolve dependencies" step** now runs `cyrius update` (stdlib → `./lib/`) before `cyrius deps` (`[deps.X]` git crates → `./lib/`). Both are required: `cyrius deps` only resolves `[deps.X]` git entries, not the `[deps].stdlib` array; `cyrius update` fills the gap from the version-pinned install dir.
+- **`src/config.cyr:176`** — collapsed consecutive blank lines (single lint warning surfaced by adding the new lint CI step).
+
+### Fixed
+
+- **CI build break** when stdlib doesn't ship to the version-pinned cyrius install path. Local dev environments with prior cyrius installs masked this until the 5.11.x bump exposed it — `cyrius deps` always resolved 5 entries (the 4 `[deps.X]` crates + `agnosys` implicit) and reported 24 errors for every stdlib entry, but the build succeeded locally because `~/.cyrius/versions/<old-version>/lib/` was still around. CI runners get fresh installs, so the bug surfaced there immediately.
+
+### Cross-repo cascade
+
+- **cyrius v5.11.33** — `PP_IFDEF_PASS` 2 MB → 8 MB cap raise. Filed by sit at 2026-05-12 ([cyrius issue](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/archived/2026-05-12-pp-2mb-cap-blocks-sit-on-sandhi-fold.md)) when the toolchain bump surfaced sandhi-fold accretion (TLS 1.3 0-RTT + HTTP/2 + RPC + retry + SSE pushed `lib/sandhi.cyr` to 11,729 lines; sit's expansion went 2,441 bytes over). Fix shipped same day; consumer expansion now well under the new ceiling.
+
+### Sit-side impact
+
+- Build: clean on `cyrius build src/main.cyr build/sit`; DCE binary **1,368,248 bytes (~1.30 MB)** x86_64, essentially flat from v0.7.6's 1.30 MB (no source-level adds).
+- Tests: `cyrius test tests/sit.tcyr` passes (sigil SHA-256, git-SHA-256 blob framing, hex roundtrip, sankoch zlib, patra COL_BYTES small + overflow, ed25519 sign/verify, validator suite).
+- Lint: clean (after `src/config.cyr:176` fix; pre-existing >120-char divider warning at `src/commit.cyr:609` still tolerated by the new CI step's whitelist).
+- Fuzz: clean — `fuzz: no crashes` across all five harnesses.
+
+### Out of scope (queued for v0.8.x patches)
+
+- **`: i64` return-type annotation pass** across sit's public fn surface (sandhi v1.3.4 ran a mechanical sed pass on 703 fns; sit has ~80 candidates).
+- **Drop sandhi, hand-roll loopback HTTP/1.0 server** on `lib/net.cyr` — the cap raise made this not-required, but the surface argument still holds: sit uses ~6 of sandhi's 11.7K lines. Worth its own slot when scope opens.
+- **`dist/sit.cyr` library export + diff primitive cleanup** (was v0.7.7) — owl-blocker; slots into v0.8.x.
+- **SSH transport** (was v0.7.8) — slots into v0.8.x.
+- **HTTPS / mTLS via sandhi first-party TLS** — sandhi's TLS arc shipped (`src/tls_policy/`, TLS 1.3 0-RTT in v1.3.2); ADR 0007's "blocked on first-party Cyrius TLS *existing*" items are unblocked pending a sit-side wire-up. See roadmap for slotting.
+
+### Issue filed + archived (cross-repo)
+
+- [`cyrius/.../archived/2026-05-12-pp-2mb-cap-blocks-sit-on-sandhi-fold.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/archived/2026-05-12-pp-2mb-cap-blocks-sit-on-sandhi-fold.md) — RESOLVED in cyrius v5.11.33 (cap raised 2 MB → 8 MB).
+
 ## [0.7.6] — 2026-05-08 — HTTP push + bearer auth + ADR 0007 (no libssl, ever)
 
 **Closes the symmetric round trip over HTTP.** `sit push origin main` works against `sit serve` over `http://...`; the server rehashes every uploaded object before storing (sigil), bearer auth via `~/.sit/serve.token` (0600) gates writes when `--require-auth` is set; reads stay anonymous. The load-bearing decision is in [ADR 0007](docs/adr/0007-network-transport-security.md): sit's no-FFI thesis is non-negotiable. **HTTPS via libssl will not ship.** Until first-party Cyrius TLS exists, sit's encrypted-over-internet transport is SSH (v0.7.7); HTTP remains loopback / private-network / behind-tunnel.
