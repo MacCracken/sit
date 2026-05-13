@@ -12,6 +12,34 @@ entry = "src/main.cyr"
 test = "src/test.cyr"
 output = "sit"
 
+# `[lib]` drives `cyrius distlib` — concatenates the listed modules in
+# order into `dist/sit.cyr` for downstream Cyrius consumers. Single-pass
+# compiler: each module may only reference symbols defined in earlier
+# modules. Order mirrors src/lib.cyr's include chain (primitives →
+# storage → refs / objects / commands → public API last).
+#
+# Public surface lives in src/api.cyr (last module); everything else is
+# internal and `_`-prefixed (or callable only via cmd_*). See ADR 0009
+# for the public-API contract.
+[lib]
+modules = [
+    "src/util.cyr",
+    "src/validate.cyr",
+    "src/config.cyr",
+    "src/object_db.cyr",
+    "src/index.cyr",
+    "src/refs.cyr",
+    "src/tree.cyr",
+    "src/diff.cyr",
+    "src/commit.cyr",
+    "src/merge.cyr",
+    "src/sign.cyr",
+    "src/wire.cyr",
+    "src/wire_http.cyr",
+    "src/serve.cyr",
+    "src/api.cyr",
+]
+
 # No libgit2, no C, no FFI. Each layer is first-party Cyrius, benchmarked
 # against its C incumbent.
 #   sankoch — LZ4/DEFLATE/zlib/gzip (git's pack-file compression layer)

@@ -4,6 +4,58 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-05-13 — Library export (`dist/sit.cyr`) + diff primitive cleanup (owl-blocker resolved)
+
+**Closes owl's library-call swap precondition.** Sit is now consumable as a Cyrius dep:
+
+```toml
+[deps.sit]
+git = "https://github.com/MacCracken/sit.git"
+tag = "0.8.1"
+modules = ["dist/sit.cyr"]
+```
+
+Originally slotted v0.7.7 before the v0.7.x line ended at v0.7.6 ahead of the v0.8.x line-opener (v0.8.0). owl's `src/vcs.cyr` `execve("git", "diff", …)` → library-call swap unblocks at this release.
+
+### Added
+
+- **`dist/sit.cyr`** — generated library bundle for downstream consumers (9,765 lines at v0.8.1). Tracked in-repo per the sandhi / cyim convention so consumers pin sit by tag and find the bundle at the pinned commit without re-running `cyrius distlib`. Generated from `cyrius.cyml`'s new `[lib].modules` block enumerating the source modules in dependency order (mirrors `src/lib.cyr`'s include chain).
+- **`[lib]` block in `cyrius.cyml`** — drives `cyrius distlib`. Order: util / validate / config / object_db / index / refs / tree / diff / commit / merge / sign / wire / wire_http / serve / **api** (last; public surface). Single-pass compiler means each module can only reference symbols defined in earlier modules — order matters.
+- **`src/api.cyr`** — sit's stable public-API surface (93 lines, all `sit_*`-prefixed):
+  - **`sit_repo_open(cwd)`** — chdirs to `cwd`, verifies `.sit/HEAD`. Returns `1` on success, `0` on failure. The returned handle is opaque in v0.8.1 (chdir-based; single-repo-per-process); will gain real semantics in a future release.
+  - **`sit_repo_close(repo)`** — no-op in v0.8.1, reserved for forward compatibility. Consumers should still call it.
+  - **`sit_diff_path(repo, path)`** — HEAD-blob vs working-tree diff for `path`. Returns a vec of annotated-op records (use `ann_kind` / `ann_line` / `ann_old` / `ann_new` to inspect each), or `0` if both sides are empty. Handles add-only / delete-only / both-present cases uniformly via empty-buffer convention.
+- **`compute_file_diff(old_buf, old_len, new_buf, new_len)`** in `src/diff.cyr` — pure-compute layer extracted from `print_file_diff`. Returns the annotated-ops vec without I/O; `print_file_diff` now calls it and emits stdout in a thin wrapper. Public surface (`sit_diff_path` is a thin wrapper over `compute_file_diff` + HEAD/working-tree resolution).
+- **[ADR 0009 — Public API contract](docs/adr/0009-public-api-contract.md)** — names `sit_*` / `ann_*` as the stable, SemVer-governed surface; everything else in `dist/sit.cyr` is internal (existence-in-bundle is a build artifact of concatenation, not a promise). Renaming / removing / arity-changing a `sit_*` or `ann_*` fn is a major bump; adding new ones is a minor; internal refactors are patch. Pre-1.0 caveat: sit commits to the contract _as if_ post-1.0 — breaking changes will be flagged explicitly in **Breaking** sections. Operational gate: every release diff `dist/sit.cyr` against the prior tag, filter `^[+-]fn (sit_|ann_)`, cross-reference against CHANGELOG.
+- **CI `Verify dist/sit.cyr is in sync` step** — runs `cyrius distlib` and asserts no diff against the tracked bundle (prevents the "public-API change forgot to regenerate dist" trap). Asserts the bundle contains the documented public symbols (`sit_repo_open`, `sit_repo_close`, `sit_diff_path`, `compute_file_diff`, `ann_kind`, `ann_line`, `ann_old`, `ann_new`) so the `[lib]` block can't silently drop a module.
+- **CI `Smoke — diff -U<N> context width` step** — asserts byte-shape of `sit diff -U0` / `-U1` / default `-U3` against the canonical unified-diff `@@` header layout on a controlled fixture; matches `git diff -U<N>` behavior.
+
+### Changed
+
+- **`cmd_diff` / `cmd_show`** parse `-U<N>` (hunk context width). Was hardcoded to 3 at the `group_hunks(annotated, 3)` call site in `print_file_diff` and ignored from CLI args. Now: `-U<N>` argument flows from the CLI through a `ctx` parameter on `print_file_diff` to `group_hunks(annotated, ctx)`. Default stays at 3 to match prior behavior. `cmd_show` also gained `-U<N>` parsing to mirror `git show -U<N>`. Owl's `git diff -U0` shell-out → `sit diff -U0` library call needs this for byte-shape parity.
+- **`print_file_diff` signature** gained a trailing `ctx` parameter. All 13 callers across `cmd_diff` and `cmd_show` updated; `print_file_stat` (the diffstat path) is unchanged — it doesn't emit hunks.
+- **`src/lib.cyr`** — `include "src/api.cyr"` appended last in the chain.
+
+### Fixed
+
+- **`src/config.cyr:176`** — consecutive blank lines collapsed. Pre-existing lint warning the v0.8.0 CI `Lint` step started surfacing; mechanical fix.
+
+### Sit-side impact
+
+- Build: clean. DCE binary stays at **1.30 MB** x86_64 (sit_repo_close / sit_diff_path show as "dead" in main builds — DCE strips them since `main()` doesn't call them; they're for library consumers).
+- Tests: 127/127 pass. Lint clean. Fuzz: `fuzz: no crashes` across all five harnesses.
+- New CI smoke verified end-to-end: `sit diff -U0` emits `@@ -2 +2 @@` (no comma, single-line range; matches git's `-U0` shape); `-U1` emits `@@ -1,3 +1,3 @@`; default emits `@@ -1,5 +1,5 @@`.
+- `dist/sit.cyr` regenerated; CI guard prevents drift.
+
+### Downstream
+
+- **owl** can now drop the `execve("git", "diff", "-U0", "--", path)` shell-out in `src/vcs.cyr` for a `sit_diff_path(repo, path)` library call returning the same annotated-ops shape. owl pin: `[deps.sit] tag = "0.8.1" modules = ["dist/sit.cyr"]`.
+
+### Out of scope (queued for v0.8.2+)
+
+- **`line_ptr` / `line_len` accessor naming** — currently bare names; ADR 0009 commits them to stability via the contract but the `ann_`-prefix convention would surface this binding more clearly. Rename slotted for a future cleanup release.
+- **Multi-repo concurrent handles** — v0.8.1 `sit_repo_open` chdirs the process; a single handle at a time. Real repo-handle struct deferred until a consumer needs it.
+
 ## [0.8.0] — 2026-05-12 — Line opener: cyrius 5.11.34 toolchain refresh + dep major bumps + CI lint/fuzz
 
 **Minor-line opener.** Toolchain + dep refresh + small CI / repo-hygiene wins; no new feature work. v0.7.6 shipped 2026-05-08; the v0.7.x line ended there ahead of the v0.7.7 (`dist/sit.cyr` lib export + diff cleanup) and v0.7.8 (SSH) slots, which now move into the v0.8.x slot table. The cap raise (cyrius v5.11.33, `PP_IFDEF_PASS` 2 MB → 8 MB) was the load-bearing precondition for this bump — sit-on-stock-`[deps].stdlib` expansion measured 2,099,593 bytes against the prior 2 MB cap mid-investigation, blocking the move forward until the cyrius side widened. Issue filed + resolved same-day: [`cyrius/.../archived/2026-05-12-pp-2mb-cap-blocks-sit-on-sandhi-fold.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/archived/2026-05-12-pp-2mb-cap-blocks-sit-on-sandhi-fold.md). No sit source changes other than one cosmetic lint fix.

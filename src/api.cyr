@@ -1,0 +1,93 @@
+# api.cyr — sit's stable public API surface for Cyrius consumers.
+#
+# Downstream Cyrius projects consume sit as a dep:
+#
+#     [deps.sit]
+#     git = "https://github.com/MacCracken/sit.git"
+#     tag = "0.8.1"
+#     modules = ["dist/sit.cyr"]
+#
+# Stable surface (governed by ADR 0009):
+#   - sit_repo_open(cwd)        — open a sit repository, returns 1 / 0
+#   - sit_repo_close(repo)      — release the handle (no-op in v0.8.1)
+#   - sit_diff_path(repo, path) — HEAD-blob vs working-tree, returns
+#                                 an annotated-ops vec (or 0)
+#   - ann_kind / ann_line / ann_old / ann_new — accessors on the
+#                                 annotated-op records returned by
+#                                 sit_diff_path (defined in diff.cyr)
+#
+# Identifier convention: any name `_`-prefixed is internal and may
+# change without notice. Public names use the `sit_` / `ann_` prefix.
+# Breaking changes to anything in this file require a major bump.
+
+# Open a sit repository at `cwd`. Returns 1 on success, 0 on failure (cwd
+# doesn't exist, isn't readable, or doesn't contain a `.sit/HEAD`).
+#
+# v0.8.1 behavior: chdirs the calling process into `cwd`. Multiple
+# concurrent repo handles in a single process aren't supported — the
+# `repo` return value is opaque and will gain real semantics in a
+# future release. Callers should treat it as a token to pass to
+# `sit_repo_close` and `sit_diff_path`, not inspect its contents.
+fn sit_repo_open(cwd) {
+    if (cwd == 0) { return 0; }
+    if (syscall(SYS_CHDIR, cwd) != 0) { return 0; }
+    if (file_exists(".sit/HEAD") != 1) { return 0; }
+    return 1;
+}
+
+# Release the sit repository handle. v0.8.1: no-op (no per-repo state).
+# Reserved for future use; callers should still call it for forward
+# compatibility.
+fn sit_repo_close(repo) {
+    return 0;
+}
+
+# Compute the diff between `path`'s HEAD blob and its working-tree contents.
+# Returns a vec of annotated-op records (use `ann_kind` / `ann_line` /
+# `ann_old` / `ann_new` to inspect each), or 0 if the file is either
+# unchanged, absent from both HEAD and the working tree, or the LCS table
+# exceeds its cap (16M cells; see diff.cyr P-15).
+#
+# Shape: ops are line-level (one per old + new line, per LCS edit script).
+# `kind` is 0 = keep / 1 = delete (was in HEAD, removed from working) /
+# 2 = add (in working, not in HEAD). Caller owns the returned vec.
+fn sit_diff_path(repo, path) {
+    if (path == 0) { return 0; }
+
+    # Resolve HEAD's blob hash for `path`. Treat "no HEAD" / "path absent
+    # from HEAD" the same as "old buffer is empty" so an all-added file
+    # still yields useful annotations.
+    var head_entries = read_head_tree_entries();
+    var old_buf = 0;
+    var old_len = 0;
+    var hp[16];
+    if (head_entries != 0) {
+        var he = tree_find(head_entries, path);
+        if (he != 0) {
+            var head_hex = tree_entry_hash(he);
+            if (read_blob_content(head_hex, &hp) == 0) {
+                old_buf = load64(&hp);
+                old_len = load64(&hp + 8);
+            }
+        }
+    }
+
+    # Resolve working-tree contents. Path missing from disk → empty new
+    # buffer (yields an all-delete diff against HEAD).
+    var new_buf = 0;
+    var new_len = 0;
+    var wp[16];
+    if (file_exists(path) == 1) {
+        if (read_file_heap(path, &wp) == 0) {
+            new_buf = load64(&wp);
+            new_len = load64(&wp + 8);
+        }
+    }
+
+    # Nothing on either side: no diff to report.
+    if (old_buf == 0) {
+        if (new_buf == 0) { return 0; }
+    }
+
+    return compute_file_diff(old_buf, old_len, new_buf, new_len);
+}

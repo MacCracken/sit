@@ -89,6 +89,67 @@ jobs:
         # 10M rounds (~46s on the dev host); the others are 5K–10K.
         run: cyrius run tests/sit.fcyr
 
+      - name: Verify dist/sit.cyr is in sync (v0.8.1 library export)
+        # `dist/sit.cyr` is the consumer-facing library bundle generated
+        # by `cyrius distlib` from cyrius.cyml's [lib] block. It's tracked
+        # in-repo (per the sandhi convention) so downstream consumers
+        # like owl pin sit by tag and find the bundle at `dist/sit.cyr`
+        # without re-running distlib. This step guards against bundle
+        # drift: a public-API change in src/api.cyr that isn't matched
+        # by a regenerated dist/sit.cyr would silently break the
+        # consumer-side build. Asserts the tracked bundle matches what
+        # the source produces today. Also asserts the bundle contains
+        # the public surface (sit_repo_open / sit_repo_close /
+        # sit_diff_path / compute_file_diff / ann_*) so the [lib]
+        # block can't silently drop a module.
+        run: |
+          cyrius distlib > /tmp/distlib.out 2>&1 || {
+            echo "distlib failed:"; cat /tmp/distlib.out; exit 1;
+          }
+          if ! git diff --quiet dist/sit.cyr; then
+            echo "dist/sit.cyr is out of sync with src/ — regenerate with 'cyrius distlib' and commit"
+            git diff dist/sit.cyr | head -50
+            exit 1
+          fi
+          for sym in "fn sit_repo_open" "fn sit_repo_close" "fn sit_diff_path" "fn compute_file_diff" "fn ann_kind" "fn ann_line" "fn ann_old" "fn ann_new"; do
+            grep -q "^$sym" dist/sit.cyr || { echo "dist/sit.cyr missing public symbol: $sym"; exit 1; }
+          done
+          echo "dist/sit.cyr: $(wc -l < dist/sit.cyr) lines; public surface intact"
+
+      - name: Smoke — diff -U<N> context width (v0.8.1)
+        # cmd_diff and cmd_show parse -U<N> and thread the context
+        # width through group_hunks; previously hardcoded to 3.
+        # Asserts byte-shape of -U0 / -U1 / default-3 against the
+        # canonical unified-diff layout (matches `git diff -U<N>`).
+        run: |
+          export HOME=$GITHUB_WORKSPACE/ci-home
+          mkdir -p "$HOME"
+          export SIT_AUTHOR_NAME="CI Runner"
+          export SIT_AUTHOR_EMAIL="ci@example.com"
+          demo=$(mktemp -d)
+          cd "$demo"
+          "$GITHUB_WORKSPACE/build/sit" init
+          printf "a\nb\nc\nd\ne\n" > f.txt
+          "$GITHUB_WORKSPACE/build/sit" add f.txt
+          "$GITHUB_WORKSPACE/build/sit" commit -m "u-test"
+          printf "a\nB\nc\nd\ne\n" > f.txt
+
+          # -U0: only the changed line, no context. Expected hunk header
+          # "@@ -2 +2 @@" (single line, no comma).
+          out=$("$GITHUB_WORKSPACE/build/sit" diff -U0)
+          echo "$out" | grep -q '^@@ -2 +2 @@$' || { echo "expected -U0 hunk header '@@ -2 +2 @@'"; echo "$out"; exit 1; }
+          ctx_lines=$(echo "$out" | grep -c '^ ' || true)
+          test "$ctx_lines" = "0" || { echo "expected -U0 to emit zero context lines, got $ctx_lines"; exit 1; }
+
+          # -U1: one keep above + below. Hunk header "@@ -1,3 +1,3 @@".
+          out=$("$GITHUB_WORKSPACE/build/sit" diff -U1)
+          echo "$out" | grep -q '^@@ -1,3 +1,3 @@$' || { echo "expected -U1 hunk header '@@ -1,3 +1,3 @@'"; echo "$out"; exit 1; }
+
+          # Default ctx=3: hunk spans the full file (5 lines).
+          out=$("$GITHUB_WORKSPACE/build/sit" diff)
+          echo "$out" | grep -q '^@@ -1,5 +1,5 @@$' || { echo "expected default-ctx hunk '@@ -1,5 +1,5 @@'"; echo "$out"; exit 1; }
+          echo "diff -U<N> smoke ok"
+
       - name: Smoke — init + add + commit + log
         run: |
           export HOME=$GITHUB_WORKSPACE/ci-home
