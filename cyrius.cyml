@@ -18,10 +18,12 @@ output = "sit"
 #   sigil   — hashing + trust verification (git's SHA layer)
 #   patra   — B+ tree / WAL object store (git's .git/objects layer)
 [deps]
-# Transitive stdlib resolution exists from cyrius v5.10.x SLOT 19, but the
-# follow-through still surfaces TLS_EARLY_DATA_* enum references at sandhi's
-# include site, so sandhi's TLS-shim transitives stay explicit until that
-# settles. Sigil's bigint/ct/keccak fold cleanly via transitive.
+# Transitive stdlib resolution (cyrius v5.10.x SLOT 19) doesn't follow
+# through enum / constant references — sandhi pulls TLS_EARLY_DATA_*,
+# fdlopen_*, base64_encode (via tls/ws shim transitives), and sigil
+# pulls u256_* / ct_eq_bytes_lens / _keccak_* / shake256 (via its crypto
+# primitives). All explicit until the cyrius transitive arc closes those
+# follow-through gaps.
 stdlib = [
     "string",
     "fmt",
@@ -40,8 +42,15 @@ stdlib = [
     "fnptr",
     "thread",
     "freelist",
+    "bigint",
+    "ct",
+    "keccak",
     "bench",
     "net",
+    "base64",
+    "mmap",
+    "dynlib",
+    "fdlopen",
     "tls",
     "ws",
     "http",
