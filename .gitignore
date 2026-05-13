@@ -1,5 +1,12 @@
 /build/
 *.core
+
+# `lib/` is populated by `cyrius deps` / `cyrius update` from cyrius.cyml [deps]
+# — a build artifact, not source. Never commit; cyrius.lock pins what was
+# resolved. Mirrors the sandhi/cyim convention.
+/lib/
+/src/lib/
+/cyrius.lock
 .claude/
 .idea/
 .vscode/

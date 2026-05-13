@@ -48,6 +48,35 @@ jobs:
       - name: Test
         run: cyrius test tests/sit.tcyr
 
+      - name: Lint
+        # Every src/*.cyr file clean; the only tolerated warning is the
+        # `exceeds 120 characters` rule on long comment / divider lines
+        # (cosmetic only). Anything else hard-fails the job.
+        #
+        # cyrius lint exits non-zero when it has anything to report (even
+        # "0 warnings"), so both invocations need `|| true` so they don't
+        # collide with the implicit `set -e` on `run:`.
+        run: |
+          fail=0
+          for f in src/*.cyr; do
+            out=$(cyrius lint "$f" 2>&1 || true)
+            echo "$out"
+            bad=$(echo "$out" | grep -E '^\s*warn ' | grep -v 'exceeds 120 characters' || true)
+            if [ -n "$bad" ]; then
+              fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || { echo "lint: non-cosmetic warnings present"; exit 1; }
+
+      - name: Fuzz
+        # Bounded harnesses in tests/sit.fcyr (sigil hash_data, zlib,
+        # hex_decode, URL validators, want_frame_decoder). Use
+        # `cyrius run` rather than `cyrius fuzz` — the latter discovers
+        # fuzz/*.fcyr (cyim layout); sit keeps the single-file
+        # tests/sit.fcyr layout. The want_frame_decoder harness runs
+        # 10M rounds (~46s on the dev host); the others are 5K–10K.
+        run: cyrius run tests/sit.fcyr
+
       - name: Smoke — init + add + commit + log
         run: |
           export HOME=$GITHUB_WORKSPACE/ci-home

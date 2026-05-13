@@ -173,7 +173,6 @@ fn config_file_set(path, key, value) {
     return 0;
 }
 
-
 # Print every non-blank, non-comment line of a config file to stdout.
 fn config_file_list(path) {
     if (file_exists(path) != 1) { return 0; }

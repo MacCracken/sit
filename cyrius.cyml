@@ -5,7 +5,7 @@ description = "Sovereign version control — a Cyrius-native git replacement"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sit"
 language = "cyrius"
-cyrius = "5.9.37"
+cyrius = "5.11.34"
 
 [build]
 entry = "src/main.cyr"
@@ -18,6 +18,10 @@ output = "sit"
 #   sigil   — hashing + trust verification (git's SHA layer)
 #   patra   — B+ tree / WAL object store (git's .git/objects layer)
 [deps]
+# Transitive stdlib resolution exists from cyrius v5.10.x SLOT 19, but the
+# follow-through still surfaces TLS_EARLY_DATA_* enum references at sandhi's
+# include site, so sandhi's TLS-shim transitives stay explicit until that
+# settles. Sigil's bigint/ct/keccak fold cleanly via transitive.
 stdlib = [
     "string",
     "fmt",
@@ -36,9 +40,6 @@ stdlib = [
     "fnptr",
     "thread",
     "freelist",
-    "bigint",
-    "ct",
-    "keccak",
     "bench",
     "net",
     "tls",
@@ -50,21 +51,24 @@ stdlib = [
 
 [deps.sakshi]
 git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.1.0"
+tag = "2.2.4"
 modules = ["dist/sakshi.cyr"]
 
 [deps.sankoch]
 git = "https://github.com/MacCracken/sankoch.git"
-tag = "2.1.0"
+tag = "2.2.5"
 modules = ["dist/sankoch.cyr"]
 
+# sigil 3.x: ct_eq retired (cyrius stdlib `ct_eq_bytes_lens` is canonical);
+# TRUST_COMMUNITY enum slot 2 retired; -D SIGIL_BATCH_PARALLEL flag removed.
+# sit uses only hash_data / hex_encode / hex_decode — none affected.
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
-tag = "2.9.3"
+tag = "3.1.1"
 modules = ["dist/sigil.cyr"]
 
 [deps.patra]
 git = "https://github.com/MacCracken/patra.git"
-tag = "1.9.2"
+tag = "1.9.4"
 modules = ["dist/patra.cyr"]
 
