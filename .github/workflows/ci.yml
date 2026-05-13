@@ -177,9 +177,11 @@ jobs:
           done
           (echo > /dev/tcp/127.0.0.1/22422) || { echo "sshd never came up"; cat "$SSHD_DIR/sshd.log"; exit 1; }
 
-          # Pre-trust the host key so ssh doesn't prompt.
-          ssh-keyscan -p 22422 -t ed25519 127.0.0.1 > "$HOME/.ssh/known_hosts" 2>/dev/null
-          chmod 600 "$HOME/.ssh/known_hosts"
+          # No known_hosts setup — ssh config below points
+          # UserKnownHostsFile at /dev/null and disables StrictHostKey-
+          # Checking, which together never verify and never save.
+          # ssh-keyscan can race the sshd startup on slow CI runners;
+          # skipping it eliminates a source of intermittent failure.
 
           # Expose sit on the remote PATH. sshd inherits its parent
           # env minus interactive shell rc files; on Ubuntu the
@@ -202,7 +204,10 @@ jobs:
               IdentityFile $SSHD_DIR/test_key
               IdentitiesOnly yes
               StrictHostKeyChecking no
-              UserKnownHostsFile $HOME/.ssh/known_hosts
+              UserKnownHostsFile /dev/null
+              GlobalKnownHostsFile /dev/null
+              CheckHostIP no
+              LogLevel ERROR
               BatchMode yes
           EOF
           chmod 600 "$HOME/.ssh/config"
