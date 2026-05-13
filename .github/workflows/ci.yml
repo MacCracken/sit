@@ -188,15 +188,17 @@ jobs:
           # symlink there for the remote's shell PATH to find sit.
           sudo ln -sf "$GITHUB_WORKSPACE/build/sit" /usr/local/bin/sit
 
-          # ── Configure sit client to use the test key + port ───────────
-          # Sit's wire_ssh shells out to plain `ssh user@host` — pin the
-          # host alias via ~/.ssh/config so the test key + port + agent
-          # bypass apply without modifying sit's argv.
+          # ── Configure sit client: IdentityFile via Host * stanza ──────
+          # sit's wire_ssh doesn't expose `-i <path>` — the test key has
+          # to be picked up via ssh config. Using a `Host *` wildcard
+          # rather than a `Host sit-test` alias makes the config apply
+          # to whatever literal host appears in the URL; the alternative
+          # (host-alias) requires sit to forward the alias name through
+          # to ssh's first positional arg, which works locally but has
+          # surprising name-resolution behavior under some CI envs.
+          # Explicit `127.0.0.1` + port in the URL avoids alias entirely.
           cat > "$HOME/.ssh/config" <<EOF
-          Host sit-test
-              HostName 127.0.0.1
-              Port 22422
-              User $USER
+          Host *
               IdentityFile $SSHD_DIR/test_key
               IdentitiesOnly yes
               StrictHostKeyChecking no
@@ -205,9 +207,18 @@ jobs:
           EOF
           chmod 600 "$HOME/.ssh/config"
 
+          # Sanity: surface the config + HOME shape so a failure at the
+          # clone step has a single-screen diagnostic above it.
+          echo "  HOME=$HOME"
+          ls -la "$HOME/.ssh/" || true
+          echo "  --- ~/.ssh/config:"
+          sed 's/^/    /' "$HOME/.ssh/config"
+
           # ── Clone via ssh:// ─────────────────────────────────────────
+          # URL uses explicit host:port — sit's _ssh_parse_url handles
+          # the optional `:port` segment per ADR 0008.
           CLONE=$(mktemp -d)/ssh-repo
-          "$GITHUB_WORKSPACE/build/sit" clone --force-absolute "ssh://sit-test$ORIG" "$CLONE"
+          "$GITHUB_WORKSPACE/build/sit" clone --force-absolute "ssh://$USER@127.0.0.1:22422$ORIG" "$CLONE"
           test "$(head -1 $CLONE/a.txt)" = "hello" || { echo "ssh clone content wrong:"; cat "$CLONE/a.txt"; exit 1; }
           (cd "$CLONE" && "$GITHUB_WORKSPACE/build/sit" fsck) | grep -q "0 bad" || { echo "ssh clone fsck failed"; exit 1; }
 
