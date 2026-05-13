@@ -25,16 +25,29 @@ jobs:
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
+          # Two layouts: flat ($HOME/.cyrius/{bin,lib}) for backward-compat,
+          # and version-pinned ($HOME/.cyrius/versions/$CYRIUS_VERSION/lib)
+          # which is where cyrius 5.11.x looks for stdlib when ./lib/ is
+          # absent. Without the latter, `cyrius update` has no source dir
+          # to pull from and the build fails with "cannot read ./lib/X.cyr".
+          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib" "$HOME/.cyrius/versions/$CYRIUS_VERSION/lib"
           cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
           cp "$CYRIUS_DIR/scripts/cyrius" "$HOME/.cyrius/bin/cyrius" 2>/dev/null || true
           cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
+          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/versions/$CYRIUS_VERSION/lib/" 2>/dev/null || true
           chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
 
       - name: Resolve dependencies
-        run: cyrius deps
+        # `cyrius deps` resolves [deps.X] git crates (sakshi/sankoch/sigil/
+        # patra) into lib/. `cyrius update` then populates lib/ from the
+        # version-pinned stdlib snapshot ($HOME/.cyrius/versions/$VER/lib).
+        # Both needed because [deps].stdlib entries aren't git-fetched —
+        # they ship with the toolchain.
+        run: |
+          cyrius update
+          cyrius deps
 
       - name: Build
         run: |
