@@ -124,10 +124,18 @@ jobs:
         # file:// clone of the same fixture. Also asserts the
         # CVE-2017-1000117 leading-dash defense rejects malformed URLs
         # before any exec.
+        #
+        # Uses the runner user's actual $HOME for ssh config /
+        # authorized_keys / known_hosts — NOT a synthetic $HOME under
+        # $GITHUB_WORKSPACE. Earlier iterations of this step exported
+        # HOME=$GITHUB_WORKSPACE/ci-home so the SIT_AUTHOR_* env carved
+        # out a clean test repo space, but ssh-on-CI didn't always
+        # honor the overridden HOME for config lookup (failures
+        # surfaced as "Host key verification failed" with the right
+        # config sitting in the synthetic dir, unread). The runner's
+        # real HOME is owned by us and not contaminated between steps.
         run: |
           set -e
-          export HOME=$GITHUB_WORKSPACE/ci-home
-          mkdir -p "$HOME"
           export SIT_AUTHOR_NAME="CI Runner"
           export SIT_AUTHOR_EMAIL="ci@example.com"
 
@@ -147,12 +155,14 @@ jobs:
           ssh-keygen -t ed25519 -f "$SSHD_DIR/host_key" -N "" -q
           ssh-keygen -t ed25519 -f "$SSHD_DIR/test_key" -N "" -q
           mkdir -p "$HOME/.ssh"
+          # Preserve any pre-existing authorized_keys / config (GitHub
+          # runners ship with their own ssh setup) by appending our
+          # entries rather than overwriting. Cleanup happens at job
+          # exit since the runner is ephemeral.
           touch "$HOME/.ssh/authorized_keys"
           cat "$SSHD_DIR/test_key.pub" >> "$HOME/.ssh/authorized_keys"
           chmod 700 "$HOME/.ssh"
           chmod 600 "$HOME/.ssh/authorized_keys"
-          # Some sshd builds reject auth if HOME isn't 0755 or stricter.
-          chmod 755 "$HOME"
 
           cat > "$SSHD_DIR/sshd_config" <<EOF
           Port 22422
@@ -177,11 +187,27 @@ jobs:
           done
           (echo > /dev/tcp/127.0.0.1/22422) || { echo "sshd never came up"; cat "$SSHD_DIR/sshd.log"; exit 1; }
 
-          # No known_hosts setup — ssh config below points
-          # UserKnownHostsFile at /dev/null and disables StrictHostKey-
-          # Checking, which together never verify and never save.
-          # ssh-keyscan can race the sshd startup on slow CI runners;
-          # skipping it eliminates a source of intermittent failure.
+          # Pre-populate known_hosts with the running sshd's host key
+          # so StrictHostKeyChecking=yes (or accept-new) wouldn't be
+          # needed even on stricter OpenSSH defaults. Retry up to 5×
+          # in case keyscan races the daemon's banner exchange.
+          touch "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          for _ in 1 2 3 4 5; do
+            scan=$(ssh-keyscan -p 22422 -t ed25519 127.0.0.1 2>/dev/null || true)
+            if [ -n "$scan" ]; then
+              # Strip any existing 127.0.0.1:22422 entry before
+              # appending so re-runs don't compound the file.
+              grep -v "^\[127.0.0.1\]:22422 " "$HOME/.ssh/known_hosts" > "$HOME/.ssh/known_hosts.new" || true
+              mv "$HOME/.ssh/known_hosts.new" "$HOME/.ssh/known_hosts"
+              echo "$scan" >> "$HOME/.ssh/known_hosts"
+              break
+            fi
+            sleep 0.3
+          done
+          if [ ! -s "$HOME/.ssh/known_hosts" ]; then
+            echo "ssh-keyscan produced no host key"; cat "$SSHD_DIR/sshd.log"; exit 1
+          fi
 
           # Expose sit on the remote PATH. sshd inherits its parent
           # env minus interactive shell rc files; on Ubuntu the
@@ -199,25 +225,47 @@ jobs:
           # to ssh's first positional arg, which works locally but has
           # surprising name-resolution behavior under some CI envs.
           # Explicit `127.0.0.1` + port in the URL avoids alias entirely.
-          cat > "$HOME/.ssh/config" <<EOF
-          Host *
+          # Specific Host block matching exactly 127.0.0.1 — narrower
+          # than Host *, so we don't risk overriding the runner's
+          # default ssh behavior for other hosts.
+          cat > "$HOME/.ssh/sit-ci.conf" <<EOF
+          Host 127.0.0.1
+              Port 22422
               IdentityFile $SSHD_DIR/test_key
               IdentitiesOnly yes
-              StrictHostKeyChecking no
-              UserKnownHostsFile /dev/null
-              GlobalKnownHostsFile /dev/null
+              UserKnownHostsFile $HOME/.ssh/known_hosts
+              StrictHostKeyChecking yes
               CheckHostIP no
               LogLevel ERROR
               BatchMode yes
           EOF
+          chmod 600 "$HOME/.ssh/sit-ci.conf"
+          # Source it from ~/.ssh/config so ssh finds the block.
+          # Append (don't overwrite) to preserve any pre-existing
+          # config the runner image ships.
+          touch "$HOME/.ssh/config"
           chmod 600 "$HOME/.ssh/config"
+          if ! grep -q "sit-ci.conf" "$HOME/.ssh/config"; then
+            printf '\nInclude %s\n' "$HOME/.ssh/sit-ci.conf" >> "$HOME/.ssh/config"
+          fi
 
           # Sanity: surface the config + HOME shape so a failure at the
           # clone step has a single-screen diagnostic above it.
           echo "  HOME=$HOME"
+          echo "  USER=$USER"
           ls -la "$HOME/.ssh/" || true
           echo "  --- ~/.ssh/config:"
           sed 's/^/    /' "$HOME/.ssh/config"
+          echo "  --- ~/.ssh/sit-ci.conf:"
+          sed 's/^/    /' "$HOME/.ssh/sit-ci.conf"
+          echo "  --- ~/.ssh/known_hosts:"
+          sed 's/^/    /' "$HOME/.ssh/known_hosts"
+
+          # Raw ssh sanity — confirms config + key + sshd are all
+          # working before we wrap them under sit's exec layer. If
+          # this step fails, sit's clone definitely will.
+          echo "  --- raw ssh smoke:"
+          ssh "$USER@127.0.0.1" echo "raw-ssh-ok" || { echo "raw ssh failed; sit clone will too"; exit 1; }
 
           # ── Clone via ssh:// ─────────────────────────────────────────
           # URL uses explicit host:port — sit's _ssh_parse_url handles
