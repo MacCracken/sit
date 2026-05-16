@@ -1,8 +1,20 @@
 # sit Development Roadmap
 
-> **v0.8.x active — release 5 of N shipped.** v0.8.0–v0.8.3 shipped 2026-05-12 / 2026-05-13 (toolchain refresh → lib export → SSH read → SSH push). **v0.8.4 shipped 2026-05-13** — `denyCurrentBranch` default refuse, closing the v0.7.6 documented footgun where push silently advanced a remote's ref while leaving its working tree stale. All three transports (file://, http://, ssh://) refuse pushes whose target ref is the remote's checked-out HEAD; initial pushes to empty remotes still succeed (matches git's behavior). HTTP/SSH wire the rejection as `423 Locked` so the client surfaces "server refuses to update its checked-out branch" rather than the misleading "non-fast-forward".
+> **v0.8.x active — release 5 of N shipped.** Line opener and arc summary:
 >
-> **HTTPS / mTLS slots blocked on upstream:** verified at v0.8.4 prep that sandhi's `tls_policy/` wraps `lib/tls.cyr` which is libssl-via-fdlopen (per [ADR 0007](../adr/0007-network-transport-security.md), unconsumable). Filed at [`issues/2026-05-13-sandhi-first-party-tls-surface-needed.md`](issues/2026-05-13-sandhi-first-party-tls-surface-needed.md). v0.8.x line continues with hardening sweep — **next: v0.8.5 — `sit fsck` reachability walk**. Closes the v0.8.2 read-only gap: `sit push origin main` works over `ssh://` URLs end-to-end. Pipeline mirrors v0.7.6 HTTP push but layered onto v0.8.2's persistent SSH stdio session — one ssh handshake per push, many HTTP/1.1 requests through the same pipe. Server-side handlers (POST objects rehash-verify + POST refs FF gate, both v0.7.6) are transport-agnostic — the entire trust-boundary story carries over unchanged. Bearer auth over SSH skipped in v0.8.3 (SSH already authenticates end-to-end); `_ssh_handle_auth_token` is a 0-returning stub, `_wire_ssh_post_xhdr` skips Authorization injection accordingly. CI smoke extended with full push roundtrip + "everything up-to-date" + non-FF rejection. **Next: v0.8.4 — HTTPS via sandhi first-party Cyrius TLS** (gate prerequisite per ADR 0007: verify it's first-party Cyrius, not a libssl-via-fdlopen shim). The v0.6.x perf arc remains the cumulative scoreboard against `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%` from v0.6.0 baseline; no new perf claims this release.
+> | tag | date | summary |
+> |---|---|---|
+> | v0.8.0 | 2026-05-12 | toolchain `5.9.37 → 5.11.34` + dep major bumps + CI lint/fuzz |
+> | v0.8.1 | 2026-05-13 | `dist/sit.cyr` library export + diff primitive cleanup + ADR 0009 (public-API contract) |
+> | v0.8.2 | 2026-05-13 | SSH transport read-only (`ssh://` clone/fetch) + ADR 0008 + CVE-2017-1000117 defense |
+> | v0.8.3 | 2026-05-13 | SSH push — `ssh://` round trip complete |
+> | v0.8.4 | 2026-05-13 | `denyCurrentBranch` default refuse — first v0.7.6 footgun closed |
+>
+> **Next: v0.8.5 — `sit fsck` reachability walk** (closes the second-listed v0.7.6 footgun).
+>
+> **HTTPS / mTLS slots are blocked on upstream sandhi / cyrius work.** Verified during v0.8.4 prep: sandhi's `tls_policy/` wraps `lib/tls.cyr` which is libssl-via-fdlopen. [ADR 0007](../adr/0007-network-transport-security.md) forbids sit from consuming. Filed at [`issues/2026-05-13-sandhi-first-party-tls-surface-needed.md`](issues/2026-05-13-sandhi-first-party-tls-surface-needed.md). When the upstream gate clears, sit's scaffolding (`URL_SCHEME_HTTPS` validator + `wire_transport_check_*` dispatch) is ready — wire-up is a single patch. v0.8.x continues with the v1 hardening sweep until then.
+>
+> The v0.6.x perf arc remains the cumulative scoreboard against `add-1MB -48%`, `add-64KB -43%`, `clone -30%`, `log -17%`, `status -9%` from v0.6.0 baseline; v0.8.x releases haven't moved that scoreboard.
 
 Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHANGELOG.md`](../../CHANGELOG.md) for the tagged artifacts.
 
@@ -387,13 +399,14 @@ Per the v0.7.x plan settled 2026-04-25. Each release is a small bite (CLAUDE.md 
 
 Add these alongside the algorithm / transport work that justifies them. v0.7.x bench fixtures will likely include a 100-object HTTP fetch round trip for the wire-protocol releases.
 
-### v0.8.x — Toolchain refresh + library export + encrypted transports
+### v0.8.x — Hardening sweep toward v1.0.0
 
-Same small-bite cadence as v0.7.x. v0.8.0 already shipped as the line-opener (toolchain + deps + CI). The remaining slots carry forward the v0.7.7 / v0.7.8 work plus the freshly-unblocked TLS items.
+Same small-bite cadence as v0.7.x. Five releases shipped (toolchain → lib export → SSH read → SSH push → denyCurrentBranch). Remaining slots tighten the git-parity surface for v1.0.0.
 
-**Architectural shifts since v0.7.x plan:**
+**Architectural state (verified during v0.8.4 prep, 2026-05-13):**
 
-- **First-party Cyrius TLS is no longer "blocked on existing"** — sandhi v1.3.2+ ships TLS 1.3 0-RTT in `src/tls_policy/` on top of cyrius v5.10.21 / .27 / .34 stdlib primitives. ADR 0007's three "blocked" items (HTTPS, mTLS, bearer-auth-over-the-open-internet) move into numbered slots below, pending verification that the sandhi/stdlib TLS surface is actually first-party Cyrius and not a libssl shim.
+- **HTTPS / mTLS blocked at the cyrius level.** Sandhi's `tls_policy/` is a composition layer over stdlib `lib/tls.cyr`, which is libssl-via-fdlopen. Sandhi v1.2.0 release notes explicitly: *"lib/tls.cyr stays libssl.so.3-bridged per the 2026-04-24 pure-Cyrius-TLS removal."* ADR 0007 forbids sit from consuming. Filed upstream as [`issues/2026-05-13-sandhi-first-party-tls-surface-needed.md`](issues/2026-05-13-sandhi-first-party-tls-surface-needed.md). When that lands, sit's HTTPS slot is a single patch. Earlier "freshly-unblocked TLS items" framing turned out to be wrong — corrected here.
+- **SSH is the encrypted-over-internet path** (v0.8.2 read + v0.8.3 push), per ADR 0008. Process boundary, not FFI. Works today.
 - **Surface minimization is a live option.** The cyrius v5.11.33 cap raise (2 MB → 8 MB) means consuming sandhi's full 11,729-line bundle is no longer blocking. Sit still uses ~6 of those lines (`sandhi_server_*`); dropping sandhi for a hand-rolled HTTP/1.0 server on `lib/net.cyr` is a defensible v0.8.x slot if the surface argument outweighs the share-with-other-AGNOS-consumers argument.
 
 **Releases:**
@@ -422,10 +435,18 @@ Same small-bite cadence as v0.7.x. v0.8.0 already shipped as the line-opener (to
 
 ### Longer horizon
 
-- **Reject push to checked-out branch** — git's `receive.denyCurrentBranch = refuse` default. Today `sit push` silently advances the remote's ref while leaving its working tree stale; surprising when the remote is someone's active repo. Check whether the remote's HEAD resolves to the branch being pushed and refuse by default; opt-in escape via a config knob later.
-- **`sit fsck` reachability** — walk commit chain and flag dangling objects (current implementation checks integrity but not reachability).
-- **Full `.sitignore` semantics** — negation (`!pattern`), double-star (`**`), character classes (`[abc]`), anchored patterns (`/foo`), path patterns (`foo/bar`).
-- **`sit log --graph`** — ASCII DAG for merge history.
-- **Shallow clone** — `--depth N` limits to N commits back from HEAD.
-- **Integration tests in-tree** — promote the shell-level scenarios from `docs/guides/getting-started.md` into `tests/` with fixtures. Current `tests/sit.tcyr` is primitive-assert smoke only.
-- **Sandhi co-adds in [deps].stdlib** — when v0.7.2 lands `sit serve`, the inline `[deps].stdlib` list grows by `net`/`tls`/`ws`/`http`/`json`/`sandhi` (sandhi's transitive needs since cyrius still has no transitive stdlib resolution). Watch whether a future cyrius release introduces transitive resolution; if so, sit can drop the explicit transitive entries (`thread`/`freelist`/`bigint`/`ct`/`keccak` + the v0.7.2 network adds) without losing reachability.
+Items that haven't yet landed in a numbered v0.8.x slot. The five items below the line ruler graduated to numbered slots above — kept here as anchors for the "see roadmap for the slot" pointer.
+
+- **Integration tests in-tree** — promote the shell-level scenarios from `docs/guides/getting-started.md` into `tests/` with fixtures. Current `tests/sit.tcyr` is primitive-assert smoke only, and the bash-based CI smoke steps don't surface failures with the same precision a Cyrius `.tcyr` runner does. Not slotted yet — depends on whether the closeout pass (v0.8.x last) gets there first or this lands separately.
+- **Bench fixture refresh** — three bench targets scoped during v0.6.0 but never landed (LCS diff at 100×100 / 1000×1000 / 4000×4000; `glob_match` against 10/50/200-pattern `.sitignore` files; `hash_file_as_blob` end-to-end on 1 KB / 64 KB / 1 MB inputs). The first two slot naturally alongside v0.8.6 (`.sitignore` semantics rewrite); the third should accompany any future sigil/SHA-256 throughput work.
+- **`sit serve` non-loopback exposure** — gated by HTTPS landing. Today `--listen 127.0.0.1:<port>` is parse-locked at the validator; non-loopback exposure waits for transport security so an unsecured HTTP daemon can't accidentally ship.
+
+---
+
+**Graduated to numbered slots (linked above):**
+
+- ~~Reject push to checked-out branch~~ → v0.8.4 ✅ (`denyCurrentBranch` default refuse, shipped 2026-05-13)
+- ~~`sit fsck` reachability~~ → v0.8.5 (next slot)
+- ~~Full `.sitignore` semantics~~ → v0.8.6
+- ~~`sit log --graph`~~ → v0.8.7 (bundled with shallow clone)
+- ~~Shallow clone (`--depth N`)~~ → v0.8.7 (bundled with `log --graph`)
