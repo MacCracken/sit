@@ -4,6 +4,57 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.5] — 2026-05-15 — `sit fsck` reachability walk + cyrius 5.11.55 toolchain refresh
+
+**Closes the second v0.7.6 footgun.** `sit fsck` now distinguishes integrity (objects whose stored bytes don't re-hash to their stored key) from reachability (objects no ref / index entry points at). Output gains a third counter and a per-object dangling line:
+
+```
+$ sit fsck
+dangling tree 497a926fc6e399...
+dangling commit a870bbd76ced31...
+checked 6 objects, 0 bad, 2 dangling
+```
+
+**Toolchain refresh.** cyrius `5.11.34 → 5.11.55` (21 patches; binaries are byte-identical to 5.11.54 so the bump is mostly a tag-line refresh). One known upstream wart: the bundled `lib/sandhi.cyr` calls retired `hashmap_*` symbols (renamed to `map_*` in 5.11.x stdlib). The four "undefined function" warnings during build / test / fuzz are TLS session-cache code (sandhi 1.3.4) that sit doesn't reach — DCE strips them and the binary is clean. Filed upstream as a follow-up to the v0.8.4 `tls_policy/` cross-repo issue.
+
+### Added
+
+- **`fsck_walk_reachable(root, seen)`** in `src/object_db.cyr` — BFS over the object graph from one root hex, marking each visited cstr in `seen` (map_new). Reads each object via the existing `read_object` framing decode, classifies by prefix (`commit `/`tree `/`blob `), and enqueues every referenced hex: for commits, the `tree` line + **every** `parent` line via `fsck_collect_commit_parents` (distinct from `parse_commit_body` which captures only the last parent — a pre-existing limitation that fetch/clone inherits but fsck explicitly does not). For trees, every entry hash via `parse_tree` + `tree_entry_hash`. Blobs are leaves.
+- **`fsck_collect_roots()`** — enumerates `.sit/refs/heads/<*>`, `.sit/refs/tags/<*>`, `.sit/refs/remotes/<*>/<*>` (via `dir_walk` — recurses into the per-remote namespaces automatically), plus `.sit/HEAD` when it's a raw hex (detached). Symbolic HEADs are skipped because the matching ref file is already a root. Malformed ref files (non-hex content, length != 64) are silently dropped — they surface in the integrity report as unreachable objects.
+- **`fsck_collect_commit_parents(body, body_len, parents)`** — pushes every `parent <hex>\n` header into `parents` as a fresh 65-byte cstring. Stops at the first blank line (end of headers). Validates each candidate via `hex_prefix_valid` so a corrupt commit body doesn't enqueue garbage.
+- **`fsck_extract_commit_tree(body, body_len)`** — pulls the `tree <hex>\n` header off the very first line (git always emits tree first); returns 0 on missing / malformed.
+- **`fsck_read_ref_tip(path)`** + **`fsck_walk_refs_dir(dir, roots)`** — file-level ref readers that share the same trim-trailing-CR/LF logic as `serve_read_ref_file` but skip the JSON-emit step. Kept in `object_db.cyr` so `cmd_fsck` doesn't pull in `serve.cyr`.
+- **Staging-index roots** — every entry from `parse_index()` contributes its blob hex as a root via `hex_encode(entry_hash(e), 32)`. Without this, a `sit add file` that hasn't been committed yet would look dangling. Mirrors git's implicit `git ls-files` keep during fsck.
+- **CI smoke step `Smoke — fsck reachability (v0.8.5)`**: builds a 2-commit linear history, asserts `0 bad, 0 dangling`; rewinds `main` to the root commit, asserts `0 bad, 2 dangling` plus `^dangling commit ` and `^dangling tree ` lines; then builds a merge commit (base → feature + main → merge), deletes `refs/heads/feature` so the only path to the on-feature commit is via the merge's second `parent` line, and asserts `0 bad, 0 dangling` — proving the walker follows both parent edges.
+
+### Changed
+
+- **`cmd_fsck` output** gains a third counter:
+  - Old: `checked N objects, M bad\n`
+  - New: `checked N objects, M bad, D dangling\n`
+  - The `0 bad` substring is preserved verbatim so the existing `grep -q "0 bad"` assertions across CI keep working unchanged.
+- **`cmd_fsck` integrity SELECT** widens from `SELECT hash FROM objects` to `SELECT hash, ty FROM objects` so dangling lines can emit the git-shaped `dangling <blob|tree|commit> <hex>` form without paying for a second read per dangling object. The `ty_map` (cstr-hex → ty + 1; the +1 keeps `map_get`'s 0 sentinel distinct from `ty==0` blobs) is consulted only on the dangling pass.
+- **Dangling does not fail the command.** Matches git's policy: integrity errors set non-zero exit; dangling objects are normal after resets, rewinds, or aborted merges. The exit code is governed solely by `bad > 0`.
+- **`cyrius` pin**: `5.11.34 → 5.11.55` in `cyrius.cyml [package].cyrius`. Lib snapshot is identical to 5.11.54 (verified `diff -rq`). No dep bumps in this release.
+- **Capabilities banner version literal** (`src/serve.cyr:89`) bumped `0.8.4` → `0.8.5`.
+
+### Fixed
+
+- **v0.7.6 footgun #2: dangling-object detection.** `sit fsck` previously only surfaced rehash failures; objects rendered unreachable by `sit reset`, manual ref rewrites, or `sit merge --abort` would persist in `.sit/objects.patra` without any signal. They still persist (sit doesn't GC yet — that's a future slot), but they're now reported, which is the prerequisite for a future `sit gc` to know what to drop.
+
+### Sit-side impact
+
+- Build: clean. DCE binary **1.39 MB** (up from 1.36 MB at v0.8.4; ~30 KB delta — the fsck additions are ~300 lines of Cyrius and the integrity-pass widening to `SELECT hash, ty FROM objects` keeps a per-object `ty_map` entry alive for the dangling pass).
+- Tests: 127/127 pass. Lint clean (1 pre-existing diagnostic in `src/object_db.cyr:122` — `ERR_BUFFER_TOO_SMALL` enum reference predates this release). Fuzz: 6 harnesses, all `fuzz: no crashes`.
+- End-to-end verified locally: clean 2-commit history → 0 dangling; ref-rewind → 2 dangling (commit + tree, blob stays reachable via staging index); merge commit + delete-feature → 0 dangling (both parent edges followed).
+
+### Out of scope (queued for v0.8.6+)
+
+- **`sit gc`** — actually drop the dangling objects. Needs a grace period (don't drop objects newer than N seconds) and probably reflog support first.
+- **Multi-parent walk for fetch/clone/push** — `parse_commit_body` still captures only the last `parent` line, so wire-protocol walkers (`walk_reachable_phased`) inherit the same single-parent limitation. CI fixtures are linear so this doesn't manifest, but cloning a merge-heavy history would miss objects reachable only via first-parent edges. Filed for v0.8.6 — `parse_commit_body` needs to return a parents vec, and `walk_reachable_phased`'s queue needs to enqueue all of them.
+- **Broken ref reporting** — `fsck_collect_roots` silently skips ref files that fail `hex_prefix_valid` or have unexpected length. Surfacing those as a third class of fsck finding (`broken ref refs/heads/foo: ...`) is a small follow-up.
+- **HTTPS / mTLS** — still blocked on sandhi's `tls_policy/` being libssl-via-fdlopen (cross-repo issue `2026-05-13-sandhi-first-party-tls-surface-needed.md` carries upstream). v0.8.6 expected to slot fsck multi-parent walk or `.sitignore` semantics next, depending on what unblocks first.
+
 ## [0.8.4] — 2026-05-13 — `denyCurrentBranch` default refuse + HTTPS/mTLS slots blocked upstream
 
 **Closes the v0.7.6 documented footgun.** Pushes to a remote whose `HEAD` is the same branch are now refused by default — mirrors git's `receive.denyCurrentBranch=refuse`. Previously, `sit push` silently advanced the remote's `refs/heads/<branch>` while leaving its working tree stale, surprising whoever was editing on the remote side. **All three transports** (file://, http://, ssh://) gate the same way.

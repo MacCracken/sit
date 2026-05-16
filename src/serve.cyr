@@ -86,7 +86,7 @@ fn serve_build_capabilities() {
     # each tag.
     # TODO: derive from VERSION at build time. Manually bumped each
     # release; closeout pass before tagging asserts the literal matches.
-    str_builder_add_cstr(sb, "{\"sit\":\"0.8.4\",\"max_body\":");
+    str_builder_add_cstr(sb, "{\"sit\":\"0.8.5\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[");
     if (_serve_require_auth == 1) {

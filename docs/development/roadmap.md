@@ -1,6 +1,6 @@
 # sit Development Roadmap
 
-> **v0.8.x active — release 5 of N shipped.** Line opener and arc summary:
+> **v0.8.x active — release 6 of N shipped.** Line opener and arc summary:
 >
 > | tag | date | summary |
 > |---|---|---|
@@ -9,8 +9,9 @@
 > | v0.8.2 | 2026-05-13 | SSH transport read-only (`ssh://` clone/fetch) + ADR 0008 + CVE-2017-1000117 defense |
 > | v0.8.3 | 2026-05-13 | SSH push — `ssh://` round trip complete |
 > | v0.8.4 | 2026-05-13 | `denyCurrentBranch` default refuse — first v0.7.6 footgun closed |
+> | v0.8.5 | 2026-05-15 | `sit fsck` reachability walk + cyrius `5.11.34 → 5.11.55` — second v0.7.6 footgun closed |
 >
-> **Next: v0.8.5 — `sit fsck` reachability walk** (closes the second-listed v0.7.6 footgun).
+> **Next: v0.8.6 — wire-walker multi-parent fix** (or `.sitignore` semantics, whichever unblocks first). v0.8.5 surfaced that `parse_commit_body` keeps only the last `parent` header, which `walk_reachable_phased` inherits — clone / fetch / push can miss objects reachable only via the first-parent edge on merge commits. Linear-history CI fixtures hide this today.
 >
 > **HTTPS / mTLS slots are blocked on upstream sandhi / cyrius work.** Verified during v0.8.4 prep: sandhi's `tls_policy/` wraps `lib/tls.cyr` which is libssl-via-fdlopen. [ADR 0007](../adr/0007-network-transport-security.md) forbids sit from consuming. Filed at [`issues/2026-05-13-sandhi-first-party-tls-surface-needed.md`](issues/2026-05-13-sandhi-first-party-tls-surface-needed.md). When the upstream gate clears, sit's scaffolding (`URL_SCHEME_HTTPS` validator + `wire_transport_check_*` dispatch) is ready — wire-up is a single patch. v0.8.x continues with the v1 hardening sweep until then.
 >
@@ -19,6 +20,31 @@
 Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHANGELOG.md`](../../CHANGELOG.md) for the tagged artifacts.
 
 ## Released
+
+### v0.8.5 — `sit fsck` reachability walk + cyrius 5.11.55 toolchain refresh
+
+- **Closes the second v0.7.6 footgun.** `sit fsck` previously only flagged objects whose stored bytes didn't sigil-rehash to their key. v0.8.5 adds a reachability pass that surfaces objects no ref / index entry points at. Output gains a third counter + per-object dangling lines (git-shaped):
+
+  ```
+  $ sit fsck
+  dangling tree 497a926fc6e399...
+  dangling commit a870bbd76ced31...
+  checked 6 objects, 0 bad, 2 dangling
+  ```
+
+- **Walker** (`fsck_walk_reachable` in `src/object_db.cyr`) is BFS over the object graph. Classifies by framing prefix (`commit `/`tree `/`blob `), enqueues every referenced hex: trees push every entry hash from `parse_tree` + `tree_entry_hash`; commits push the `tree` line + **every** `parent` line via the new `fsck_collect_commit_parents`. The multi-parent collector is distinct from `parse_commit_body`, which captures only the last parent header — a pre-existing limitation that `walk_reachable_phased` inherits but fsck explicitly does not (queued separately as v0.8.6 work).
+
+- **Roots** (`fsck_collect_roots`) cover `.sit/refs/heads/<*>` + `.sit/refs/tags/<*>` + `.sit/refs/remotes/<*>/<*>` (via `dir_walk` — recurses into the per-remote namespaces automatically) + `.sit/HEAD` when detached (raw hex, not symbolic). Symbolic HEADs are skipped because the matching ref file is already a root. Every `parse_index()` entry contributes its blob hex as a root via `hex_encode(entry_hash(e), 32)` — without this, every `sit add` not yet committed would look dangling.
+
+- **Dangling does not fail the command.** Matches git's policy: integrity errors set non-zero exit; dangling objects are normal after resets, rewinds, or aborted merges. The exit code is governed solely by `bad > 0`. Existing CI assertions of the form `grep -q "0 bad"` keep matching because the substring is preserved verbatim in the new output shape `checked N objects, M bad, D dangling`.
+
+- **Integrity SELECT widened** from `SELECT hash FROM objects` to `SELECT hash, ty FROM objects` so the dangling pass can emit `dangling <blob|tree|commit> <hex>` without a second read per dangling object. The `ty_map` (cstr-hex → ty + 1; the +1 keeps `map_get`'s 0 sentinel distinct from `ty == 0` blobs) is consulted only on the dangling pass.
+
+- **Toolchain bump** `5.11.34 → 5.11.55` (21 patches; binaries byte-identical to 5.11.54, so the bump is mostly a tag-line refresh). One known upstream wart: bundled `lib/sandhi.cyr` calls retired `hashmap_*` symbols (renamed to `map_*` in 5.11.x stdlib). The four "undefined function" warnings during build / test / fuzz are TLS session-cache code (sandhi 1.3.4) that sit doesn't reach — DCE strips them and the binary is clean.
+
+- **CI smoke step** `Smoke — fsck reachability (v0.8.5)`: 2-commit linear history → assert `0 bad, 0 dangling`; rewind `main` to root → assert `0 bad, 2 dangling` (commit + tree) plus `^dangling commit ` / `^dangling tree ` lines; merge commit (base → feature + main → merge) + `rm .sit/refs/heads/feature` → assert `0 bad, 0 dangling` (proves both-parent walk; if the walker fell back to parse_commit_body's single-parent capture, the on-main commit + its tree would appear dangling).
+
+- **Build / test / lint / fuzz green.** DCE binary **1.39 MB** (+30 KB vs v0.8.4). 127/127 tests pass. Lint clean (one pre-existing `ERR_BUFFER_TOO_SMALL` enum reference at `src/object_db.cyr:122` predates this release). Known-footgun list (in `docs/development/state.md`) has its second item closed.
 
 ### v0.8.4 — `denyCurrentBranch` default refuse + HTTPS/mTLS slots blocked upstream
 
@@ -418,9 +444,10 @@ Same small-bite cadence as v0.7.x. Five releases shipped (toolchain → lib expo
 | ~~0.8.2~~ | ✅ shipped 2026-05-13 — SSH transport (`ssh://`, read-only). `sit serve --stdio` server mode + `src/wire_ssh.cyr` client + `OBJ_SRC_SSH` tagged dispatch + ADR 0008 + CVE-2017-1000117 three-layer defense + 100K fuzz-rounds clean + CI sshd-loopback smoke. Push over SSH still gated to v0.8.3. | `src/wire_ssh.cyr`, ADR 0008 | (see Released — clone works end-to-end; CVE injection rejected; binary 1.36 MB) |
 | ~~0.8.3~~ | ✅ shipped 2026-05-13 — push over SSH. `_wire_ssh_post_xhdr` + `_wire_ssh_recv_response` (GET/POST recv-split) + `ssh_remote_push_object` + `ssh_remote_push_ref` + `_do_push_ssh`. `cmd_push` SSH dispatch + `wire_transport_check_writable` accepts ssh. Bearer-over-SSH deferred (stub returns 0; SSH already authenticates end-to-end). CI smoke: full push roundtrip + up-to-date + non-FF rejection. | extends `src/wire_ssh.cyr` + `src/wire.cyr` | (see Released — push works end-to-end; binary flat at 1.36 MB) |
 | ~~0.8.4~~ | ✅ shipped 2026-05-13 — `denyCurrentBranch` default refuse. Server-side check in `serve_handle_put_ref` (423 Locked when target=HEAD and ref exists); file:// symmetric pre-check via `_remote_current_branch`; push-helper return convention extended with `2 = denyCurrentBranch`; client surfaces distinct message. Initial pushes to empty remotes still succeed (git parity). CI smoke: rejection + detached-HEAD bypass. | extends `src/serve.cyr` + `src/wire.cyr` | (see Released — first v0.7.6 footgun closed; binary flat at 1.36 MB) |
-| **0.8.5** | **`sit fsck` reachability walk.** Today `cmd_fsck` checks per-object integrity (SHA-256 roundtrip against framed `<type> <len>\0<content>`) but doesn't detect dangling objects — orphaned trees / blobs from interrupted commits silently bloat `objects.patra`. Walk the commit DAG from every `refs/heads/*` + `refs/tags/*` + `refs/remotes/*` tip, mark every reachable hash, scan `objects.patra` for unreferenced rows, report them. Add `--prune` flag to delete the dangling set after a confirmation prompt. | extends `src/object_db.cyr`'s `cmd_fsck`; reuses `walk_reachable_phased` (OBJ_SRC_DB transport) | CI smoke: create a fixture with an intentionally-orphaned tree, fsck reports the dangling hash; fsck --prune removes it and the row count drops; previously-reachable objects unchanged |
-| **0.8.6** | **Full `.sitignore` semantics — git-parity.** Today `match_ignore` handles bare `*` globs and literal paths; gaps: negation (`!pattern` re-includes a previously-excluded match), `**` (multi-segment wildcard), char classes (`[abc]`), anchored patterns (`/foo` only matches at repo root), path patterns (`foo/bar` only matches that nesting). Substantial parser work in `src/index.cyr`; high test coverage given corner cases (negation order, `**/` vs `/**`, escaped brackets). | extends `src/index.cyr`'s ignore matcher | new tests/sit.tcyr group covering each new feature against a synthetic .sitignore + path matrix; fixture-based smoke with negation re-include + `**/build/*` exclude patterns |
-| **0.8.7** | **`sit log --graph` + `--depth N` shallow clone (bundled).** Two visualization/transport items that share a DFS-over-the-commit-DAG primitive. `--graph` emits an ASCII DAG using `\|` / `/` / `\` characters for merge branches; needs commit-parent walking which `read_head_tree_entries` doesn't expose today — small new helper. `--depth N` caps `walk_reachable_phased` to N commits back from HEAD; touches `src/wire.cyr`'s walker and `cmd_clone` arg parsing. | extends `src/commit.cyr` (`cmd_log --graph`) and `src/wire.cyr` (`walk_reachable_depth`) | CI smoke: 5-commit fixture with a merge; `sit log --graph` byte-shape matches an expected snapshot. Plus a `--depth 1` clone of a 10-commit fixture pulls exactly 1 commit-tree-blob-set (3 objects) |
+| ~~0.8.5~~ | ✅ shipped 2026-05-15 — `sit fsck` reachability walk + cyrius `5.11.34 → 5.11.55`. New helpers in `src/object_db.cyr`: `fsck_walk_reachable` (BFS, multi-parent), `fsck_collect_roots` (heads + tags + remotes via `dir_walk` + detached HEAD + staging-index blobs), `fsck_collect_commit_parents` (distinct from `parse_commit_body`), `fsck_extract_commit_tree`, `fsck_read_ref_tip`, `fsck_walk_refs_dir`, `fsck_ty_word`. Integrity SELECT widened to `(hash, ty)` for git-shaped `dangling <type> <hex>` output. Dangling doesn't fail the command. `--prune` deferred (needs grace-period + reflog support). Toolchain pin bumped (lib byte-identical to 5.11.54). CI smoke covers clean / rewind / merge cases. | extends `src/object_db.cyr`'s `cmd_fsck` (~300 lines new); separate walker — does NOT reuse `walk_reachable_phased` because that walker inherits `parse_commit_body`'s single-parent capture, which v0.8.6 will fix | (see Released — second v0.7.6 footgun closed; binary 1.39 MB) |
+| **0.8.6** | **Wire-walker multi-parent fix.** Surfaced during v0.8.5: `parse_commit_body` overwrites the parent-slot on each `parent ` header it sees, so `walk_reachable_phased` only follows the last parent on merge commits. Linear-history fixtures hide it but cloning a merge-heavy repo can miss objects reachable only via first-parent edges. Fix is to make `parse_commit_body` return a parents vec and have phase-1 of the phased walker enqueue all of them. `is_ancestor` (`src/commit.cyr:80`) needs the same generalization — today's first-parent walk would falsely report "not an ancestor" across a merge. May bundle with `.sitignore` semantics depending on which has clearer scope at slot time. | rewrites `parse_commit_body` signature in `src/commit.cyr`; touches `walk_reachable_phased` in `src/wire.cyr`; generalizes `is_ancestor` to a graph walk | new tests/sit.tcyr asserting parse_commit_body now returns both parents from a synthesized merge body; CI smoke: clone a 3-commit fixture with a merge, fsck on clone reports 0 dangling AND `sit log main --oneline | wc -l` matches origin exactly (would mismatch by 1 if first-parent edge dropped) |
+| **0.8.7** | **Full `.sitignore` semantics — git-parity.** Today `match_ignore` handles bare `*` globs and literal paths; gaps: negation (`!pattern` re-includes a previously-excluded match), `**` (multi-segment wildcard), char classes (`[abc]`), anchored patterns (`/foo` only matches at repo root), path patterns (`foo/bar` only matches that nesting). Substantial parser work in `src/index.cyr`; high test coverage given corner cases (negation order, `**/` vs `/**`, escaped brackets). | extends `src/index.cyr`'s ignore matcher | new tests/sit.tcyr group covering each new feature against a synthetic .sitignore + path matrix; fixture-based smoke with negation re-include + `**/build/*` exclude patterns |
+| **0.8.8** | **`sit log --graph` + `--depth N` shallow clone (bundled).** Two visualization/transport items that share a DFS-over-the-commit-DAG primitive. `--graph` emits an ASCII DAG using `\|` / `/` / `\` characters for merge branches; needs commit-parent walking which `read_head_tree_entries` doesn't expose today — small new helper. `--depth N` caps `walk_reachable_phased` to N commits back from HEAD; touches `src/wire.cyr`'s walker and `cmd_clone` arg parsing. | extends `src/commit.cyr` (`cmd_log --graph`) and `src/wire.cyr` (`walk_reachable_depth`) | CI smoke: 5-commit fixture with a merge; `sit log --graph` byte-shape matches an expected snapshot. Plus a `--depth 1` clone of a 10-commit fixture pulls exactly 1 commit-tree-blob-set (3 objects) |
 | **0.8.x last** | **Closeout pass before v1.0.0.** Per CLAUDE.md closeout procedure: full test suite, bench baseline vs. v0.6.x scoreboard, dead-code audit, refactor pass on any v0.8.x parallel-codepath accretion, code-review pass, cleanup sweep, security re-scan, downstream check (owl on `dist/sit.cyr`), doc sync, version-verify, full-clean build. | — | all closeout-pass checks green; v1.0.0 tag goes out |
 
 **Blocked on upstream sandhi / cyrius work** (no numbered slot until the gate clears):
@@ -446,7 +473,8 @@ Items that haven't yet landed in a numbered v0.8.x slot. The five items below th
 **Graduated to numbered slots (linked above):**
 
 - ~~Reject push to checked-out branch~~ → v0.8.4 ✅ (`denyCurrentBranch` default refuse, shipped 2026-05-13)
-- ~~`sit fsck` reachability~~ → v0.8.5 (next slot)
-- ~~Full `.sitignore` semantics~~ → v0.8.6
-- ~~`sit log --graph`~~ → v0.8.7 (bundled with shallow clone)
-- ~~Shallow clone (`--depth N`)~~ → v0.8.7 (bundled with `log --graph`)
+- ~~`sit fsck` reachability~~ → v0.8.5 ✅ (BFS walker + dangling output, shipped 2026-05-15)
+- Wire-walker multi-parent fix → v0.8.6 (next slot; surfaced during v0.8.5 — `parse_commit_body` captures only last `parent` so `walk_reachable_phased` misses first-parent edges)
+- ~~Full `.sitignore` semantics~~ → v0.8.7 (slid one slot to make room for wire-walker fix)
+- ~~`sit log --graph`~~ → v0.8.8 (bundled with shallow clone)
+- ~~Shallow clone (`--depth N`)~~ → v0.8.8 (bundled with `log --graph`)

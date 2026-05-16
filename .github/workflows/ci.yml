@@ -422,6 +422,56 @@ jobs:
           "$GITHUB_WORKSPACE/build/sit" log | head -5
           "$GITHUB_WORKSPACE/build/sit" fsck
 
+      - name: Smoke — fsck reachability (v0.8.5)
+        run: |
+          export HOME=$GITHUB_WORKSPACE/ci-home
+          mkdir -p "$HOME"
+          demo=$(mktemp -d)
+          cd "$demo"
+          export SIT_AUTHOR_NAME="CI Runner"
+          export SIT_AUTHOR_EMAIL="ci@example.com"
+          # Build a 2-commit history.
+          "$GITHUB_WORKSPACE/build/sit" init
+          echo "v1" > a.txt
+          "$GITHUB_WORKSPACE/build/sit" add a.txt
+          "$GITHUB_WORKSPACE/build/sit" commit -m "v1"
+          ROOT_TIP=$(cat .sit/refs/heads/main | tr -d '\n')
+          echo "v2" > a.txt
+          "$GITHUB_WORKSPACE/build/sit" add a.txt
+          "$GITHUB_WORKSPACE/build/sit" commit -m "v2"
+          # Clean state: no dangling.
+          OUT=$("$GITHUB_WORKSPACE/build/sit" fsck)
+          echo "$OUT"
+          echo "$OUT" | grep -q "0 bad, 0 dangling" || { echo "expected clean fsck after 2 linear commits"; exit 1; }
+          # Rewind main to root commit — the v2 commit + its tree become
+          # unreachable. The v2 blob stays reachable via the staging
+          # index (sit doesn't reset index on manual ref rewrite).
+          echo -n "$ROOT_TIP" > .sit/refs/heads/main
+          OUT=$("$GITHUB_WORKSPACE/build/sit" fsck)
+          echo "$OUT"
+          echo "$OUT" | grep -q "0 bad, 2 dangling" || { echo "expected 2 dangling (commit + tree) after rewind"; exit 1; }
+          echo "$OUT" | grep -q "^dangling commit " || { echo "expected dangling commit line"; exit 1; }
+          echo "$OUT" | grep -q "^dangling tree "   || { echo "expected dangling tree line"; exit 1; }
+          # Merge-commit walk: fsck must follow BOTH parent edges. After
+          # deleting the feature branch, the only path to the on-feature
+          # commit is via the merge's second `parent` line. If the
+          # walker only followed parse_commit_body's single-parent
+          # capture, those objects would dangle.
+          demo2=$(mktemp -d)
+          cd "$demo2"
+          "$GITHUB_WORKSPACE/build/sit" init
+          echo "base" > base.txt && "$GITHUB_WORKSPACE/build/sit" add base.txt && "$GITHUB_WORKSPACE/build/sit" commit -m "base"
+          "$GITHUB_WORKSPACE/build/sit" branch feature
+          "$GITHUB_WORKSPACE/build/sit" checkout feature
+          echo "branch" > b.txt && "$GITHUB_WORKSPACE/build/sit" add b.txt && "$GITHUB_WORKSPACE/build/sit" commit -m "on feature"
+          "$GITHUB_WORKSPACE/build/sit" checkout main
+          echo "main" > m.txt && "$GITHUB_WORKSPACE/build/sit" add m.txt && "$GITHUB_WORKSPACE/build/sit" commit -m "on main"
+          "$GITHUB_WORKSPACE/build/sit" merge feature -m "merge feature"
+          rm .sit/refs/heads/feature
+          OUT=$("$GITHUB_WORKSPACE/build/sit" fsck)
+          echo "$OUT"
+          echo "$OUT" | grep -q "0 bad, 0 dangling" || { echo "merge-commit fsck must follow both parents (got dangling — first-parent edge dropped)"; exit 1; }
+
       - name: Smoke — signed commit roundtrip
         run: |
           export HOME=$GITHUB_WORKSPACE/ci-home
