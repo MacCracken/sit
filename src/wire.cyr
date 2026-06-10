@@ -457,8 +457,17 @@ fn walk_reachable_phased(src, root_hex, out, seen, raw_cache) {
                         store8(tree_copy + 64, 0);
                         vec_push(trees, tree_copy);
                     }
-                    var parent_hex = load64(&info + 8);
-                    if (parent_hex != 0) { vec_push(queue, parent_hex); }
+                    # Enqueue EVERY parent (merge commits have 2+) so the
+                    # clone/fetch/push object set isn't missing the subgraph
+                    # reachable only via a non-last parent edge.
+                    var pv = load64(&info + 48);
+                    if (pv != 0) {
+                        var pi = 0;
+                        while (pi < vec_len(pv)) {
+                            vec_push(queue, vec_get(pv, pi));
+                            pi = pi + 1;
+                        }
+                    }
                 }
             }
         }
@@ -751,8 +760,16 @@ fn is_ancestor_in_db(db, ancestor_hex, desc_hex) {
                 var coff = load64(&obj + 16);
                 var info[56];
                 if (parse_commit_body(buf + coff, blen - coff, &info) == 0) {
-                    var p = load64(&info + 8);
-                    if (p != 0) { vec_push(queue, p); }
+                    # Walk every parent edge so the FF gate doesn't falsely
+                    # report non-ancestor across a merge commit.
+                    var pv = load64(&info + 48);
+                    if (pv != 0) {
+                        var pi = 0;
+                        while (pi < vec_len(pv)) {
+                            vec_push(queue, vec_get(pv, pi));
+                            pi = pi + 1;
+                        }
+                    }
                 }
             }
         }

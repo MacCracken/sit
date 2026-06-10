@@ -3,11 +3,15 @@
 # sankoch zlib roundtrip, hex encode/decode, and git-SHA-256-framed blob
 # hashing. Stdlib + deps are auto-included via cyrius.cyml.
 #
-# As of v0.6.0: validate.cyr is included directly so its pure validators
-# can be tested without the full sit include chain (they only depend on
-# stdlib primitives).
+# As of v0.6.0: validate.cyr was included directly so its pure validators
+# could be tested without the full sit include chain.
+#
+# As of the wire-walker multi-parent fix: include the full chain (src/lib.cyr,
+# same as tests/sit.fcyr) so parse_commit_body is in scope. DCE strips
+# everything not reached from this file's main(). validate.cyr is pulled in
+# transitively by lib.cyr, so the validator tests below still resolve.
 
-include "src/validate.cyr"
+include "src/lib.cyr"
 
 fn test_sigil_hash_known_answer() {
     test_group("sigil SHA-256 known answers");
@@ -382,6 +386,44 @@ fn test_validate_url_scheme() {
     return 0;
 }
 
+# Regression for the wire-walker multi-parent fix: parse_commit_body must
+# expose EVERY parent (merge commits have 2+) via the vec at out+48, not just
+# the last one at out+8. walk_reachable_phased / is_ancestor / is_ancestor_in_db
+# all consume out+48 so clone/fetch/push + FF checks don't drop merge edges.
+fn test_parse_commit_multiparent() {
+    test_group("commit.cyr — parse_commit_body multi-parent");
+
+    var p1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    var p2 = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    var info[56];
+
+    # Merge commit — two parent lines.
+    var mbody = "tree 3333333333333333333333333333333333333333333333333333333333333333\nparent 1111111111111111111111111111111111111111111111111111111111111111\nparent 2222222222222222222222222222222222222222222222222222222222222222\nauthor x <x@y> 0 +0000\ncommitter x <x@y> 0 +0000\n\nmerge\n";
+    assert_eq(parse_commit_body(mbody, strlen(mbody), &info), 0, "merge body parses");
+    var mpv = load64(&info + 48);
+    assert_eq((mpv == 0), 0, "merge commit has a parents vec");
+    assert_eq(vec_len(mpv), 2, "merge commit exposes 2 parents");
+    assert_streq(vec_get(mpv, 0), p1, "merge parent 0 = p1 (body order)");
+    assert_streq(vec_get(mpv, 1), p2, "merge parent 1 = p2 (body order)");
+    # Back-compat: out+8 still carries the last parent for single-chain readers.
+    assert_streq(load64(&info + 8), p2, "out+8 keeps last parent (cmd_log/merge_base)");
+
+    # Single-parent commit — vec of length 1.
+    var sbody = "tree 3333333333333333333333333333333333333333333333333333333333333333\nparent 1111111111111111111111111111111111111111111111111111111111111111\nauthor x <x@y> 0 +0000\ncommitter x <x@y> 0 +0000\n\nmsg\n";
+    assert_eq(parse_commit_body(sbody, strlen(sbody), &info), 0, "single-parent body parses");
+    var spv = load64(&info + 48);
+    assert_eq(vec_len(spv), 1, "single-parent commit exposes 1 parent");
+    assert_streq(vec_get(spv, 0), p1, "single parent = p1");
+
+    # Root commit — no parent line, vec stays 0.
+    var rbody = "tree 3333333333333333333333333333333333333333333333333333333333333333\nauthor x <x@y> 0 +0000\ncommitter x <x@y> 0 +0000\n\nroot\n";
+    assert_eq(parse_commit_body(rbody, strlen(rbody), &info), 0, "root body parses");
+    assert_eq((load64(&info + 48) == 0), 1, "root commit has no parents vec");
+
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -398,6 +440,7 @@ fn main() {
     test_validate_config_value();
     test_validate_remote_url();
     test_validate_url_scheme();
+    test_parse_commit_multiparent();
     return assert_summary();
 }
 
