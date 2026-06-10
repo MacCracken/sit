@@ -4,6 +4,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.7] — 2026-06-10 — Wire-walker multi-parent fix
+
+**Closes the wire-walker single-parent footgun surfaced in v0.8.5.** `parse_commit_body` captured only the *last* `parent` header, so the three commit-graph traversals that consumed it followed just one edge per merge commit. Cloning / fetching / pushing a merge-bearing repo could silently drop every object reachable only through a non-last parent — and the resulting clone still passed `sit fsck` ("0 dangling") while missing data. Reproduced on a 3-commit + merge fixture: a clone dropped 2 objects (the first-parent commit + its tree), 11 → 9, with no error surfaced.
+
+### Fixed
+
+- **`parse_commit_body` (`src/commit.cyr`)** now collects *every* `parent` line into a vec at the previously-unused struct slot `out+48` (in body order). `out+8` is left unchanged (still the last parent) so single-parent-chain readers — `cmd_log`, `merge_base` — keep their exact prior behavior; only the traversals below switch to the vec.
+- **`walk_reachable_phased` (`src/wire.cyr`)** — the clone / fetch / push object enumerator — enqueues all parents from `out+48` instead of the single `out+8`. This is the load-bearing fix that makes merge-bearing clones complete.
+- **`is_ancestor` (`src/commit.cyr`)** rewritten from a naive single-parent chain walk into a BFS over the full commit DAG (queue + seen-set) enqueuing all parents. A first-parent-only walk would falsely report "not an ancestor" across a merge, skewing fast-forward / merge-base decisions.
+- **`is_ancestor_in_db` (`src/wire.cyr`)** — the server-side / push fast-forward gate — same fix; it was already a BFS, just enqueuing a single parent.
+
+### Added
+
+- **`tests/sit.tcyr` multi-parent group** (`test_parse_commit_multiparent`): asserts `parse_commit_body` exposes both parents of a synthesized merge body in body order, exactly one for a single-parent commit, and none for a root commit, plus the `out+8` last-parent back-compat invariant. The test file now `include`s `src/lib.cyr` (the `tests/sit.fcyr` pattern) so `parse_commit_body` is in scope; DCE strips everything else. **138 assertions** (was 127).
+
+### Changed
+
+- **Capabilities banner version literal** (`src/serve.cyr:89`) bumped `0.8.5` → `0.8.7` (v0.8.6 skipped the banner bump).
+
+### Out of scope (tracked)
+
+- `merge_base` (`src/merge.cyr`) and `cmd_log` (`src/commit.cyr`) still follow the single `out+8` parent chain. For `cmd_log` that's the intended single-chain log behavior; for `merge_base` it's a latent limitation — correct lowest-common-ancestor across diamond / octopus merges wants a full DAG walk. Queued, not in this slot's scope.
+
+### Notes
+
+- Build / test / lint / fuzz green. DCE binary **2.12 MB** (+672 bytes vs v0.8.6). Lint clean apart from the pre-existing >120-character `eprintln` at `src/commit.cyr:642`.
+
+## [0.8.6] — 2026-06-10 — cyrius 6.1.27 toolchain refresh + dep bumps + stdlib reorg
+
+**Major toolchain line bump.** cyrius `5.11.55 → 6.1.27` (6.x major). No sit source changes — the work was absorbing the cyrius 6.x stdlib reorganization in `cyrius.cyml`.
+
+### Changed
+
+- **cyrius pin** `5.11.55 → 6.1.27` in `cyrius.cyml [package].cyrius`.
+- **Dependency bumps**: sakshi `2.2.4 → 2.2.10`, sankoch `2.2.5 → 2.3.0`, sigil `3.1.1 → 3.7.8`, patra `1.9.4 → 1.11.0`. sit's consumed surface (sigil `hash_data` / `hex_*` / ed25519, sankoch zlib, patra object store) is unchanged — build / test / fuzz confirm, end-to-end smoke verifies signed-commit verify against sigil 3.7.8.
+- **Stdlib list reorg for cyrius 6.x** (`cyrius.cyml [deps].stdlib`):
+  - `bigint` / `base64` / `json` removed — cyrius 6.x folded all three into the new omnibus bundle **`bayan`** (functions gained a `bayan_` prefix; back-compat aliases keep sigil's `u256_*` crypto path working). Replaced the three entries with `bayan`.
+  - Added **`slice`** — cyrius 6.x's `agnosys` stdlib module now requires it (`_slice_idx_get_*` helpers).
+
+### Notes
+
+- **Known benign build warning**: `lib/sandhi.cyr` (1.4.10) gained a concurrent server variant `sandhi_server_run_async` that calls `lib/async.cyr`. sit's `cmd_serve` uses the *synchronous* `sandhi_server_run`, so the async path is dead code DCE strips — but the compile emits four `undefined function 'async_*'` warnings. Adding `async` to the stdlib list overflows the 256-initialized-globals cap and hard-fails the build, so the warnings are accepted (same shape as v0.8.5's retired-`hashmap_*` wart).
+- **`tls_native` unblock noted** (not consumed this release): cyrius 6.x ships `lib/tls_native.cyr`, a sovereign pure-Cyrius TLS 1.3 stack on sigil primitives (ChaCha20-Poly1305 / AES-GCM / HKDF / X25519 / ECDSA / X.509; no fdlopen, no libssl; interops with OpenSSL 3.x). This clears [ADR 0007](docs/adr/0007-network-transport-security.md)'s gate for the long-blocked HTTPS slot — wiring deferred to a later v0.8.x release.
+- DCE binary **2.12 MB** (up from 1.39 MB at v0.8.5 — cyrius 6.x stdlib / sandhi is heavier). 127/127 tests; lint / fuzz green.
+- Shipped undocumented (the tag changed only `VERSION` + `cyrius.cyml` + `dist/sit.cyr`); this entry is the retroactive record, written during v0.8.7 prep.
+
 ## [0.8.5] — 2026-05-15 — `sit fsck` reachability walk + cyrius 5.11.55 toolchain refresh
 
 **Closes the second v0.7.6 footgun.** `sit fsck` now distinguishes integrity (objects whose stored bytes don't re-hash to their stored key) from reachability (objects no ref / index entry points at). Output gains a third counter and a per-object dangling line:
@@ -1035,7 +1081,9 @@ First official release. Rolls up the entire pre-release development arc (scaffol
 - **Git format compatibility** — object framing + tree format are byte-compatible with git's SHA-256 mode, but sit is *not* a drop-in for a git repo (the wire protocol is sit-native, signed commits use sit's `sitsig` header rather than git's `gpgsig`).
 - **Not on the AGNOS critical path** — post-boot, when-there's-time project.
 
-[Unreleased]: https://github.com/MacCracken/sit/compare/0.6.0...HEAD
+[Unreleased]: https://github.com/MacCracken/sit/compare/0.8.7...HEAD
+[0.8.7]: https://github.com/MacCracken/sit/releases/tag/0.8.7
+[0.8.6]: https://github.com/MacCracken/sit/releases/tag/0.8.6
 [0.6.0]: https://github.com/MacCracken/sit/releases/tag/0.6.0
 [0.5.1]: https://github.com/MacCracken/sit/releases/tag/0.5.1
 [0.5.0]: https://github.com/MacCracken/sit/releases/tag/0.5.0
