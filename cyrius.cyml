@@ -5,7 +5,7 @@ description = "Sovereign version control — a Cyrius-native git replacement"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sit"
 language = "cyrius"
-cyrius = "5.11.55"
+cyrius = "6.1.27"
 
 [build]
 entry = "src/main.cyr"
@@ -48,11 +48,13 @@ modules = [
 [deps]
 # Transitive stdlib resolution (cyrius v5.10.x SLOT 19) doesn't follow
 # through enum / constant references — sandhi pulls TLS_EARLY_DATA_*,
-# fdlopen_*, base64_encode (via tls/ws shim transitives), and sigil
-# pulls u256_* / ct_eq_bytes_lens / _keccak_* / shake256 (via its crypto
+# fdlopen_*, base64 (via tls/ws shim transitives), and sigil pulls
+# u256_* / ct_eq_bytes_lens / _keccak_* / shake256 (via its crypto
 # primitives). All explicit until the cyrius transitive arc closes those
-# follow-through gaps.
+# follow-through gaps. `bayan` is the cyrius 6.x omnibus bundle that
+# folded the old base64 / json / bigint stdlib modules into one.
 stdlib = [
+    "slice",
     "string",
     "fmt",
     "alloc",
@@ -70,30 +72,28 @@ stdlib = [
     "fnptr",
     "thread",
     "freelist",
-    "bigint",
+    "bayan",
     "ct",
     "keccak",
     "bench",
     "net",
-    "base64",
     "mmap",
     "dynlib",
     "fdlopen",
     "tls",
     "ws",
     "http",
-    "json",
     "sandhi",
 ]
 
 [deps.sakshi]
 git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.2.4"
+tag = "2.2.10"
 modules = ["dist/sakshi.cyr"]
 
 [deps.sankoch]
 git = "https://github.com/MacCracken/sankoch.git"
-tag = "2.2.5"
+tag = "2.3.0"
 modules = ["dist/sankoch.cyr"]
 
 # sigil 3.x: ct_eq retired (cyrius stdlib `ct_eq_bytes_lens` is canonical);
@@ -101,11 +101,11 @@ modules = ["dist/sankoch.cyr"]
 # sit uses only hash_data / hex_encode / hex_decode — none affected.
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
-tag = "3.1.1"
+tag = "3.7.8"
 modules = ["dist/sigil.cyr"]
 
 [deps.patra]
 git = "https://github.com/MacCracken/patra.git"
-tag = "1.9.4"
+tag = "1.11.0"
 modules = ["dist/patra.cyr"]
 
