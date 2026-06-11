@@ -10,9 +10,12 @@ The name is from *smriti* (स्मृति — "that which is remembered"). T
 
 - **Version**: see [`VERSION`](VERSION) (single source of truth) and [`docs/development/state.md`](docs/development/state.md) for the live state snapshot (current version, dep pins, source layout, recent releases).
 - **Language**: Cyrius (toolchain pinned in [`cyrius.cyml`](cyrius.cyml) under `[package].cyrius`).
-- **Commands**: `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `reset`, `commit`, `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md).
+- **Commands**: `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `reset`, `commit`, `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `serve`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md).
+- **Transports**: `file://` (+ bare paths) · `http://` · **`https://`** (first-party TLS 1.3, TOFU-pinned) · `ssh://`. Clone / fetch / push work over all four; `sit serve` is the loopback HTTP daemon (`--tls` for HTTPS, `--stdio` for SSH).
 
-Objects are SHA-256-hashed (via [sigil](https://github.com/MacCracken/sigil)) and zlib-compressed (via [sankoch](https://github.com/MacCracken/sankoch)), stored in a [patra](https://github.com/MacCracken/patra) table with a `COL_BYTES` content column. Trees are recursive and byte-compatible with git's SHA-256 object format. Commits can be ed25519-signed via sigil. Still exploratory, post-boot — not on the AGNOS critical path.
+Objects are SHA-256-hashed (via [sigil](https://github.com/MacCracken/sigil)) and zlib-compressed (via [sankoch](https://github.com/MacCracken/sankoch)), stored in a [patra](https://github.com/MacCracken/patra) table with a `COL_BYTES` content column. Trees are recursive and byte-compatible with git's SHA-256 object format. Commits can be ed25519-signed via sigil.
+
+**What works today** (v0.8.x line): the full local VCS loop (init → add → commit → branch → merge → tag); ed25519 signed commits + `verify-commit`; `fsck` with integrity + reachability (dangling) checks; git-parity `.sitignore` (negation, `**`, char classes, anchoring); and network sync over HTTP, **HTTPS (first-party Cyrius TLS — no libssl)**, and SSH, with `sit serve` on the host side. Still exploratory, post-boot — not on the AGNOS critical path.
 
 ## Size and performance
 
@@ -29,7 +32,10 @@ Each layer is first-party, no C below the Cyrius compiler:
 | Compression | [sankoch](https://github.com/MacCracken/sankoch) | zlib |
 | Hashing / signing | [sigil](https://github.com/MacCracken/sigil) | OpenSSL / libsha / ed25519 |
 | Object store | [patra](https://github.com/MacCracken/patra) | loose objects + pack files |
-| Wire protocol | sit (first-party, in-tree) | smart-HTTP / ssh |
+| Wire protocol | sit (first-party `/sit/v1/...` JSON/REST, in-tree) | git smart-HTTP |
+| TLS (HTTPS) | cyrius `lib/tls_native.cyr` (TLS 1.3) | OpenSSL / libssl |
+
+The no-FFI thesis holds end-to-end: `ldd build/sit` reports *not a dynamic executable*, and HTTPS rides cyrius's own pure-Cyrius TLS 1.3 stack rather than libssl ([ADR 0007](docs/adr/0007-network-transport-security.md)). SSH reuses the system `ssh` binary as a process boundary, not an FFI dep ([ADR 0008](docs/adr/0008-ssh-transport.md)).
 
 See [ADR 0001](docs/adr/0001-no-ffi-first-party-only.md) for the first-party thesis.
 

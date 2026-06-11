@@ -172,10 +172,17 @@ The signature is a `sitsig <128-hex-sig> <64-hex-pubkey>` line spliced into the 
 
 ## Sync with a remote
 
-In v0.5.0 a "remote" is another sit working-tree directory on the same filesystem. Network transports (HTTP, SSH) land in v0.6.x; the object-transfer mechanics here carry over unchanged.
+A "remote" can be a sit working-tree directory on the same filesystem **or** a network endpoint. sit supports four transports — the object-transfer mechanics (reachability walk → copy raw compressed bytes → fsck verifies) are identical across all of them:
+
+| URL form | Transport | Read (clone/fetch) | Write (push) |
+|---|---|---|---|
+| `/srv/repo` or `file:///srv/repo` | local path | ✅ | ✅ |
+| `http://host:port` | plain HTTP (loopback / private net) | ✅ | ✅ |
+| `https://host:port` | TLS 1.3, first-party (TOFU-pinned) | ✅ | ✅ |
+| `ssh://user@host/path` | system `ssh` process | ✅ | ✅ |
 
 ```sh
-# Register a remote. The URL is a path (bare or file://).
+# Register a remote. The URL is a path, http(s)://, or ssh://.
 /path/to/sit/build/sit remote add origin /srv/sit-repos/demo
 /path/to/sit/build/sit remote list
 # origin	/srv/sit-repos/demo
@@ -189,7 +196,7 @@ sit fetch origin feature-x  # or a specific branch
 # fetched origin/main at 05359719b7c3 (7 new objects)
 ```
 
-The fetched objects land in your local `.sit/objects.patra`; the remote's tip is written to `.sit/refs/remotes/origin/<branch>`. Fetch does not merge — run `sit merge origin/main` (or, when v0.5.1 lands, `sit pull`) to integrate.
+The fetched objects land in your local `.sit/objects.patra`; the remote's tip is written to `.sit/refs/remotes/origin/<branch>`. Fetch does not merge — run `sit merge origin/main` or `sit pull` to integrate.
 
 Push the current branch back upstream:
 
@@ -223,6 +230,31 @@ sit log
 ```
 
 Under the hood it's `mkdir` + `chdir` + `sit init` + `sit remote add origin <url>` + `sit fetch origin main` + `write HEAD ref` + materialize the tree. The target directory defaults to the URL's last path segment when you don't pass one.
+
+## Serve and sync over the network
+
+`sit serve` exposes a repo over the `/sit/v1/...` wire protocol. It's loopback-bound by default (`127.0.0.1`); put it behind a tunnel, or use `--tls` / `ssh://` for encrypted-over-internet.
+
+```sh
+# Plain HTTP (loopback / private network / behind a tunnel)
+sit serve /srv/repos/demo --listen 127.0.0.1:8484 &
+sit clone http://127.0.0.1:8484 my-demo
+
+# HTTPS — first-party TLS 1.3 (no libssl). Bring an ECDSA P-256 cert+key:
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=127.0.0.1"
+sit serve /srv/repos/demo --tls --cert cert.pem --key key.pem --listen 127.0.0.1:8443 &
+sit clone https://127.0.0.1:8443 my-demo
+```
+
+HTTPS trust is **TOFU / pinned** (like SSH host keys): the first clone records the server's certificate fingerprint in `~/.sit/known_certs`; a later mismatch refuses the connection. The TLS connection is reused across the whole clone (one handshake). Use an **ECDSA P-256** cert — Ed25519 server certs currently fail the handshake (a tracked upstream `tls_native` gap).
+
+```sh
+# SSH — reuses the system ssh binary; sit runs 'sit serve --stdio' on the far side
+sit clone ssh://user@host/srv/repos/demo my-demo
+```
+
+Bearer-token auth (`--require-auth`, `~/.sit/serve.token`) gates writes over HTTP/HTTPS; reads stay anonymous. Pushing to a remote's currently-checked-out branch is refused (`denyCurrentBranch`), matching git.
 
 ## View history
 
@@ -324,19 +356,26 @@ Output is the log-style header followed by the diff of that commit against its p
 Drop a `.sitignore` at the repo root to keep build artifacts, editor junk, and secrets out of status and commits:
 
 ```
-# .sitignore — blank lines and comments are skipped
+# .sitignore — blank lines and # comments are skipped
 .env
 build
 *.log
-*.tmp
-file?.bak
+!keep.log          # negation: re-include a file an earlier pattern excluded
+/root-only         # leading '/' anchors to the repo root
+**/cache/*         # '**' spans directories
+[Tt]emp            # char classes (ranges + [!…] negation too)
 ```
 
-- Patterns are segment-matched: `build` ignores `build/`, `src/build/`, and `lib/build/foo.cyr`.
-- `*` matches any run of non-`/` chars; `?` matches exactly one. No `**` yet.
-- Trailing `/` on a pattern is allowed but not enforced (v1 doesn't restrict matches to directories).
-- `sit add <ignored>` errors out — like git, no `-f` override in v1.
-- `.sitignore` itself is trackable; `sit add .sitignore` works normally.
+As of v0.8.10 the matcher is git-parity:
+
+- **`*`** matches a run of non-`/`; **`?`** matches one non-`/`; **`[abc]` / `[a-z]` / `[!abc]`** char classes match one char.
+- **`**`** spans directories — `**/foo` matches `foo` at any depth, `foo/**` matches everything under `foo`, `a/**/b` matches across nesting.
+- **Anchoring**: a pattern with a leading or middle `/` (`/foo`, `a/b`) is matched from the repo root; a pattern with no `/` (`build`, `*.log`) matches at any level.
+- **Negation**: `!pattern` re-includes a previously-excluded match — patterns are evaluated in order, last match wins.
+- **Directory exclusion**: a matched directory excludes its contents (`build` also ignores `build/foo.o`).
+- `sit add <ignored>` errors out — like git, override with `-f`. `.sitignore` itself is trackable.
+
+Simplifications vs git (documented in `src/index.cyr`): a non-segment `**` (e.g. `a**b`) still crosses `/`; a trailing `/` (`build/`) is allowed but not enforced as directories-only.
 
 **Note**: unlike older sit versions, dotfiles aren't hidden by default anymore — only `.sit/` is hardcoded-skipped. To keep `.git/` out of your sit repo when both coexist, list `.git` in your `.sitignore`.
 
@@ -352,8 +391,8 @@ file?.bak
 - `sit reset <path>` — unstage: rewrite the index entry for the path to HEAD's tree hash (or drop it if HEAD doesn't have it). Working tree untouched.
 - `sit reset --hard <ref>` — move the current branch's ref to `<ref>` (branch / tag / commit hex) and restore the working tree to that commit.
 - `sit config [--global] <key> [<value>]` — read/write config entries (`user.name`, `user.email`, etc). Local at `.sit/config`, global at `~/.sitconfig`
-- `sit fsck` — verify that each stored object's content hashes back to its filename
-- `.sitignore` — gitignore-style pattern file (at repo root) filters untracked-file display and `sit add` (override with `-f`)
+- `sit fsck` — integrity (each stored object re-hashes to its key) **and reachability** (objects no ref / index entry points at are reported as `dangling <type> <hex>`)
+- `.sitignore` — git-parity ignore matcher (`*` / `?` / `[...]` char classes / `**` / `!` negation / leading-or-middle-`/` anchoring) filtering untracked-file display and `sit add` (override with `-f`)
 - `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
 - `sit log` — walk commit history from HEAD with git-style output
 - `sit status` — three-way diff across HEAD tree, staging index, and working directory
@@ -362,20 +401,22 @@ file?.bak
 - `sit key generate` / `sit key show` — create / inspect the local ed25519 signing key at `~/.sit/signing_key`
 - `sit commit -S` — sign the commit body (inserts a `sitsig <sig> <pubkey>` header line)
 - `sit verify-commit [<hash>]` — check a commit's signature; defaults to HEAD
-- `sit remote add|list|remove <name> [<url>]` — manage named remotes (local-path URLs for now)
-- `sit fetch <remote> [<branch>]` — copy remote objects + tracking ref into the local repo
+- `sit remote add|list|remove <name> [<url>]` — manage named remotes (`file://` / `http://` / `https://` / `ssh://`)
+- `sit fetch <remote> [<branch>]` — copy remote objects + tracking ref into the local repo (any transport)
 - `sit pull <remote> [<branch>]` — fetch + fast-forward merge (divergence → use `sit merge` manually)
-- `sit push <remote> [<branch>]` — push HEAD's branch to a remote (fast-forward only)
-- `sit clone [--force-absolute] <url> [<dir>]` — init + remote add + fetch + materialize in one shot. Absolute target paths require `--force-absolute` (so `sit clone <url> /etc/passwd` doesn't silently land where you didn't mean — S-23 hardening from v0.6.2).
+- `sit push <remote> [<branch>]` — push HEAD's branch to a remote, fast-forward only (any transport; refuses the remote's checked-out branch per `denyCurrentBranch`)
+- `sit clone [--force-absolute] <url> [<dir>]` — init + remote add + fetch + materialize in one shot, over any transport. Absolute target paths require `--force-absolute` (so `sit clone <url> /etc/passwd` doesn't silently land where you didn't mean — S-23 hardening from v0.6.2).
+- `sit serve <repo> [--listen 127.0.0.1:<port>] [--tls --cert <f> --key <f>] [--stdio] [--require-auth]` — host a repo over the `/sit/v1/...` wire protocol (loopback HTTP, HTTPS via first-party TLS 1.3, or SSH stdio)
 - `sit merge -S <branch>` — signed merge commit (same ed25519 flow as `sit commit -S`)
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
 
 ## What doesn't yet
 
-- Network transports (HTTP / SSH) — v0.5.0 ships local-path remotes only
-- Pack bundles / delta compression for object transfer
-- Rebase
-- Full gitignore semantics (no negation / `**` / char-classes yet)
+- `sit log --graph` and shallow clone (`--depth N`) — next slot (v0.8.11)
+- Rebase; cherry-pick; stash
+- Pack bundles / delta compression for object transfer (objects copy one-at-a-time)
+- HTTPS over public CA certs / mTLS — HTTPS today is TOFU-pinned (CA-chain + hostname verification is a post-v1 opt-in); Ed25519 server certs are blocked on an upstream `tls_native` gap (use ECDSA P-256)
+- `.sitignore` directory-only (`build/`) enforcement; `merge_base` across complex (diamond/octopus) merges still follows the first-parent chain
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).
