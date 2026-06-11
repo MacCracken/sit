@@ -4,6 +4,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.10] — 2026-06-10 — Full `.sitignore` semantics (git-parity)
+
+`.sitignore` matching gains negation, `**`, char classes, and anchoring — the gaps that separated sit's matcher from git's.
+
+### Added
+
+- **`_wildmatch`** (`src/index.cyr`) — a gitignore-style glob with `WM_PATHNAME` semantics replacing the old single-segment `glob_match`: `*` / `?` (a run / one char, neither crossing `/`), **char classes** `[abc]` / `[a-z]` / `[!…]` (with a leading `]` as a literal member), **`**`** (crosses `/`; `**/` collapses zero dirs so `**/foo` matches `foo` at any depth, `/**` trails), and **directory-exclusion** (a matched dir-prefix excludes its contents, so `foo/bar` matches `foo/bar/baz`).
+- **`!pattern` negation** — `is_ignored` now evaluates patterns in order with **last-match-wins**, so `!keep.log` after `*.log` re-includes the file (git semantics).
+- **Anchoring** — `load_sitignore` flags a pattern as anchored when it has a leading `/` or a middle `/`; anchored patterns match against the full path from the repo root, non-anchored (no `/`) patterns match at any level. `\!` / `\#` escape a literal first char.
+- **Tests** — `tests/sit.tcyr` gains two groups (`_wildmatch` glob core + `is_ignored` negation/anchoring): globs, char classes, `**`, dir-exclusion, negation re-include, anchored-vs-nested, path patterns. **180 assertions** (was 146).
+- **CI smoke** `Smoke — .sitignore semantics` — a fixture (`*.log` / `!keep.log` / `/root-only` / `**/build/*` / `[Tt]emp`) asserting `sit add` ignores / re-includes / anchors / char-class-matches correctly.
+
+### Changed
+
+- Pattern storage is now a struct vec (`[text, len, negated, anchored]`) instead of plain cstrings; `is_ignored` / `load_sitignore` callers (`cmd_add`, `cmd_status`) are unaffected (they pass `patterns` opaquely).
+- Capabilities banner `0.8.9 → 0.8.10`.
+
+### Notes
+
+- **Simplifications** (documented in-code): `**` crosses `/` even when not a whole path segment (git only crosses for segment-bounded `**`; `a**b` is rare and the real cases `**/x` / `x/**` / `a/**/b` are exact). Trailing-`/` (`build/`) is still stripped, not enforced as directory-only (unchanged, and not in scope). A `!` can re-include a file under an excluded directory (git can't) — a minor, friendlier divergence.
+- Build / test / lint / fuzz green; no new lint warnings. DCE binary **2.15 MB**. Toolchain pin unchanged at 6.1.30.
+
 ## [0.8.9] — 2026-06-10 — HTTPS followups: push, keep-alive, read-timeout, CI smoke
 
 Followups to the v0.8.8 HTTPS transport. `https://` is now a full read **+ write** transport with persistent (one-handshake) connections.
@@ -1133,7 +1155,8 @@ First official release. Rolls up the entire pre-release development arc (scaffol
 - **Git format compatibility** — object framing + tree format are byte-compatible with git's SHA-256 mode, but sit is *not* a drop-in for a git repo (the wire protocol is sit-native, signed commits use sit's `sitsig` header rather than git's `gpgsig`).
 - **Not on the AGNOS critical path** — post-boot, when-there's-time project.
 
-[Unreleased]: https://github.com/MacCracken/sit/compare/0.8.9...HEAD
+[Unreleased]: https://github.com/MacCracken/sit/compare/0.8.10...HEAD
+[0.8.10]: https://github.com/MacCracken/sit/releases/tag/0.8.10
 [0.8.9]: https://github.com/MacCracken/sit/releases/tag/0.8.9
 [0.8.8]: https://github.com/MacCracken/sit/releases/tag/0.8.8
 [0.8.7]: https://github.com/MacCracken/sit/releases/tag/0.8.7

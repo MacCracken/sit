@@ -1,6 +1,6 @@
 # sit Development Roadmap
 
-> **v0.8.x active — release 9 of N shipped.** Line opener and arc summary:
+> **v0.8.x active — release 10 of N shipped.** Line opener and arc summary:
 >
 > | tag | date | summary |
 > |---|---|---|
@@ -14,10 +14,11 @@
 > | v0.8.7 | 2026-06-10 | wire-walker multi-parent fix — third v0.7.6-era footgun closed |
 > | v0.8.8 | 2026-06-10 | **HTTPS transport** (`https://` clone/fetch over first-party TLS 1.3, TOFU-pinned) — the long-blocked slot, shipped; cyrius pin `6.1.27 → 6.1.29` |
 > | v0.8.9 | 2026-06-10 | **HTTPS followups** — push + keep-alive (1 handshake/clone) + read-timeout + CI smoke; cyrius pin `6.1.29 → 6.1.30` |
+> | v0.8.10 | 2026-06-10 | **Full `.sitignore` semantics** — git-parity: negation, `**`, char classes, anchoring (new `_wildmatch`) |
 >
 > **Slot note:** v0.8.6 shipped as the cyrius 6.x toolchain refresh (not the originally-planned wire-walker fix); wire-walker landed at **v0.8.7**; **HTTPS took v0.8.8** (it was the long-blocked slot and `tls_native` made it ready). So HTTPS followups are **v0.8.9**, `.sitignore` slid to **v0.8.10**, and `log --graph` / shallow-clone to **v0.8.11**.
 >
-> **Next: v0.8.10 — `.sitignore` semantics** (git-parity: negation, `**`, char classes, anchored/path patterns); then v0.8.11 (`log --graph` + shallow clone). HTTPS is complete (clone/fetch/push over first-party TLS 1.3, keep-alive, TOFU-pinned) as of v0.8.8–0.8.9.
+> **Next: v0.8.11 — `sit log --graph` + `--depth N` shallow clone** (bundled; share a DFS-over-the-commit-DAG primitive, now easy via `parse_commit_body`'s `out+48` parents vec). HTTPS (v0.8.8–0.8.9) and `.sitignore` git-parity (v0.8.10) are complete.
 >
 > **HTTPS is SHIPPED (v0.8.8).** cyrius 6.x's [`lib/tls_native.cyr`](../adr/0007-network-transport-security.md) — sovereign pure-Cyrius TLS 1.3 on sigil primitives (**no fdlopen, no libssl**; interops with OpenSSL 3.6.2) — satisfied [ADR 0007](../adr/0007-network-transport-security.md)'s gate. `sit clone https://` against `sit serve --tls` works end-to-end, TOFU-pinned (SPKI SHA-256 in `~/.sit/known_certs`, ADR 0008 parity). Read-only this release; **https push + keep-alive + read-timeout are v0.8.9**. **mTLS** still builds on this (`tls_native_new_server` + client-cert verify primitives exist); slot after https push. The cross-repo blocker `issues/archived/2026-05-13-sandhi-first-party-tls-surface-needed.md` is archived RESOLVED.
 >
@@ -26,6 +27,14 @@
 Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHANGELOG.md`](../../CHANGELOG.md) for the tagged artifacts.
 
 ## Released
+
+### v0.8.10 — Full `.sitignore` semantics (git-parity)
+
+- **Closes the five gaps** between sit's ignore matcher and git's: negation (`!pattern`), `**` multi-segment wildcard, char classes (`[abc]` / `[a-z]` / `[!…]`), anchored patterns (`/foo`), and path patterns (`foo/bar`).
+- **New `_wildmatch` (`src/index.cyr`)** — WM_PATHNAME glob replacing single-segment `glob_match`: `*` / `?` don't cross `/`; `**` does (with `**/` zero-dir collapse and `/**` trailing); char classes with ranges + `!` negation + literal leading `]`; directory-exclusion (a matched dir-prefix excludes its contents).
+- **`is_ignored`** evaluates patterns last-match-wins (so `!keep.log` re-includes after `*.log`); anchored patterns (leading/middle `/`) match from the repo root, non-anchored match at any level. **`load_sitignore`** parses `!`, `/` anchoring, `\!` / `\#` escapes; pattern storage moved cstrings → struct vec `[text, len, negated, anchored]` (callers unaffected).
+- **Tests**: two `tests/sit.tcyr` groups — `_wildmatch` glob core + `is_ignored` negation/anchoring (**180 assertions**, +34). **CI smoke** `Smoke — .sitignore semantics` (fixture `*.log` / `!keep.log` / `/root-only` / `**/build/*` / `[Tt]emp`).
+- **Documented simplifications**: `**` crosses `/` even when not a whole segment (real cases `**/x` / `x/**` / `a/**/b` are exact; `a**b` is rare); trailing-`/` (`build/`) stripped not enforced as dir-only; a `!` can re-include under an excluded dir (git can't). No toolchain change. Build / test / lint / fuzz green; DCE 2.15 MB.
 
 ### v0.8.9 — HTTPS followups: push, keep-alive, read-timeout, CI smoke
 
@@ -491,7 +500,7 @@ Same small-bite cadence as v0.7.x. Five releases shipped (toolchain → lib expo
 | ~~0.8.7~~ | ✅ shipped 2026-06-10 — wire-walker multi-parent fix. `parse_commit_body` exposes every parent via a vec at `out+48`; `walk_reachable_phased` + `is_ancestor` + `is_ancestor_in_db` follow all edges. Verified: merge-fixture clone 9 → 11 objects. `out+8` untouched (cmd_log/merge_base byte-identical); `merge_base` LCA left as a tracked follow-up. | `parse_commit_body` parents-vec in `src/commit.cyr`; `walk_reachable_phased` + `is_ancestor_in_db` in `src/wire.cyr`; `is_ancestor` rewritten as full-DAG BFS | (see Released — third footgun closed; 138 tests; binary 2.12 MB) |
 | ~~0.8.8~~ | ✅ shipped 2026-06-10 — **HTTPS transport (`https://` clone/fetch over first-party TLS 1.3, TOFU-pinned).** Closes the slot blocked on first-party Cyrius TLS for the whole v0.8.x line. Three bites: (1) TOFU pin store in new `src/wire_https.cyr` (SPKI SHA-256 in `~/.sit/known_certs`, ADR 0008 parity); (2) client TLS I/O in `wire_http.cyr` (`_wire_https_connect` + `set_verify(NONE)` + SPKI pin, fragmented `_wire_io_send/recv`); (3) server TLS in `serve.cyr` (`sit serve --tls --cert --key` + hand-rolled `_serve_run_tls` accept loop + 67 send sites routed via `_serve_tls_ctx`-gated wrappers). `tls_native` added to stdlib; pin `6.1.27 → 6.1.29`. ADR 0007 Update + blocker archived RESOLVED. | `src/wire_https.cyr`, extends `wire_http.cyr` + `wire.cyr` + `serve.cyr` | (see Released — clone https:// against serve --tls TOFU-pinned + fsck-clean; OpenSSL 3.6.2 interop; mismatch refused; binary 2.14 MB) |
 | ~~0.8.9~~ | ✅ shipped 2026-06-10 — **HTTPS followups.** https push (writable-check + `_url_is_http_family` dispatch); keep-alive (persistent socket+ctx, `_wire_https_exchange` exact-Content-Length read, server per-connection loop — 1 handshake/clone, verified); 30s `SO_RCVTIMEO` both ends; `Smoke — https transport` CI step; Ed25519-cert `tls_native` gap filed. Pin `6.1.29 → 6.1.30`. | extends `src/wire_http.cyr` + `src/serve.cyr` + `src/wire.cyr` + `src/wire_https.cyr` | (see Released — push roundtrip fsck-clean; 1 handshake/clone verified; no http regression) |
-| **0.8.10** | **Full `.sitignore` semantics — git-parity.** Today `match_ignore` handles bare `*` globs and literal paths; gaps: negation (`!pattern` re-includes a previously-excluded match), `**` (multi-segment wildcard), char classes (`[abc]`), anchored patterns (`/foo` only matches at repo root), path patterns (`foo/bar` only matches that nesting). Substantial parser work in `src/index.cyr`; high test coverage given corner cases (negation order, `**/` vs `/**`, escaped brackets). | extends `src/index.cyr`'s ignore matcher | new tests/sit.tcyr group covering each new feature against a synthetic .sitignore + path matrix; fixture-based smoke with negation re-include + `**/build/*` exclude patterns |
+| ~~0.8.10~~ | ✅ shipped 2026-06-10 — **Full `.sitignore` semantics (git-parity).** New `_wildmatch` (WM_PATHNAME glob: `*`/`?`/`[...]`/`**`/dir-exclusion) replaces single-segment `glob_match`; `is_ignored` last-match-wins (`!` negation); `load_sitignore` anchoring (leading/middle `/`) + `\!`/`\#` escapes; pattern storage cstrings → struct vec. 180 assertions (+34) + `Smoke — .sitignore semantics`. | `src/index.cyr` ignore matcher | (see Released — 5 gaps closed; documented `**`/dir-only simplifications; DCE 2.15 MB) |
 | **0.8.11** | **`sit log --graph` + `--depth N` shallow clone (bundled).** Two visualization/transport items that share a DFS-over-the-commit-DAG primitive. `--graph` emits an ASCII DAG using `\|` / `/` / `\` characters for merge branches; needs commit-parent walking — now trivially available via `parse_commit_body`'s `out+48` parents vec (v0.8.7). `--depth N` caps `walk_reachable_phased` to N commits back from HEAD; touches `src/wire.cyr`'s walker and `cmd_clone` arg parsing. | extends `src/commit.cyr` (`cmd_log --graph`) and `src/wire.cyr` (`walk_reachable_depth`) | CI smoke: 5-commit fixture with a merge; `sit log --graph` byte-shape matches an expected snapshot. Plus a `--depth 1` clone of a 10-commit fixture pulls exactly 1 commit-tree-blob-set (3 objects) |
 | **0.8.x last** | **Closeout pass before v1.0.0.** Per CLAUDE.md closeout procedure: full test suite, bench baseline vs. v0.6.x scoreboard, dead-code audit, refactor pass on any v0.8.x parallel-codepath accretion, code-review pass, cleanup sweep, security re-scan, downstream check (owl on `dist/sit.cyr`), doc sync, version-verify, full-clean build. | — | all closeout-pass checks green; v1.0.0 tag goes out |
 
@@ -523,6 +532,6 @@ Items that haven't yet landed in a numbered v0.8.x slot. The five items below th
 - ~~Wire-walker multi-parent fix~~ → **v0.8.7 ✅** (parents-vec at `out+48`; shipped 2026-06-10 — slid from v0.8.6, which shipped as the cyrius 6.x toolchain refresh instead)
 - ~~HTTPS via `tls_native`~~ → **v0.8.8 ✅** (clone/fetch over first-party TLS 1.3, TOFU-pinned; shipped 2026-06-10 — took the slot ahead of `.sitignore` as the long-blocked item)
 - ~~HTTPS followups (push / keep-alive / read-timeout / Ed25519 cert gap)~~ → **v0.8.9 ✅** (shipped 2026-06-10)
-- Full `.sitignore` semantics → v0.8.10 (slid: HTTPS took v0.8.8, followups v0.8.9)
+- ~~Full `.sitignore` semantics~~ → **v0.8.10 ✅** (git-parity: negation / `**` / char classes / anchoring; shipped 2026-06-10)
 - `sit log --graph` → v0.8.11 (bundled with shallow clone)
 - Shallow clone (`--depth N`) → v0.8.11 (bundled with `log --graph`)
