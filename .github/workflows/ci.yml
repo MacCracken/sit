@@ -422,6 +422,31 @@ jobs:
           "$GITHUB_WORKSPACE/build/sit" log | head -5
           "$GITHUB_WORKSPACE/build/sit" fsck
 
+      - name: Smoke — .sitignore semantics (v0.8.10)
+        run: |
+          export HOME=$GITHUB_WORKSPACE/ci-home
+          mkdir -p "$HOME"
+          export SIT_AUTHOR_NAME="CI Runner"
+          export SIT_AUTHOR_EMAIL="ci@example.com"
+          SIT="$GITHUB_WORKSPACE/build/sit"
+          demo=$(mktemp -d); cd "$demo"
+          "$SIT" init
+          printf '%s\n' '*.log' '!keep.log' '/root-only' '**/build/*' '[Tt]emp' > .sitignore
+          mkdir -p sub src/build
+          for f in debug.log keep.log root-only sub/root-only src/build/out.o Temp temp normal.txt; do : > "$f"; done
+          # add of an ignored path errors (no -f); a non-ignored path succeeds.
+          ign() { if "$SIT" add "$1" 2>/dev/null; then echo "FAIL: '$1' should be ignored"; exit 1; fi; }
+          ok()  { "$SIT" add "$1" || { echo "FAIL: '$1' should be addable"; exit 1; }; }
+          ign debug.log         # *.log
+          ok  keep.log          # !keep.log re-includes (negation, last match wins)
+          ign root-only         # /root-only (anchored at root)
+          ok  sub/root-only     # /root-only must NOT match a nested copy
+          ign src/build/out.o   # **/build/* (multi-segment wildcard)
+          ign Temp              # [Tt]emp (char class)
+          ign temp              # [Tt]emp
+          ok  normal.txt
+          echo ".sitignore semantics OK"
+
       - name: Smoke — fsck reachability (v0.8.5)
         run: |
           export HOME=$GITHUB_WORKSPACE/ci-home

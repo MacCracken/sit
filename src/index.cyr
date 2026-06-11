@@ -1,7 +1,9 @@
 # index.cyr — staging index + .sitignore + cmd_add / cmd_rm / cmd_reset.
 #
-# Patra-backed index at .sit/index.patra. Pattern-based ignore with segment
-# matching and * / ? globs (no **, no negation, no char classes).
+# Patra-backed index at .sit/index.patra. Git-parity `.sitignore` (v0.8.10):
+# `*` / `?` / `[...]` char classes, `**` multi-segment wildcard, `!` negation
+# (last match wins), and leading/middle `/` anchoring. See _wildmatch /
+# is_ignored / load_sitignore below.
 
 fn cmd_add() {
     if (argc() < 3) {
@@ -520,70 +522,199 @@ fn index_find(entries, path) {
     return 0;
 }
 
-# Glob match (single segment, no '/' crossing). Supports `*` (any run) and
-# `?` (single char). Recursive — pattern segments are short, no depth issue.
+# gitignore-style wildmatch (v0.8.10 — WM_PATHNAME semantics):
+#   '*'     a run of non-'/' chars
+#   '?'     one non-'/' char
+#   '[...]' a char class for one non-'/' char ('!' negates; 'a-z' ranges;
+#           a leading ']' is a literal member)
+#   '**'    (two+ stars) a run that MAY cross '/'; a following '/' allows zero
+#           dirs, so '**/foo' matches 'foo' at any depth and '/**/' collapses
+#   '/'     a literal separator
+# Trailing match also succeeds at a '/' boundary in str — directory exclusion:
+# 'foo/bar' matches 'foo/bar/baz'. Pattern length capped (S-15) against crafted
+# '*'-heavy patterns forcing exponential backtracking.
+#
+# Simplification vs git: any '**' crosses '/', even when not a whole path
+# segment (git only crosses for a segment-bounded '**'). 'a**b' is vanishingly
+# rare in real ignore files; the segment cases ('**/x', 'x/**', 'a/**/b') are
+# exact.
 var _GLOB_PAT_MAX = 256;
 
-fn glob_match(pat, pat_len, name, name_len) {
-    # S-15: cap pattern length at entry — prevents a crafted .sitignore
-    # from triggering O(2^N) recursion via many '*' chars. Real patterns
-    # fit easily under 256.
-    if (pat_len > _GLOB_PAT_MAX) { return 0; }
-    if (pat_len == 0) {
-        if (name_len == 0) { return 1; }
+fn _wildmatch(pat, plen, str, slen) {
+    if (plen > _GLOB_PAT_MAX) { return 0; }
+    if (plen == 0) {
+        if (slen == 0) { return 1; }
+        if ((load8(str) & 0xFF) == 47) { return 1; }   # dir-exclusion
         return 0;
     }
-    var pc = load8(pat);
-    if (pc == 42) {
-        if (glob_match(pat + 1, pat_len - 1, name, name_len) == 1) { return 1; }
-        if (name_len == 0) { return 0; }
-        return glob_match(pat, pat_len, name + 1, name_len - 1);
+    var pc = load8(pat) & 0xFF;
+
+    if (pc == 42) {   # '*'
+        var nstar = 0;
+        var counting = 1;
+        while (counting == 1) {
+            if (nstar < plen) {
+                if ((load8(pat + nstar) & 0xFF) == 42) { nstar = nstar + 1; }
+                else { counting = 0; }
+            }
+            else { counting = 0; }
+        }
+        var rest = pat + nstar;
+        var restlen = plen - nstar;
+        if (nstar >= 2) {                       # '**' — may cross '/'
+            if (restlen == 0) { return 1; }
+            if ((load8(rest) & 0xFF) == 47) {   # '**/...' may match zero dirs
+                if (_wildmatch(rest + 1, restlen - 1, str, slen) == 1) { return 1; }
+            }
+            var m = 0;
+            var res = 0;
+            var done = 0;
+            while (done == 0) {
+                if (_wildmatch(rest, restlen, str + m, slen - m) == 1) { res = 1; done = 1; }
+                else {
+                    if (m >= slen) { done = 1; }
+                    else { m = m + 1; }
+                }
+            }
+            return res;
+        }
+        # single '*' — run of non-'/'
+        if (_wildmatch(rest, restlen, str, slen) == 1) { return 1; }
+        if (slen == 0) { return 0; }
+        if ((load8(str) & 0xFF) == 47) { return 0; }
+        return _wildmatch(pat, plen, str + 1, slen - 1);
     }
-    if (name_len == 0) { return 0; }
-    if (pc == 63) {
-        return glob_match(pat + 1, pat_len - 1, name + 1, name_len - 1);
+
+    if (pc == 47) {   # '/'
+        if (slen == 0) { return 0; }
+        if ((load8(str) & 0xFF) != 47) { return 0; }
+        return _wildmatch(pat + 1, plen - 1, str + 1, slen - 1);
     }
-    if (pc != load8(name)) { return 0; }
-    return glob_match(pat + 1, pat_len - 1, name + 1, name_len - 1);
+
+    if (slen == 0) { return 0; }
+    var sc = load8(str) & 0xFF;
+
+    if (pc == 63) {   # '?'
+        if (sc == 47) { return 0; }
+        return _wildmatch(pat + 1, plen - 1, str + 1, slen - 1);
+    }
+
+    if (pc == 91) {   # '[' char class
+        if (sc == 47) { return 0; }
+        var ci = 1;
+        var negate = 0;
+        if (ci < plen) {
+            if ((load8(pat + ci) & 0xFF) == 33) { negate = 1; ci = ci + 1; }
+        }
+        var matched = 0;
+        var first = 1;
+        var closed = 0;
+        var bad = 0;
+        while (closed == 0) {
+            if (ci >= plen) { bad = 1; closed = 1; }   # unterminated class
+            else {
+                var cc = load8(pat + ci) & 0xFF;
+                if (cc == 93) {                        # ']'
+                    if (first == 1) {                  # literal ']' as first member
+                        if (sc == 93) { matched = 1; }
+                        ci = ci + 1;
+                        first = 0;
+                    }
+                    else { closed = 1; ci = ci + 1; }
+                }
+                else {
+                    first = 0;
+                    var is_range = 0;
+                    if (ci + 2 < plen) {
+                        if ((load8(pat + ci + 1) & 0xFF) == 45) {
+                            if ((load8(pat + ci + 2) & 0xFF) != 93) { is_range = 1; }
+                        }
+                    }
+                    if (is_range == 1) {
+                        var lo = cc;
+                        var hi = load8(pat + ci + 2) & 0xFF;
+                        if (sc >= lo) { if (sc <= hi) { matched = 1; } }
+                        ci = ci + 3;
+                    }
+                    else {
+                        if (sc == cc) { matched = 1; }
+                        ci = ci + 1;
+                    }
+                }
+            }
+        }
+        if (bad == 1) { return 0; }
+        var ok = matched;
+        if (negate == 1) {
+            if (matched == 1) { ok = 0; }
+            else { ok = 1; }
+        }
+        if (ok == 0) { return 0; }
+        return _wildmatch(pat + ci, plen - ci, str + 1, slen - 1);
+    }
+
+    if (pc != sc) { return 0; }
+    return _wildmatch(pat + 1, plen - 1, str + 1, slen - 1);
 }
 
-# True if `path` is matched by any pattern. Each pattern is tested against
-# every path segment — a pattern like `build` matches `build/`, `src/build/`,
-# or `lib/build/foo.cyr`. First-match wins.
+# True if `path` (repo-relative, e.g. "src/build/foo.o") is ignored. Patterns are
+# evaluated IN ORDER and the LAST matching pattern wins — so a later `!pattern`
+# re-includes a file an earlier pattern excluded (git semantics). Each pattern is
+# a struct: [text, text_len, negated, anchored] (see load_sitignore).
+#
+#   anchored (pattern had a leading or middle '/'): matched against the full path
+#     from the repo root via _wildmatch (its '**' handles any-depth cases).
+#   non-anchored (no '/'): matches at ANY level — tried against the full path and
+#     against every suffix beginning just after a '/'.
 fn is_ignored(path, patterns) {
     if (patterns == 0) { return 0; }
     var path_len = strlen(path);
     var n = vec_len(patterns);
     var i = 0;
+    var result = 0;   # 0 = not ignored; the last matching pattern overwrites this
     while (i < n) {
-        var pat = vec_get(patterns, i);
-        var pat_len = strlen(pat);
+        var p = vec_get(patterns, i);
+        var text = load64(p);
+        var tlen = load64(p + 8);
+        var negated = load64(p + 16);
+        var anchored = load64(p + 24);
 
-        var seg_start = 0;
-        var j = 0;
-        while (j <= path_len) {
-            var is_boundary = 0;
-            if (j == path_len) { is_boundary = 1; }
-            else { if (load8(path + j) == 47) { is_boundary = 1; } }
-            if (is_boundary == 1) {
-                var seg_len = j - seg_start;
-                if (seg_len > 0) {
-                    if (glob_match(pat, pat_len, path + seg_start, seg_len) == 1) {
-                        return 1;
+        var m = 0;
+        if (anchored == 1) {
+            m = _wildmatch(text, tlen, path, path_len);
+        }
+        else {
+            if (_wildmatch(text, tlen, path, path_len) == 1) { m = 1; }
+            else {
+                var k = 0;
+                while (k < path_len) {
+                    if (load8(path + k) == 47) {
+                        if (_wildmatch(text, tlen, path + k + 1, path_len - k - 1) == 1) {
+                            m = 1;
+                            k = path_len;
+                        }
                     }
+                    if (k < path_len) { k = k + 1; }
                 }
-                seg_start = j + 1;
             }
-            j = j + 1;
+        }
+
+        if (m == 1) {
+            if (negated == 1) { result = 0; }
+            else { result = 1; }
         }
         i = i + 1;
     }
-    return 0;
+    return result;
 }
 
-# Read `.sitignore` into a vec of pattern cstrings. Blank lines and lines
-# starting with `#` are skipped. Trailing `/` on a pattern is stripped
-# (directory-only hints aren't enforced yet).
+# Read `.sitignore` into a vec of pattern structs (32 bytes each):
+#   [0]  text ptr (NUL-terminated, with leading `!` / leading `/` / trailing `/`
+#        stripped), [8] text_len, [16] negated (leading `!`), [24] anchored
+#        (leading or middle `/` → matched from the repo root).
+# Blank lines and `#` comments are skipped; `\!` / `\#` escape a literal first
+# char; a trailing `/` (directory hint) is stripped (dir-only is not enforced —
+# the same simplification as before).
 fn load_sitignore() {
     if (file_exists(".sitignore") != 1) { return 0; }
     var pair[16];
@@ -600,28 +731,62 @@ fn load_sitignore() {
             line_end = line_end + 1;
         }
 
-        var line_start = pos;
-        var line_stop = line_end;
-        if (line_stop > line_start) {
-            if (load8(data + line_stop - 1) == 13) { line_stop = line_stop - 1; }
+        var ls = pos;
+        var le = line_end;
+        if (le > ls) {
+            if (load8(data + le - 1) == 13) { le = le - 1; }   # strip CR
         }
 
         var keep = 1;
-        if (line_stop == line_start) { keep = 0; }
+        if (le == ls) { keep = 0; }                            # blank line
         else {
-            if (load8(data + line_start) == 35) { keep = 0; }
+            if (load8(data + ls) == 35) { keep = 0; }          # '#' comment
         }
 
         if (keep == 1) {
-            var p_len = line_stop - line_start;
-            if (p_len > 0) {
-                if (load8(data + line_start + p_len - 1) == 47) { p_len = p_len - 1; }
+            var s = ls;
+            var negated = 0;
+            var c0 = load8(data + s) & 0xFF;
+            if (c0 == 33) { negated = 1; s = s + 1; }           # leading '!'
+            else {
+                if (c0 == 92) {                                 # '\' escape
+                    if (s + 1 < le) {
+                        var nx = load8(data + s + 1) & 0xFF;
+                        if (nx == 33) { s = s + 1; }             # '\!' -> literal '!'
+                        else {
+                            if (nx == 35) { s = s + 1; }         # '\#' -> literal '#'
+                        }
+                    }
+                }
             }
-            if (p_len > 0) {
-                var pat = alloc(p_len + 1);
-                memcpy(pat, data + line_start, p_len);
-                store8(pat + p_len, 0);
-                vec_push(patterns, pat);
+
+            var anchored = 0;
+            if (s < le) {
+                if (load8(data + s) == 47) { anchored = 1; s = s + 1; }   # leading '/'
+            }
+            var e = le;
+            if (e > s) {
+                if (load8(data + e - 1) == 47) { e = e - 1; }   # strip trailing '/'
+            }
+            if (anchored == 0) {
+                var k = s;
+                while (k < e) {
+                    if (load8(data + k) == 47) { anchored = 1; k = e; }   # middle '/'
+                    else { k = k + 1; }
+                }
+            }
+
+            var tlen = e - s;
+            if (tlen > 0) {
+                var text = alloc(tlen + 1);
+                memcpy(text, data + s, tlen);
+                store8(text + tlen, 0);
+                var p = alloc(32);
+                store64(p, text);
+                store64(p + 8, tlen);
+                store64(p + 16, negated);
+                store64(p + 24, anchored);
+                vec_push(patterns, p);
             }
         }
         pos = line_end + 1;

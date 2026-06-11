@@ -457,6 +457,95 @@ fn test_tofu_pin_lookup() {
     return 0;
 }
 
+# .sitignore matcher (v0.8.10). _wildmatch is the WM_PATHNAME glob core (`*`,
+# `?`, `[...]`, `**`, `/`, dir-exclusion); is_ignored layers anchoring + last-
+# match-wins negation over it.
+fn _wm(p, s) { return _wildmatch(p, strlen(p), s, strlen(s)); }
+
+fn test_sitignore_wildmatch() {
+    test_group("index.cyr — _wildmatch glob core");
+
+    # '*' is a run of non-'/'.
+    assert_eq(_wm("*.o", "foo.o"), 1, "*.o matches foo.o");
+    assert_eq(_wm("*.o", "foo.c"), 0, "*.o rejects foo.c");
+    assert_eq(_wm("*.o", "a/foo.o"), 0, "* does not cross '/'");
+    assert_eq(_wm("f*o", "fo"), 1, "f*o matches fo (empty run)");
+    assert_eq(_wm("f*o", "f/o"), 0, "f*o rejects f/o");
+
+    # '?' is one non-'/'.
+    assert_eq(_wm("fo?", "foo"), 1, "fo? matches foo");
+    assert_eq(_wm("fo?", "fo"), 0, "fo? needs a char");
+
+    # char classes.
+    assert_eq(_wm("[abc]at", "bat"), 1, "[abc]at matches bat");
+    assert_eq(_wm("[abc]at", "dat"), 0, "[abc]at rejects dat");
+    assert_eq(_wm("[a-c]at", "bat"), 1, "[a-c] range matches");
+    assert_eq(_wm("[!a-c]at", "dat"), 1, "[!a-c] negation matches dat");
+    assert_eq(_wm("[!a-c]at", "bat"), 0, "[!a-c] negation rejects bat");
+
+    # '**' crosses '/'.
+    assert_eq(_wm("**/foo", "foo"), 1, "**/foo matches root foo");
+    assert_eq(_wm("**/foo", "a/b/foo"), 1, "**/foo matches deep foo");
+    assert_eq(_wm("**/foo", "a/foobar"), 0, "**/foo rejects foobar");
+    assert_eq(_wm("build/**", "build/x"), 1, "build/** matches contents");
+    assert_eq(_wm("build/**", "build/a/b"), 1, "build/** matches deep contents");
+    assert_eq(_wm("build/**", "build"), 0, "build/** does not match build itself");
+    assert_eq(_wm("a/**/b", "a/b"), 1, "a/**/b matches a/b (zero dirs)");
+    assert_eq(_wm("a/**/b", "a/x/y/b"), 1, "a/**/b matches a/x/y/b");
+
+    # directory exclusion: a matched dir-prefix excludes its contents.
+    assert_eq(_wm("foo", "foo/bar"), 1, "foo excludes foo/bar (dir-exclusion)");
+    assert_eq(_wm("foo", "foobar"), 0, "foo does not match foobar");
+    return 0;
+}
+
+fn _mkpat(text, negated, anchored) {
+    var p = alloc(32);
+    store64(p, text);
+    store64(p + 8, strlen(text));
+    store64(p + 16, negated);
+    store64(p + 24, anchored);
+    return p;
+}
+
+fn test_sitignore_negation_anchor() {
+    test_group("index.cyr — .sitignore negation + anchoring");
+
+    # Negation: *.log excludes, !keep.log re-includes (last match wins).
+    var a = vec_new();
+    vec_push(a, _mkpat("*.log", 0, 0));
+    vec_push(a, _mkpat("keep.log", 1, 0));
+    assert_eq(is_ignored("debug.log", a), 1, "*.log ignores debug.log");
+    assert_eq(is_ignored("keep.log", a), 0, "!keep.log re-includes");
+    assert_eq(is_ignored("sub/keep.log", a), 0, "!keep.log re-includes at depth");
+    assert_eq(is_ignored("sub/other.log", a), 1, "*.log still ignores sub/other.log");
+
+    # Anchored '/foo' matches only at root (+ its dir contents).
+    var b = vec_new();
+    vec_push(b, _mkpat("foo", 0, 1));
+    assert_eq(is_ignored("foo", b), 1, "/foo matches root foo");
+    assert_eq(is_ignored("foo/bar", b), 1, "/foo excludes its contents");
+    assert_eq(is_ignored("sub/foo", b), 0, "/foo does NOT match nested foo");
+
+    # Non-anchored 'foo' matches at any level.
+    var c = vec_new();
+    vec_push(c, _mkpat("foo", 0, 0));
+    assert_eq(is_ignored("sub/foo", c), 1, "non-anchored foo matches nested");
+
+    # Path pattern 'a/b' (anchored by its middle '/').
+    var d = vec_new();
+    vec_push(d, _mkpat("a/b", 0, 1));
+    assert_eq(is_ignored("a/b", d), 1, "a/b matches a/b");
+    assert_eq(is_ignored("x/a/b", d), 0, "a/b does not match x/a/b");
+
+    # '**/build' anchored, any depth.
+    var e = vec_new();
+    vec_push(e, _mkpat("**/build", 0, 1));
+    assert_eq(is_ignored("build", e), 1, "**/build matches root build");
+    assert_eq(is_ignored("src/build", e), 1, "**/build matches nested build");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -475,6 +564,8 @@ fn main() {
     test_validate_url_scheme();
     test_parse_commit_multiparent();
     test_tofu_pin_lookup();
+    test_sitignore_wildmatch();
+    test_sitignore_negation_anchor();
     return assert_summary();
 }
 
