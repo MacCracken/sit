@@ -558,6 +558,50 @@ jobs:
           test "$(cat a)" = "hello-http" || { echo "http clone content wrong"; exit 1; }
           "$GITHUB_WORKSPACE/build/sit" fsck
 
+      - name: Smoke — https transport (sit serve --tls + https clone + fsck) (v0.8.8)
+        run: |
+          export HOME=$GITHUB_WORKSPACE/ci-home
+          export SIT_AUTHOR_NAME="CI Runner"
+          export SIT_AUTHOR_EMAIL="ci@example.com"
+          PORT=18443
+          CERTDIR=$(mktemp -d)
+          # ECDSA P-256 cert: tls_native verifies ecdsa_secp256r1_sha256. Ed25519
+          # server certs currently fail tls_native_accept — tracked for v0.8.9.
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout "$CERTDIR/key.pem" -out "$CERTDIR/cert.pem" -days 1 -nodes \
+            -subj "/CN=127.0.0.1" 2>/dev/null
+
+          ORIG=$(mktemp -d)
+          (cd "$ORIG" && "$GITHUB_WORKSPACE/build/sit" init && echo hello-https > a && "$GITHUB_WORKSPACE/build/sit" add a && "$GITHUB_WORKSPACE/build/sit" commit -m "https-root")
+
+          # Start sit serve --tls; trap tears the daemon down on any exit.
+          "$GITHUB_WORKSPACE/build/sit" serve "$ORIG" --tls --cert "$CERTDIR/cert.pem" --key "$CERTDIR/key.pem" --listen 127.0.0.1:$PORT &
+          SERVE_PID=$!
+          trap 'kill $SERVE_PID 2>/dev/null || true' EXIT
+
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1; then break; fi
+            sleep 0.5
+          done
+          if ! (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1; then
+            echo "sit serve --tls never came up on 127.0.0.1:$PORT"
+            exit 1
+          fi
+
+          # Clone over first-party TLS 1.3 (tls_native), TOFU-pinned.
+          CLONE=$(mktemp -d)/https-repo
+          "$GITHUB_WORKSPACE/build/sit" clone --force-absolute https://127.0.0.1:$PORT "$CLONE"
+          test "$(cat "$CLONE/a")" = "hello-https" || { echo "https clone content wrong"; exit 1; }
+          (cd "$CLONE" && "$GITHUB_WORKSPACE/build/sit" fsck) | grep -q "0 bad" || { echo "https clone fsck failed"; exit 1; }
+
+          # TOFU: the first clone must have recorded an SPKI pin for this host:port.
+          grep -q "127.0.0.1 $PORT " "$HOME/.sit/known_certs" || { echo "TOFU pin not recorded after https clone"; exit 1; }
+
+          # TOFU mismatch must be refused: tamper the stored pin, re-clone → reject.
+          sed -i "s#127.0.0.1 $PORT .*#127.0.0.1 $PORT 0000000000000000000000000000000000000000000000000000000000000000#" "$HOME/.sit/known_certs"
+          "$GITHUB_WORKSPACE/build/sit" clone --force-absolute https://127.0.0.1:$PORT "$(mktemp -d)/https-mismatch" > /tmp/sit-tofu-mm.out 2>&1 || true
+          grep -qi "MISMATCH" /tmp/sit-tofu-mm.out || { echo "expected TOFU pin MISMATCH rejection"; cat /tmp/sit-tofu-mm.out; exit 1; }
+
       - name: Smoke — http push + bearer auth (v0.7.6)
         run: |
           export HOME=$GITHUB_WORKSPACE/ci-home
