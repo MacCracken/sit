@@ -1,7 +1,16 @@
 # 0007 — Network transport security: SSH or first-party only
 
-**Status**: Accepted
+**Status**: Accepted — HTTPS gate satisfied 2026-06-10 (see Update below; the ruling stands, its precondition is now met)
 **Date**: 2026-05-08
+
+## Update — 2026-06-10: first-party Cyrius TLS now exists
+
+This ADR's decision was never "no HTTPS ever" — it was **"no HTTPS until a first-party Cyrius TLS implementation exists"** (Decision point 3: *file it as "blocked on first-party Cyrius TLS existing"*). As of **cyrius 6.x** (picked up by sit at v0.8.6), that precondition is met:
+
+- **`lib/tls_native.cyr`** ships a sovereign **pure-Cyrius TLS 1.3** stack built on sigil primitives (ChaCha20-Poly1305 / AES-GCM / HKDF / SHA-2 / X25519 / ECDSA / X.509). **No fdlopen, no libssl, no libcrypto** — it interops with OpenSSL 3.x as a peer, it does not link it. This is categorically different from the `lib/tls.cyr` libssl-via-fdlopen shim this ADR forbids; the no-FFI thesis ([ADR 0001](0001-no-ffi-first-party-only.md)) stays intact.
+- The original cross-repo blocker (`docs/development/issues/archived/2026-05-13-sandhi-first-party-tls-surface-needed.md`) is **archived RESOLVED**.
+
+**What stays unchanged:** the prohibition on libssl / libcrypto / any fdlopen-bridged C-TLS is permanent. `https://` in sit may only be implemented over `tls_native` (or a future first-party successor). HTTP remains loopback / private-network / behind-tunnel; SSH remains the process-boundary transport. Wiring `tls_native` into `wire_http.cyr` (client) + `serve.cyr` (server) is tracked as the **HTTPS** roadmap slot — a multi-release arc (read-only client first), not a single patch.
 
 ## Context
 

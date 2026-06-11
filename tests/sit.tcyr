@@ -424,6 +424,39 @@ fn test_parse_commit_multiparent() {
     return 0;
 }
 
+# HTTPS TOFU pin store (wire_https.cyr): the pure line-scan that decides whether
+# a host:port already has a pinned SPKI hash. Exact host+port match required;
+# wrong port, wrong host, and prefix-collision (host is a prefix of a stored
+# host) must all miss.
+fn test_tofu_pin_lookup() {
+    test_group("wire_https.cyr — TOFU pin lookup");
+
+    var a64 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var b64 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    var content = "localhost 8484 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n127.0.0.1 443 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+    var clen = strlen(content);
+
+    var stored[65];
+
+    assert_eq(_tofu_find_pin(content, clen, "localhost", 8484, &stored), 1, "found localhost:8484");
+    store8(&stored + 64, 0);
+    assert_streq(&stored, a64, "localhost:8484 pin = a64");
+
+    assert_eq(_tofu_find_pin(content, clen, "127.0.0.1", 443, &stored), 1, "found 127.0.0.1:443");
+    store8(&stored + 64, 0);
+    assert_streq(&stored, b64, "127.0.0.1:443 pin = b64");
+
+    assert_eq(_tofu_find_pin(content, clen, "localhost", 9999, &stored), 0, "wrong port misses");
+    assert_eq(_tofu_find_pin(content, clen, "example.com", 8484, &stored), 0, "wrong host misses");
+    assert_eq(_tofu_find_pin("", 0, "localhost", 8484, &stored), 0, "empty store misses");
+
+    # Prefix-collision: a stored host that the query is a prefix of must not match.
+    var collide = "localhostx 8484 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n";
+    assert_eq(_tofu_find_pin(collide, strlen(collide), "localhost", 8484, &stored), 0, "prefix-collision misses");
+
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -441,6 +474,7 @@ fn main() {
     test_validate_remote_url();
     test_validate_url_scheme();
     test_parse_commit_multiparent();
+    test_tofu_pin_lookup();
     return assert_summary();
 }
 

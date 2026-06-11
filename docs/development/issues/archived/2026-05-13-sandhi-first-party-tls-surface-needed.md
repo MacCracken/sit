@@ -1,12 +1,22 @@
-# sandhi — First-party Cyrius TLS surface needed for sit's HTTPS / mTLS slots
+# sandhi — First-party Cyrius TLS surface needed for sit's HTTPS / mTLS slots — RESOLVED
 
 **Discovered:** 2026-05-13 during sit v0.8.4 prep
 **Severity:** High — blocks sit's v0.8.4 (HTTPS) and v0.8.5 (mTLS) roadmap slots; sit has no path to encrypted-over-internet read/write other than SSH while this stands.
 **Affects:** sandhi 1.3.4 (and the cyrius-vendored copy at `lib/sandhi.cyr`), cyrius 5.11.34 (`lib/tls.cyr` is the underlying libssl-via-fdlopen shim)
 
+## Resolution — RESOLVED 2026-06-10
+
+**Resolved upstream by cyrius 6.x** shipping a *new, separate* first-party TLS stack rather than de-FFI-ing `lib/tls.cyr`. cyrius `lib/tls_native.cyr` is a sovereign pure-Cyrius TLS 1.3 implementation on sigil primitives (ChaCha20-Poly1305 / AES-GCM / HKDF / X25519 / ECDSA / X.509) — **no fdlopen, no libssl, no libcrypto**; interops with OpenSSL 3.x as a peer. This satisfies [ADR 0007](../../../adr/0007-network-transport-security.md)'s "first-party Cyrius TLS *existing*" gate exactly.
+
+- The old `lib/tls.cyr` libssl-via-fdlopen shim is untouched and remains forbidden for sit; `tls_native` is the path sit consumes.
+- sit picked up cyrius 6.1.27 at **v0.8.6**; HTTPS wiring (into `wire_http.cyr` + `serve.cyr`) is now a real roadmap slot — a multi-release arc, read-only client first.
+- Recorded in [ADR 0007](../../../adr/0007-network-transport-security.md)'s 2026-06-10 Update.
+
+Known `tls_native` caveats (none block sit's HTTP/1.0 use): `tls_native_set_alpn` / `set_version_range` return `NOT_IMPLEMENTED` (sit doesn't use ALPN), TLS 1.2 backport still in progress (both ends are sit → TLS-1.3-only is fine).
+
 ## Summary
 
-Sit's v0.8.4 roadmap slot is **HTTPS via sandhi first-party Cyrius TLS** (client + server). Per [ADR 0007](../../adr/0007-network-transport-security.md), the gate to ship is: *the underlying TLS implementation must be first-party Cyrius — not libssl-via-fdlopen, not libssh-via-fdlopen, not any C-bound shim.* That decision is load-bearing for sit's no-FFI thesis ([ADR 0001](../../adr/0001-no-ffi-first-party-only.md)); it's exactly why sit invested in SSH (ADR 0008, v0.8.2 / v0.8.3) as the encrypted-over-internet path.
+Sit's v0.8.4 roadmap slot is **HTTPS via sandhi first-party Cyrius TLS** (client + server). Per [ADR 0007](../../../adr/0007-network-transport-security.md), the gate to ship is: *the underlying TLS implementation must be first-party Cyrius — not libssl-via-fdlopen, not libssh-via-fdlopen, not any C-bound shim.* That decision is load-bearing for sit's no-FFI thesis ([ADR 0001](../../../adr/0001-no-ffi-first-party-only.md)); it's exactly why sit invested in SSH (ADR 0008, v0.8.2 / v0.8.3) as the encrypted-over-internet path.
 
 Today the sandhi `tls_policy` surface (which sit would consume) wraps stdlib `lib/tls.cyr`, which is libssl-via-fdlopen. So consuming sandhi's TLS in sit means linking libssl — exactly what ADR 0007 forbids.
 

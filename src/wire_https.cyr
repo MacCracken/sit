@@ -1,0 +1,156 @@
+# wire_https.cyr — HTTPS transport for sit (TLS 1.3 via cyrius lib/tls_native.cyr).
+#
+# Trust model: TOFU / pinned (decided 2026-06-10; ADR 0008 SSH host-key parity).
+# sit pins the peer's SubjectPublicKeyInfo (SPKI) SHA-256 — the same key-identity
+# an SSH host key represents, and stable across cert renewals that keep the key.
+# Pins live in ~/.sit/known_certs, one ASCII line per host:
+#
+#     <host> <port> <64-hex-sha256-of-SPKI>\n
+#
+# First connection to a host records its pin (trust-on-first-use). Later
+# connections must match; a mismatch aborts (possible MITM). CA-chain + hostname
+# verification is a post-v1 opt-in (roadmap "Longer horizon").
+#
+# This is the first bite of the HTTPS arc: the pin store. The TLS I/O wiring into
+# wire_http.cyr's open/request/post (tls_native_connect over the socket, routing
+# reads/writes through tls_native_read/write) is the follow-on bite. tofu_check_pin
+# / _tofu_record_pin are scaffolding for that bite; DCE strips them until a live
+# https client path calls them.
+
+# ~/.sit/known_certs path. Returns a heap cstring, or 0 if HOME unset.
+fn known_certs_path() {
+    var dir = signing_home_dir();          # ~/.sit
+    if (dir == 0) { return 0; }
+    var dlen = strlen(dir);
+    var p = alloc(dlen + 13);              # "/known_certs" (12) + NUL
+    if (p == 0) { return 0; }
+    memcpy(p, dir, dlen);
+    memcpy(p + dlen, "/known_certs", 12);
+    store8(p + dlen + 12, 0);
+    return p;
+}
+
+# Pure scan of an in-memory known_certs buffer for a (host, port) pin. On a
+# match, copies the stored 64-char hex into out_hex64 (caller-owned, >= 64 bytes)
+# and returns 1. Returns 0 if no line matches. Lines are "<host> <port> <hex>";
+# malformed / wrong-length lines are skipped. No allocation, no I/O — the unit
+# of behaviour tests/sit.tcyr exercises directly.
+fn _tofu_find_pin(content, content_len, host, port, out_hex64) {
+    var host_len = strlen(host);
+    if (host_len > 255) { return 0; }
+
+    # Build the "<host> <port> " match prefix once; a line matches iff it starts
+    # with this prefix AND the remaining bytes (to end-of-line) are exactly 64.
+    var pref[320];
+    var pl = 0;
+    memcpy(&pref + pl, host, host_len); pl = pl + host_len;
+    store8(&pref + pl, 32); pl = pl + 1;                 # ' '
+    pl = pl + write_decimal(&pref + pl, port);
+    store8(&pref + pl, 32); pl = pl + 1;                 # ' '
+
+    var pos = 0;
+    var found = 0;
+    while (pos < content_len) {
+        if (found == 1) { pos = content_len; }
+        else {
+            var nl = pos;
+            while (nl < content_len) {
+                if (load8(content + nl) == 10) { break; }
+                nl = nl + 1;
+            }
+            var line_len = nl - pos;
+            if (line_len == pl + 64) {
+                if (memeq(content + pos, &pref, pl) == 1) {
+                    memcpy(out_hex64, content + pos + pl, 64);
+                    found = 1;
+                }
+            }
+            pos = nl + 1;
+        }
+    }
+    return found;
+}
+
+# Append a "<host> <port> <pin_hex>\n" line to ~/.sit/known_certs (read-modify-
+# write; the file is small). Creates ~/.sit and the file (0600) as needed.
+# Returns 0 on success, negative on failure.
+fn _tofu_record_pin(host, port, pin_hex) {
+    var dir = signing_home_dir();
+    if (dir == 0) { return 0 - 1; }
+    if (ensure_dir(dir) != 0) { return 0 - 1; }
+    var path = known_certs_path();
+    if (path == 0) { return 0 - 1; }
+    if (path_is_symlink(path) == 1) { return 0 - 1; }   # refuse to follow a planted symlink
+
+    var host_len = strlen(host);
+
+    # Existing content (absent file → treat as empty).
+    var pair[16];
+    var old = 0;
+    var oldlen = 0;
+    if (read_file_heap(path, &pair) == 0) {
+        old = load64(&pair);
+        oldlen = load64(&pair + 8);
+    }
+
+    var line_cap = host_len + 1 + 20 + 1 + 64 + 1;      # host ' ' port ' ' hex '\n'
+    var buf = alloc(oldlen + line_cap);
+    if (buf == 0) { return 0 - 1; }
+    var pos = 0;
+    if (oldlen > 0) { memcpy(buf, old, oldlen); pos = oldlen; }
+    memcpy(buf + pos, host, host_len); pos = pos + host_len;
+    store8(buf + pos, 32); pos = pos + 1;
+    pos = pos + write_decimal(buf + pos, port);
+    store8(buf + pos, 32); pos = pos + 1;
+    memcpy(buf + pos, pin_hex, 64); pos = pos + 64;
+    store8(buf + pos, 10); pos = pos + 1;
+
+    var fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0x180);   # 0600
+    if (fd < 0) { return 0 - 1; }
+    syscall(SYS_WRITE, fd, buf, pos);
+    sys_close(fd);
+    return 0;
+}
+
+# TOFU gate for an HTTPS handshake: given the peer's SPKI DER (from
+# tls_native_get_peer_spki_der), decide whether to trust the connection.
+# Returns 1 = trust (proceed), 0 = reject (abort the clone/fetch).
+#   - no stored pin for this host:port → record it (trust-on-first-use), trust.
+#   - stored pin matches the presented SPKI hash → trust.
+#   - stored pin differs → reject, loudly (possible MITM).
+fn tofu_check_pin(host, port, spki_der, der_len) {
+    if (spki_der == 0) { eprintln("sit: server presented no certificate"); return 0; }
+    if (der_len <= 0) { eprintln("sit: server presented no certificate"); return 0; }
+
+    var pin_hex = hash_data(spki_der, der_len);         # 64-char SHA-256 hex cstr
+
+    var path = known_certs_path();
+    if (path == 0) { eprintln("sit: HOME not set; cannot check cert pin"); return 0; }
+
+    var pair[16];
+    var stored[65];
+    if (read_file_heap(path, &pair) == 0) {
+        var content = load64(&pair);
+        var clen = load64(&pair + 8);
+        if (_tofu_find_pin(content, clen, host, port, &stored) == 1) {
+            store8(&stored + 64, 0);
+            if (streq(pin_hex, &stored) == 1) { return 1; }
+            eprintln("sit: SECURITY: certificate pin MISMATCH for this host — refusing to connect");
+            eprintln("  a previously-pinned certificate changed; if this is intentional, remove the");
+            eprintln("  matching line from ~/.sit/known_certs and retry");
+            return 0;
+        }
+    }
+
+    # No pin on record → trust-on-first-use.
+    if (_tofu_record_pin(host, port, pin_hex) != 0) {
+        eprintln("sit: cannot record certificate pin in ~/.sit/known_certs");
+        return 0;
+    }
+    stdout_write("sit: pinned new certificate for ", 32);
+    stdout_write(host, strlen(host));
+    stdout_write(" (sha256 ", 9);
+    stdout_write(pin_hex, 12);
+    stdout_write("...)\n", 5);
+    return 1;
+}
