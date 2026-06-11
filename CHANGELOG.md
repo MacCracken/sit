@@ -4,6 +4,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.8] — 2026-06-10 — HTTPS transport (clone/fetch over `https://`, first-party TLS 1.3, TOFU-pinned)
+
+**Closes the HTTPS slot that was blocked on first-party Cyrius TLS for the whole v0.8.x line.** cyrius 6.x shipped `lib/tls_native.cyr` — a sovereign pure-Cyrius TLS 1.3 stack on sigil primitives (no fdlopen, no libssl), satisfying [ADR 0007](docs/adr/0007-network-transport-security.md)'s gate. `sit clone https://...` and `sit fetch` now work end-to-end against `sit serve --tls`, both ends first-party Cyrius. Read-only this release; https push is queued for 0.8.9.
+
+**Trust model: TOFU / pinned** (ADR 0008 SSH host-key parity). sit pins the peer's SubjectPublicKeyInfo SHA-256 (survives cert renewal) in `~/.sit/known_certs`; the first connection records, a later mismatch refuses (MITM signal). CA-chain + hostname verification is a post-v1 opt-in.
+
+### Added
+
+- **`src/wire_https.cyr`** (new, 244 lines) — TOFU pin store (`known_certs_path`, `_tofu_find_pin`, `_tofu_record_pin`, `tofu_check_pin`) + TLS transport helpers: `_wire_https_connect` (handshake → `set_verify(NONE)` → SPKI pin), `_wire_io_send` / `_wire_io_recv` (TLS-or-plain I/O with 16 KB record fragmentation + post-handshake-record skipping), `_url_is_http_family`.
+- **Client** (`src/wire_http.cyr`, `src/wire.cyr`): the http handle carries `is_tls` + hostname; `wire_http_open` accepts `https://` (default port 443); `_wire_http_request` + both POST variants do a per-request TLS handshake and route I/O through the helpers; `wire_transport_check_readable` accepts `https://`; clone/fetch dispatch + target-derive handle the https scheme.
+- **Server** (`src/serve.cyr`): `sit serve --tls --cert <file> --key <file>` (cert PEM via sigil `pem_decode_certs`, or DER; key PEM/DER). New TLS accept loop `_serve_run_tls` (accept → `tls_native_new_server` → `tls_native_server_load_creds` → `tls_native_accept` → recv-request-over-TLS → dispatch → close) + `_serve_tls_recv_request`. The response path routes through TLS-aware `_serve_send_status` / `_serve_send_response` wrappers (67 call sites) gated on a per-connection `_serve_tls_ctx` global (safe — the serve loop is single-threaded); plain http stays byte-identical.
+- **`tests/sit.tcyr`** — TOFU pin-lookup group (exact match, wrong port/host, empty store, prefix-collision). **146 assertions** (was 138).
+
+### Changed
+
+- **`cyrius.cyml`**: `tls_native` added to `[deps].stdlib` (fits the build — no 256-global cap overflow, unlike `async`). **Toolchain pin `6.1.27 → 6.1.29`** — the toolchain the HTTPS arc was actually validated on. The 6.1.27 pin had drifted from the locally-active cycc; bumping ensures CI builds the same `tls_native` that was tested (the scaffold→working transition in cyrius 6.0.x makes the exact version load-bearing).
+- **[ADR 0007](docs/adr/0007-network-transport-security.md)** gained a 2026-06-10 Update recording the `tls_native` unblock — the ruling stands (no libssl / libcrypto / fdlopen, ever), its precondition is now met. The cross-repo blocker `docs/development/issues/archived/2026-05-13-sandhi-first-party-tls-surface-needed.md` is archived **RESOLVED**.
+- **Capabilities banner** (`src/serve.cyr`) `0.8.7 → 0.8.8`.
+
+### Validated
+
+- Full e2e: `sit clone https://127.0.0.1:<port>` against `sit serve --tls` (ECDSA P-256 cert) — TOFU-pinned, fetched every object over TLS 1.3, fsck-clean, content correct. The `tls_native` handshake interops with OpenSSL 3.6.2 (`s_client` / `s_server` cross-checks during development). TOFU paths exercised: first-use pins; re-clone matches silently; a tampered pin refuses with a `SECURITY: certificate pin MISMATCH` error and no data transfer.
+
+### Notes / deferred to 0.8.9
+
+- **https push** — `wire_transport_check_writable` still rejects `https://`; the server's 64 KiB TLS request buffer can't take 16 MiB push bodies without streaming.
+- **Per-request handshake** (no keep-alive) and a **socket read-timeout** (against a server that holds the connection open, like `openssl s_server -www`) are perf / hardening followups.
+- **Ed25519 server certs** fail `tls_native_accept` (ECDSA P-256 works) — use ECDSA P-256 for `sit serve --tls`; a likely upstream `tls_native` gap worth filing.
+- Build / test / lint / fuzz green. DCE binary **2.14 MB** (+~14 KB vs v0.8.7).
+
 ## [0.8.7] — 2026-06-10 — Wire-walker multi-parent fix
 
 **Closes the wire-walker single-parent footgun surfaced in v0.8.5.** `parse_commit_body` captured only the *last* `parent` header, so the three commit-graph traversals that consumed it followed just one edge per merge commit. Cloning / fetching / pushing a merge-bearing repo could silently drop every object reachable only through a non-last parent — and the resulting clone still passed `sit fsck` ("0 dangling") while missing data. Reproduced on a 3-commit + merge fixture: a clone dropped 2 objects (the first-parent commit + its tree), 11 → 9, with no error surfaced.
@@ -1081,7 +1111,8 @@ First official release. Rolls up the entire pre-release development arc (scaffol
 - **Git format compatibility** — object framing + tree format are byte-compatible with git's SHA-256 mode, but sit is *not* a drop-in for a git repo (the wire protocol is sit-native, signed commits use sit's `sitsig` header rather than git's `gpgsig`).
 - **Not on the AGNOS critical path** — post-boot, when-there's-time project.
 
-[Unreleased]: https://github.com/MacCracken/sit/compare/0.8.7...HEAD
+[Unreleased]: https://github.com/MacCracken/sit/compare/0.8.8...HEAD
+[0.8.8]: https://github.com/MacCracken/sit/releases/tag/0.8.8
 [0.8.7]: https://github.com/MacCracken/sit/releases/tag/0.8.7
 [0.8.6]: https://github.com/MacCracken/sit/releases/tag/0.8.6
 [0.6.0]: https://github.com/MacCracken/sit/releases/tag/0.6.0
