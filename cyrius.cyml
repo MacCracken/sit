@@ -81,6 +81,7 @@ stdlib = [
     "dynlib",
     "fdlopen",
     "tls",
+    "tls_native",
     "ws",
     "http",
     "sandhi",
