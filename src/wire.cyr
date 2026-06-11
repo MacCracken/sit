@@ -38,11 +38,7 @@ fn wire_transport_check_writable(url) {
     if (s == URL_SCHEME_FILE) { return 0; }
     if (s == URL_SCHEME_HTTP) { return 0; }   # v0.7.6
     if (s == URL_SCHEME_SSH)  { return 0; }   # v0.8.3
-    if (s == URL_SCHEME_HTTPS) {
-        # Per ADR 0007: HTTPS is not in the near-term roadmap.
-        eprintln("sit: https transport requires first-party Cyrius TLS (see ADR 0007)");
-        return 1;
-    }
+    if (s == URL_SCHEME_HTTPS) { return 0; }  # TLS 1.3 via tls_native, TOFU-pinned (push, v0.8.9)
     eprintln("sit: unrecognized URL scheme");
     return 1;
 }
@@ -1309,7 +1305,7 @@ fn cmd_push() {
     }
 
     var s = url_scheme(url);
-    if (s == URL_SCHEME_HTTP) {
+    if (_url_is_http_family(s) == 1) {        # http:// + https:// (v0.8.9)
         return _do_push_http(name, branch, url, src_db, local_tip);
     }
     if (s == URL_SCHEME_SSH) {

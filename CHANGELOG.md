@@ -4,6 +4,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.9] — 2026-06-10 — HTTPS followups: push, keep-alive, read-timeout, CI smoke
+
+Followups to the v0.8.8 HTTPS transport. `https://` is now a full read **+ write** transport with persistent (one-handshake) connections.
+
+### Added
+
+- **https push** — `sit push origin main` works over `https://`. The push primitives (`http_remote_push_object` / `_ref` via `_wire_http_post_xhdr`) were already TLS-aware (v0.8.8); this lights up `wire_transport_check_writable` for https and routes `cmd_push`'s dispatch through `_url_is_http_family`. Validated e2e: clone https → commit → push https → origin advances, fsck-clean. Same request-size bound as http push (the ~64 KiB server request buffer).
+- **HTTPS keep-alive** — the http handle now holds ONE persistent socket + `tls_native` ctx (`_wire_https_acquire` / `_wire_https_teardown`) reused across every request of a clone / fetch / push, so a clone does **one TLS handshake instead of one-per-object** (verified: a 15-object clone made exactly 1 handshake). New `_wire_https_exchange` reads each response by exact Content-Length (via sandhi's `body_offset` / `content_length` / `find_header` parsers) so the reused connection stays framed; `_wire_http_request` / `_wire_http_post` / `_wire_http_post_xhdr` delegate to it when `is_tls`. Server: `_serve_run_tls` loops requests per connection until the client closes (recv 0) or the 30s timeout fires; TLS responses now advertise `Connection: keep-alive`. Plain http keeps its proven per-request path (the sandhi server closes per response). Handle grows 64 → 80 bytes.
+- **Socket read-timeout** — 30s `SO_RCVTIMEO` on the client TLS socket (`_wire_https_connect`) and the server's accepted connections (`_serve_run_tls`), so a stalled / hostile peer can't pin a clone or a serve worker indefinitely (slowloris bound; mirrors sandhi's plain-http path).
+- **CI smoke** `Smoke — https transport` — `sit serve --tls` (ECDSA P-256 cert) + `clone https://` + content + fsck, plus TOFU **pin-recorded** and **tampered-pin-refused** assertions.
+- **Filed** [`docs/development/issues/2026-06-10-tls-native-ed25519-server-cert-accept-fails.md`](docs/development/issues/2026-06-10-tls-native-ed25519-server-cert-accept-fails.md) — `tls_native_accept` fails with an Ed25519 server cert (ECDSA P-256 works); upstream cyrius gap, workaround documented.
+
+### Changed
+
+- `wire_transport_check_writable` accepts `https://`; `cmd_push` dispatch uses `_url_is_http_family`.
+- **Toolchain pin `6.1.29 → 6.1.30`** — the validated cycc (same chase-the-drift reasoning as v0.8.8: keeps CI building the tested toolchain; the followups add no new `tls_native` surface beyond v0.8.8's).
+- Capabilities banner `0.8.8 → 0.8.9`.
+
+### Notes
+
+- Build / test / lint / fuzz green; **146 assertions**; DCE binary **2.14 MB** (flat). No new lint warnings. Plain http clone re-verified (no regression). https clone + push both validated over keep-alive (1 handshake/clone).
+
 ## [0.8.8] — 2026-06-10 — HTTPS transport (clone/fetch over `https://`, first-party TLS 1.3, TOFU-pinned)
 
 **Closes the HTTPS slot that was blocked on first-party Cyrius TLS for the whole v0.8.x line.** cyrius 6.x shipped `lib/tls_native.cyr` — a sovereign pure-Cyrius TLS 1.3 stack on sigil primitives (no fdlopen, no libssl), satisfying [ADR 0007](docs/adr/0007-network-transport-security.md)'s gate. `sit clone https://...` and `sit fetch` now work end-to-end against `sit serve --tls`, both ends first-party Cyrius. Read-only this release; https push is queued for 0.8.9.
@@ -1111,7 +1133,8 @@ First official release. Rolls up the entire pre-release development arc (scaffol
 - **Git format compatibility** — object framing + tree format are byte-compatible with git's SHA-256 mode, but sit is *not* a drop-in for a git repo (the wire protocol is sit-native, signed commits use sit's `sitsig` header rather than git's `gpgsig`).
 - **Not on the AGNOS critical path** — post-boot, when-there's-time project.
 
-[Unreleased]: https://github.com/MacCracken/sit/compare/0.8.8...HEAD
+[Unreleased]: https://github.com/MacCracken/sit/compare/0.8.9...HEAD
+[0.8.9]: https://github.com/MacCracken/sit/releases/tag/0.8.9
 [0.8.8]: https://github.com/MacCracken/sit/releases/tag/0.8.8
 [0.8.7]: https://github.com/MacCracken/sit/releases/tag/0.8.7
 [0.8.6]: https://github.com/MacCracken/sit/releases/tag/0.8.6

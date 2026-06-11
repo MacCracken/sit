@@ -1,6 +1,6 @@
 # sit Development Roadmap
 
-> **v0.8.x active — release 8 of N shipped.** Line opener and arc summary:
+> **v0.8.x active — release 9 of N shipped.** Line opener and arc summary:
 >
 > | tag | date | summary |
 > |---|---|---|
@@ -13,10 +13,11 @@
 > | v0.8.6 | 2026-06-10 | cyrius `5.11.55 → 6.1.27` major + dep bumps + stdlib reorg (bayan/slice); `tls_native` unblock |
 > | v0.8.7 | 2026-06-10 | wire-walker multi-parent fix — third v0.7.6-era footgun closed |
 > | v0.8.8 | 2026-06-10 | **HTTPS transport** (`https://` clone/fetch over first-party TLS 1.3, TOFU-pinned) — the long-blocked slot, shipped; cyrius pin `6.1.27 → 6.1.29` |
+> | v0.8.9 | 2026-06-10 | **HTTPS followups** — push + keep-alive (1 handshake/clone) + read-timeout + CI smoke; cyrius pin `6.1.29 → 6.1.30` |
 >
 > **Slot note:** v0.8.6 shipped as the cyrius 6.x toolchain refresh (not the originally-planned wire-walker fix); wire-walker landed at **v0.8.7**; **HTTPS took v0.8.8** (it was the long-blocked slot and `tls_native` made it ready). So HTTPS followups are **v0.8.9**, `.sitignore` slid to **v0.8.10**, and `log --graph` / shallow-clone to **v0.8.11**.
 >
-> **Next: v0.8.9 — HTTPS followups** (https push, keep-alive, socket read-timeout, the Ed25519-server-cert `tls_native` gap), or `.sitignore` semantics (v0.8.10).
+> **Next: v0.8.10 — `.sitignore` semantics** (git-parity: negation, `**`, char classes, anchored/path patterns); then v0.8.11 (`log --graph` + shallow clone). HTTPS is complete (clone/fetch/push over first-party TLS 1.3, keep-alive, TOFU-pinned) as of v0.8.8–0.8.9.
 >
 > **HTTPS is SHIPPED (v0.8.8).** cyrius 6.x's [`lib/tls_native.cyr`](../adr/0007-network-transport-security.md) — sovereign pure-Cyrius TLS 1.3 on sigil primitives (**no fdlopen, no libssl**; interops with OpenSSL 3.6.2) — satisfied [ADR 0007](../adr/0007-network-transport-security.md)'s gate. `sit clone https://` against `sit serve --tls` works end-to-end, TOFU-pinned (SPKI SHA-256 in `~/.sit/known_certs`, ADR 0008 parity). Read-only this release; **https push + keep-alive + read-timeout are v0.8.9**. **mTLS** still builds on this (`tls_native_new_server` + client-cert verify primitives exist); slot after https push. The cross-repo blocker `issues/archived/2026-05-13-sandhi-first-party-tls-surface-needed.md` is archived RESOLVED.
 >
@@ -25,6 +26,15 @@
 Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHANGELOG.md`](../../CHANGELOG.md) for the tagged artifacts.
 
 ## Released
+
+### v0.8.9 — HTTPS followups: push, keep-alive, read-timeout, CI smoke
+
+- **https push** — `sit push origin main` over `https://`. The push primitives were already TLS-aware (v0.8.8); v0.8.9 opens `wire_transport_check_writable` for https and routes `cmd_push` through `_url_is_http_family`. Validated: clone https → commit → push https → origin advances, fsck-clean. Same request-size bound as http push (~64 KiB server buffer; the original "needs streaming for 16 MiB" framing was wrong — http push has the identical bound, so this is parity, not a regression).
+- **Keep-alive** — the http handle (now 80 bytes) holds one persistent socket + `tls_native` ctx (`_wire_https_acquire` / `_teardown`) reused across every request of a clone/fetch/push: **one TLS handshake instead of one-per-object** (verified — a 15-object clone made exactly 1 handshake). `_wire_https_exchange` reads each response by exact Content-Length (sandhi `body_offset` / `content_length` / `find_header`) so the connection stays framed; the three request entrypoints delegate to it when `is_tls`. Server `_serve_run_tls` loops requests per connection (until client-close / 30s timeout) and advertises `Connection: keep-alive`. Plain http keeps its per-request path.
+- **Socket read-timeout** — 30s `SO_RCVTIMEO` on the client TLS socket + the server's accepted connections (slowloris / stalled-peer bound).
+- **CI** — `Smoke — https transport`: `sit serve --tls` (ECDSA P-256) + `clone https://` + fsck + TOFU pin-recorded + tampered-pin-refused.
+- **Filed** the Ed25519-server-cert `tls_native_accept` gap (`issues/2026-06-10-tls-native-ed25519-server-cert-accept-fails.md`; ECDSA P-256 works, upstream cyrius).
+- Toolchain pin `6.1.29 → 6.1.30` (validated cycc). 146 tests; lint/fuzz green; DCE 2.14 MB flat; no http regression.
 
 ### v0.8.8 — HTTPS transport (`https://` clone/fetch, first-party TLS 1.3, TOFU-pinned)
 
@@ -480,7 +490,7 @@ Same small-bite cadence as v0.7.x. Five releases shipped (toolchain → lib expo
 | ~~0.8.6~~ | ✅ shipped 2026-06-10 — cyrius 6.x toolchain refresh (NOT the originally-planned wire-walker fix). cyrius `5.11.55 → 6.1.27` major; deps sakshi `→2.2.10` / sankoch `→2.3.0` / sigil `→3.7.8` / patra `→1.11.0`; stdlib reorg (`bigint`/`base64`/`json` → `bayan`; `+slice`; `async` omitted as benign dead-code). `tls_native` unblock noted. Source-flat. | — | (see Released — 127/127 tests; binary 2.12 MB) |
 | ~~0.8.7~~ | ✅ shipped 2026-06-10 — wire-walker multi-parent fix. `parse_commit_body` exposes every parent via a vec at `out+48`; `walk_reachable_phased` + `is_ancestor` + `is_ancestor_in_db` follow all edges. Verified: merge-fixture clone 9 → 11 objects. `out+8` untouched (cmd_log/merge_base byte-identical); `merge_base` LCA left as a tracked follow-up. | `parse_commit_body` parents-vec in `src/commit.cyr`; `walk_reachable_phased` + `is_ancestor_in_db` in `src/wire.cyr`; `is_ancestor` rewritten as full-DAG BFS | (see Released — third footgun closed; 138 tests; binary 2.12 MB) |
 | ~~0.8.8~~ | ✅ shipped 2026-06-10 — **HTTPS transport (`https://` clone/fetch over first-party TLS 1.3, TOFU-pinned).** Closes the slot blocked on first-party Cyrius TLS for the whole v0.8.x line. Three bites: (1) TOFU pin store in new `src/wire_https.cyr` (SPKI SHA-256 in `~/.sit/known_certs`, ADR 0008 parity); (2) client TLS I/O in `wire_http.cyr` (`_wire_https_connect` + `set_verify(NONE)` + SPKI pin, fragmented `_wire_io_send/recv`); (3) server TLS in `serve.cyr` (`sit serve --tls --cert --key` + hand-rolled `_serve_run_tls` accept loop + 67 send sites routed via `_serve_tls_ctx`-gated wrappers). `tls_native` added to stdlib; pin `6.1.27 → 6.1.29`. ADR 0007 Update + blocker archived RESOLVED. | `src/wire_https.cyr`, extends `wire_http.cyr` + `wire.cyr` + `serve.cyr` | (see Released — clone https:// against serve --tls TOFU-pinned + fsck-clean; OpenSSL 3.6.2 interop; mismatch refused; binary 2.14 MB) |
-| **0.8.9** | **HTTPS followups.** (1) **https push** — `wire_transport_check_writable` rejects `https://` today; the server's 64 KiB TLS request buffer can't take 16 MiB push bodies without streaming `_serve_tls_recv_request` to the put-object handler. (2) **keep-alive** — drop the per-request TLS handshake (one handshake → many requests) for clone throughput. (3) **socket read-timeout** — bound the TLS recv against a server that holds the connection open (defence-in-depth). (4) **Ed25519 server cert gap** — `tls_native_accept` fails on Ed25519 server certs (ECDSA P-256 works); reproduce + file upstream. | extends `src/serve.cyr` + `src/wire.cyr` + `src/wire_https.cyr` | https push roundtrip + fsck-clean; keep-alive clone faster than per-request; read-timeout test; upstream issue filed |
+| ~~0.8.9~~ | ✅ shipped 2026-06-10 — **HTTPS followups.** https push (writable-check + `_url_is_http_family` dispatch); keep-alive (persistent socket+ctx, `_wire_https_exchange` exact-Content-Length read, server per-connection loop — 1 handshake/clone, verified); 30s `SO_RCVTIMEO` both ends; `Smoke — https transport` CI step; Ed25519-cert `tls_native` gap filed. Pin `6.1.29 → 6.1.30`. | extends `src/wire_http.cyr` + `src/serve.cyr` + `src/wire.cyr` + `src/wire_https.cyr` | (see Released — push roundtrip fsck-clean; 1 handshake/clone verified; no http regression) |
 | **0.8.10** | **Full `.sitignore` semantics — git-parity.** Today `match_ignore` handles bare `*` globs and literal paths; gaps: negation (`!pattern` re-includes a previously-excluded match), `**` (multi-segment wildcard), char classes (`[abc]`), anchored patterns (`/foo` only matches at repo root), path patterns (`foo/bar` only matches that nesting). Substantial parser work in `src/index.cyr`; high test coverage given corner cases (negation order, `**/` vs `/**`, escaped brackets). | extends `src/index.cyr`'s ignore matcher | new tests/sit.tcyr group covering each new feature against a synthetic .sitignore + path matrix; fixture-based smoke with negation re-include + `**/build/*` exclude patterns |
 | **0.8.11** | **`sit log --graph` + `--depth N` shallow clone (bundled).** Two visualization/transport items that share a DFS-over-the-commit-DAG primitive. `--graph` emits an ASCII DAG using `\|` / `/` / `\` characters for merge branches; needs commit-parent walking — now trivially available via `parse_commit_body`'s `out+48` parents vec (v0.8.7). `--depth N` caps `walk_reachable_phased` to N commits back from HEAD; touches `src/wire.cyr`'s walker and `cmd_clone` arg parsing. | extends `src/commit.cyr` (`cmd_log --graph`) and `src/wire.cyr` (`walk_reachable_depth`) | CI smoke: 5-commit fixture with a merge; `sit log --graph` byte-shape matches an expected snapshot. Plus a `--depth 1` clone of a 10-commit fixture pulls exactly 1 commit-tree-blob-set (3 objects) |
 | **0.8.x last** | **Closeout pass before v1.0.0.** Per CLAUDE.md closeout procedure: full test suite, bench baseline vs. v0.6.x scoreboard, dead-code audit, refactor pass on any v0.8.x parallel-codepath accretion, code-review pass, cleanup sweep, security re-scan, downstream check (owl on `dist/sit.cyr`), doc sync, version-verify, full-clean build. | — | all closeout-pass checks green; v1.0.0 tag goes out |
@@ -512,7 +522,7 @@ Items that haven't yet landed in a numbered v0.8.x slot. The five items below th
 - ~~`sit fsck` reachability~~ → v0.8.5 ✅ (BFS walker + dangling output, shipped 2026-05-15)
 - ~~Wire-walker multi-parent fix~~ → **v0.8.7 ✅** (parents-vec at `out+48`; shipped 2026-06-10 — slid from v0.8.6, which shipped as the cyrius 6.x toolchain refresh instead)
 - ~~HTTPS via `tls_native`~~ → **v0.8.8 ✅** (clone/fetch over first-party TLS 1.3, TOFU-pinned; shipped 2026-06-10 — took the slot ahead of `.sitignore` as the long-blocked item)
-- HTTPS followups (push / keep-alive / read-timeout / Ed25519 cert gap) → v0.8.9
+- ~~HTTPS followups (push / keep-alive / read-timeout / Ed25519 cert gap)~~ → **v0.8.9 ✅** (shipped 2026-06-10)
 - Full `.sitignore` semantics → v0.8.10 (slid: HTTPS took v0.8.8, followups v0.8.9)
 - `sit log --graph` → v0.8.11 (bundled with shallow clone)
 - Shallow clone (`--depth N`) → v0.8.11 (bundled with `log --graph`)

@@ -95,7 +95,7 @@ fn serve_build_capabilities() {
     # each tag.
     # TODO: derive from VERSION at build time. Manually bumped each
     # release; closeout pass before tagging asserts the literal matches.
-    str_builder_add_cstr(sb, "{\"sit\":\"0.8.8\",\"max_body\":");
+    str_builder_add_cstr(sb, "{\"sit\":\"0.8.9\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[");
     if (_serve_require_auth == 1) {
@@ -209,8 +209,8 @@ fn _serve_send_status(cfd, code, msg) {
     var ml = strlen(msg);
     var buf = alloc(64 + ml);
     var pos = _serve_emit_status_line(buf, 0, code, msg);
-    memcpy(buf + pos, "Content-Length: 0\r\nConnection: close\r\n\r\n", 40);
-    pos = pos + 40;
+    memcpy(buf + pos, "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n", 45);
+    pos = pos + 45;
     _wire_io_send(_serve_tls_ctx, cfd, buf, pos);
     return 0;
 }
@@ -233,7 +233,7 @@ fn _serve_send_response(cfd, code, msg, ctype, body, body_len, extra) {
     memcpy(hdr + pos, &clen_buf, clen_digits); pos = pos + clen_digits;
     store8(hdr + pos, 13); pos = pos + 1; store8(hdr + pos, 10); pos = pos + 1;
     if (el > 0) { memcpy(hdr + pos, extra, el); pos = pos + el; }   # extra carries its own CRLF
-    memcpy(hdr + pos, "Connection: close\r\n\r\n", 21); pos = pos + 21;
+    memcpy(hdr + pos, "Connection: keep-alive\r\n\r\n", 26); pos = pos + 26;
     _wire_io_send(_serve_tls_ctx, cfd, hdr, pos);
     if (body_len > 0) { _wire_io_send(_serve_tls_ctx, cfd, body, body_len); }
     return 0;
@@ -1205,15 +1205,28 @@ fn _serve_run_tls(port, cert, cert_len, key, key_len) {
         var cr = sock_accept(sfd);
         if (is_err_result(cr) == 0) {
             var cfd = payload(cr);
+            # 30s recv timeout per connection — slowloris bound on the TLS
+            # handshake + request read (v0.8.9 hardening; mirrors what
+            # sandhi_server_run_opts does for the plain-http path).
+            sock_set_recv_timeout(cfd, 30, 0);
             var ctx = tls_native_new_server(cert, cert_len, key, key_len);
             if (ctx != 0) {
                 if (tls_native_server_load_creds(ctx) == TLS_OK) {
                     if (tls_native_accept(ctx, cfd) == TLS_OK) {
-                        var n = _serve_tls_recv_request(ctx, reqbuf, SERVE_TLS_REQ_MAX);
-                        if (n > 0) {
-                            _serve_set_tls_ctx(ctx);
-                            serve_handle_request(0, cfd, reqbuf, n);
-                            _serve_set_tls_ctx(0);
+                        # v0.8.9 keep-alive: serve every request on this TLS
+                        # connection until the client closes (recv returns 0) or
+                        # the 30s SO_RCVTIMEO fires. The client (wire_https) reads
+                        # each response by exact Content-Length, so the stream
+                        # stays framed across requests.
+                        var alive = 1;
+                        while (alive == 1) {
+                            var n = _serve_tls_recv_request(ctx, reqbuf, SERVE_TLS_REQ_MAX);
+                            if (n <= 0) { alive = 0; }
+                            else {
+                                _serve_set_tls_ctx(ctx);
+                                serve_handle_request(0, cfd, reqbuf, n);
+                                _serve_set_tls_ctx(0);
+                            }
                         }
                     }
                     tls_native_close(ctx);

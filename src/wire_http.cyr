@@ -60,8 +60,11 @@ var WIRE_HTTP_BATCH_CHUNK = 256;
 #            path wraps the connection in tls_native when set (bite 2).
 #   56..64 : host cstring pointer (for TLS SNI + TOFU pin lookup; the numeric
 #            addr at 0..8 drives sock_connect, the name drives the handshake)
+#   64..72 : keepalive socket fd (0 = no live connection) — v0.8.9 https keep-alive
+#   72..80 : keepalive tls_native ctx (0 = none); the persistent TLS connection
+#            reused across requests so one handshake serves a whole clone/fetch
 fn _http_remote_alloc(addr, port, is_tls, host) {
-    var h = alloc(64);
+    var h = alloc(80);
     store64(h,      addr);
     store64(h +  8, port);
     store64(h + 16, 0);
@@ -70,6 +73,8 @@ fn _http_remote_alloc(addr, port, is_tls, host) {
     store64(h + 40, 0);
     store64(h + 48, is_tls);
     store64(h + 56, host);
+    store64(h + 64, 0);
+    store64(h + 72, 0);
     return h;
 }
 
@@ -83,6 +88,10 @@ fn _http_remote_set_requires_auth(h, v) { store64(h + 32, v); return 0; }
 fn _http_remote_requires_auth(h) { return load64(h + 32); }
 fn _http_remote_token(h)         { return load64(h + 40); }
 fn _http_remote_set_token(h, t)  { store64(h + 40, t); return 0; }
+fn _http_remote_ka_fd(h)         { return load64(h + 64); }
+fn _http_remote_set_ka_fd(h, v)  { store64(h + 64, v); return 0; }
+fn _http_remote_ka_tls(h)        { return load64(h + 72); }
+fn _http_remote_set_ka_tls(h, v) { store64(h + 72, v); return 0; }
 fn _http_remote_is_tls(h)        { return load64(h + 48); }
 fn _http_remote_host(h)          { return load64(h + 56); }
 
@@ -192,8 +201,9 @@ fn wire_http_open(url) {
 }
 
 fn wire_http_close(h) {
-    # No persistent socket today — every request is one-shot.
-    # Hook for v0.7.4+ keep-alive cleanup.
+    # v0.8.9: tear down the persistent https keep-alive connection if one is
+    # live (no-op for plain http, which holds no persistent socket).
+    _wire_https_teardown(h);
     return 0;
 }
 
@@ -216,6 +226,10 @@ fn wire_http_close(h) {
 # could parse", not "status was 2xx"), -1 on socket errors.
 
 fn _wire_http_request(h, sub_path, out_quad) {
+    # https:// → persistent keep-alive connection (one handshake per clone/fetch).
+    if (_http_remote_is_tls(h) == 1) {
+        return _wire_https_exchange(h, 0, sub_path, 0, 0, 0, out_quad);
+    }
     var fd_r = tcp_socket();
     if (is_err_result(fd_r) == 1) {
         eprintln("sit: tcp_socket failed");
@@ -382,6 +396,173 @@ fn _wire_http_response_free(out_quad) {
     return 0;
 }
 
+# ── HTTPS keep-alive (v0.8.9) ──
+#
+# For https:// the TLS handshake dominates per-request cost, so the handle holds
+# ONE persistent socket + tls_native ctx and reuses it across every request of a
+# clone/fetch/push (one handshake instead of N). Plain http keeps its proven
+# per-request path (the sandhi server closes after each response anyway).
+#
+# The reused connection requires exact-Content-Length response framing (read
+# precisely status+headers+body, never to-EOF) so the next request stays aligned.
+# sit's server always emits Content-Length, so this is well-defined.
+
+# Establish (or reuse) the handle's persistent TLS connection. Returns 1 on a
+# live connection, 0 on failure.
+fn _wire_https_acquire(h) {
+    if (_http_remote_ka_fd(h) != 0) { return 1; }
+    var fd_r = tcp_socket();
+    if (is_err_result(fd_r) == 1) { eprintln("sit: tcp_socket failed"); return 0; }
+    var fd = payload(fd_r);
+    if (is_err_result(sock_connect(fd, _http_remote_addr(h), _http_remote_port(h))) == 1) {
+        sys_close(fd);
+        eprintln("sit: sock_connect failed (is sit serve running?)");
+        return 0;
+    }
+    var tls = _wire_https_connect(_http_remote_host(h), _http_remote_port(h), fd);
+    if (tls == 0) { sys_close(fd); return 0; }
+    _http_remote_set_ka_fd(h, fd);
+    _http_remote_set_ka_tls(h, tls);
+    return 1;
+}
+
+# Close + clear the persistent connection (on I/O error, or at handle close).
+fn _wire_https_teardown(h) {
+    var tls = _http_remote_ka_tls(h);
+    var fd = _http_remote_ka_fd(h);
+    if (tls != 0) { tls_native_close(tls); }
+    if (fd != 0) { sys_close(fd); }
+    _http_remote_set_ka_fd(h, 0);
+    _http_remote_set_ka_tls(h, 0);
+    return 0;
+}
+
+# One request/response over the persistent TLS connection. is_post selects
+# GET vs POST; extra_hdr (or 0) is an already-CRLF-terminated header line
+# (e.g. "X-Sit-Type: 1\r\n"). out_quad matches _wire_http_request. Returns 0 on
+# success, -1 on I/O error (tearing the connection down so the next call redials).
+fn _wire_https_exchange(h, is_post, sub_path, body, body_len, extra_hdr, out_quad) {
+    if (_wire_https_acquire(h) == 0) { return 0 - 1; }
+    var fd = _http_remote_ka_fd(h);
+    var tls = _http_remote_ka_tls(h);
+
+    var sp_len = strlen(sub_path);
+    var token = _http_remote_token(h);
+    var tlen = 0;
+    if (token != 0) { tlen = strlen(token); }
+    var ehl = 0;
+    if (extra_hdr != 0) { ehl = strlen(extra_hdr); }
+    var clen_buf[24];
+    var clen_digits = 0;
+    if (is_post == 1) { clen_digits = write_decimal(&clen_buf, body_len); }
+
+    var hdr = alloc(192 + sp_len + clen_digits + ehl + tlen);
+    var pos = 0;
+    if (is_post == 1) { memcpy(hdr + pos, "POST ", 5); pos = pos + 5; }
+    else { memcpy(hdr + pos, "GET ", 4); pos = pos + 4; }
+    memcpy(hdr + pos, sub_path, sp_len); pos = pos + sp_len;
+    memcpy(hdr + pos, " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n", 52); pos = pos + 52;
+    if (is_post == 1) {
+        memcpy(hdr + pos, "Content-Type: application/octet-stream\r\nContent-Length: ", 56); pos = pos + 56;
+        memcpy(hdr + pos, &clen_buf, clen_digits); pos = pos + clen_digits;
+        memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
+    }
+    if (ehl > 0) { memcpy(hdr + pos, extra_hdr, ehl); pos = pos + ehl; }
+    if (token != 0) {
+        memcpy(hdr + pos, "Authorization: Bearer ", 22); pos = pos + 22;
+        memcpy(hdr + pos, token, tlen); pos = pos + tlen;
+        memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
+    }
+    memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;   # end of request headers
+
+    if (_wire_io_send(tls, fd, hdr, pos) != 0) { _wire_https_teardown(h); return 0 - 1; }
+    if (is_post == 1) {
+        if (body_len > 0) {
+            if (_wire_io_send(tls, fd, body, body_len) != 0) { _wire_https_teardown(h); return 0 - 1; }
+        }
+    }
+
+    # Read EXACTLY one response: status + headers + Content-Length body.
+    var cap = WIRE_HTTP_INITIAL_BUF;
+    var buf = fl_alloc(cap);
+    if (buf == 0) {
+        _wire_https_teardown(h);
+        eprintln("sit: out of memory allocating https recv buffer");
+        return 0 - 1;
+    }
+    var used = 0;
+    var body_off = 0 - 1;
+    var content_len = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        if (used == cap) {
+            if (cap >= WIRE_HTTP_MAX_BODY) {
+                fl_free(buf, cap); _wire_https_teardown(h);
+                eprintln("sit: https response exceeds 16 MiB cap"); return 0 - 1;
+            }
+            var new_cap = cap * 2;
+            if (new_cap > WIRE_HTTP_MAX_BODY) { new_cap = WIRE_HTTP_MAX_BODY; }
+            var new_buf = fl_alloc(new_cap);
+            if (new_buf == 0) { fl_free(buf, cap); _wire_https_teardown(h); return 0 - 1; }
+            memcpy(new_buf, buf, used);
+            fl_free(buf, cap);
+            buf = new_buf;
+            cap = new_cap;
+        }
+        var n = _wire_io_recv(tls, fd, buf + used, cap - used);
+        if (n <= 0) {
+            fl_free(buf, cap); _wire_https_teardown(h);
+            eprintln("sit: https connection closed mid-response"); return 0 - 1;
+        }
+        used = used + n;
+        if (body_off < 0) {
+            body_off = sandhi_server_body_offset(buf, used);
+            if (body_off > 0) { content_len = sandhi_server_content_length(buf, used); }
+        }
+        if (body_off > 0) {
+            if (used >= body_off + content_len) { rgo = 0; }
+        }
+    }
+
+    var status = 0;
+    if (used >= 12) {
+        if (memeq(buf, "HTTP/1.", 7) == 1) {
+            status = (load8(buf + 9) - 48) * 100 + (load8(buf + 10) - 48) * 10 + (load8(buf + 11) - 48);
+        }
+    }
+    var ty = 0 - 1;
+    var tyv = sandhi_server_find_header(buf, used, "X-Sit-Type");
+    if (tyv != 0) {
+        var ti = 0;
+        var skipping = 1;
+        while (skipping == 1) {
+            skipping = 0;
+            var tc = load8(tyv + ti) & 0xFF;
+            if (tc == 32) { ti = ti + 1; skipping = 1; }
+            if (tc == 9)  { ti = ti + 1; skipping = 1; }
+        }
+        var tv = 0;
+        var saw = 0;
+        var collecting = 1;
+        while (collecting == 1) {
+            collecting = 0;
+            var d = load8(tyv + ti) & 0xFF;
+            if (d >= 48) {
+                if (d <= 57) { tv = tv * 10 + (d - 48); saw = 1; ti = ti + 1; collecting = 1; }
+            }
+        }
+        if (saw == 1) { ty = tv; }
+    }
+
+    store64(out_quad,      buf + body_off);
+    store64(out_quad +  8, content_len);
+    store64(out_quad + 16, status);
+    store64(out_quad + 24, ty);
+    store64(out_quad + 32, buf);
+    store64(out_quad + 40, cap);
+    return 0;
+}
+
 # POST variant of _wire_http_request: same response-parsing shape,
 # different request-build path. Sends a fixed-shape body with
 # Content-Type: application/octet-stream + Content-Length. Used
@@ -396,6 +577,9 @@ fn _wire_http_response_free(out_quad) {
 # the wire format and v0.7.4 CHANGELOG entry for the gate analysis.
 
 fn _wire_http_post(h, sub_path, body, body_len, out_quad) {
+    if (_http_remote_is_tls(h) == 1) {
+        return _wire_https_exchange(h, 1, sub_path, body, body_len, 0, out_quad);
+    }
     var fd_r = tcp_socket();
     if (is_err_result(fd_r) == 1) {
         eprintln("sit: tcp_socket failed");
@@ -1069,6 +1253,9 @@ fn http_remote_push_ref(h, refname, hex) {
 # `extra_headers` arg through every call site.
 
 fn _wire_http_post_xhdr(h, sub_path, body, body_len, extra_hdr, out_quad) {
+    if (_http_remote_is_tls(h) == 1) {
+        return _wire_https_exchange(h, 1, sub_path, body, body_len, extra_hdr, out_quad);
+    }
     var fd_r = tcp_socket();
     if (is_err_result(fd_r) == 1) {
         eprintln("sit: tcp_socket failed");

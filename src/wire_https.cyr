@@ -168,6 +168,9 @@ fn tofu_check_pin(host, port, spki_der, der_len) {
 # the cert without a CA chain, then pin the SPKI ourselves. The caller still owns
 # and closes `fd`.
 fn _wire_https_connect(host, port, fd) {
+    # 30s recv timeout: bound every TLS read (handshake + app data) so a stalled
+    # or hostile server can't pin the clone/fetch indefinitely (v0.8.9 hardening).
+    sock_set_recv_timeout(fd, 30, 0);
     var ctx = tls_native_new_client(host, 0);
     if (ctx == 0) { eprintln("sit: tls: out of memory"); return 0; }
     tls_native_set_verify(ctx, TLS_VERIFY_NONE);   # TOFU: pin SPKI instead of CA-verify
