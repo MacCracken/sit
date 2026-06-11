@@ -1122,9 +1122,112 @@ fn _serve_run_stdio() {
 
 # ── Top-level command ──────────────────────────────────────────────
 
+# ── TLS server (bite 3b) ──
+#
+# `sit serve --tls --cert <file> --key <file>`. The cert is DER, or PEM (auto-
+# decoded via sigil's pem_decode_certs); the key is PEM or DER (tls_native
+# detects). Per ADR 0007 the only TLS is tls_native (first-party Cyrius) — no
+# libssl. Read-only over TLS today: GET (capabilities/refs/objects) + POST /want
+# fit the 64 KiB request buffer. POST push bodies (up to 16 MiB) would overflow
+# it, but https push stays gated at wire_transport_check_writable so it cannot
+# reach here.
+
+var SERVE_TLS_REQ_MAX = 65536;   # 64 KiB request buffer (matches sandhi's HSV cap)
+
+# Load a certificate file as DER. Accepts PEM (decoded via pem_decode_certs) or
+# raw DER. Writes [der_ptr, der_len] to out_pair (16 bytes). Returns 0 on
+# success, negative on read failure.
+fn _serve_load_cert(path, out_pair) {
+    var fp[16];
+    if (read_file_heap(path, &fp) != 0) { return 0 - 1; }
+    var data = load64(&fp);
+    var len = load64(&fp + 8);
+    var chain[16];
+    var nc = pem_decode_certs(data, len, &chain, 1);
+    if (nc >= 1) {
+        store64(out_pair, load64(&chain));
+        store64(out_pair + 8, load64(&chain + 8));
+        return 0;
+    }
+    store64(out_pair, data);          # not PEM → assume DER
+    store64(out_pair + 8, len);
+    return 0;
+}
+
+# Read a full HTTP/1.0 request off a TLS connection into buf (cap `max`). Reads
+# records until the header terminator is seen and the declared body is present,
+# or the stream ends / the cap is hit. Returns total bytes read.
+fn _serve_tls_recv_request(ctx, buf, max) {
+    var used = 0;
+    var headers_end = 0 - 1;
+    var content_len = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        if (used >= max) { rgo = 0; }
+        else {
+            var n = tls_native_read(ctx, buf + used, max - used);
+            if (n <= 0) { rgo = 0; }
+            else {
+                used = used + n;
+                if (headers_end < 0) {
+                    headers_end = sandhi_server_body_offset(buf, used);
+                    if (headers_end > 0) {
+                        content_len = sandhi_server_content_length(buf, used);
+                    }
+                }
+                if (headers_end > 0) {
+                    if (used >= headers_end + content_len) { rgo = 0; }
+                }
+            }
+        }
+    }
+    return used;
+}
+
+# TLS accept loop. One TLS connection per HTTP/1.0 request (Connection: close):
+# accept → fresh server ctx (re-parses creds per connection) → handshake → recv
+# request → dispatch with _serve_tls_ctx set so the response goes back over TLS →
+# close. Single-threaded/sequential like sandhi_server_run, so the global ctx is
+# connection-safe. cert/key DER buffers are loaded once by the caller.
+fn _serve_run_tls(port, cert, cert_len, key, key_len) {
+    var sfd_r = tcp_socket();
+    if (is_err_result(sfd_r) == 1) { eprintln("sit: tcp_socket failed"); return 1; }
+    var sfd = payload(sfd_r);
+    sock_reuse(sfd);
+    if (is_err_result(sock_bind(sfd, INADDR_LOOPBACK(), port)) == 1) {
+        eprintln("sit: bind failed"); return 1;
+    }
+    if (is_err_result(sock_listen(sfd, 16)) == 1) {
+        eprintln("sit: listen failed"); return 1;
+    }
+    var reqbuf = alloc(SERVE_TLS_REQ_MAX);
+    while (1 == 1) {
+        var cr = sock_accept(sfd);
+        if (is_err_result(cr) == 0) {
+            var cfd = payload(cr);
+            var ctx = tls_native_new_server(cert, cert_len, key, key_len);
+            if (ctx != 0) {
+                if (tls_native_server_load_creds(ctx) == TLS_OK) {
+                    if (tls_native_accept(ctx, cfd) == TLS_OK) {
+                        var n = _serve_tls_recv_request(ctx, reqbuf, SERVE_TLS_REQ_MAX);
+                        if (n > 0) {
+                            _serve_set_tls_ctx(ctx);
+                            serve_handle_request(0, cfd, reqbuf, n);
+                            _serve_set_tls_ctx(0);
+                        }
+                    }
+                    tls_native_close(ctx);
+                }
+            }
+            sock_close(cfd);
+        }
+    }
+    return 0;
+}
+
 fn cmd_serve() {
     if (argc() < 3) {
-        eprintln("usage: sit serve <repo-path> [--stdio | --listen 127.0.0.1:<port>] [--require-auth] [--token <path>]");
+        eprintln("usage: sit serve <repo-path> [--stdio | --listen 127.0.0.1:<port>] [--tls --cert <f> --key <f>] [--require-auth] [--token <path>]");
         return 1;
     }
     var repo_path = argv_heap(2);
@@ -1132,6 +1235,11 @@ fn cmd_serve() {
     var stdio_mode = 0;
     var token_path = "~/.sit/serve.token";   # default; overridable via --token
     var custom_token_path = 0;
+    var tls_mode = 0;
+    var cert_path = 0;
+    var key_path = 0;
+    var cert_pair[16];
+    var key_pair[16];
     var ai = 3;
     while (ai < argc()) {
         var a = argv(ai);
@@ -1170,8 +1278,34 @@ fn cmd_serve() {
                     ai = ai + 2;
                 }
                 else {
-                    eprintln("sit: unknown serve option");
-                    return 1;
+                    if (streq(a, "--tls") == 1) {
+                        tls_mode = 1;
+                        ai = ai + 1;
+                    }
+                    else {
+                        if (streq(a, "--cert") == 1) {
+                            if (ai + 1 >= argc()) {
+                                eprintln("sit: --cert requires a path argument");
+                                return 1;
+                            }
+                            cert_path = argv_heap(ai + 1);
+                            ai = ai + 2;
+                        }
+                        else {
+                            if (streq(a, "--key") == 1) {
+                                if (ai + 1 >= argc()) {
+                                    eprintln("sit: --key requires a path argument");
+                                    return 1;
+                                }
+                                key_path = argv_heap(ai + 1);
+                                ai = ai + 2;
+                            }
+                            else {
+                                eprintln("sit: unknown serve option");
+                                return 1;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1210,6 +1344,31 @@ fn cmd_serve() {
         }
     }
 
+    # Load TLS creds before chdir — --cert/--key are relative to the invocation
+    # cwd, not the repo (same reasoning as the token path above).
+    if (tls_mode == 1) {
+        if (stdio_mode == 1) {
+            eprintln("sit: --tls and --stdio are mutually exclusive");
+            return 1;
+        }
+        if (cert_path == 0) {
+            eprintln("sit: --tls requires --cert <file>");
+            return 1;
+        }
+        if (key_path == 0) {
+            eprintln("sit: --tls requires --key <file>");
+            return 1;
+        }
+        if (_serve_load_cert(cert_path, &cert_pair) != 0) {
+            eprintln("sit: cannot read --cert file");
+            return 1;
+        }
+        if (read_file_heap(key_path, &key_pair) != 0) {
+            eprintln("sit: cannot read --key file");
+            return 1;
+        }
+    }
+
     # chdir into the repo so .sit/refs/* and .sit/objects.patra
     # resolve as relative paths in every dependent helper.
     if (syscall(SYS_CHDIR, repo_path) != 0) {
@@ -1233,6 +1392,18 @@ fn cmd_serve() {
             eprintln("sit serve --stdio (auth: none)");
         }
         return _serve_run_stdio();
+    }
+
+    if (tls_mode == 1) {
+        if (_serve_require_auth == 1) {
+            println("sit serve listening on 127.0.0.1 (tls, auth: bearer)");
+        }
+        else {
+            println("sit serve listening on 127.0.0.1 (tls, auth: none)");
+        }
+        stdout_flush();
+        return _serve_run_tls(port, load64(&cert_pair), load64(&cert_pair + 8),
+                              load64(&key_pair), load64(&key_pair + 8));
     }
 
     if (_serve_require_auth == 1) {
