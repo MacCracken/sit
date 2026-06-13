@@ -73,6 +73,33 @@ EOF
 )
 assert_eq "$GRAPH" "$EXPECTED" "graph DAG shape matches the merge snapshot"
 
+# ── 3b. merge-base full-DAG LCA (v0.8.13 diamond gate) ─────────────
+# Build a diamond where the first-parent chain reaches the true base only
+# through a merge's second parent. Layout:
+#   R ─ A ─ M ─ C   (main; M merges feature)
+#    \     /
+#     B ─────── D   (feature)
+# True LCA(C, D) = B. The pre-v0.8.13 first-parent walk fell back to R.
+hr "merge-base full-DAG LCA (diamond)"
+R="$WORK/diamond"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'r\n' > r.txt; "$SIT" add r.txt >/dev/null; "$SIT" commit -m "R" >/dev/null
+ROOT=$(tr -d '\n' < .sit/refs/heads/main)
+"$SIT" checkout -b feature >/dev/null
+printf 'b\n' > b.txt; "$SIT" add b.txt >/dev/null; "$SIT" commit -m "B" >/dev/null
+BASE=$(tr -d '\n' < .sit/refs/heads/feature)
+"$SIT" checkout main >/dev/null
+printf 'a\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m "A" >/dev/null
+"$SIT" merge feature >/dev/null 2>&1
+printf 'c\n' > c.txt; "$SIT" add c.txt >/dev/null; "$SIT" commit -m "C" >/dev/null
+"$SIT" checkout feature >/dev/null
+printf 'd\n' > d.txt; "$SIT" add d.txt >/dev/null; "$SIT" commit -m "D" >/dev/null
+MB=$("$SIT" merge-base main feature)
+assert_eq "$MB" "$BASE" "merge-base(main,feature) = B (true full-DAG LCA)"
+if [ "$MB" = "$ROOT" ]; then bad "merge-base returned root (pre-v0.8.13 first-parent behavior)"; else ok; fi
+# self and ancestor identities
+assert_eq "$("$SIT" merge-base main main)" "$(tr -d '\n' < .sit/refs/heads/main)" "merge-base(X,X) = X"
+
 # ── 4. clone (file://) full round-trip ─────────────────────────────
 hr "clone file:// full"
 R="$WORK/origin"; mkdir -p "$R"; cd "$R"

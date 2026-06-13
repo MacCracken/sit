@@ -47,6 +47,7 @@ fn print_usage() {
     eprintln("  checkout [-b] <branch>  switch to <branch>, optionally creating it first");
     eprintln("  tag [-d <name>|<name> [<commit>]]  list / create / delete tag (-d deletes)");
     eprintln("  merge <branch>          fast-forward HEAD to <branch> (3-way deferred)");
+    eprintln("  merge-base <a> <b>      print the lowest common ancestor of two commits");
     eprintln("  reset <path> | --hard <ref>  unstage a path, or move HEAD to <ref>");
     eprintln("  config [--global] <key> [<value>]  read or write a config value");
     eprintln("  fsck                    verify object integrity (sha-256 vs filename)");
@@ -86,6 +87,7 @@ fn main() {
     if (streq(cmd, "checkout") == 1) { return cmd_checkout(); }
     if (streq(cmd, "tag")      == 1) { return cmd_tag(); }
     if (streq(cmd, "merge")    == 1) { return cmd_merge(); }
+    if (streq(cmd, "merge-base") == 1) { return cmd_merge_base(); }
     if (streq(cmd, "reset")    == 1) { return cmd_reset(); }
     if (streq(cmd, "config")   == 1) { return cmd_config(); }
     if (streq(cmd, "fsck")     == 1) { return cmd_fsck(); }

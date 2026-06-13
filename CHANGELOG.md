@@ -4,6 +4,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.13] — 2026-06-13 — `merge_base` full-DAG LCA + `sit merge-base`
+
+Corrects the merge base across merges and exposes it as a plumbing command. Closes the last of the v0.8.7-era single-parent-walk footguns.
+
+### Fixed
+
+- **`find_merge_base` walks the full DAG** (`src/merge.cyr`) — it previously followed only the single first-parent chain (`out+8`) on *both* sides, so for any history containing a merge it returned a too-high common ancestor. Concretely, in a diamond where one tip reaches the true base only through a merge commit's second parent, it fell back to the repository root. The rewrite computes a real lowest common ancestor over the `out+48` parent graph: (1) full-DAG ancestor set of *a*; (2) prune-BFS from *b* for the frontier of common ancestors; (3) reduce redundant candidates (a candidate that is an ancestor of another is dropped, via the v0.8.7 full-DAG `is_ancestor`), returning the newest maximal base. Verified on a diamond fixture: the new base is the true LCA `B`; the old code returned root `R`. Self (`merge-base X X = X`) and ancestor (`merge-base anc desc = anc`) identities hold. This makes `sit merge`'s 3-way base correct across merge-bearing history.
+
+### Added
+
+- **`sit merge-base <a> <b>`** — git-parity plumbing that prints the lowest common ancestor of two commits (resolved via branch / tag / hex-prefix). Exposes the LCA so it's testable independently of a full merge. **26 commands total.**
+- **Diamond integration gate** — `tests/integration/run.sh` gains a diamond fixture (first-parent LCA = root, true LCA = the feature base) asserting `merge-base` returns the true base, plus the self identity. **22 integration assertions** (was 19).
+
+### Notes
+
+- **Documented simplification**: criss-cross histories can have several equally-valid merge bases; sit returns one (newest by author timestamp) where git would do a recursive merge. Octopus (3+ parent) bases are handled correctly by the walk but aren't creatable via sit's 2-way `merge` yet.
+- Build / test / lint / fuzz / bench green; 180 unit / 22 integration; fuzz clean; bench flat vs the v0.8.12 baseline (no perf-touching change). `dist/sit.cyr` regenerated (`merge.cyr` is `[lib].modules`). DCE binary **2.20 MB** (flat). No toolchain or dep change.
+
 ## [0.8.12] — 2026-06-13 — `log --graph` + `--depth N` shallow clone + bench/test infrastructure
 
 Two git-parity features plus the long-deferred bench-fixture refresh and an in-tree integration suite. The two features share the full-DAG commit walk that `parse_commit_body`'s out+48 parents vec (v0.8.7) unlocked.
