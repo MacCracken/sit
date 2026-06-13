@@ -4,6 +4,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-06-13 — v1.0.0 closeout / stabilization
+
+The stabilization pass before the v1.0.0 cut: an independent adversarial review of the v0.8.x additions (`log --graph`, `--depth` shallow clone, `merge_base`, `fsck --prune`), a whole-tree dead-code / lint / security re-scan, and one consolidation refactor. Three HIGH findings fixed; no new features. Full report: [`docs/audit/2026-06-13-audit.md`](docs/audit/2026-06-13-audit.md).
+
+### Security
+
+- **`sit log --graph` out-of-bounds write (memory safety)** — `_graph_join_connector` (`src/commit.cyr`) wrote the collapse seam at `buf + 2*rcol - 1`, which underflows to `buf-1` when the collapsing lane is column 0. Reachable whenever a merge's second parent (feature lane) is *strictly* newer than its first (main lane) — a common real-history shape. Guarded `if (rcol > 0)`; the same `2*x-1` seam in `_graph_merge_connector` is guarded defensively (analysis shows it can't underflow, but the invariant is now explicit). Regression test added.
+- **`sit fsck --prune` data loss behind a corrupt object** — the reachability walk silently skips unreadable objects, so a single corrupt interior commit/tree orphaned its whole subgraph into the `dangling` set, and `--prune` (running before the `bad > 0` check) would permanently delete those genuinely-reachable objects. Now refuses to prune when any object is bad/unreadable, and when *every* object is unreachable (the signature of a corrupt/missing HEAD that would otherwise wipe the store).
+
+### Fixed
+
+- **`find_merge_base` on a cyclic/corrupt store** (`src/merge.cyr`) — falls back to a real candidate instead of reporting "no common ancestor" if a parent cycle makes `is_ancestor` mark every candidate redundant (only reachable on a corrupt store; defense-in-depth).
+
+### Changed
+
+- **Refactor** — extracted `commit_parents_of(hex)` (`src/commit.cyr`), consolidating the `read_object → parse_commit_body → iterate out+48 parents` boilerplate shared by `is_ancestor` and both BFS loops in `find_merge_base` (~30 lines removed). The walkers that also need the tree/timestamp/body (`walk_reachable_phased`, `print_graph`, `cmd_fsck`) keep their inline reads.
+- **Dead code** — removed the unused `_ssh_handle_batch_known` / `_ssh_handle_carry` getters (reserved SSH-handle slots with no readers; zero-init setters retained). Remaining unreachable-from-binary floor is the intentional set: the `sit_*` public API (live in `dist/sit.cyr`) and the `build_commit` / `build_merge_commit` wrappers.
+
+### Notes
+
+- No feature changes, no public-API changes (`src/api.cyr` + the `ann_*` accessors are byte-identical, so the owl downstream needs no adaptation). No toolchain or dep change.
+- **Verification**: 180 unit + **33 integration** assertions (the v0.8.x gates + the new lane-0-join graph regression), fuzz clean (6 harnesses), bench flat vs the v0.8.12 baseline ([snapshot](docs/benchmarks/2026-06-13-v0.9.0.md)), lint clean, clean-from-scratch DCE build. DCE binary **2.204 MB** (−336 B vs v0.8.14). `dist/sit.cyr` regenerated. **Next: the v1.0.0 cut.**
+
 ## [0.8.14] — 2026-06-13 — `sit fsck --prune`
 
 Completes the v0.8.5 fsck reachability work by letting it remove what it finds. Deferred from v0.8.5 pending a safety story.

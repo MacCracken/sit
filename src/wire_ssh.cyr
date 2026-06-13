@@ -38,8 +38,9 @@ var WIRE_SSH_RECV_MAX = 16777216;  # 16 MiB — match WIRE_HTTP_MAX_BODY
 fn _ssh_handle_pid(h)         { return load64(h); }
 fn _ssh_handle_write_fd(h)    { return load64(h + 8); }
 fn _ssh_handle_read_fd(h)     { return load64(h + 16); }
-fn _ssh_handle_batch_known(h) { return load64(h + 24); }
-fn _ssh_handle_carry(h)       { return load64(h + 32); }
+# Slots h+24 (batch_known) / h+32 (carry) are reserved + zero-initialised by
+# the setters below; their getters were removed in the v0.9.0 closeout as
+# dead (no readers yet — pipelining carryover / batch detection are unwired).
 fn _ssh_set_pid(h, v)         { store64(h, v); }
 fn _ssh_set_write_fd(h, v)    { store64(h + 8, v); }
 fn _ssh_set_read_fd(h, v)     { store64(h + 16, v); }

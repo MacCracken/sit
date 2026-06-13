@@ -1,6 +1,6 @@
 # sit Development Roadmap
 
-> **v0.8.x active — release 14 of N shipped.** Line opener and arc summary:
+> **v0.9.0 shipped — v1.0.0 closeout complete; the 1.0 cut is next.** v0.8.x line + the 0.9.0 stabilization minor:
 >
 > | tag | date | summary |
 > |---|---|---|
@@ -19,12 +19,13 @@
 > | v0.8.12 | 2026-06-13 | **`log --graph`** (ASCII DAG) + **`clone --depth N`** (shallow + `.sit/shallow`) + bench-fixture refresh + in-tree integration suite |
 > | v0.8.13 | 2026-06-13 | **`merge_base` full-DAG LCA** (correct base across merges) + **`sit merge-base`** plumbing — last v0.8.7-era single-parent footgun closed |
 > | v0.8.14 | 2026-06-13 | **`sit fsck --prune`** — removes the dangling objects the v0.8.5 walk finds (durable, MERGE_HEAD-guarded); completes the v0.8.5 reachability work |
+> | v0.9.0 | 2026-06-13 | **v1.0.0 closeout** — adversarial review of the v0.8.x additions; 3 HIGH bugs fixed (graph OOB write, fsck-prune data loss, merge-base cyclic fallback) + dead-code sweep + `commit_parents_of` refactor |
 >
 > **Slot note:** v0.8.6 shipped as the cyrius 6.x toolchain refresh (not the originally-planned wire-walker fix); wire-walker landed at **v0.8.7**; **HTTPS took v0.8.8** (it was the long-blocked slot and `tls_native` made it ready). So HTTPS followups are **v0.8.9**, `.sitignore` slid to **v0.8.10**, **v0.8.11** took the cyrius 6.2.2 toolchain refresh, and `log --graph` / shallow-clone slides to **v0.8.12**.
 >
-> **Next: v0.8.15 — closeout pass → v1.0.0.** Per the CLAUDE.md closeout procedure: full test suite, bench baseline vs the v0.6.x scoreboard (now meaningful — fixtures landed in 0.8.12), dead-code audit, refactor pass on any v0.8.x parallel-codepath accretion, code-review pass, cleanup sweep, security re-scan, downstream check (owl on `dist/sit.cyr`), doc sync, version-verify, full-clean build → then the v1.0.0 tag. v0.8.14 (`fsck --prune`), v0.8.13 (`merge_base` + `sit merge-base`), v0.8.12 (graph + shallow + bench + integration tests), HTTPS (v0.8.8–0.8.9), `.sitignore` git-parity (v0.8.10), and the cyrius 6.2.2 refresh (v0.8.11) are complete.
+> **Next: v1.0.0 — the clean cut.** The v0.9.0 closeout pass is done (full suite, bench vs the v0.6.x scoreboard, dead-code audit, code review, security re-scan, refactor, downstream check, doc sync, clean build — audit at [`docs/audit/2026-06-13-audit.md`](audit/2026-06-13-audit.md)). v1.0.0 is the ceremonial cut on top of a green v0.9.0: VERSION → 1.0.0, CHANGELOG header, final version-verify, tag. No further feature or fix work is planned before it. All v0.8.x slots — `fsck --prune` (v0.8.14), `merge_base` + `sit merge-base` (v0.8.13), graph + shallow + bench + integration tests (v0.8.12), HTTPS (v0.8.8–0.8.9), `.sitignore` git-parity (v0.8.10), cyrius 6.2.2 (v0.8.11) — are complete.
 >
-> **v0.8.x tail plan (set 2026-06-13):** ~~`0.8.12` (graph + shallow + bench + tests)~~ ✅ → ~~`0.8.13` (`merge_base` full-DAG LCA)~~ ✅ → ~~`0.8.14` (`fsck --prune`)~~ ✅ → `0.8.15` (closeout pass → v1.0.0).
+> **Tail plan (set 2026-06-13, revised):** ~~`0.8.12`~~ ✅ → ~~`0.8.13`~~ ✅ → ~~`0.8.14`~~ ✅ → ~~`0.9.0` (closeout / stabilization)~~ ✅ → **`1.0.0` (clean cut)**.
 >
 > **HTTPS is SHIPPED (v0.8.8).** cyrius 6.x's [`lib/tls_native.cyr`](../adr/0007-network-transport-security.md) — sovereign pure-Cyrius TLS 1.3 on sigil primitives (**no fdlopen, no libssl**; interops with OpenSSL 3.6.2) — satisfied [ADR 0007](../adr/0007-network-transport-security.md)'s gate. `sit clone https://` against `sit serve --tls` works end-to-end, TOFU-pinned (SPKI SHA-256 in `~/.sit/known_certs`, ADR 0008 parity). Read-only this release; **https push + keep-alive + read-timeout are v0.8.9**. **mTLS** still builds on this (`tls_native_new_server` + client-cert verify primitives exist); slot after https push. The cross-repo blocker `issues/archived/2026-05-13-sandhi-first-party-tls-surface-needed.md` is archived RESOLVED.
 >
@@ -33,6 +34,17 @@
 Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHANGELOG.md`](../../CHANGELOG.md) for the tagged artifacts.
 
 ## Released
+
+### v0.9.0 — v1.0.0 closeout / stabilization
+
+- **No features.** The hardening pass before the 1.0 cut (promoted from the planned 0.8.15 slot to its own minor). An independent adversarial review agent walked the four v0.8.x feature groups; the whole tree got a dead-code / lint / security re-scan. Full report: [`docs/audit/2026-06-13-audit.md`](audit/2026-06-13-audit.md).
+- **3 HIGH bugs fixed + regression-tested**:
+  - `sit log --graph` **out-of-bounds write** — `_graph_join_connector` wrote the collapse seam at `buf + 2*rcol - 1`, underflowing to `buf-1` when the collapsing lane is column 0 (reachable when a merge's second parent is strictly newer than the first). Guarded `rcol > 0`; the matching `_graph_merge_connector` seam guarded defensively. New `tests/integration/run.sh` lane-0-join regression.
+  - `sit fsck --prune` **data loss** — the reachability walk skips unreadable objects, so a corrupt interior object orphaned its subgraph into the dangling set and `--prune` (before the `bad>0` check) would delete reachable objects. Now refused when `bad>0` or every object is unreachable.
+  - `find_merge_base` **cyclic-store fallback** — returns a real candidate instead of "no common ancestor" if a corrupt parent cycle marks every candidate redundant.
+- **Dead code**: removed the unused `_ssh_handle_batch_known` / `_ssh_handle_carry` getters. Floor recorded: the `sit_*` public API (live in the library bundle) + the intentional `build_commit` / `build_merge_commit` wrappers.
+- **Refactor**: `commit_parents_of` consolidates the parent-walk read+parse boilerplate in `is_ancestor` + `find_merge_base` (~30 lines).
+- **Public API byte-identical** (`api.cyr` + `ann_*` untouched) — owl downstream needs no changes. 180 unit / 33 integration; fuzz/bench/lint green; bench flat vs v0.8.12 ([snapshot](benchmarks/2026-06-13-v0.9.0.md)). DCE binary **2.204 MB** (−336 B vs v0.8.14). No toolchain/dep change.
 
 ### v0.8.14 — `sit fsck --prune`
 
@@ -540,7 +552,8 @@ Same small-bite cadence as v0.7.x. Five releases shipped (toolchain → lib expo
 | ~~0.8.12~~ | ✅ shipped 2026-06-13 — **`log --graph` + `--depth N` shallow clone + bench/test infrastructure.** (1) `sit log --graph` — `print_graph` + `_graph_*` in `src/commit.cyr`: full-DAG BFS, position-grid `* | / \` lanes, reverse-topological newest-first emission, deterministic. (2) `sit clone --depth N` — depth-capped `walk_reachable_phased` (module globals `_wire_clone_depth` / `_wire_shallow_boundary`, four call sites unchanged) + `.sit/shallow` marker so `log` stops cleanly; `--depth 1` = 3 objects, fsck-clean. (3) Bench refresh — fixed stale `copy_objects`; added LCS-diff / `is_ignored` / blob-hash groups; baseline `docs/benchmarks/2026-06-13-v0.8.12.md`. (4) `tests/integration/run.sh` (19 assertions) + CI step. | `src/commit.cyr` graph renderer; `src/wire.cyr` depth cap; `tests/sit.bcyr` Phase 3; `tests/integration/run.sh` | (see Released — gates met: `--graph` snapshot matches, `--depth 1` = 3 objects; 180 unit / 19 integration; bench green; DCE 2.20 MB) |
 | ~~0.8.13~~ | ✅ shipped 2026-06-13 — **`merge_base` full-DAG LCA + `sit merge-base`.** `find_merge_base` rewritten over the `out+48` parent graph: full-DAG ancestor-set of *a* → prune-BFS from *b* for the common-ancestor frontier → redundancy reduction (drop a candidate that is an `is_ancestor` of another) → newest maximal base. New `sit merge-base <a> <b>` plumbing (26 commands). Diamond integration gate (true base B, not root R) + self/ancestor identities. Criss-cross picks one (documented). | rewrote `find_merge_base` + `cmd_merge_base` in `src/merge.cyr`; dispatch in `src/main.cyr` | (see Released — base correct across merges; 180 unit / 22 integration; DCE 2.20 MB flat) |
 | ~~0.8.14~~ | ✅ shipped 2026-06-13 — **`sit fsck --prune`.** Removes the dangling objects the v0.8.5 reachability walk identifies. New `db_object_delete` (hex-validated `DELETE FROM objects`) + `patra_flush` (durable across process exit) + `pruned <n> objects` report; refused under `.sit/MERGE_HEAD`. Immediate/unrecoverable (no reflog yet → `git gc --prune=now` semantics, documented; a reflog-backed grace period is a separate future feature). | extends `cmd_fsck` + adds `db_object_delete` in `src/object_db.cyr` | (see Released — `reset --hard` → 3 dangling → prune → fresh fsck 0 dangling, reachable intact; 180 unit / 30 integration; DCE 2.20 MB) |
-| **0.8.15** | **Closeout pass before v1.0.0.** Per CLAUDE.md closeout procedure: full test suite, bench baseline vs. v0.6.x scoreboard (now meaningful — bench fixtures landed in 0.8.12), dead-code audit, refactor pass on any v0.8.x parallel-codepath accretion, code-review pass, cleanup sweep, security re-scan, downstream check (owl on `dist/sit.cyr`), doc sync, version-verify, full-clean build. | — | all closeout-pass checks green; v1.0.0 tag goes out |
+| ~~0.9.0~~ | ✅ shipped 2026-06-13 — **v1.0.0 closeout / stabilization** (promoted from the planned 0.8.15 to its own minor). Adversarial review of the v0.8.x additions; **3 HIGH bugs fixed** (graph `_graph_join_connector` OOB write, `fsck --prune` data-loss, `find_merge_base` cyclic fallback) + dead-code sweep (2 ssh getters) + `commit_parents_of` refactor. Public API byte-identical. Audit `docs/audit/2026-06-13-audit.md`. | guards in `src/commit.cyr` + `src/object_db.cyr` + `src/merge.cyr`; `commit_parents_of` extraction | (see Released — 180 unit / 33 integration; bench flat; DCE 2.204 MB) |
+| **1.0.0** | **The clean cut.** Ceremonial release on a green v0.9.0: VERSION → 1.0.0, CHANGELOG header, version-verify gate, tag. No feature/fix work planned. | — | version-verify passes; release workflow ships the 1.0.0 artifact |
 
 **Previously blocked on upstream — unblocked at cyrius 6.x (v0.8.6), SHIPPED at v0.8.8:**
 
@@ -578,4 +591,5 @@ Items that haven't yet landed in a numbered v0.8.x slot. The five items below th
 - ~~Integration tests in-tree~~ → **v0.8.12 ✅** (`tests/integration/run.sh`, 19 assertions)
 - ~~`merge_base` full-DAG LCA~~ → **v0.8.13 ✅** (+ `sit merge-base` plumbing; shipped 2026-06-13)
 - ~~`fsck --prune`~~ → **v0.8.14 ✅** (durable, MERGE_HEAD-guarded; shipped 2026-06-13)
-- Closeout pass → v0.8.15 → v1.0.0 (next)
+- ~~Closeout pass~~ → **v0.9.0 ✅** (stabilization minor; 3 HIGH bugs fixed; shipped 2026-06-13)
+- Clean 1.0.0 cut → **v1.0.0 (next)**

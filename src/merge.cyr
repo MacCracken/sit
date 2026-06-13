@@ -306,21 +306,12 @@ fn find_merge_base(a_hex, b_hex) {
         if (map_has(anc_a, cur) == 1) { }
         else {
             map_set(anc_a, cur, 1);
-            var obj[24];
-            if (read_object(cur, &obj) == 0) {
-                var buf = load64(&obj);
-                var blen = load64(&obj + 8);
-                var coff = load64(&obj + 16);
-                var info[56];
-                if (parse_commit_body(buf + coff, blen - coff, &info) == 0) {
-                    var pv = load64(&info + 48);
-                    if (pv != 0) {
-                        var pi = 0;
-                        while (pi < vec_len(pv)) {
-                            vec_push(q, vec_get(pv, pi));
-                            pi = pi + 1;
-                        }
-                    }
+            var pv = commit_parents_of(cur);
+            if (pv != 0) {
+                var pi = 0;
+                while (pi < vec_len(pv)) {
+                    vec_push(q, vec_get(pv, pi));
+                    pi = pi + 1;
                 }
             }
         }
@@ -344,21 +335,12 @@ fn find_merge_base(a_hex, b_hex) {
                 vec_push(candidates, cur);
             }
             else {
-                var obj[24];
-                if (read_object(cur, &obj) == 0) {
-                    var buf = load64(&obj);
-                    var blen = load64(&obj + 8);
-                    var coff = load64(&obj + 16);
-                    var info[56];
-                    if (parse_commit_body(buf + coff, blen - coff, &info) == 0) {
-                        var pv = load64(&info + 48);
-                        if (pv != 0) {
-                            var pi = 0;
-                            while (pi < vec_len(pv)) {
-                                vec_push(q2, vec_get(pv, pi));
-                                pi = pi + 1;
-                            }
-                        }
+                var pv = commit_parents_of(cur);
+                if (pv != 0) {
+                    var pi = 0;
+                    while (pi < vec_len(pv)) {
+                        vec_push(q2, vec_get(pv, pi));
+                        pi = pi + 1;
                     }
                 }
             }
@@ -393,6 +375,11 @@ fn find_merge_base(a_hex, b_hex) {
         }
         ci = ci + 1;
     }
+    # In a well-formed DAG the partial order always has a maximal element, so
+    # `best` is set. Guard the corrupt/cyclic case (mutual is_ancestor marks
+    # every candidate redundant) — fall back to a real candidate rather than
+    # reporting "no common ancestor" when common ancestors demonstrably exist.
+    if (best == 0) { best = vec_get(candidates, 0); }
     return best;
 }
 

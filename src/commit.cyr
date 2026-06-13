@@ -77,6 +77,22 @@ fn build_commit_signed(tree_hex, parent_hex, message, seed) {
     return write_typed_object("commit", 6, body, pos);
 }
 
+# Read a commit's parent hexes — the out+48 vec from parse_commit_body, or 0
+# if the object is unreadable / not a parseable commit. The returned vec holds
+# heap-owned 64-char NUL-terminated hex copies (safe to retain across calls).
+# Consolidates the read_object → parse_commit_body → load64(out+48) boilerplate
+# shared by the pure parent-graph walks (is_ancestor, find_merge_base). [v0.9.0]
+fn commit_parents_of(hex) {
+    var obj[24];
+    if (read_object(hex, &obj) != 0) { return 0; }
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    var info[56];
+    if (parse_commit_body(buf + coff, blen - coff, &info) != 0) { return 0; }
+    return load64(&info + 48);
+}
+
 # True iff `ancestor_hex` is reachable from `descendant_hex` via any parent
 # chain. BFS over the full commit DAG (every parent line, not just the last)
 # with a seen-set so merge commits don't hide first-parent-only ancestors and
@@ -99,21 +115,12 @@ fn is_ancestor(ancestor_hex, descendant_hex) {
         else {
             map_set(seen, cur, 1);
             if (streq(cur, ancestor_hex) == 1) { return 1; }
-            var obj[24];
-            if (read_object(cur, &obj) == 0) {
-                var buf = load64(&obj);
-                var blen = load64(&obj + 8);
-                var coff = load64(&obj + 16);
-                var info[56];
-                if (parse_commit_body(buf + coff, blen - coff, &info) == 0) {
-                    var pv = load64(&info + 48);
-                    if (pv != 0) {
-                        var pi = 0;
-                        while (pi < vec_len(pv)) {
-                            vec_push(queue, vec_get(pv, pi));
-                            pi = pi + 1;
-                        }
-                    }
+            var pv = commit_parents_of(cur);
+            if (pv != 0) {
+                var pi = 0;
+                while (pi < vec_len(pv)) {
+                    vec_push(queue, vec_get(pv, pi));
+                    pi = pi + 1;
                 }
             }
         }
@@ -598,7 +605,14 @@ fn _graph_merge_connector(lanes, base) {
     var j = 0;
     while (j < base) { store8(buf + 2 * j, 124); j = j + 1; }
     var k = base;
-    while (k < nl) { store8(buf + 2 * k - 1, 92); k = k + 1; }
+    # Seam sits at the odd column 2*k-1, left of the new lane. Guard k>0:
+    # a branch opened at column 0 has no column to its left (defensive — the
+    # join branch needs >=2 lanes so base is normally >=1, but never let the
+    # index underflow to buf-1).
+    while (k < nl) {
+        if (k > 0) { store8(buf + 2 * k - 1, 92); }
+        k = k + 1;
+    }
     _graph_write_trimmed(buf, width);
     return 0;
 }
@@ -615,7 +629,10 @@ fn _graph_join_connector(old_nl, rcol) {
         if (j != rcol) { store8(buf + 2 * j, 124); }
         j = j + 1;
     }
-    store8(buf + 2 * rcol - 1, 47);
+    # Seam at 2*rcol-1 — guard rcol>0 so a lane-0 collapse (the right-lane
+    # branch commit being strictly newer than the left) doesn't write buf-1.
+    # With rcol==0 there is no column to the left, so no `/` is drawn.
+    if (rcol > 0) { store8(buf + 2 * rcol - 1, 47); }
     _graph_write_trimmed(buf, width);
     return 0;
 }

@@ -73,6 +73,27 @@ EOF
 )
 assert_eq "$GRAPH" "$EXPECTED" "graph DAG shape matches the merge snapshot"
 
+# ── 3a. log --graph lane-0 join (v0.9.0 regression — seam underflow) ─
+# When the merge's second parent (feature) is STRICTLY newer than the first
+# (main), the feature lane emits first and main's lane (column 0) collapses —
+# the join seam would underflow to buf-1. Guarded in v0.9.0. The 2s sleep
+# forces feature's commit into a later whole-second so it sorts newest.
+hr "log --graph lane-0 join (seam-underflow regression)"
+R="$WORK/graph0"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'base\n' > base.txt; "$SIT" add base.txt >/dev/null; "$SIT" commit -m "base" >/dev/null
+"$SIT" branch feature >/dev/null 2>&1
+printf 'a\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m "main-work" >/dev/null
+sleep 2
+"$SIT" checkout feature >/dev/null 2>&1
+printf 'b\n' > b.txt; "$SIT" add b.txt >/dev/null; "$SIT" commit -m "feature-work" >/dev/null
+"$SIT" checkout main >/dev/null 2>&1
+"$SIT" merge feature >/dev/null 2>&1
+G0=$("$SIT" log --graph 2>&1); RC=$?
+assert_eq "$RC" "0" "log --graph exits 0 on a lane-0 join (no OOB write)"
+assert_contains "$G0" "feature-work" "lane-0-join graph still lists the feature commit"
+assert_contains "$G0" "main-work" "lane-0-join graph still lists the main commit"
+
 # ── 3b. merge-base full-DAG LCA (v0.8.13 diamond gate) ─────────────
 # Build a diamond where the first-parent chain reaches the true base only
 # through a merge's second parent. Layout:

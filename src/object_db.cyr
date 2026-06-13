@@ -901,6 +901,24 @@ fn cmd_fsck() {
     # is durable across the process exit. Reachable history is untouched —
     # only objects absent from the reachability walk are removed.
     if (prune == 1) {
+        # Data-loss guard: the reachability walk SKIPS unreadable objects
+        # (read_object failure → its children are never enqueued), so a single
+        # corrupt interior commit/tree would orphan its whole subgraph into the
+        # dangling set. Pruning then deletes genuinely-reachable objects with no
+        # reflog to recover them. Refuse while any object is bad/unreadable.
+        if (bad > 0) {
+            eprintln("sit: refusing --prune with bad/unreadable objects — resolve integrity first");
+            return 1;
+        }
+        # If EVERY object is unreachable, the roots are almost certainly broken
+        # (corrupt / missing HEAD or refs), not the objects. Pruning would wipe
+        # the whole store. Refuse.
+        if (total > 0) {
+            if (dangling == total) {
+                eprintln("sit: refusing --prune — every object is unreachable (corrupt or missing HEAD/refs?)");
+                return 1;
+            }
+        }
         var pruned = 0;
         var pi = 0;
         while (pi < vec_len(dangling_hexes)) {
