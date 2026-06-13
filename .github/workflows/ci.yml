@@ -422,7 +422,7 @@ jobs:
           "$GITHUB_WORKSPACE/build/sit" log | head -5
           "$GITHUB_WORKSPACE/build/sit" fsck
 
-      - name: Smoke — integration suite (v0.8.12: shallow clone + log --graph)
+      - name: Smoke — integration suite (v0.8.12 shallow clone + log --graph)
         run: |
           export SIT="$GITHUB_WORKSPACE/build/sit"
           bash "$GITHUB_WORKSPACE/tests/integration/run.sh"
