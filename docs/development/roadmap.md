@@ -1,6 +1,6 @@
 # sit Development Roadmap
 
-> **v0.8.x active — release 10 of N shipped.** Line opener and arc summary:
+> **v0.8.x active — release 11 of N shipped.** Line opener and arc summary:
 >
 > | tag | date | summary |
 > |---|---|---|
@@ -15,10 +15,11 @@
 > | v0.8.8 | 2026-06-10 | **HTTPS transport** (`https://` clone/fetch over first-party TLS 1.3, TOFU-pinned) — the long-blocked slot, shipped; cyrius pin `6.1.27 → 6.1.29` |
 > | v0.8.9 | 2026-06-10 | **HTTPS followups** — push + keep-alive (1 handshake/clone) + read-timeout + CI smoke; cyrius pin `6.1.29 → 6.1.30` |
 > | v0.8.10 | 2026-06-10 | **Full `.sitignore` semantics** — git-parity: negation, `**`, char classes, anchoring (new `_wildmatch`) |
+> | v0.8.11 | 2026-06-13 | cyrius `6.1.30 → 6.2.2` toolchain refresh + dep bumps (sakshi 2.3.0 / sankoch 2.3.1 / sigil 3.7.13 / patra 1.11.1); pins-only, no source change |
 >
-> **Slot note:** v0.8.6 shipped as the cyrius 6.x toolchain refresh (not the originally-planned wire-walker fix); wire-walker landed at **v0.8.7**; **HTTPS took v0.8.8** (it was the long-blocked slot and `tls_native` made it ready). So HTTPS followups are **v0.8.9**, `.sitignore` slid to **v0.8.10**, and `log --graph` / shallow-clone to **v0.8.11**.
+> **Slot note:** v0.8.6 shipped as the cyrius 6.x toolchain refresh (not the originally-planned wire-walker fix); wire-walker landed at **v0.8.7**; **HTTPS took v0.8.8** (it was the long-blocked slot and `tls_native` made it ready). So HTTPS followups are **v0.8.9**, `.sitignore` slid to **v0.8.10**, **v0.8.11** took the cyrius 6.2.2 toolchain refresh, and `log --graph` / shallow-clone slides to **v0.8.12**.
 >
-> **Next: v0.8.11 — `sit log --graph` + `--depth N` shallow clone** (bundled; share a DFS-over-the-commit-DAG primitive, now easy via `parse_commit_body`'s `out+48` parents vec). HTTPS (v0.8.8–0.8.9) and `.sitignore` git-parity (v0.8.10) are complete.
+> **Next: v0.8.12 — `sit log --graph` + `--depth N` shallow clone** (bundled; share a DFS-over-the-commit-DAG primitive, now easy via `parse_commit_body`'s `out+48` parents vec). HTTPS (v0.8.8–0.8.9), `.sitignore` git-parity (v0.8.10), and the cyrius 6.2.2 refresh (v0.8.11) are complete.
 >
 > **HTTPS is SHIPPED (v0.8.8).** cyrius 6.x's [`lib/tls_native.cyr`](../adr/0007-network-transport-security.md) — sovereign pure-Cyrius TLS 1.3 on sigil primitives (**no fdlopen, no libssl**; interops with OpenSSL 3.6.2) — satisfied [ADR 0007](../adr/0007-network-transport-security.md)'s gate. `sit clone https://` against `sit serve --tls` works end-to-end, TOFU-pinned (SPKI SHA-256 in `~/.sit/known_certs`, ADR 0008 parity). Read-only this release; **https push + keep-alive + read-timeout are v0.8.9**. **mTLS** still builds on this (`tls_native_new_server` + client-cert verify primitives exist); slot after https push. The cross-repo blocker `issues/archived/2026-05-13-sandhi-first-party-tls-surface-needed.md` is archived RESOLVED.
 >
@@ -27,6 +28,13 @@
 Historical per-sub-version notes were collapsed into the 0.4.0 entry; see [`CHANGELOG.md`](../../CHANGELOG.md) for the tagged artifacts.
 
 ## Released
+
+### v0.8.11 — cyrius 6.2.2 toolchain refresh + dep bumps
+
+- **Pins-only release** (same shape as v0.8.6). No sit source changes.
+- **Toolchain**: cyrius `6.1.30 → 6.2.2` (6.2.x line). `[deps].stdlib` unchanged — no new stdlib surface consumed. The four `async_*` build warnings remain benign DCE-stripped dead-code refs.
+- **Deps**: sakshi `2.2.10 → 2.3.0` (minor), sankoch `2.3.0 → 2.3.1` (patch), sigil `3.7.8 → 3.7.13` (patch; audit clean — sit calls `hash_data` / `hex_*` / ed25519 verbs only, signed-commit verify confirmed e2e), patra `1.11.0 → 1.11.1` (patch).
+- **Verification**: 180/180 tests; lint clean (0 warnings); fuzz green across all six harnesses (incl. 10M-round `want_frame_decoder`). `dist/sit.cyr` regenerated (version-stamp bump only — no module change). DCE binary **2.19 MB** (+~44 KB vs v0.8.10 — 6.2.x stdlib + dep heft).
 
 ### v0.8.10 — Full `.sitignore` semantics (git-parity)
 

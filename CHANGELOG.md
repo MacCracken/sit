@@ -4,6 +4,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.11] — 2026-06-13 — cyrius 6.2.2 toolchain refresh + dep bumps
+
+A toolchain + dependency refresh release (same shape as v0.8.6). No sit source changes — pins only.
+
+### Changed
+
+- **Toolchain** — cyrius `6.1.30 → 6.2.2` (6.2.x line). No new stdlib surface consumed; the `[deps].stdlib` list is unchanged. The four `async_*` build warnings remain benign dead-code refs DCE strips (sit's `cmd_serve` uses the synchronous `sandhi_server_run`).
+- **Dependencies** — all four git-tag pins bumped to current:
+  - **sakshi** `2.2.10 → 2.3.0` (minor-line; tracing/error-handling — no public-surface impact for sit)
+  - **sankoch** `2.3.0 → 2.3.1` (patch-line; LZ4/DEFLATE/zlib/gzip)
+  - **sigil** `3.7.8 → 3.7.13` (patch-line within major 3; sit calls only `hash_data` / `hex_encode` / `hex_decode` / ed25519 verbs — audit clean, signed-commit verify confirmed e2e)
+  - **patra** `1.11.0 → 1.11.1` (patch-line; B+ tree / WAL object store — no public-surface impact)
+
+### Notes
+
+- Build / test / lint / fuzz green; no new lint warnings. **180/180 tests** pass; fuzz clean across all six harnesses (incl. the 10M-round `want_frame_decoder`). DCE binary **2.19 MB** (up from 2.15 MB — 6.2.x stdlib + dep heft). `dist/sit.cyr` regenerated (version-stamp bump only; no module change).
+
 ## [0.8.10] — 2026-06-10 — Full `.sitignore` semantics (git-parity)
 
 `.sitignore` matching gains negation, `**`, char classes, and anchoring — the gaps that separated sit's matcher from git's.
