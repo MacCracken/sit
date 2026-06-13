@@ -198,9 +198,14 @@ fn bench_copy_objects_per_row(count) {
         i = i + 1;
     }
 
+    # v0.7.3 changed copy_objects to (obj_src, dst_db, hashes, raw_cache).
+    # The pre-v0.7.3 3-arg call here was stale — it passed a raw patra db
+    # where an obj_src tagged handle was expected, so the number was noise.
+    var src = obj_src_for_db(src_db);
+    var raw_cache = map_new();
     var b = bench_new("copy-objects-100");
     bench_batch_start(b);
-    copy_objects(src_db, dst_db, hashes);
+    copy_objects(src, dst_db, hashes, raw_cache);
     bench_batch_stop(b, count);
     bench_report(b);
 
@@ -316,6 +321,149 @@ fn bench_validators(iters) {
     return 0;
 }
 
+# ── Phase 3 (v0.8.12): diff LCS, gitignore matcher, blob hashing ───
+#
+# Three targets scoped during the 0.6.0 audit but never landed. They map
+# directly to sit's hot paths: `compute_file_diff` drives `sit diff/show`,
+# `is_ignored` runs on every `sit add`/`status` walk entry, and
+# `hash_blob_of_content` is the per-file cost of `sit add`. Landing them
+# makes `cyrius bench` a meaningful per-release gate again.
+
+# Build a heap text buffer of `n` lines ("line <i>\n"); writes total byte
+# length to the 8-byte cell `out_len`. Returns the buffer pointer.
+fn bench_make_lines(n, out_len) {
+    var cap = n * 16 + 16;
+    var buf = alloc(cap);
+    var off = 0;
+    var i = 0;
+    while (i < n) {
+        memcpy(buf + off, "line ", 5);
+        off = off + 5;
+        off = off + write_decimal(buf + off, i);
+        store8(buf + off, 10);
+        off = off + 1;
+        i = i + 1;
+    }
+    store64(out_len, off);
+    return buf;
+}
+
+# LCS diff at n×n lines (every 10th line edited → realistic small-change
+# shape). Drives `sit diff`/`show`'s compute_file_diff (split + lcs + annotate).
+fn bench_lcs_diff(n, iters) {
+    var nb = alloc(32);
+    memcpy(nb, "lcs-diff-", 9);
+    var d = write_decimal(nb + 9, n);
+    memcpy(nb + 9 + d, "x", 1);
+    var d2 = write_decimal(nb + 9 + d + 1, n);
+    store8(nb + 9 + d + 1 + d2, 0);
+
+    var olen[8];
+    var old_buf = bench_make_lines(n, &olen);
+    var old_len = load64(&olen);
+    var nlen[8];
+    var new_buf = bench_make_lines(n, &nlen);
+    var new_len = load64(&nlen);
+
+    # Mutate the first char of every 10th line so the LCS has real edits.
+    var cnt = 0;
+    var p = 0;
+    while (p < new_len) {
+        if (cnt == 0) { store8(new_buf + p, 88); }
+        cnt = cnt + 1;
+        if (cnt >= 10) { cnt = 0; }
+        var go = 1;
+        while (go == 1) {
+            if (p >= new_len) { go = 0; }
+            else {
+                if (load8(new_buf + p) == 10) { go = 0; }
+                else { p = p + 1; }
+            }
+        }
+        p = p + 1;
+    }
+
+    var b = bench_new(nb);
+    bench_batch_start(b);
+    var i = 0;
+    while (i < iters) {
+        compute_file_diff(old_buf, old_len, new_buf, new_len);
+        i = i + 1;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    return 0;
+}
+
+# Build a vec of `n` non-anchored `*.tmp` pattern structs (matching
+# load_sitignore's 32-byte [text, len, negated, anchored] layout).
+fn bench_make_patterns(n) {
+    var patterns = vec_new();
+    var i = 0;
+    while (i < n) {
+        var text = alloc(8);
+        memcpy(text, "*.tmp", 5);
+        store8(text + 5, 0);
+        var p = alloc(32);
+        store64(p, text);
+        store64(p + 8, 5);
+        store64(p + 16, 0);
+        store64(p + 24, 0);
+        vec_push(patterns, p);
+        i = i + 1;
+    }
+    return patterns;
+}
+
+# `.sitignore` matcher cost: is_ignored against an n-pattern set. Drives
+# every `sit add`/`status` working-tree walk entry (last-match-wins scans
+# all n patterns).
+fn bench_wildmatch(n, iters) {
+    var nb = alloc(32);
+    memcpy(nb, "is_ignored-", 11);
+    var d = write_decimal(nb + 11, n);
+    memcpy(nb + 11 + d, "pat", 3);
+    store8(nb + 11 + d + 3, 0);
+
+    var patterns = bench_make_patterns(n);
+    var path = "src/deep/nested/path/to/file.cyr";
+
+    var b = bench_new(nb);
+    bench_batch_start(b);
+    var i = 0;
+    while (i < iters) {
+        is_ignored(path, patterns);
+        i = i + 1;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    return 0;
+}
+
+# Blob framing + SHA-256 of `size`-byte content — the per-file cost of
+# `sit add` (hash_file_as_blob's compute core, minus the file read).
+fn bench_blob_hash(size, iters) {
+    var nb = alloc(32);
+    memcpy(nb, "blob-hash-", 10);
+    var d = write_decimal(nb + 10, size);
+    memcpy(nb + 10 + d, "B", 1);
+    store8(nb + 10 + d + 1, 0);
+
+    var content = alloc(size);
+    fill_pseudo_random(content, size);
+
+    var b = bench_new(nb);
+    bench_batch_start(b);
+    var i = 0;
+    while (i < iters) {
+        hash_blob_of_content(content, size);
+        i = i + 1;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -335,6 +483,19 @@ fn main() {
     bench_commit_parse(10000);
     bench_ed25519_sign_verify(1000);
     bench_validators(100000);
+
+    # ── Phase 3: diff LCS, gitignore matcher, blob hashing (0.8.12) ─
+    bench_lcs_diff(100, 100);
+    bench_lcs_diff(1000, 10);
+    bench_lcs_diff(4000, 2);
+
+    bench_wildmatch(10, 100000);
+    bench_wildmatch(50, 20000);
+    bench_wildmatch(200, 5000);
+
+    bench_blob_hash(1024, 5000);
+    bench_blob_hash(65536, 500);
+    bench_blob_hash(1048576, 50);
 
     return 0;
 }

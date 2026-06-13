@@ -363,6 +363,19 @@ fn obj_src_batch_prefetch(src, hashes, raw_cache) {
 var _WIRE_MAX_DEPTH = 256;
 var _wire_walk_depth = 0;
 
+# Shallow-clone state (v0.8.12). `_wire_clone_depth` caps the phase-1
+# commit-chain walk in `walk_reachable_phased`: 0 = unlimited (the normal
+# case for fetch / pull / push), N = stop after N commits back from the
+# tip. cmd_clone sets it around its do_fetch call and resets it after.
+# `_wire_shallow_boundary`, when non-zero, is a vec the walker appends each
+# boundary commit hex to (a present commit whose parents were NOT fetched);
+# cmd_clone writes that set to `.sit/shallow` so `sit log` stops cleanly at
+# the boundary instead of erroring on the absent parent. Module globals
+# (not params) so the four walk_reachable_phased call sites stay unchanged —
+# same idiom as `_wire_walk_depth`.
+var _wire_clone_depth = 0;
+var _wire_shallow_boundary = 0;
+
 # Helper: store a copy of a 24-byte raw struct into the cache, keyed by hex.
 # The hex pointer must already be a heap-owned cstring (the walk uses the
 # `hex_copy` it just pushed onto `out`, so map_set can safely retain it).
@@ -410,15 +423,23 @@ fn _walk_cache_insert(raw_cache, hex, raw_struct_ptr) {
 
 fn walk_reachable_phased(src, root_hex, out, seen, raw_cache) {
     # Phase 1: commit chain walk (sequential).
+    # `qdepth` shadows `queue` 1:1 carrying each commit's distance from the
+    # tip, so the v0.8.12 shallow cap (`_wire_clone_depth`) can stop the
+    # walk N commits back. For unlimited walks the depth is tracked but
+    # never gates anything, so the object set is identical to pre-v0.8.12.
     var trees = vec_new();
     var queue = vec_new();
+    var qdepth = vec_new();
     var hex_copy = alloc(65);
     memcpy(hex_copy, root_hex, 64);
     store8(hex_copy + 64, 0);
     vec_push(queue, hex_copy);
+    vec_push(qdepth, 0);
     while (vec_len(queue) > 0) {
         var cur = vec_get(queue, vec_len(queue) - 1);
+        var cdep = vec_get(qdepth, vec_len(qdepth) - 1);
         vec_pop(queue);
+        vec_pop(qdepth);
         if (map_has(seen, cur) == 1) { }
         else {
             map_set(seen, cur, 1);
@@ -450,12 +471,31 @@ fn walk_reachable_phased(src, root_hex, out, seen, raw_cache) {
                     # Enqueue EVERY parent (merge commits have 2+) so the
                     # clone/fetch/push object set isn't missing the subgraph
                     # reachable only via a non-last parent edge.
+                    #
+                    # Shallow cap (v0.8.12): if `_wire_clone_depth` is set and
+                    # this commit sits at the depth boundary, DON'T enqueue its
+                    # parents — record it as a shallow boundary instead. Depth
+                    # is exact for linear history (the success-gate shape); for
+                    # merges the cut is approximate (the first pop of a commit
+                    # wins via `seen`), matching git's own shallow fuzziness.
                     var pv = load64(&info + 48);
                     if (pv != 0) {
-                        var pi = 0;
-                        while (pi < vec_len(pv)) {
-                            vec_push(queue, vec_get(pv, pi));
-                            pi = pi + 1;
+                        var allow_parents = 1;
+                        if (_wire_clone_depth != 0) {
+                            if (cdep + 1 >= _wire_clone_depth) { allow_parents = 0; }
+                        }
+                        if (allow_parents == 1) {
+                            var pi = 0;
+                            while (pi < vec_len(pv)) {
+                                vec_push(queue, vec_get(pv, pi));
+                                vec_push(qdepth, cdep + 1);
+                                pi = pi + 1;
+                            }
+                        }
+                        else {
+                            if (_wire_shallow_boundary != 0) {
+                                vec_push(_wire_shallow_boundary, cur);
+                            }
                         }
                     }
                 }
@@ -1087,9 +1127,36 @@ fn cmd_pull() {
 
 # Clone = mkdir + chdir + init + remote-add + fetch + HEAD ref + materialize.
 # Target directory defaults to the last '/'-delimited segment of the URL.
+# Write `.sit/shallow` (v0.8.12): one boundary commit hex per line. A
+# boundary commit is present in the clone but its parent(s) were not
+# fetched (depth cap). `sit log` reads this set and stops cleanly at the
+# boundary instead of erroring on the absent parent. No-op when `boundary`
+# is 0 or empty (a full clone leaves no `.sit/shallow`). Mirrors git's
+# `.git/shallow`.
+fn _write_shallow_file(boundary) {
+    if (boundary == 0) { return 0; }
+    var n = vec_len(boundary);
+    if (n == 0) { return 0; }
+    var total = n * 65;
+    var buf = alloc_or_die(total);
+    var off = 0;
+    var i = 0;
+    while (i < n) {
+        var h = vec_get(boundary, i);
+        memcpy(buf + off, h, 64);
+        store8(buf + off + 64, 10);
+        off = off + 65;
+        i = i + 1;
+    }
+    if (file_write_all(".sit/shallow", buf, total) < 0) {
+        eprintln("sit: warning — failed to write .sit/shallow (log may error at boundary)");
+    }
+    return 0;
+}
+
 fn cmd_clone() {
     if (argc() < 3) {
-        eprintln("usage: sit clone [--force-absolute] <url> [<dir>]");
+        eprintln("usage: sit clone [--force-absolute] [--depth <n>] <url> [<dir>]");
         return 1;
     }
     # S-23: --force-absolute is the explicit opt-in to clone into a path
@@ -1097,6 +1164,7 @@ fn cmd_clone() {
     # `sit clone <url> /etc/cron.d/x` doesn't silently mkdir + chdir into
     # a system path the invoking user happens to have write access to).
     var force_absolute = 0;
+    var depth = 0;
     var url = 0;
     var target = 0;
     var ai = 2;
@@ -1104,19 +1172,33 @@ fn cmd_clone() {
         var a = argv(ai);
         if (streq(a, "--force-absolute") == 1) { force_absolute = 1; }
         else {
-            if (url == 0) { url = argv_heap(ai); }
-            else {
-                if (target == 0) { target = argv_heap(ai); }
-                else {
-                    eprintln("usage: sit clone [--force-absolute] <url> [<dir>]");
+            if (streq(a, "--depth") == 1) {
+                if (ai + 1 >= argc()) {
+                    eprintln("sit: --depth requires a number");
                     return 1;
+                }
+                depth = atoi(argv(ai + 1));
+                if (depth < 1) {
+                    eprintln("sit: --depth must be a positive integer");
+                    return 1;
+                }
+                ai = ai + 1;
+            }
+            else {
+                if (url == 0) { url = argv_heap(ai); }
+                else {
+                    if (target == 0) { target = argv_heap(ai); }
+                    else {
+                        eprintln("usage: sit clone [--force-absolute] [--depth <n>] <url> [<dir>]");
+                        return 1;
+                    }
                 }
             }
         }
         ai = ai + 1;
     }
     if (url == 0) {
-        eprintln("usage: sit clone [--force-absolute] <url> [<dir>]");
+        eprintln("usage: sit clone [--force-absolute] [--depth <n>] <url> [<dir>]");
         return 1;
     }
     # S-04: reject malformed URLs up-front so we fail cleanly instead of
@@ -1253,7 +1335,19 @@ fn cmd_clone() {
         return 1;
     }
 
+    # Shallow clone (v0.8.12): arm the walker's depth cap + boundary
+    # collector for the duration of this fetch, then write `.sit/shallow`
+    # and disarm. fetch / pull leave `_wire_clone_depth` at 0 (unlimited).
+    if (depth > 0) {
+        _wire_clone_depth = depth;
+        _wire_shallow_boundary = vec_new();
+    }
     var tip = do_fetch("origin", "main");
+    if (depth > 0) {
+        _write_shallow_file(_wire_shallow_boundary);
+        _wire_clone_depth = 0;
+        _wire_shallow_boundary = 0;
+    }
     if (tip == 0) { return 1; }
 
     if (write_head_ref(tip) != 0) {

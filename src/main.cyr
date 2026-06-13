@@ -56,10 +56,10 @@ fn print_usage() {
     eprintln("  fetch <remote> [<ref>]  copy objects + ref from a remote (no merge)");
     eprintln("  pull <remote> [<ref>]   fetch + fast-forward merge (diverged → use merge)");
     eprintln("  push <remote> [<ref>]   push HEAD's branch to a remote (fast-forward only)");
-    eprintln("  clone <url> [<dir>]     init + remote add origin + fetch + checkout");
+    eprintln("  clone [--depth <n>] <url> [<dir>]  init + remote add origin + fetch + checkout");
     eprintln("  serve <repo> [--listen 127.0.0.1:<port>]  read-only HTTP daemon (sit/v1)");
     eprintln("  commit [-S] [-m] <msg>  record staged changes as a new commit (-S to sign)");
-    eprintln("  log [--oneline]         show commit history from HEAD");
+    eprintln("  log [--oneline] [--graph]  show commit history from HEAD");
     eprintln("  status                  show working tree status");
     eprintln("  diff [--staged|HEAD]    show unstaged / staged / working-vs-HEAD diffs");
     eprintln("  show [--stat] [<hash>]  show a single commit (full diff or per-file stat)");

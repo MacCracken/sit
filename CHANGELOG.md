@@ -4,6 +4,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.12] — 2026-06-13 — `log --graph` + `--depth N` shallow clone + bench/test infrastructure
+
+Two git-parity features plus the long-deferred bench-fixture refresh and an in-tree integration suite. The two features share the full-DAG commit walk that `parse_commit_body`'s out+48 parents vec (v0.8.7) unlocked.
+
+### Added
+
+- **`sit log --graph`** (`src/commit.cyr`) — an ASCII commit-DAG renderer. Unlike the default log (which follows only the first-parent chain via out+8), `--graph` walks the **full DAG** so merge topology is visible. Layout uses a position grid (lane *k* at column 2*k*, seams at odd columns): a commit row shows `*` at its lane and `|` elsewhere; a merge is followed by a `|\` connector; a commit whose parent rejoins an existing lane is followed by a `|/` connector. Linear history degrades to a clean column of `*`. Emission is reverse-topological (a commit before its parents), newest-first by author timestamp, leftmost-lane tiebreak (deterministic even when timestamps tie). New helpers: `_graph_build_node`, `_graph_lane_find`, `_graph_commit_row`, `_graph_merge_connector`, `_graph_join_connector`, `_graph_write_subject`, `print_graph`.
+- **`sit clone --depth <n>`** (`src/wire.cyr`) — shallow clone. `walk_reachable_phased` gains a per-commit depth cap (`_wire_clone_depth`, a module global so the four walk call sites stay unchanged); the phase-1 commit walk stops *n* commits back from the tip but still pulls each kept commit's complete tree + blobs. A `--depth 1` clone of a 10-commit repo pulls exactly 3 objects (1 commit + tree + blob); `--depth 3` pulls 9. Depth is exact for linear history; for merges the boundary is approximate (first-pop-wins via `seen`), matching git's own shallow fuzziness.
+- **`.sit/shallow` boundary marker** — a shallow clone writes the boundary commit hexes (present commits whose parents were not fetched), one per line, mirroring git's `.git/shallow`. `sit log` reads it and stops cleanly at the boundary instead of erroring on the absent parent. `fsck` was already boundary-tolerant (its reachability walk skips unreadable objects), so a shallow clone stays fsck-clean.
+- **Bench-fixture refresh** (`tests/sit.bcyr`) — the three targets scoped during the 0.6.0 audit but never landed: **LCS diff** (`compute_file_diff`) at 100×100 / 1000×1000 / 4000×4000; the **`.sitignore` matcher** (`is_ignored`) against 10 / 50 / 200 patterns; **blob hashing** (`hash_blob_of_content`) at 1 KB / 64 KB / 1 MB. Also fixed the stale `bench_copy_objects_per_row` (was calling the pre-v0.7.3 3-arg `copy_objects` — its number was noise; now uses `obj_src_for_db` + `raw_cache`). Baseline snapshot at [`docs/benchmarks/2026-06-13-v0.8.12.md`](docs/benchmarks/2026-06-13-v0.8.12.md). `cyrius bench` is a per-release gate again.
+- **In-tree integration suite** (`tests/integration/run.sh`) — promotes the `docs/guides/getting-started.md` end-to-end scenarios into a versioned, locally-runnable test with explicit assertions (19 checks: core loop, branch+merge, `log --graph` hash-independent snapshot, full clone round-trip, `--depth 1`/`--depth 3` shallow gates, push dispatch). New CI step `Smoke — integration suite (v0.8.12)`.
+
+### Changed
+
+- `cmd_log` arg parser accepts `--graph`; usage strings for `log` and `clone` updated in `src/main.cyr`.
+
+### Notes
+
+- **Documented simplifications** (consistent with the v0.8.10 `.sitignore` approach): `--graph` spacing is sit-native, not byte-identical to git (git pads a merge commit row with extra lane spaces; sit uses a single space before the commit info). A commit that simultaneously opens a new lane and rejoins an existing one in one step renders best-effort. Shallow `--depth` is clone-only this release (fetch/pull leave the walk unlimited); `fetch --deepen` is a future slot.
+- Build / test / lint / fuzz / bench green; **180** unit assertions, **19** integration assertions, fuzz clean across all six harnesses, no new lint warnings. `dist/sit.cyr` regenerated (commit.cyr + wire.cyr are `[lib].modules`). DCE binary **2.20 MB** (+~8 KB vs v0.8.11). No toolchain or dep change.
+
 ## [0.8.11] — 2026-06-13 — cyrius 6.2.2 toolchain refresh + dep bumps
 
 A toolchain + dependency refresh release (same shape as v0.8.6). No sit source changes — pins only.

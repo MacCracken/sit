@@ -170,6 +170,23 @@ sit show
 
 The signature is a `sitsig <128-hex-sig> <64-hex-pubkey>` line spliced into the commit header between `committer` and the blank separator. `cat-file` shows it verbatim; the signed payload is the commit body *without* the sitsig line, matching git's self-consistent `gpgsig` convention.
 
+## Browse history
+
+`sit log` walks the first-parent chain (`--oneline` for one line per commit, `-n <count>` to cap). To see merge topology, `--graph` renders an ASCII DAG over the **full** parent graph:
+
+```sh
+sit log --graph
+# * 5379191fde87 Merge branch 'feature'
+# |\
+# * | ad72885ba558 main work
+# | * a0efb20c9948 feature work
+# |/
+# * 2e6de91b936a base2
+# * 40853f1196f3 base1
+```
+
+Each commit is a `*` on its lane; a merge opens a `\` branch, a rejoin closes with `/`. Linear history is just a column of `*`. (Spacing is sit-native, not byte-identical to git.)
+
 ## Sync with a remote
 
 A "remote" can be a sit working-tree directory on the same filesystem **or** a network endpoint. sit supports four transports — the object-transfer mechanics (reachability walk → copy raw compressed bytes → fsck verifies) are identical across all of them:
@@ -230,6 +247,14 @@ sit log
 ```
 
 Under the hood it's `mkdir` + `chdir` + `sit init` + `sit remote add origin <url>` + `sit fetch origin main` + `write HEAD ref` + materialize the tree. The target directory defaults to the URL's last path segment when you don't pass one.
+
+**Shallow clone** — `--depth <n>` pulls only the most recent *n* commits (each with its complete tree + blobs), not the full history:
+
+```sh
+sit clone --depth 1 /srv/sit-repos/demo my-demo   # just the tip commit
+```
+
+The kept commits' un-fetched parents are recorded in `.sit/shallow` (git's `.git/shallow` parity), so `sit log` stops cleanly at the boundary and `sit fsck` stays clean. Depth is exact for linear history; across merges the boundary is approximate.
 
 ## Serve and sync over the network
 
