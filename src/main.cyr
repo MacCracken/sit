@@ -50,7 +50,7 @@ fn print_usage() {
     eprintln("  merge-base <a> <b>      print the lowest common ancestor of two commits");
     eprintln("  reset <path> | --hard <ref>  unstage a path, or move HEAD to <ref>");
     eprintln("  config [--global] <key> [<value>]  read or write a config value");
-    eprintln("  fsck                    verify object integrity (sha-256 vs filename)");
+    eprintln("  fsck [--prune]          verify object integrity; --prune removes dangling objects");
     eprintln("  key generate | show     manage the local ed25519 signing key (~/.sit/)");
     eprintln("  verify-commit [<hash>]  verify a commit's sitsig signature (defaults HEAD)");
     eprintln("  remote add|list|remove  manage named remotes (local-path transport)");

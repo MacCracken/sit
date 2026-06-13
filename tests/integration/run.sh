@@ -100,6 +100,29 @@ if [ "$MB" = "$ROOT" ]; then bad "merge-base returned root (pre-v0.8.13 first-pa
 # self and ancestor identities
 assert_eq "$("$SIT" merge-base main main)" "$(tr -d '\n' < .sit/refs/heads/main)" "merge-base(X,X) = X"
 
+# ── 3c. fsck --prune (v0.8.14) ─────────────────────────────────────
+# Two commits, then reset --hard to the first → the second's commit+tree+blob
+# go dangling. --prune removes exactly those; the first commit's objects stay.
+hr "fsck --prune"
+R="$WORK/prune"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'v1\n' > f.txt; "$SIT" add f.txt >/dev/null; "$SIT" commit -m "A" >/dev/null
+APRUNE=$(tr -d '\n' < .sit/refs/heads/main)
+printf 'v2\n' > f.txt; "$SIT" add f.txt >/dev/null; "$SIT" commit -m "B" >/dev/null
+assert_eq "$(objcount)" "6" "two commits = 6 objects"
+"$SIT" reset --hard "$APRUNE" >/dev/null 2>&1
+assert_eq "$("$SIT" fsck | sed -n 's/.*0 bad, \([0-9]*\) dangling/\1/p')" "3" "reset --hard leaves 3 dangling (B's commit/tree/blob)"
+assert_contains "$("$SIT" fsck --prune)" "pruned 3 objects" "--prune reports 3 removed"
+# fresh process: durability + reachable history intact
+assert_eq "$(objcount)" "3" "after prune, only A's 3 objects remain"
+assert_contains "$("$SIT" fsck)" "0 dangling" "post-prune fsck is dangling-free"
+assert_eq "$(cat f.txt)" "v1" "working tree still has A's content"
+assert_eq "$("$SIT" log --oneline | wc -l | tr -d ' ')" "1" "log shows only the kept commit"
+# refuse --prune during an in-progress merge
+printf '%s\n' "$APRUNE" > .sit/MERGE_HEAD
+"$SIT" fsck --prune >/dev/null 2>&1; assert_eq "$?" "1" "--prune refused while MERGE_HEAD present"
+rm -f .sit/MERGE_HEAD
+
 # ── 4. clone (file://) full round-trip ─────────────────────────────
 hr "clone file:// full"
 R="$WORK/origin"; mkdir -p "$R"; cd "$R"

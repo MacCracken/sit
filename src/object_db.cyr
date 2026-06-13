@@ -749,10 +749,41 @@ fn fsck_ty_word(ty) {
 # they don't fail the command — only integrity errors set non-zero
 # exit, mirroring git's policy that dangling objects are expected
 # after resets / rewinds.
+# Delete a single object row by hex (v0.8.14, fsck --prune). The hex is
+# validated 64-char hex before interpolation — even though it comes from the
+# inventory SELECT, never build SQL from unchecked bytes. Returns patra_exec's
+# code (0 = ok), or -1 if the hex fails validation.
+fn db_object_delete(db, hex) {
+    if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
+    var sql = alloc(128);
+    memcpy(sql, "DELETE FROM objects WHERE hash = '", 34);
+    memcpy(sql + 34, hex, 64);
+    memcpy(sql + 34 + 64, "'", 1);
+    store8(sql + 34 + 64 + 1, 0);
+    return patra_exec(db, sql);
+}
+
 fn cmd_fsck() {
     if (file_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
+    }
+
+    # v0.8.14: `--prune` removes the dangling (unreachable) objects this walk
+    # identifies. Immediate + unrecoverable (sit has no reflog yet — matches
+    # `git gc --prune=now`, not git's default 2-week grace). Refused while a
+    # merge is in progress so a half-finished op's objects can't be dropped.
+    var prune = 0;
+    var ai = 2;
+    while (ai < argc()) {
+        if (streq(argv(ai), "--prune") == 1) { prune = 1; }
+        ai = ai + 1;
+    }
+    if (prune == 1) {
+        if (file_exists(".sit/MERGE_HEAD") == 1) {
+            eprintln("sit: refusing --prune during an in-progress merge (.sit/MERGE_HEAD present)");
+            return 1;
+        }
     }
 
     var db = get_object_db();
@@ -837,6 +868,7 @@ fn cmd_fsck() {
 
     # Diff: objects in the inventory but not reachable.
     var dangling = 0;
+    var dangling_hexes = vec_new();
     var di = 0;
     while (di < hn) {
         var hex2 = vec_get(hashes, di);
@@ -851,6 +883,7 @@ fn cmd_fsck() {
             stdout_write(hex2, 64);
             stdout_write("\n", 1);
             dangling = dangling + 1;
+            vec_push(dangling_hexes, hex2);
         }
         di = di + 1;
     }
@@ -862,6 +895,25 @@ fn cmd_fsck() {
     stdout_write(" bad, ", 6);
     write_unsigned(dangling);
     stdout_write(" dangling\n", 10);
+
+    # v0.8.14: prune the dangling set. Deletes each unreachable object, then
+    # flushes (the main trailer only flushes stdout, not patra) so the removal
+    # is durable across the process exit. Reachable history is untouched —
+    # only objects absent from the reachability walk are removed.
+    if (prune == 1) {
+        var pruned = 0;
+        var pi = 0;
+        while (pi < vec_len(dangling_hexes)) {
+            if (db_object_delete(db, vec_get(dangling_hexes, pi)) == 0) {
+                pruned = pruned + 1;
+            }
+            pi = pi + 1;
+        }
+        patra_flush(db);
+        stdout_write("pruned ", 7);
+        write_unsigned(pruned);
+        stdout_write(" objects\n", 9);
+    }
 
     if (bad > 0) { return 1; }
     return 0;

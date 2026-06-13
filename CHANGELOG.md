@@ -4,6 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.14] — 2026-06-13 — `sit fsck --prune`
+
+Completes the v0.8.5 fsck reachability work by letting it remove what it finds. Deferred from v0.8.5 pending a safety story.
+
+### Added
+
+- **`sit fsck --prune`** (`src/object_db.cyr`) — removes the dangling (unreachable) objects the v0.8.5 reachability walk already identifies. The walk's roots are unchanged (refs/heads, tags, remotes, detached HEAD, and every staged index blob), so only objects referenced by no ref and no staged entry are deleted. New `db_object_delete(db, hex)` helper (`DELETE FROM objects WHERE hash = '<hex>'`, hex validated 64-char before interpolation). After deleting, `patra_flush` makes the removal durable across process exit (the `main` trailer flushes only stdout). Reports `pruned <n> objects` after the usual `checked … dangling` line.
+- **Safety guard** — `--prune` is **refused while a merge is in progress** (`.sit/MERGE_HEAD` present), so a half-finished operation's objects can't be dropped out from under it.
+
+### Notes
+
+- **No grace period / no reflog**: `--prune` is immediate and unrecoverable — sit has no reflog yet, so this matches `git gc --prune=now`, not git's default 2-week grace. Without `--prune`, `fsck` behavior is unchanged (it reports dangling but deletes nothing; dangling never sets a non-zero exit — only integrity errors do). A reflog (which would enable a real grace period) is a separate future feature.
+- **Verification**: integration gate in `tests/integration/run.sh` — two commits, `reset --hard` to the first → the second's commit/tree/blob go dangling; `--prune` reports 3 removed; a **fresh fsck process** sees `0 dangling` with the first commit's 3 objects intact and the working tree preserved; `--prune` refused under `MERGE_HEAD`. **30 integration assertions** (was 22).
+- Build / test / lint / fuzz / bench green; 180 unit / 30 integration; fuzz clean; bench flat vs the v0.8.12 baseline. `dist/sit.cyr` regenerated (`object_db.cyr` is `[lib].modules`). DCE binary **2.20 MB** (flat). No toolchain or dep change.
+
 ## [0.8.13] — 2026-06-13 — `merge_base` full-DAG LCA + `sit merge-base`
 
 Corrects the merge base across merges and exposes it as a plumbing command. Closes the last of the v0.8.7-era single-parent-walk footguns.
