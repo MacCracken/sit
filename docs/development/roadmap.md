@@ -18,15 +18,14 @@ The weight tends to track the tier (surface-adding work is the heavier work), wi
 
 ### `1.0.x` — patch line (no new surface)
 
-Take these as they're ready; none change behavior a caller can observe beyond "faster" / "handles bigger inputs":
+Bug fixes, perf, internal work, and dep consumption — nothing a caller observes beyond "faster" / "handles bigger inputs". Shipped patch work moves to the [CHANGELOG](../../CHANGELOG.md) (e.g. 1.0.1: the Myers diff fallback for large files, the `lcs_diff` minimality fix it surfaced, and the ADR-0003 no-upward-discovery test).
 
 - **Consume upstream + dependency fixes** as they land (a dep bump + dropping a workaround, no sit-code change). These are filed on the deps' roadmaps — watch their CHANGELOGs:
   - cyrius `tls_native` **Ed25519 server-cert** fix ([issue](issues/2026-06-10-tls-native-ed25519-server-cert-accept-fails.md)) → drop the "use an ECDSA P-256 cert" caveat from `sit serve --tls`.
   - **patra `or_ignore`** on `patra_insert_row` → unblocks **P-11** (`sit add` index upsert without a full rewrite; also lets `db_object_insert_raw` drop its inner `db_object_has` probe). Plus bound parameters for STR columns (the structural fix for the SQL interpolation `hex_prefix_valid` currently guards).
   - **sigil** strict-fail `hex_decode` (reject an invalid char instead of partial-decoding); **sankoch** `zlib_decompress_with_ratio_cap` (one-call decompression-bomb defense) + the 2.x match-finder / SIMD work that targets the `add-1MB` `zlib_compress` floor (~140 ms) and moves the v0.6.x scoreboard.
-- **Myers O((N+M)D) diff fallback (P-14)** — internal; the diff *output* is byte-identical, it just stops refusing inputs past the LCS DP cap (8192/dim — the `lcs-diff-4000x4000` cliff). Heavy code, zero surface → a patch.
-- **Surface minimization** — drop sandhi for a hand-rolled `net`-direct loopback HTTP/1.0 server (~500 lines in `src/serve.cyr`); behavior byte-identical, just ~11.7k fewer lines of dependency attack surface.
-- **No-upward-discovery regression test** into [`tests/integration/run.sh`](../../tests/integration/run.sh) (ADR 0003): `cd` into a subdir → `sit status` / `log` / `commit` fail with `not a sit repository`.
+
+**On hold — keep sandhi.** Dropping sandhi for a hand-rolled `net`-direct loopback HTTP/1.0 server (surface minimization) is deliberately *not* on the patch line: a future cyrius change is expected to make `stdlib`/`lib` consumption easier, which changes both the trade-off and the likely implementation. Until that lands, sit keeps consuming sandhi's `sandhi_server_*` surface and we wait.
 
 ### Minor line — `1.1.0` onward (new surface, themed)
 

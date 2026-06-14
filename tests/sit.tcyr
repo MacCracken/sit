@@ -546,6 +546,69 @@ fn test_sitignore_negation_anchor() {
     return 0;
 }
 
+# Edit distance (del + ins ops) of a diff script — the minimality measure.
+fn _diff_editdist(ops) {
+    var c = 0;
+    var i = 0;
+    while (i < vec_len(ops)) {
+        if (load64(vec_get(ops, i)) != 0) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+# Does the script reconstruct `b`? The keep (0) + insert (2) line ptrs, in
+# order, must equal b's lines. A wrong keep (mislabelled, wrong line) or a
+# miscounted insert breaks this.
+fn _diff_reconstructs(ops, b) {
+    var bi = 0;
+    var i = 0;
+    var ok = 1;
+    while (i < vec_len(ops)) {
+        var op = vec_get(ops, i);
+        if (load64(op) != 1) {
+            if (bi >= vec_len(b)) { ok = 0; }
+            else {
+                if (lines_equal(load64(op + 8), vec_get(b, bi)) == 0) { ok = 0; }
+                bi = bi + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (bi != vec_len(b)) { ok = 0; }
+    return ok;
+}
+
+# One differential case: myers_diff must agree with the LCS DP on minimality
+# (same edit distance) and both must reconstruct `news`.
+fn _myers_case(olds, news, label) {
+    var a = split_lines(olds, strlen(olds));
+    var b = split_lines(news, strlen(news));
+    var dp = lcs_diff(a, b);
+    var my = myers_diff(a, b);
+    assert_eq((dp == 0), 0, label);
+    assert_eq((my == 0), 0, label);
+    assert_eq(_diff_reconstructs(dp, b), 1, label);
+    assert_eq(_diff_reconstructs(my, b), 1, label);
+    assert_eq(_diff_editdist(my), _diff_editdist(dp), label);
+    return 0;
+}
+
+fn test_myers_diff_differential() {
+    test_group("diff.cyr — myers_diff matches DP (differential, P-14)");
+    _myers_case("a\nb\nc\n", "a\nb\nc\n", "identical → 0 edits");
+    _myers_case("a\nc\n", "a\nb\nc\n", "pure insert");
+    _myers_case("a\nb\nc\n", "a\nc\n", "pure delete");
+    _myers_case("a\nx\nc\n", "a\ny\nc\n", "replace middle (del+ins)");
+    _myers_case("a\nb\n", "c\nd\n", "all different");
+    _myers_case("", "a\nb\n", "empty old → all inserts");
+    _myers_case("a\nb\n", "", "empty new → all deletes");
+    _myers_case("A\nB\nC\nA\nB\nB\nA\n", "C\nB\nA\nB\nA\nC\n", "Myers classic ABCABBA/CBABAC");
+    _myers_case("1\n2\n3\n4\n5\n6\n7\n8\n", "1\n2\nX\n4\n5\n6\nY\n8\n", "two scattered replaces");
+    _myers_case("x\na\nb\nc\n", "a\nb\nc\ny\n", "leading del + trailing ins");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -566,6 +629,7 @@ fn main() {
     test_tofu_pin_lookup();
     test_sitignore_wildmatch();
     test_sitignore_negation_anchor();
+    test_myers_diff_differential();
     return assert_summary();
 }
 

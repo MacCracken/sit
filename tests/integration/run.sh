@@ -45,6 +45,17 @@ assert_contains "$("$SIT" fsck)" "0 bad" "fsck clean after first commit"
 printf 'hello\nworld\n' > a.txt
 assert_contains "$("$SIT" diff)" "+world" "diff shows the added line"
 
+# ── 1b. no upward repo discovery (ADR 0003) ────────────────────────
+# sit never walks parent dirs to find a .sit/ (CVE-2022-24765 shape). From a
+# subdirectory of a repo, commands that need a repo must refuse, not climb.
+# Run in the main shell (no subshell) so the assert counters accumulate; the
+# next section cd's to its own absolute dir, so leaving cwd here is fine.
+mkdir -p sub/deep && cd sub/deep
+"$SIT" status >/dev/null 2>&1; assert_eq "$?" "1" "status refuses from a subdir (no upward discovery)"
+"$SIT" log    >/dev/null 2>&1; assert_eq "$?" "1" "log refuses from a subdir"
+DISC_OUT=$("$SIT" commit -m x 2>&1); assert_eq "$?" "1" "commit refuses from a subdir"
+assert_contains "$DISC_OUT" "not a sit repository" "subdir error names 'not a sit repository'"
+
 # ── 2. branch + merge → merge commit ───────────────────────────────
 hr "branch + merge"
 R="$WORK/merge"; mkdir -p "$R"; cd "$R"
@@ -197,6 +208,24 @@ cd "$WORK/full"
 #  exercises that the dispatch + FF preflight run without crashing.)
 "$SIT" push target main >/dev/null 2>&1 || true
 ok   # reaching here without a crash is the assertion
+
+# ── 8. large-file diff via Myers fallback (P-14) ───────────────────
+# A >8192-line file exceeds the LCS DP cap, so the diff must route through
+# the Myers fallback and produce a real diff, not the "too large" refusal.
+hr "large-file diff (Myers fallback)"
+R="$WORK/bigdiff"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+seq 1 9000 > big.txt
+"$SIT" add big.txt >/dev/null
+"$SIT" commit -m "9000 lines" >/dev/null
+sed -i '5000s/.*/CHANGED-LINE/' big.txt   # change one line in the middle
+DOUT=$("$SIT" diff 2>&1)
+assert_contains "$DOUT" "+CHANGED-LINE" "9000-line diff shows the changed line (Myers engaged)"
+assert_contains "$DOUT" "-5000" "9000-line diff shows the removed original line"
+case "$DOUT" in
+  *"too large"*) bad "large-file diff was refused — Myers fallback not engaged" ;;
+  *) ok ;;
+esac
 
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"

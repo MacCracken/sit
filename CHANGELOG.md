@@ -4,6 +4,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-06-13 — diff: large-file Myers fallback + minimality fix
+
+First 1.0.x patch. No new surface (per the SemVer commitment) — a diff correctness fix, a large-file capability, and a test. The headline started as the Myers fallback and ended up uncovering a latent bug in the existing DP.
+
+### Fixed
+
+- **`lcs_diff` produced non-minimal diffs on the 2nd+ diff in a process** (`src/diff.cyr`). The LCS dynamic-programming table relied on its base row/column being zero, but never zeroed them — true only for fresh mmap-backed pages (large tables). A small table served from the recycled `fl_alloc` freelist carried stale non-zero values, so the DP computed a too-short LCS and emitted a non-minimal diff (e.g. `delete c` + `insert c` instead of `keep c`). A single `sit diff` in a fresh process was usually fine; `sit show` of a multi-file commit, or any command diffing several files, could hit it. Now the base row/column are explicitly zeroed. Surfaced by the new Myers differential test.
+
+### Added
+
+- **Myers O((N+M)D) diff fallback (P-14)** (`src/diff.cyr`). Files past the LCS DP cap (>8192 lines/dim) previously refused with `diff table exceeds cap; file too large`; they now diff via a bounded greedy Myers algorithm (forward search + trace backtrack) that needs only O(N+M) working space. A large-but-similar file (small edit distance) diffs cheaply where the DP would allocate 100+ MB. Output is a valid minimal edit script in the same op-tuple format, so `cmd_diff` / `cmd_show` / `sit_diff_path` are unchanged. Bounded at edit distance 4096 (~67 MB trace ceiling); a pathologically-rewritten huge file still refuses, preserving the old behavior for that case.
+- **Tests** — a `tests/sit.tcyr` differential group (**10 cases**, +50 assertions → **230**) checks `myers_diff` against the DP on minimality (equal edit distance) and reconstruction (the script rebuilds the new file); an integration gate (`tests/integration/run.sh`, **40 assertions**) diffs a 9000-line file through the fallback. Plus the **ADR-0003 no-upward-discovery** regression test (a subdir of a repo refuses `status` / `log` / `commit` with `not a sit repository`).
+
+### Notes
+
+- Build / test / lint / fuzz / bench green; 230 unit / 40 integration; bench flat (the base-zeroing is O(N+M) on an O(N·M) path). DCE binary 2.20 MB. `dist/sit.cyr` regenerated (`diff.cyr` is `[lib].modules`). No public-API, toolchain, or dep change. Surface-minimization (dropping sandhi) stays on hold pending an easier cyrius `stdlib`/`lib` consumption path.
+
 ## [1.0.0] — 2026-06-13 — Sovereign version control, 1.0
 
 The first stable release. A ceremonial cut on a green [v0.9.0](#090--2026-06-13--v100-closeout--stabilization) — **no code changes from 0.9.0**, only the version stamp. sit owns the "track a codebase over time" job on AGNOS end-to-end, with every layer first-party Cyrius — no libgit2, no C, no FFI ([ADR 0001](docs/adr/0001-no-ffi-first-party-only.md)).
