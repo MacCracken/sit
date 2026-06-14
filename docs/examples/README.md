@@ -8,4 +8,4 @@ Each example is its own subdirectory with a `README.md` explaining what it demon
 
 - [local-vcs-loop](local-vcs-loop/) — end-to-end shell walkthrough covering init, add, branch, signed commit, merge, status, diff, show `--stat`, verify-commit, and fsck. Useful as a smoke check after touching cross-command flows.
 
-Wire-protocol examples (`clone-fetch-push/` and friends) will land alongside the v0.5.0 network transport work.
+Network sync (clone / fetch / push over file / http / https / ssh, plus shallow clone and `merge-base`) is exercised end-to-end by the in-tree integration suite, [`tests/integration/run.sh`](../../tests/integration/run.sh) — runnable locally (`SIT=build/sit tests/integration/run.sh`) and the canonical worked example of the transport flows. The `sit serve` / clone-over-network recipes are in [getting-started § Serve and sync over the network](../guides/getting-started.md#serve-and-sync-over-the-network).

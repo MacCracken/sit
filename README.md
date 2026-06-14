@@ -10,12 +10,12 @@ The name is from *smriti* (स्मृति — "that which is remembered"). T
 
 - **Version**: see [`VERSION`](VERSION) (single source of truth) and [`docs/development/state.md`](docs/development/state.md) for the live state snapshot (current version, dep pins, source layout, recent releases).
 - **Language**: Cyrius (toolchain pinned in [`cyrius.cyml`](cyrius.cyml) under `[package].cyrius`).
-- **Commands**: `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `reset`, `commit`, `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `serve`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md).
+- **Commands** (26): `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `merge-base`, `reset`, `commit`, `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `serve`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md).
 - **Transports**: `file://` (+ bare paths) · `http://` · **`https://`** (first-party TLS 1.3, TOFU-pinned) · `ssh://`. Clone / fetch / push work over all four; `sit serve` is the loopback HTTP daemon (`--tls` for HTTPS, `--stdio` for SSH).
 
 Objects are SHA-256-hashed (via [sigil](https://github.com/MacCracken/sigil)) and zlib-compressed (via [sankoch](https://github.com/MacCracken/sankoch)), stored in a [patra](https://github.com/MacCracken/patra) table with a `COL_BYTES` content column. Trees are recursive and byte-compatible with git's SHA-256 object format. Commits can be ed25519-signed via sigil.
 
-**What works today** (v0.8.x line): the full local VCS loop (init → add → commit → branch → merge → tag); ed25519 signed commits + `verify-commit`; `fsck` with integrity + reachability (dangling) checks; git-parity `.sitignore` (negation, `**`, char classes, anchoring); and network sync over HTTP, **HTTPS (first-party Cyrius TLS — no libssl)**, and SSH, with `sit serve` on the host side. Still exploratory, post-boot — not on the AGNOS critical path.
+**What works** (the full git-parity surface, heading into the v1.0.0 cut): the local VCS loop (init → add → commit → branch → merge → tag); ed25519 signed commits + `verify-commit`; `fsck` with integrity + reachability (`dangling`) + `--prune`; git-parity `.sitignore` (negation, `**`, char classes, anchoring); `log --graph`, shallow clone (`--depth N`), and `merge-base` (full-DAG lowest common ancestor); and network sync — clone / fetch / push over HTTP, **HTTPS (first-party Cyrius TLS — no libssl)**, and SSH, with `sit serve` on the host side. Intentionally post-boot — not on the AGNOS critical path.
 
 ## Size and performance
 
@@ -66,18 +66,25 @@ Full walkthrough: [docs/guides/getting-started.md](docs/guides/getting-started.m
 ## Benchmarks and fuzz
 
 ```sh
-cyrius build tests/sit.bcyr build/sit-bench && ./build/sit-bench
-cyrius build tests/sit.fcyr build/sit-fuzz && ./build/sit-fuzz
+cyrius bench tests/sit.bcyr   # SHA-256 / zlib / patra / LCS-diff / .sitignore / blob-hash
+cyrius run tests/sit.fcyr     # fuzz: hash / zlib / hex-decode / URL / ssh-url / want-frame
 ```
 
 ## Docs
 
 - [`docs/guides/getting-started.md`](docs/guides/getting-started.md) — build + use
-- [`docs/development/roadmap.md`](docs/development/roadmap.md) — what shipped, what's next
+- [`CHANGELOG.md`](CHANGELOG.md) — shipped history (tagged releases) · [`docs/development/roadmap.md`](docs/development/roadmap.md) — what's next · [`docs/development/state.md`](docs/development/state.md) — live state snapshot
 - [`docs/adr/`](docs/adr/) — decisions, starting with [0001 — no FFI](docs/adr/0001-no-ffi-first-party-only.md)
 - [`docs/architecture/`](docs/architecture/) — non-obvious constraints that outlive the code
 - [`docs/examples/`](docs/examples/) — runnable examples
 
+## Contributing & security
+
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — build/test gates, Cyrius conventions, the no-FFI bar
+- [`SECURITY.md`](SECURITY.md) — threat model + how to report a vulnerability (don't open a public issue)
+- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
+
 ## License
 
 GPL-3.0-only
+

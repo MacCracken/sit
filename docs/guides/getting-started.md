@@ -4,7 +4,7 @@ Build sit from source and initialize your first repository.
 
 ## Prerequisites
 
-- Cyrius toolchain — version pinned in `cyrius.cyml` under `[package].cyrius` (currently **5.6.16**). Check `cyrius --version`.
+- Cyrius toolchain — version pinned in `cyrius.cyml` under `[package].cyrius` (the pin is the single source of truth; check it there, and `cyrius --version` to confirm your install matches).
 - Linux x86_64. Other targets will work when the corresponding `syscalls_*` stdlib modules are exercised, but x86_64 Linux is the primary target today.
 
 ## Build
@@ -416,10 +416,11 @@ Simplifications vs git (documented in `src/index.cyr`): a non-segment `**` (e.g.
 - `sit reset <path>` — unstage: rewrite the index entry for the path to HEAD's tree hash (or drop it if HEAD doesn't have it). Working tree untouched.
 - `sit reset --hard <ref>` — move the current branch's ref to `<ref>` (branch / tag / commit hex) and restore the working tree to that commit.
 - `sit config [--global] <key> [<value>]` — read/write config entries (`user.name`, `user.email`, etc). Local at `.sit/config`, global at `~/.sitconfig`
-- `sit fsck` — integrity (each stored object re-hashes to its key) **and reachability** (objects no ref / index entry points at are reported as `dangling <type> <hex>`)
+- `sit fsck [--prune]` — integrity (each stored object re-hashes to its key) **and reachability** (objects no ref / index entry points at are reported as `dangling <type> <hex>`); `--prune` removes the dangling objects (immediate/unrecoverable — `git gc --prune=now` semantics; refused mid-merge or when the store looks corrupt)
+- `sit merge-base <a> <b>` — print the lowest common ancestor of two commits over the full parent DAG (correct across merges; git's `git merge-base`)
 - `.sitignore` — git-parity ignore matcher (`*` / `?` / `[...]` char classes / `**` / `!` negation / leading-or-middle-`/` anchoring) filtering untracked-file display and `sit add` (override with `-f`)
 - `sit commit [-m] <message>` — write tree + commit objects, update `refs/heads/main`
-- `sit log` — walk commit history from HEAD with git-style output
+- `sit log [--oneline] [--graph] [-n <count>] [<ref>]` — walk commit history from HEAD with git-style output; `--oneline` for one line per commit, `--graph` for an ASCII commit DAG over the full parent graph (`* | / \` lanes)
 - `sit status` — three-way diff across HEAD tree, staging index, and working directory
 - `sit diff [--staged|HEAD]` — unified diff with `@@` hunk headers (working vs index / index vs HEAD / working vs HEAD)
 - `sit show [--stat] [<hash>]` — show a single commit's header + parent-diff (defaults to HEAD); `--stat` emits per-file insertion/deletion counts instead of the full diff
@@ -430,7 +431,7 @@ Simplifications vs git (documented in `src/index.cyr`): a non-segment `**` (e.g.
 - `sit fetch <remote> [<branch>]` — copy remote objects + tracking ref into the local repo (any transport)
 - `sit pull <remote> [<branch>]` — fetch + fast-forward merge (divergence → use `sit merge` manually)
 - `sit push <remote> [<branch>]` — push HEAD's branch to a remote, fast-forward only (any transport; refuses the remote's checked-out branch per `denyCurrentBranch`)
-- `sit clone [--force-absolute] <url> [<dir>]` — init + remote add + fetch + materialize in one shot, over any transport. Absolute target paths require `--force-absolute` (so `sit clone <url> /etc/passwd` doesn't silently land where you didn't mean — S-23 hardening from v0.6.2).
+- `sit clone [--force-absolute] [--depth <n>] <url> [<dir>]` — init + remote add + fetch + materialize in one shot, over any transport. `--depth <n>` is a shallow clone (only the most recent *n* commits, each with its full tree + blobs; boundary recorded in `.sit/shallow` so `log` stops cleanly). Absolute target paths require `--force-absolute` (so `sit clone <url> /etc/passwd` doesn't silently land where you didn't mean — S-23 hardening from v0.6.2).
 - `sit serve <repo> [--listen 127.0.0.1:<port>] [--tls --cert <f> --key <f>] [--stdio] [--require-auth]` — host a repo over the `/sit/v1/...` wire protocol (loopback HTTP, HTTPS via first-party TLS 1.3, or SSH stdio)
 - `sit merge -S <branch>` — signed merge commit (same ed25519 flow as `sit commit -S`)
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
@@ -438,10 +439,10 @@ Simplifications vs git (documented in `src/index.cyr`): a non-segment `**` (e.g.
 
 ## What doesn't yet
 
-- `sit log --graph` and shallow clone (`--depth N`) — next slot (v0.8.11)
-- Rebase; cherry-pick; stash
+- Rebase; cherry-pick; stash; reflog (and the reflog-backed `fsck --prune` grace period)
+- Octopus (3+ parent) merges — `merge-base` resolves them correctly, but `sit merge` is 2-way, so 3-parent commits can't be created yet
 - Pack bundles / delta compression for object transfer (objects copy one-at-a-time)
 - HTTPS over public CA certs / mTLS — HTTPS today is TOFU-pinned (CA-chain + hostname verification is a post-v1 opt-in); Ed25519 server certs are blocked on an upstream `tls_native` gap (use ECDSA P-256)
-- `.sitignore` directory-only (`build/`) enforcement; `merge_base` across complex (diamond/octopus) merges still follows the first-parent chain
+- `.sitignore` directory-only (`build/`) enforcement
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).

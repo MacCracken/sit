@@ -36,7 +36,7 @@ This is a **permanent** design decision, not a provisional one. Future commands 
 
 ## Regression protection
 
-Add an integration test: create a sit repo, cd into a subdirectory, run `sit status` and assert exit != 0 and stderr contains `not a sit repository`. Same test for `sit log`, `sit commit`, `sit fetch`. (Not yet implemented in `tests/sit.tcyr`; queued alongside the v0.6.0 integration-test expansion.)
+Candidate for the in-tree integration suite ([`tests/integration/run.sh`](../../tests/integration/run.sh)): create a sit repo, `cd` into a subdirectory, run `sit status` and assert a non-zero exit with `not a sit repository` on stderr — same for `sit log`, `sit commit`, `sit fetch`. The "not a sit repository" guard itself ships in every `cmd_*` (each checks `file_exists(".sit/HEAD")` against the current directory only, never walking upward).
 
 ## References
 
