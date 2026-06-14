@@ -2,17 +2,9 @@
 
 Forward-looking only. **Shipped history lives in [`CHANGELOG.md`](../../CHANGELOG.md)** (the tagged-release source of truth); the **live state snapshot** (current version, dep pins, source layout, command inventory) lives in [`state.md`](state.md). This file is just what's *next*.
 
-## Now: the v1.0.0 cut
+## Shipped: 1.0.0 (2026-06-13)
 
-The v0.9.0 closeout / stabilization pass is complete (full suite, bench vs the v0.6.x scoreboard, dead-code audit, code review, security re-scan, refactor, downstream check, doc sweep, clean build — audit at [`../audit/2026-06-13-audit.md`](../audit/2026-06-13-audit.md)). The full git-parity surface is in place:
-
-- Local VCS loop (init → add → commit → branch → merge → tag), ed25519-signed commits + `verify-commit`.
-- `fsck` with integrity + reachability (`dangling`) + `--prune`.
-- Git-parity `.sitignore` (negation, `**`, char classes, anchoring).
-- `log --graph`, shallow clone (`--depth N`), `merge-base` (full-DAG LCA).
-- Network sync over `file://` / `http://` / `https://` (first-party TLS 1.3, TOFU-pinned) / `ssh://` — clone, fetch, push on all four; `sit serve` host side.
-
-**v1.0.0 is the ceremonial cut on a green tree**: VERSION → 1.0.0, CHANGELOG header, version-verify gate, tag. No feature or fix work is planned before it.
+The first stable release. The full git-parity surface is in place — local VCS loop + `merge-base`; `fsck` integrity/reachability/`--prune`; ed25519 signing; git-parity `.sitignore`; `log --graph`; shallow clone; network sync (clone/fetch/push) over `file://` / `http://` / `https://` (first-party TLS 1.3) / `ssh://`; `dist/sit.cyr` library export. From 1.0 the CLI, `.sit/` layout, `/sit/v1/...` wire protocol, and the `sit_*` / `ann_*` public API are SemVer-governed. Details in [`CHANGELOG.md`](../../CHANGELOG.md); closeout audit at [`../audit/2026-06-13-audit.md`](../audit/2026-06-13-audit.md).
 
 ## After v1.0.0
 

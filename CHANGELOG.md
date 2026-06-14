@@ -4,6 +4,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-06-13 — Sovereign version control, 1.0
+
+The first stable release. A ceremonial cut on a green [v0.9.0](#090--2026-06-13--v100-closeout--stabilization) — **no code changes from 0.9.0**, only the version stamp. sit owns the "track a codebase over time" job on AGNOS end-to-end, with every layer first-party Cyrius — no libgit2, no C, no FFI ([ADR 0001](docs/adr/0001-no-ffi-first-party-only.md)).
+
+### What 1.0 is
+
+- **Local VCS loop** — `init` / `add` / `rm` / `commit` / `branch` / `checkout` / `tag` / `merge` (3-way, diff3 conflict markers) / `merge-base` (full-DAG LCA) / `reset` / `log` (`--oneline`, `--graph`) / `status` / `diff` / `show` / `cat-file` / `owl-file` / `config`. **26 commands.**
+- **Integrity & trust** — `fsck` (integrity + reachability + `--prune`); ed25519-signed commits + `verify-commit` (sitsig, [ADR 0002](docs/adr/0002-sitsig-not-gpgsig.md)); SHA-256 only, git-byte-compatible object framing ([ADR 0004](docs/adr/0004-sha256-only.md)).
+- **Git-parity `.sitignore`** — `*` / `?` / `[...]` char classes / `**` / `!` negation / anchoring.
+- **Network sync** — clone / fetch / push over `file://` / `http://` / `https://` (first-party TLS 1.3, TOFU-pinned, **no libssl**, [ADR 0007](docs/adr/0007-network-transport-security.md)) / `ssh://` (system `ssh` as a process boundary, [ADR 0008](docs/adr/0008-ssh-transport.md)); shallow clone (`--depth N`); `sit serve` host side.
+- **Library export** — consumable as a Cyrius dep via `dist/sit.cyr`; the `sit_*` / `ann_*` public surface is **stable and SemVer-governed** from 1.0 on ([ADR 0009](docs/adr/0009-public-api-contract.md)).
+
+### Stability
+
+From 1.0.0, the CLI surface, on-disk `.sit/` layout, wire protocol (`/sit/v1/...`), and the `dist/sit.cyr` public API follow SemVer — breaking changes require a major bump with a migration note. Single statically-linked binary, **no dynamic dependencies** (`ldd` reports *not a dynamic executable*).
+
+### Verification
+
+Unchanged from v0.9.0: 180 unit + 33 integration assertions, fuzz clean (6 harnesses), bench flat vs the v0.8.12 baseline, lint clean, clean-from-scratch DCE build **2.204 MB**. `dist/sit.cyr` regenerated (version stamp only). Cyrius 6.2.2; sakshi 2.3.0 / sankoch 2.3.1 / sigil 3.7.13 / patra 1.11.1.
+
 ## [0.9.0] — 2026-06-13 — v1.0.0 closeout / stabilization
 
 The stabilization pass before the v1.0.0 cut: an independent adversarial review of the v0.8.x additions (`log --graph`, `--depth` shallow clone, `merge_base`, `fsck --prune`), a whole-tree dead-code / lint / security re-scan, and one consolidation refactor. Three HIGH findings fixed; no new features. Full report: [`docs/audit/2026-06-13-audit.md`](docs/audit/2026-06-13-audit.md).

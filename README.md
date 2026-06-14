@@ -15,7 +15,7 @@ The name is from *smriti* (स्मृति — "that which is remembered"). T
 
 Objects are SHA-256-hashed (via [sigil](https://github.com/MacCracken/sigil)) and zlib-compressed (via [sankoch](https://github.com/MacCracken/sankoch)), stored in a [patra](https://github.com/MacCracken/patra) table with a `COL_BYTES` content column. Trees are recursive and byte-compatible with git's SHA-256 object format. Commits can be ed25519-signed via sigil.
 
-**What works** (the full git-parity surface, heading into the v1.0.0 cut): the local VCS loop (init → add → commit → branch → merge → tag); ed25519 signed commits + `verify-commit`; `fsck` with integrity + reachability (`dangling`) + `--prune`; git-parity `.sitignore` (negation, `**`, char classes, anchoring); `log --graph`, shallow clone (`--depth N`), and `merge-base` (full-DAG lowest common ancestor); and network sync — clone / fetch / push over HTTP, **HTTPS (first-party Cyrius TLS — no libssl)**, and SSH, with `sit serve` on the host side. Intentionally post-boot — not on the AGNOS critical path.
+**What works** (the full git-parity surface, stable as of **1.0.0**): the local VCS loop (init → add → commit → branch → merge → tag); ed25519 signed commits + `verify-commit`; `fsck` with integrity + reachability (`dangling`) + `--prune`; git-parity `.sitignore` (negation, `**`, char classes, anchoring); `log --graph`, shallow clone (`--depth N`), and `merge-base` (full-DAG lowest common ancestor); and network sync — clone / fetch / push over HTTP, **HTTPS (first-party Cyrius TLS — no libssl)**, and SSH, with `sit serve` on the host side. Intentionally post-boot — not on the AGNOS critical path.
 
 ## Size and performance
 
