@@ -4,6 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.2] — 2026-06-19 — cyrius 6.2.25 toolchain refresh + dep bumps
+
+Pins-only maintenance release (same shape as [1.0.0]'s ceremonial cut and the v0.8.11 / v0.8.6 refreshes). No sit source changes, no surface change — the full 1.0 git-parity surface stands and the CLI / `.sit/` layout / `/sit/v1/...` wire protocol / `sit_*`/`ann_*` public API remain SemVer-governed.
+
+### Changed
+
+- **Cyrius toolchain `6.2.2 → 6.2.25`** (pinned in `cyrius.cyml [package].cyrius`). `[deps].stdlib` unchanged.
+- **Dependencies** — sakshi `2.3.0 → 2.4.0` (minor-line), sankoch `2.3.1 → 2.4.4` (minor-line; the larger 2.x match-finder / SIMD work is still queued), sigil `3.7.13 → 3.9.1` (minor-line within major 3 — **audit clean**, sit calls only `hash_data` / `hex_encode` / `hex_decode` / ed25519 verbs; signed-commit verify confirmed end-to-end), patra `1.11.1 → 1.12.0` (minor-line; no public-surface impact).
+
+### Notes
+
+- Build / test / lint / fuzz green: **230/230 unit**, lint clean, fuzz clean (6 harnesses — `zlib_decompress`, `hash_data`, `hex_decode`, `url_validators`, `ssh_url_parser`, `want_frame_decoder` 10M rounds, no crashes). DCE binary **2.245 MB** (+~38 KB vs 1.0.1 — 6.2.25 stdlib/dep heft).
+- Benign upstream build warnings carried forward and DCE-stripped: the four `async_*` undefined-function refs (sandhi's async server variant, which sit's synchronous `cmd_serve` never reaches), a new `random_bytes` undefined ref, and a `duplicate symbol 'SANDHI_CONN_OFF_FD'` (last-definition-wins) — all originate in the vendored `lib/sandhi.cyr`, none reachable from sit.
+- `dist/sit.cyr` regenerated — version-stamp bump only (no `[lib].modules` source file changed). No public-API change.
+
 ## [1.0.1] — 2026-06-13 — diff: large-file Myers fallback + minimality fix
 
 First 1.0.x patch. No new surface (per the SemVer commitment) — a diff correctness fix, a large-file capability, and a test. The headline started as the Myers fallback and ended up uncovering a latent bug in the existing DP.
