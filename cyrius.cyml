@@ -75,6 +75,7 @@ stdlib = [
     "bayan",
     "ct",
     "keccak",
+    "random",
     "bench",
     "net",
     "mmap",

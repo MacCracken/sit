@@ -6,17 +6,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.0.2] — 2026-06-19 — cyrius 6.2.25 toolchain refresh + dep bumps
 
-Pins-only maintenance release (same shape as [1.0.0]'s ceremonial cut and the v0.8.11 / v0.8.6 refreshes). No sit source changes, no surface change — the full 1.0 git-parity surface stands and the CLI / `.sit/` layout / `/sit/v1/...` wire protocol / `sit_*`/`ann_*` public API remain SemVer-governed.
+Toolchain + dependency refresh (same shape as the v0.8.11 / v0.8.6 refreshes). No `src/*.cyr` changes and no public-surface change — the full 1.0 git-parity surface stands and the CLI / `.sit/` layout / `/sit/v1/...` wire protocol / `sit_*`/`ann_*` public API remain SemVer-governed. One required manifest change: the `random` stdlib module is now declared (see below).
 
 ### Changed
 
-- **Cyrius toolchain `6.2.2 → 6.2.25`** (pinned in `cyrius.cyml [package].cyrius`). `[deps].stdlib` unchanged.
+- **Cyrius toolchain `6.2.2 → 6.2.25`** (pinned in `cyrius.cyml [package].cyrius`).
 - **Dependencies** — sakshi `2.3.0 → 2.4.0` (minor-line), sankoch `2.3.1 → 2.4.4` (minor-line; the larger 2.x match-finder / SIMD work is still queued), sigil `3.7.13 → 3.9.1` (minor-line within major 3 — **audit clean**, sit calls only `hash_data` / `hex_encode` / `hex_decode` / ed25519 verbs; signed-commit verify confirmed end-to-end), patra `1.11.1 → 1.12.0` (minor-line; no public-surface impact).
+- **`[deps].stdlib` gains `random`** — sigil 3.9.1 reworked ed25519 keypair generation to source entropy through the cyrius stdlib `random_bytes` (`lib/random.cyr`) rather than calling `getrandom` itself. Without `random` declared, that symbol is unresolved and `sit key generate` jumps to a bad address and crashes (**SIGILL**, exit 132) — caught by the signed-commit-round-trip CI smoke. Declaring `random` resolves it; the 43-line module adds `random_bytes` only and stays well under the 256-global cap.
+
+### Fixed
+
+- **`sit key generate` crash under sigil 3.9.1** (SIGILL / exit 132). The new sigil routes `ed25519_generate_keypair` entropy through stdlib `random_bytes`; sit's manifest didn't declare the `random` stdlib module, so the call resolved to nothing. Adding `random` to `[deps].stdlib` restores keygen; verified `key generate` → signed commit → `verify-commit` end-to-end (good signature).
 
 ### Notes
 
 - Build / test / lint / fuzz green: **230/230 unit**, lint clean, fuzz clean (6 harnesses — `zlib_decompress`, `hash_data`, `hex_decode`, `url_validators`, `ssh_url_parser`, `want_frame_decoder` 10M rounds, no crashes). DCE binary **2.245 MB** (+~38 KB vs 1.0.1 — 6.2.25 stdlib/dep heft).
-- Benign upstream build warnings carried forward and DCE-stripped: the four `async_*` undefined-function refs (sandhi's async server variant, which sit's synchronous `cmd_serve` never reaches), a new `random_bytes` undefined ref, and a `duplicate symbol 'SANDHI_CONN_OFF_FD'` (last-definition-wins) — all originate in the vendored `lib/sandhi.cyr`, none reachable from sit.
+- Remaining benign upstream build warnings, DCE-stripped: the four `async_*` undefined-function refs (sandhi's async server variant, which sit's synchronous `cmd_serve` never reaches) and a `duplicate symbol 'SANDHI_CONN_OFF_FD'` (last-definition-wins) — both originate in the vendored `lib/sandhi.cyr`, neither reachable from sit. (The `random_bytes` undefined warning is gone now that `random` is declared.)
 - `dist/sit.cyr` regenerated — version-stamp bump only (no `[lib].modules` source file changed). No public-API change.
 
 ## [1.0.1] — 2026-06-13 — diff: large-file Myers fallback + minimality fix
