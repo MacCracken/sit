@@ -265,14 +265,14 @@ The kept commits' un-fetched parents are recorded in `.sit/shallow` (git's `.git
 sit serve /srv/repos/demo --listen 127.0.0.1:8484 &
 sit clone http://127.0.0.1:8484 my-demo
 
-# HTTPS — first-party TLS 1.3 (no libssl). Bring an ECDSA P-256 cert+key:
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+# HTTPS — first-party TLS 1.3 (no libssl). Bring an Ed25519 (or ECDSA P-256) cert+key:
+openssl req -x509 -newkey ed25519 \
   -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=127.0.0.1"
 sit serve /srv/repos/demo --tls --cert cert.pem --key key.pem --listen 127.0.0.1:8443 &
 sit clone https://127.0.0.1:8443 my-demo
 ```
 
-HTTPS trust is **TOFU / pinned** (like SSH host keys): the first clone records the server's certificate fingerprint in `~/.sit/known_certs`; a later mismatch refuses the connection. The TLS connection is reused across the whole clone (one handshake). Use an **ECDSA P-256** cert — Ed25519 server certs currently fail the handshake (a tracked upstream `tls_native` gap).
+HTTPS trust is **TOFU / pinned** (like SSH host keys): the first clone records the server's certificate fingerprint in `~/.sit/known_certs`; a later mismatch refuses the connection. The TLS connection is reused across the whole clone (one handshake). **Ed25519, ECDSA P-256, and ECDSA P-384** server certs all work (Ed25519 support landed via the sigil 3.9 / cyrius 6.x X.509-parser fix); RSA server certs are not supported.
 
 ```sh
 # SSH — reuses the system ssh binary; sit runs 'sit serve --stdio' on the far side
@@ -442,7 +442,7 @@ Simplifications vs git (documented in `src/index.cyr`): a non-segment `**` (e.g.
 - Rebase; cherry-pick; stash; reflog (and the reflog-backed `fsck --prune` grace period)
 - Octopus (3+ parent) merges — `merge-base` resolves them correctly, but `sit merge` is 2-way, so 3-parent commits can't be created yet
 - Pack bundles / delta compression for object transfer (objects copy one-at-a-time)
-- HTTPS over public CA certs / mTLS — HTTPS today is TOFU-pinned (CA-chain + hostname verification is a post-v1 opt-in); Ed25519 server certs are blocked on an upstream `tls_native` gap (use ECDSA P-256)
+- HTTPS over public CA certs / mTLS — HTTPS today is TOFU-pinned (CA-chain + hostname verification is a post-v1 opt-in; the 1.5.0 transport-trust minor)
 - `.sitignore` directory-only (`build/`) enforcement
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).

@@ -1,5 +1,15 @@
 # cyrius `lib/tls_native.cyr` — server handshake fails with an Ed25519 certificate (ECDSA P-256 works)
 
+> **RESOLVED (2026-06-25, sit 1.0.x).** Fixed upstream and confirmed against the
+> pinned deps (cyrius 6.2.44 / sigil 3.9.4). Root cause was **not** the TLS layer —
+> `tls_native`'s CertVerify already signed/verified Ed25519 — but sigil's X.509
+> parser was ECDSA/RSA-only, so the server's `load_creds` rejected the Ed25519 cert
+> (`x509_parse → CERT_INVALID`) before the handshake. sigil 3.9.x added id-Ed25519 to
+> `_xp_parse_sig_algid` / `_xp_parse_spki` / `_x509_verify_link`; cyrius 6.x folds it
+> in. sit needed **no code change** — `sit serve --tls` is cert-algorithm-agnostic.
+> Consumed on the 1.0.x line: the getting-started "ECDSA P-256 only" caveat is
+> dropped and the https CI smoke now uses an Ed25519 server cert. Archived.
+
 **Discovered:** 2026-06-10 during sit v0.8.8 HTTPS server work (`sit serve --tls`)
 **Severity:** Medium — limits `sit serve --tls` (and any `tls_native` server consumer) to ECDSA P-256 / P-384 certs; an Ed25519 server cert fails the handshake. ECDSA P-256 works, so sit ships unblocked, but Ed25519 is a common modern default and the failure mode is opaque ("tls handshake failed").
 **Affects:** cyrius `lib/tls_native.cyr` at 6.1.29 (server role). Client role + ECDSA certs unaffected.

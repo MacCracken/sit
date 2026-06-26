@@ -11,11 +11,11 @@
 # connections must match; a mismatch aborts (possible MITM). CA-chain + hostname
 # verification is a post-v1 opt-in (roadmap "Longer horizon").
 #
-# This is the first bite of the HTTPS arc: the pin store. The TLS I/O wiring into
-# wire_http.cyr's open/request/post (tls_native_connect over the socket, routing
-# reads/writes through tls_native_read/write) is the follow-on bite. tofu_check_pin
-# / _tofu_record_pin are scaffolding for that bite; DCE strips them until a live
-# https client path calls them.
+# Two parts, both live since v0.8.8: this pin store, and the TLS I/O wiring in
+# wire_http.cyr's open/request/post (tls_native handshake over the socket, reads/
+# writes routed through _wire_io_send / _wire_io_recv). tofu_check_pin is called
+# from _wire_https_connect on every https client connection; _tofu_record_pin
+# records the pin on first use.
 
 # ~/.sit/known_certs path. Returns a heap cstring, or 0 if HOME unset.
 fn known_certs_path() {
@@ -155,12 +155,12 @@ fn tofu_check_pin(host, port, spki_der, der_len) {
     return 1;
 }
 
-# ── TLS transport (bite 2) ──
+# ── TLS transport ──
 #
-# Per-request TLS: wire_http opens a fresh socket per request (HTTP/1.0
-# Connection: close), so the TLS handshake happens per request right after
-# sock_connect. Correctness-first; a persistent keep-alive connection would
-# cut the per-request handshake cost (a perf item on the roadmap HTTPS slot).
+# Keep-alive (v0.8.9): the https handle holds one persistent socket + tls_native
+# ctx, so a single TLS handshake right after the first sock_connect is reused
+# across every request in a clone/fetch/push (see wire_http.cyr's
+# `── HTTPS keep-alive (v0.8.9) ──`).
 
 # Handshake over an already-connected socket `fd` to `host:port`, then TOFU-pin
 # the peer. Returns the TLS ctx (>0) on success+trusted, or 0 on any failure /

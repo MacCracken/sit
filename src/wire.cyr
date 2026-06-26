@@ -1221,14 +1221,20 @@ fn cmd_clone() {
             var p = 7;                                  # past "http://"
             if (sch == URL_SCHEME_HTTPS) { p = 8; }     # past "https://"
             var ulen = strlen(url);
+            # Scan to the first ':' (port) or '/' (path). Flag-driven,
+            # not `break`: a `break` after an in-loop `var` declaration
+            # is unreliable in cyrius (CLAUDE.md). host_end lands on the
+            # delimiter, or on ulen for a bare host.
             var host_end = p;
-            while (host_end < ulen) {
-                var c = load8(url + host_end);
-                if (c == 58) { host_end = host_end; }
-                if (c == 47) { host_end = host_end; }
-                if (c == 58) { break; }
-                if (c == 47) { break; }
-                host_end = host_end + 1;
+            var scanning = 1;
+            while (scanning == 1) {
+                if (host_end >= ulen) { scanning = 0; }
+                if (scanning == 1) {
+                    var c = load8(url + host_end);
+                    if (c == 58) { scanning = 0; }
+                    if (c == 47) { scanning = 0; }
+                }
+                if (scanning == 1) { host_end = host_end + 1; }
             }
             var hl = host_end - p;
             if (hl > 0) {

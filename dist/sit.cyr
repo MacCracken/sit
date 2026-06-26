@@ -8545,14 +8545,20 @@ fn cmd_clone() {
             var p = 7;                                  # past "http://"
             if (sch == URL_SCHEME_HTTPS) { p = 8; }     # past "https://"
             var ulen = strlen(url);
+            # Scan to the first ':' (port) or '/' (path). Flag-driven,
+            # not `break`: a `break` after an in-loop `var` declaration
+            # is unreliable in cyrius (CLAUDE.md). host_end lands on the
+            # delimiter, or on ulen for a bare host.
             var host_end = p;
-            while (host_end < ulen) {
-                var c = load8(url + host_end);
-                if (c == 58) { host_end = host_end; }
-                if (c == 47) { host_end = host_end; }
-                if (c == 58) { break; }
-                if (c == 47) { break; }
-                host_end = host_end + 1;
+            var scanning = 1;
+            while (scanning == 1) {
+                if (host_end >= ulen) { scanning = 0; }
+                if (scanning == 1) {
+                    var c = load8(url + host_end);
+                    if (c == 58) { scanning = 0; }
+                    if (c == 47) { scanning = 0; }
+                }
+                if (scanning == 1) { host_end = host_end + 1; }
             }
             var hl = host_end - p;
             if (hl > 0) {
@@ -9051,15 +9057,15 @@ fn _do_push_ssh(name, branch, url, src_db, local_tip) {
 # host strings deliberately. When stdlib http_get grows past 64KB
 # (filed informally), wire_http_request can switch back.
 #
-# Out of scope for v0.7.3 (deferred to v0.7.x patches that
-# explicitly call them out):
-#   * keep-alive / pipelined requests (every request opens a fresh
-#     TCP socket; HTTP/1.0 + `Connection: close`)
-#   * non-loopback host resolution (anything other than "127.0.0.1"
-#     literal or "localhost" rewrite) — DNS is queued for v0.7.4
-#   * https / TLS (v0.7.6) — `wire_http_open` rejects https://
-#     URLs explicitly to keep the dispatch error well-formed
-#   * push-side endpoints — POST /objects + POST /refs are v0.7.5
+# Plain-HTTP transport notes (current):
+#   * plain http opens a fresh TCP socket per request (HTTP/1.0 +
+#     `Connection: close`); the https path is keep-alive (v0.8.9).
+#   * https / TLS landed in v0.8.8 — `wire_http_open` accepts
+#     https:// (see wire_https.cyr); POST /want batching landed in
+#     v0.7.4/v0.7.5, push-side POST /objects + /refs in v0.7.6.
+#   * non-loopback host resolution (anything other than the
+#     "127.0.0.1" literal or "localhost" rewrite) is still parked —
+#     DNS / non-loopback serve is the 1.5.0 transport-trust minor.
 #
 # Hash trust boundary: the client does NOT re-hash incoming
 # objects. The compressed bytes are persisted into the local
@@ -9210,7 +9216,7 @@ fn wire_http_open(url) {
     if (p < ulen) {
         var path_len = ulen - p;
         if (path_len > 1) {
-            eprintln("sit: http base paths are not supported in v0.7.3 (use http://host:port)");
+            eprintln("sit: http base paths are not supported (use http://host:port)");
             return 0;
         }
         if (load8(url + p) != 47) {
@@ -9227,7 +9233,7 @@ fn wire_http_open(url) {
             addr = INADDR_LOOPBACK();
         }
         else {
-            eprintln("sit: host resolution requires a numeric IPv4 literal or 'localhost' in v0.7.3");
+            eprintln("sit: host resolution requires a numeric IPv4 literal or 'localhost'");
             return 0;
         }
     }
@@ -9600,16 +9606,11 @@ fn _wire_https_exchange(h, is_post, sub_path, body, body_len, extra_hdr, out_qua
 
 # POST variant of _wire_http_request: same response-parsing shape,
 # different request-build path. Sends a fixed-shape body with
-# Content-Type: application/octet-stream + Content-Length. Used
-# for /sit/v1/want in v0.7.4. Out-quad layout matches GET.
-#
-# v0.7.4 status: the function is currently dead code (no caller —
-# DCE strips it from the binary). It ships as scaffolding so v0.7.5
-# can plumb walk-side batching in without re-doing wire work. The
-# v0.7.4 client stays on per-object GET because batching only the
-# blobs (the slice walk_reachable's cache misses) saves only ~7%
-# on loopback — well under the v0.7.4 ≥30% gate. See ADR 0006 for
-# the wire format and v0.7.4 CHANGELOG entry for the gate analysis.
+# Content-Type: application/octet-stream + Content-Length. Out-quad
+# layout matches GET. Introduced for /sit/v1/want in v0.7.4; now has
+# live callers — http_remote_read_batch (want batching, since v0.7.5)
+# and http_remote_push_ref (push, since v0.7.6). See ADR 0006 for the
+# wire format.
 
 fn _wire_http_post(h, sub_path, body, body_len, out_quad) {
     if (_http_remote_is_tls(h) == 1) {
@@ -10409,14 +10410,14 @@ fn _wire_http_post_xhdr(h, sub_path, body, body_len, extra_hdr, out_quad) {
 #                                 X-Sit-Type: <patra-ty> header
 #                                 carries the type code
 #
-# Subsequent v0.7.x patches add: POST /want batched stream (v0.7.4),
-# POST /objects + POST /refs + bearer auth (v0.7.5), TLS (v0.7.6),
-# mTLS (v0.7.7).
+# Later patches added: POST /want batched stream (v0.7.4), POST
+# /objects + POST /refs + bearer auth (v0.7.6), TLS / HTTPS (v0.8.8);
+# mTLS is deferred to the 1.5.0 transport-trust minor.
 #
 # Bound to 127.0.0.1 only — listening on 0.0.0.0 / a routable
-# interface needs explicit threat-model review (auth model isn't
-# wired yet; non-loopback exposure of a no-auth read path leaks
-# ref topology + object content). Bearer auth lands in v0.7.5.
+# interface needs explicit threat-model review (a no-auth read path
+# leaks ref topology + object content; bearer auth — v0.7.6 — guards
+# writes only). Lifting the loopback lock is the 1.5.0 minor.
 
 var SIT_SERVE_DEFAULT_PORT = 8484;
 var SIT_SERVE_MAX_BODY = 16777216;  # 16 MiB — advertised in capabilities
@@ -10490,12 +10491,15 @@ fn serve_read_ref_file(path) {
 
 fn serve_build_capabilities() {
     var sb = str_builder_new();
-    # The "sit" string identifies the wire-protocol release line
-    # the server promises. It bumps in lockstep with VERSION at
-    # each tag.
-    # TODO: derive from VERSION at build time. Manually bumped each
-    # release; closeout pass before tagging asserts the literal matches.
-    str_builder_add_cstr(sb, "{\"sit\":\"0.8.10\",\"max_body\":");
+    # The "sit" string identifies the wire-protocol release line the
+    # server promises; it tracks VERSION. The CI "Verify version
+    # consistency" step asserts this literal == VERSION so it cannot
+    # silently drift (it had drifted to 0.8.10 through v1.0.3 before
+    # the guard landed).
+    # TODO: derive from VERSION at build time once cyrius exposes a
+    # source-level VERSION constant — the manifest ${file:VERSION} is
+    # build-metadata only. Until then it is bumped by hand at each tag.
+    str_builder_add_cstr(sb, "{\"sit\":\"1.0.3\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[");
     if (_serve_require_auth == 1) {

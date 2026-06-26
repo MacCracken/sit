@@ -9,14 +9,14 @@
 #                                 X-Sit-Type: <patra-ty> header
 #                                 carries the type code
 #
-# Subsequent v0.7.x patches add: POST /want batched stream (v0.7.4),
-# POST /objects + POST /refs + bearer auth (v0.7.5), TLS (v0.7.6),
-# mTLS (v0.7.7).
+# Later patches added: POST /want batched stream (v0.7.4), POST
+# /objects + POST /refs + bearer auth (v0.7.6), TLS / HTTPS (v0.8.8);
+# mTLS is deferred to the 1.5.0 transport-trust minor.
 #
 # Bound to 127.0.0.1 only — listening on 0.0.0.0 / a routable
-# interface needs explicit threat-model review (auth model isn't
-# wired yet; non-loopback exposure of a no-auth read path leaks
-# ref topology + object content). Bearer auth lands in v0.7.5.
+# interface needs explicit threat-model review (a no-auth read path
+# leaks ref topology + object content; bearer auth — v0.7.6 — guards
+# writes only). Lifting the loopback lock is the 1.5.0 minor.
 
 var SIT_SERVE_DEFAULT_PORT = 8484;
 var SIT_SERVE_MAX_BODY = 16777216;  # 16 MiB — advertised in capabilities
@@ -90,12 +90,15 @@ fn serve_read_ref_file(path) {
 
 fn serve_build_capabilities() {
     var sb = str_builder_new();
-    # The "sit" string identifies the wire-protocol release line
-    # the server promises. It bumps in lockstep with VERSION at
-    # each tag.
-    # TODO: derive from VERSION at build time. Manually bumped each
-    # release; closeout pass before tagging asserts the literal matches.
-    str_builder_add_cstr(sb, "{\"sit\":\"0.8.10\",\"max_body\":");
+    # The "sit" string identifies the wire-protocol release line the
+    # server promises; it tracks VERSION. The CI "Verify version
+    # consistency" step asserts this literal == VERSION so it cannot
+    # silently drift (it had drifted to 0.8.10 through v1.0.3 before
+    # the guard landed).
+    # TODO: derive from VERSION at build time once cyrius exposes a
+    # source-level VERSION constant — the manifest ${file:VERSION} is
+    # build-metadata only. Until then it is bumped by hand at each tag.
+    str_builder_add_cstr(sb, "{\"sit\":\"1.0.3\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[");
     if (_serve_require_auth == 1) {
