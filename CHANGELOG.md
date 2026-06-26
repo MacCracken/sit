@@ -31,7 +31,7 @@ A pre-release multi-agent adversarial review hardened the new reflog surface bef
 
 ### Notes
 
-- Build / **273 unit** / **40 integration** / fuzz (7 harnesses incl. `reflog_index` at 200k rounds, no crashes) / lint green. A new CI smoke step exercises reflog + `@{N}` recovery + the prune grace window end-to-end. DCE binary **2.375 MB** (+~126 KB vs 1.0.4 — the reflog module plus fsck/refs/wire wiring), static (`ldd` → not a dynamic executable). No toolchain/dep change.
+- Build / **273 unit** / **46 integration** / fuzz (7 harnesses incl. `reflog_index` at 200k rounds, no crashes) / lint green. The integration suite's `fsck --prune` block was rewritten for the reflog-aware semantics (protection → recovery → grace → `--prune-now`), and a new CI smoke step exercises reflog + `@{N}` recovery + the prune grace window end-to-end. DCE binary **2.375 MB** (+~126 KB vs 1.0.4 — the reflog module plus fsck/refs/wire wiring), static (`ldd` → not a dynamic executable). No toolchain/dep change.
 - **Deferred** (per ADR 0010): `reflog expire` / `delete` — reflog entries are currently unbounded, so reflog-protected objects persist until the log is cleared (`--prune` reclaims them only via `--prune-now` or after a manual log clear); and the `@{<date>}` selector. The same unsanitized-identity pattern exists in `commit.cyr` / `merge.cyr` object framing and is flagged for a follow-up hardening pass.
 
 ## [1.0.4] — 2026-06-25 — Ed25519 server certs + 1.0.x hygiene

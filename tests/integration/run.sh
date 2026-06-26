@@ -132,21 +132,37 @@ if [ "$MB" = "$ROOT" ]; then bad "merge-base returned root (pre-v0.8.13 first-pa
 # self and ancestor identities
 assert_eq "$("$SIT" merge-base main main)" "$(tr -d '\n' < .sit/refs/heads/main)" "merge-base(X,X) = X"
 
-# ── 3c. fsck --prune (v0.8.14) ─────────────────────────────────────
-# Two commits, then reset --hard to the first → the second's commit+tree+blob
-# go dangling. --prune removes exactly those; the first commit's objects stay.
+# ── 3c. fsck --prune + reflog grace (v0.8.14 prune; v1.1.0 reflog grace) ──
+# Two commits, then reset --hard to the first. v1.1.0: the reflog records the
+# discarded tip, so B's objects are reflog-REACHABLE (not dangling) and --prune
+# protects them. Clearing the log un-protects them; --prune then keeps recent
+# objects within the 90-day grace window, and --prune-now sweeps immediately.
 hr "fsck --prune"
 R="$WORK/prune"; mkdir -p "$R"; cd "$R"
 "$SIT" init >/dev/null
 printf 'v1\n' > f.txt; "$SIT" add f.txt >/dev/null; "$SIT" commit -m "A" >/dev/null
 APRUNE=$(tr -d '\n' < .sit/refs/heads/main)
 printf 'v2\n' > f.txt; "$SIT" add f.txt >/dev/null; "$SIT" commit -m "B" >/dev/null
+BPRUNE=$(tr -d '\n' < .sit/refs/heads/main)
 assert_eq "$(objcount)" "6" "two commits = 6 objects"
 "$SIT" reset --hard "$APRUNE" >/dev/null 2>&1
-assert_eq "$("$SIT" fsck | sed -n 's/.*0 bad, \([0-9]*\) dangling/\1/p')" "3" "reset --hard leaves 3 dangling (B's commit/tree/blob)"
-assert_contains "$("$SIT" fsck --prune)" "pruned 3 objects" "--prune reports 3 removed"
+# reflog protects the discarded tip → not dangling
+assert_eq "$("$SIT" fsck | sed -n 's/.*0 bad, \([0-9]*\) dangling/\1/p')" "0" "reset --hard: B's objects reflog-protected (0 dangling)"
+assert_contains "$("$SIT" fsck --prune)" "pruned 0 objects" "--prune keeps reflog-reachable objects"
+assert_eq "$(objcount)" "6" "all 6 objects survive --prune while reflog intact"
+# recovery: HEAD@{1} resolves to the discarded tip
+"$SIT" reset --hard "HEAD@{1}" >/dev/null 2>&1
+assert_eq "$(tr -d '\n' < .sit/refs/heads/main)" "$BPRUNE" "reset --hard HEAD@{1} recovers B"
+"$SIT" reset --hard "$APRUNE" >/dev/null 2>&1
+# clear the reflog → B's objects are now genuinely dangling
+rm -rf .sit/logs
+assert_eq "$("$SIT" fsck | sed -n 's/.*0 bad, \([0-9]*\) dangling/\1/p')" "3" "after clearing reflog, 3 dangling (B's commit/tree/blob)"
+# 90-day grace keeps the recent objects; --prune-now sweeps them
+assert_contains "$("$SIT" fsck --prune)" "kept 3 within grace" "--prune keeps recent dangling within grace window"
+assert_eq "$(objcount)" "6" "grace window leaves all 6 in place"
+assert_contains "$("$SIT" fsck --prune-now)" "pruned 3 objects" "--prune-now reports 3 removed"
 # fresh process: durability + reachable history intact
-assert_eq "$(objcount)" "3" "after prune, only A's 3 objects remain"
+assert_eq "$(objcount)" "3" "after prune-now, only A's 3 objects remain"
 assert_contains "$("$SIT" fsck)" "0 dangling" "post-prune fsck is dangling-free"
 assert_eq "$(cat f.txt)" "v1" "working tree still has A's content"
 assert_eq "$("$SIT" log --oneline | wc -l | tr -d ' ')" "1" "log shows only the kept commit"

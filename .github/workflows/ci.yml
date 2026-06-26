@@ -511,6 +511,11 @@ jobs:
           # unreachable. The v2 blob stays reachable via the staging
           # index (sit doesn't reset index on manual ref rewrite).
           echo -n "$ROOT_TIP" > .sit/refs/heads/main
+          # v1.1.0: the two `sit commit`s wrote reflog entries that would keep
+          # the v2 commit reflog-reachable; clear the reflog so this test still
+          # exercises the dangling-classification path (reflog roots only ever
+          # ADD reachability — the prune-grace tests cover protection).
+          rm -rf .sit/logs
           OUT=$("$GITHUB_WORKSPACE/build/sit" fsck)
           echo "$OUT"
           echo "$OUT" | grep -q "0 bad, 2 dangling" || { echo "expected 2 dangling (commit + tree) after rewind"; exit 1; }
