@@ -4,6 +4,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.4] — 2026-06-25 — Ed25519 server certs + 1.0.x hygiene
+
+First post-1.0.3 patch. No new observable surface — consumes a now-fixed upstream gap and clears accumulated drift / stale references. Headlined by Ed25519 `sit serve --tls` support, which the 1.0.3 dep bumps unblocked.
+
+### Added
+
+- **Ed25519 server certificates for `sit serve --tls`.** The parked `tls_native` gap (issue 2026-06-10) is fixed upstream: the root cause was sigil's X.509 parser being ECDSA/RSA-only — the server's `load_creds` rejected the Ed25519 cert (`x509_parse → CERT_INVALID`) before the handshake. Fixed in sigil 3.9.x, folded into cyrius 6.x. sit needed **no code change** (`sit serve --tls` and the https client are cert-algorithm-agnostic). Verified end-to-end: Ed25519 **and** ECDSA P-256 https clones both complete, TOFU-pin, and fsck clean. The https CI smoke now exercises both algorithms; getting-started drops the "ECDSA P-256 only" caveat; the issue is archived.
+- **CI guard: serve capabilities banner must equal VERSION.** The `/sit/v1/capabilities` `"sit"` field had silently drifted to `0.8.10` through v1.0.3 (no automated check). The version-consistency step now asserts the banner literal == VERSION (with a clear message if the literal can't be located), so it can't drift again.
+
+### Fixed
+
+- **serve capabilities banner** corrected from `0.8.10` to track VERSION (now `1.0.4`).
+- **clone default-target host scan** (`cmd_clone`, http(s) without `<dir>`): replaced a `break`-after-in-loop-`var` (a CLAUDE.md-flagged unreliable pattern) plus two dead `host_end = host_end` no-ops with a flag-driven loop. The derived dir is the bare host (port/path dropped) across all URL shapes.
+
+### Notes
+
+- Comment/doc accuracy sweep on touched files: `_wire_http_post` "dead code" note (now has live callers); stale version headers in `wire_http.cyr` / `wire_https.cyr` / `serve.cyr` (keep-alive v0.8.9, https v0.8.8, push v0.7.6, mTLS → 1.5.0); and `v0.7.3` dropped from two user-facing error strings.
+- Still parked (verified not yet consumable against the current pins): patra `or_ignore` for **P-11** (landed only on the SQL path, can't serve the BYTES `content` column), sankoch `zlib_decompress_with_ratio_cap` + SIMD match-finder (not landed), sigil strict-fail `hex_decode` (predates the pin; nothing to consume).
+- Build / **230 unit** / **40 integration** / fuzz / bench / lint green; Ed25519 + ECDSA P-256 https clones verified; `dist/sit.cyr` regenerated (`serve.cyr` + `wire_http.cyr` are `[lib].modules`). DCE binary **2.249 MB**, static (`ldd` → not a dynamic executable). No toolchain/dep change.
+
 ## [1.0.3] — 2026-06-25 — cyrius 6.2.44 toolchain refresh + dep bumps
 
 Toolchain + dependency refresh (same shape as the v1.0.2 / v0.8.11 refreshes). No public-surface change — the full 1.0 git-parity surface stands and the CLI / `.sit/` layout / `/sit/v1/...` wire protocol / `sit_*`/`ann_*` public API remain SemVer-governed. One small required source change: the cyrius 6.2.44 stdlib retired `fl_free`'s second (size) argument, so 30 call sites were updated to the one-arg form (see below).
