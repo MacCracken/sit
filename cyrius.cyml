@@ -26,6 +26,7 @@ modules = [
     "src/util.cyr",
     "src/validate.cyr",
     "src/config.cyr",
+    "src/reflog.cyr",
     "src/object_db.cyr",
     "src/index.cyr",
     "src/refs.cyr",

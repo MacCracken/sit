@@ -609,6 +609,119 @@ fn test_myers_diff_differential() {
     return 0;
 }
 
+fn test_reflog_format_and_index() {
+    test_group("reflog format + @{N} indexing");
+
+    var A = "1111111111111111111111111111111111111111111111111111111111111111";
+    var B = "2222222222222222222222222222222222222222222222222222222222222222";
+    var C = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    # Creation entry: old_hex == 0 → 64 ASCII '0', then SP, then new-oid.
+    var line = alloc(512);
+    var llen = reflog_format_line(line, 0, A, "n", "e", 5, "commit (initial): x");
+    assert_eq(load8(line) & 0xFF, 48, "creation old-oid byte 0 is '0'");
+    assert_eq(load8(line + 63) & 0xFF, 48, "creation old-oid byte 63 is '0'");
+    assert_eq(load8(line + 64) & 0xFF, 32, "field separator after old-oid is space");
+    assert_eq(load8(line + 65) & 0xFF, 49, "new-oid byte 0 is '1'");
+    assert_eq(load8(line + llen - 1) & 0xFF, 10, "line ends with LF");
+
+    # Message field extraction (everything after the TAB).
+    var mp[16];
+    assert_eq(_reflog_line_msg(line, llen, &mp), 1, "msg field found");
+    assert_eq(load64(&mp + 8), 19, "msg length = strlen('commit (initial): x')");
+
+    # Control bytes in a message are sanitized to spaces (no line forging).
+    var dirty = alloc(64);
+    var dn = _reflog_san_into(dirty, "a\nb\tc", 5);
+    assert_eq(dn, 5, "sanitize preserves length");
+    assert_eq(load8(dirty + 1) & 0xFF, 32, "embedded LF → space");
+    assert_eq(load8(dirty + 3) & 0xFF, 32, "embedded TAB → space");
+
+    # Regression (review #1): an LF in the IDENTITY must not forge a second
+    # line — reflog_format_line sanitizes name/email too, so the only LF in a
+    # formatted line is its terminator.
+    var fl = alloc(512);
+    var fll = reflog_format_line(fl, A, B, "ev\nil", "e\tx", 7, "msg");
+    var lfcount = 0;
+    var fi = 0;
+    while (fi < fll) { if (load8(fl + fi) == 10) { lfcount = lfcount + 1; } fi = fi + 1; }
+    assert_eq(lfcount, 1, "formatted line has exactly one LF (identity LF sanitized)");
+    assert_eq(load8(fl + fll - 1) & 0xFF, 10, "the one LF is the terminator");
+
+    # Build a 3-entry log buffer (A→B, B→C creation-chain) and index it.
+    # Entry 0: old=0 new=A ; Entry 1: old=A new=B ; Entry 2: old=B new=C.
+    var log = alloc(2048);
+    var p = 0;
+    p = p + reflog_format_line(log + p, 0, A, "n", "e", 1, "commit: a");
+    p = p + reflog_format_line(log + p, A, B, "n", "e", 2, "commit: b");
+    p = p + reflog_format_line(log + p, B, C, "n", "e", 3, "commit: c");
+    assert_eq(_reflog_count_in_buf(log, p), 3, "3 entries counted");
+
+    var out = alloc(80);
+    # @{0} = last = C ; @{1} = B ; @{2} = A ; @{3} = out of range.
+    assert_eq(_reflog_nth_in_buf(log, p, 0, out), 1, "@{0} resolves");
+    assert_streq(out, C, "@{0} is newest (C)");
+    assert_eq(_reflog_nth_in_buf(log, p, 1, out), 1, "@{1} resolves");
+    assert_streq(out, B, "@{1} is one move back (B)");
+    assert_eq(_reflog_nth_in_buf(log, p, 2, out), 1, "@{2} resolves");
+    assert_streq(out, A, "@{2} is two moves back (A)");
+    assert_eq(_reflog_nth_in_buf(log, p, 3, out), 0, "@{3} out of range");
+
+    # Empty buffer and negative index are rejected, not crashed.
+    assert_eq(_reflog_nth_in_buf(log, 0, 0, out), 0, "empty log → no entry");
+    assert_eq(_reflog_nth_in_buf(log, p, 0 - 1, out), 0, "negative index rejected");
+    return 0;
+}
+
+fn test_reflog_spec_parse() {
+    test_group("reflog @{N} selector parsing");
+
+    var spec[24];
+    # Well-formed selectors.
+    assert_eq(_reflog_spec_parse("HEAD@{0}", &spec), 1, "HEAD@{0} parses");
+    assert_eq(load64(&spec + 8), 4, "base len = 4 (HEAD)");
+    assert_eq(load64(&spec + 16), 0, "index = 0");
+
+    assert_eq(_reflog_spec_parse("HEAD@{12}", &spec), 1, "HEAD@{12} parses");
+    assert_eq(load64(&spec + 16), 12, "multi-digit index = 12");
+
+    assert_eq(_reflog_spec_parse("main@{3}", &spec), 1, "main@{3} parses");
+    assert_eq(load64(&spec + 8), 4, "base len = 4 (main)");
+    assert_eq(load64(&spec + 16), 3, "index = 3");
+
+    assert_eq(_reflog_spec_parse("origin/main@{1}", &spec), 1, "origin/main@{1} parses");
+    assert_eq(load64(&spec + 8), 11, "base len = 11 (origin/main)");
+
+    # Malformed / non-selectors must be rejected (fall through to plain lookup).
+    assert_eq(_reflog_spec_parse("HEAD", &spec), 0, "plain HEAD is not a selector");
+    assert_eq(_reflog_spec_parse("main", &spec), 0, "plain name is not a selector");
+    assert_eq(_reflog_spec_parse("@{0}", &spec), 0, "empty base rejected");
+    assert_eq(_reflog_spec_parse("HEAD@{}", &spec), 0, "empty index rejected");
+    assert_eq(_reflog_spec_parse("HEAD@{1", &spec), 0, "missing close brace rejected");
+    assert_eq(_reflog_spec_parse("HEAD@{x}", &spec), 0, "non-digit index rejected");
+    assert_eq(_reflog_spec_parse("HEAD@{1}x", &spec), 0, "trailing junk rejected");
+    assert_eq(_reflog_spec_parse("HEAD@{1.day.ago}", &spec), 0, "time form rejected (1.1.0)");
+    return 0;
+}
+
+fn test_fsck_commit_author_ts() {
+    test_group("fsck commit author-ts extraction (prune grace)");
+
+    # A well-formed commit body — author ts is the 2nd-to-last token of the
+    # "author NAME <EMAIL> TS TZ" line.
+    var body = "tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nauthor Test User <t@e.x> 1782446793 +0000\ncommitter Test User <t@e.x> 1782446793 +0000\n\nhello\n";
+    assert_eq(_fsck_commit_author_ts(body, strlen(body)), 1782446793, "author ts parsed");
+
+    # With a parent line present (merge/normal), still finds author.
+    var body2 = "tree bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nparent cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\nauthor N <e> 1000000000 +0000\ncommitter N <e> 1000000000 +0000\n\nm\n";
+    assert_eq(_fsck_commit_author_ts(body2, strlen(body2)), 1000000000, "author ts parsed past parent line");
+
+    # A blob/tree-shaped body (no author line) is undatable → 0.
+    var notc = "100644 a\0somethingbinary";
+    assert_eq(_fsck_commit_author_ts(notc, 24), 0, "no author line → 0 (undatable)");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -630,6 +743,9 @@ fn main() {
     test_sitignore_wildmatch();
     test_sitignore_negation_anchor();
     test_myers_diff_differential();
+    test_reflog_format_and_index();
+    test_reflog_spec_parse();
+    test_fsck_commit_author_ts();
     return assert_summary();
 }
 

@@ -1,0 +1,456 @@
+# reflog.cyr — ref-movement journal (.sit/logs/), git-compatible.
+#
+# Every ref movement appends one line to a per-ref log under .sit/logs/,
+# mirroring the ref tree: .sit/logs/HEAD, .sit/logs/refs/heads/<name>,
+# .sit/logs/refs/remotes/<remote>/<name>. (Tags are not logged, matching
+# git's default.) A branch-tip move that HEAD points at logs TWICE — once
+# to the branch log and once to logs/HEAD — see docs/architecture/005.
+#
+# Line format (byte-compatible with git's SHA-256 reflog):
+#   <old64> SP <new64> SP <name> " <" <email> "> " <unixts> " +0000" TAB <msg> LF
+# Creation uses 64 ASCII '0' for <old64>. Entries are append-only, newest
+# LAST; <ref>@{0} = the last line (current value), @{N} = N moves ago =
+# the NEW oid recorded at line (count-1-N). Identity + timestamp + tz
+# mirror build_commit_signed (commit.cyr) so the journal matches commits.
+#
+# This module is intentionally I/O-thin: the pure formatting / indexing
+# core (reflog_format_line, _reflog_nth_in_buf, _reflog_count_in_buf) is
+# unit-tested directly; the file wrappers (reflog_append, reflog_read_nth)
+# are exercised by the CI smoke suite.
+
+# ── Identity (mirrors build_commit_signed's resolution chain) ──────────
+# env SIT_AUTHOR_* → .sit/config / ~/.sitconfig user.* → fallback.
+# NOTE: commit.cyr and merge.cyr inline this same chain; this is the third
+# copy — a shared author_ident() helper is the natural next refactor.
+fn _reflog_user_name() {
+    var name = getenv("SIT_AUTHOR_NAME");
+    if (name == 0) { name = config_get("user.name"); }
+    if (name == 0) { name = "sit user"; }
+    return name;
+}
+
+fn _reflog_user_email() {
+    var email = getenv("SIT_AUTHOR_EMAIL");
+    if (email == 0) { email = config_get("user.email"); }
+    if (email == 0) { email = "user@localhost"; }
+    return email;
+}
+
+# Copy `len` bytes of message into dst, replacing any control byte
+# (< 0x20 or 0x7f) with a space so the entry stays a single line and
+# can't forge extra reflog records. Returns bytes written (== len).
+fn _reflog_san_into(dst, src, len) {
+    var i = 0;
+    var o = 0;
+    while (i < len) {
+        var c = load8(src + i) & 0xFF;
+        var bad = 0;
+        if (c < 32) { bad = 1; }
+        if (c == 127) { bad = 1; }
+        if (bad == 1) { store8(dst + o, 32); }
+        else { store8(dst + o, c); }
+        o = o + 1;
+        i = i + 1;
+    }
+    return o;
+}
+
+# Format one reflog line into buf. old_hex == 0 → 64 zeros (creation).
+# new_hex must be a 64-char hex cstring. Returns the line length.
+# buf must be sized >= 200 + strlen(name) + strlen(email) + strlen(msg).
+fn reflog_format_line(buf, old_hex, new_hex, name, email, ts, msg) {
+    var pos = 0;
+    if (old_hex == 0) {
+        var z = 0;
+        while (z < 64) { store8(buf + pos, 48); pos = pos + 1; z = z + 1; }
+    } else {
+        memcpy(buf + pos, old_hex, 64); pos = pos + 64;
+    }
+    store8(buf + pos, 32); pos = pos + 1;
+
+    memcpy(buf + pos, new_hex, 64); pos = pos + 64;
+    store8(buf + pos, 32); pos = pos + 1;
+
+    # Identity is sanitized exactly like the message: a control byte (LF/TAB/
+    # …) in SIT_AUTHOR_NAME/EMAIL or a hand-edited config must NOT be able to
+    # forge or shift a reflog line. _reflog_san_into preserves length.
+    var nl = _reflog_san_into(buf + pos, name, strlen(name)); pos = pos + nl;
+    memcpy(buf + pos, " <", 2); pos = pos + 2;
+    var el = _reflog_san_into(buf + pos, email, strlen(email)); pos = pos + el;
+    memcpy(buf + pos, "> ", 2); pos = pos + 2;
+
+    var d = write_decimal(buf + pos, ts); pos = pos + d;
+    memcpy(buf + pos, " +0000", 6); pos = pos + 6;
+
+    store8(buf + pos, 9); pos = pos + 1;            # TAB before message
+    var ml = _reflog_san_into(buf + pos, msg, strlen(msg)); pos = pos + ml;
+    store8(buf + pos, 10); pos = pos + 1;           # LF terminator
+    return pos;
+}
+
+# ── Reflog message builders ──────────────
+
+# "<prefix><first line of message>" as a heap cstring for a reflog entry.
+# The subject stops at the first LF; reflog_append later sanitizes any
+# remaining control bytes. Used for commit/reset entries.
+fn reflog_msg_subject(prefix, message) {
+    var pl = strlen(prefix);
+    var sl = 0;
+    var scanning = 1;
+    while (scanning == 1) {
+        var c = load8(message + sl);
+        if (c == 0) { scanning = 0; }
+        else {
+            if (c == 10) { scanning = 0; }
+            else { sl = sl + 1; }
+        }
+    }
+    var out = alloc(pl + sl + 1);
+    memcpy(out, prefix, pl);
+    memcpy(out + pl, message, sl);
+    store8(out + pl + sl, 0);
+    return out;
+}
+
+# "<a><b><c>" as a heap cstring — e.g. ("merge ", name, ": Fast-forward").
+fn reflog_msg_join(a, b, c) {
+    var al = strlen(a);
+    var bl = strlen(b);
+    var cl = strlen(c);
+    var out = alloc(al + bl + cl + 1);
+    memcpy(out, a, al);
+    memcpy(out + al, b, bl);
+    memcpy(out + al + bl, c, cl);
+    store8(out + al + bl + cl, 0);
+    return out;
+}
+
+# ── Pure indexing core (LF-terminated, append-only log buffers) ────────
+
+# Count entries (LF-terminated lines) in a log buffer.
+fn _reflog_count_in_buf(buf, len) {
+    var i = 0;
+    var c = 0;
+    while (i < len) {
+        if (load8(buf + i) == 10) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+# Byte offset where line `idx` (0-based) starts, or -1 if absent.
+fn _reflog_line_start(buf, len, idx) {
+    if (idx == 0) { return 0; }
+    var i = 0;
+    var seen = 0;
+    var found = 0 - 1;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (i >= len) { scanning = 0; }
+        else {
+            if (load8(buf + i) == 10) {
+                seen = seen + 1;
+                if (seen == idx) { found = i + 1; scanning = 0; }
+            }
+            i = i + 1;
+        }
+    }
+    return found;
+}
+
+# Resolve <ref>@{n} within a log buffer: write the new-oid (field 2) of the
+# entry n moves ago into out (65 bytes, nul-terminated). n == 0 is the last
+# (current) entry. Returns 1 on success, 0 if n is out of range or the
+# target line is malformed. Never reads past `len`.
+fn _reflog_nth_in_buf(buf, len, n, out) {
+    if (n < 0) { return 0; }
+    var c = _reflog_count_in_buf(buf, len);
+    if (n >= c) { return 0; }
+    var target = c - 1 - n;
+    var s = _reflog_line_start(buf, len, target);
+    if (s < 0) { return 0; }
+    # Layout: old(64) SP new(64) SP ... — need new-oid at [s+65, s+129).
+    if (s + 129 > len) { return 0; }
+    if (load8(buf + s + 64) != 32) { return 0; }
+    if (hex_prefix_valid(buf + s + 65, 64) == 0) { return 0; }
+    memcpy(out, buf + s + 65, 64);
+    store8(out + 64, 0);
+    return 1;
+}
+
+# Message field of one line (everything after the first TAB, up to LF).
+# Writes {ptr, len} into out_pair (16 bytes). Returns 1 if a TAB was found,
+# else 0 (ptr/len zeroed). Used by cmd_reflog rendering.
+fn _reflog_line_msg(line, len, out_pair) {
+    var i = 0;
+    var tab = 0 - 1;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (i >= len) { scanning = 0; }
+        else {
+            var c = load8(line + i);
+            if (c == 9) { tab = i; scanning = 0; }
+            else {
+                if (c == 10) { scanning = 0; }
+                else { i = i + 1; }
+            }
+        }
+    }
+    if (tab < 0) { store64(out_pair, 0); store64(out_pair + 8, 0); return 0; }
+    var mstart = tab + 1;
+    var mend = mstart;
+    var scan2 = 1;
+    while (scan2 == 1) {
+        if (mend >= len) { scan2 = 0; }
+        else {
+            if (load8(line + mend) == 10) { scan2 = 0; }
+            else { mend = mend + 1; }
+        }
+    }
+    store64(out_pair, line + mstart);
+    store64(out_pair + 8, mend - mstart);
+    return 1;
+}
+
+# Parse a "<base>@{<N>}" ordinal selector. On success writes the base ref
+# into out (24 bytes: [0]=ptr into `name`, [8]=base byte-length, [16]=N)
+# and returns 1. Returns 0 if the string isn't a well-formed @{N} selector:
+# no "@{", empty base, no closing "}", a non-digit / empty index, or junk
+# after the "}". Only the bare-integer ordinal form is accepted (the
+# @{<date>} time form is intentionally unsupported in 1.1.0). Pure — no I/O.
+fn _reflog_spec_parse(name, out) {
+    var nlen = strlen(name);
+    var at = 0 - 1;
+    var i = 0;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (i + 1 >= nlen) { scanning = 0; }
+        else {
+            if (load8(name + i) == 64) {
+                if (load8(name + i + 1) == 123) { at = i; scanning = 0; }
+                else { i = i + 1; }
+            } else { i = i + 1; }
+        }
+    }
+    if (at <= 0) { return 0; }                 # no "@{" or empty base
+    var j = at + 2;
+    var num = 0;
+    var ndig = 0;
+    var ok = 1;
+    var parsing = 1;
+    while (parsing == 1) {
+        if (j >= nlen) { ok = 0; parsing = 0; }
+        else {
+            var c = load8(name + j);
+            if (c == 125) { parsing = 0; }     # '}'
+            else {
+                if (c < 48) { ok = 0; parsing = 0; }
+                else {
+                    if (c > 57) { ok = 0; parsing = 0; }
+                    else { num = num * 10 + (c - 48); ndig = ndig + 1; j = j + 1; }
+                }
+            }
+        }
+    }
+    if (ok == 0) { return 0; }
+    if (ndig == 0) { return 0; }               # "@{}" rejected
+    if (j != nlen - 1) { return 0; }           # "}" must be the final byte
+    store64(out, name);
+    store64(out + 8, at);
+    store64(out + 16, num);
+    return 1;
+}
+
+# Push a 64-hex oid at `p` into the `roots` vec as a fresh 65-byte cstring,
+# unless it's invalid hex or the all-zeros creation sentinel. Used by fsck
+# to treat reflog entries as reachability roots (prune grace).
+fn _reflog_push_oid_if_valid(p, roots) {
+    if (hex_prefix_valid(p, 64) == 0) { return 0; }
+    var allzero = 1;
+    var k = 0;
+    while (k < 64) {
+        if (load8(p + k) != 48) { allzero = 0; k = 64; }
+        else { k = k + 1; }
+    }
+    if (allzero == 1) { return 0; }
+    var hex = alloc(65);
+    memcpy(hex, p, 64);
+    store8(hex + 64, 0);
+    vec_push(roots, hex);
+    return 0;
+}
+
+# Collect every old+new oid from a reflog buffer into `roots` (skipping the
+# all-zeros creation sentinel). Pure parse over one log file's bytes.
+fn _reflog_collect_oids(buf, len, roots) {
+    var count = _reflog_count_in_buf(buf, len);
+    var d = 0;
+    while (d < count) {
+        var s = _reflog_line_start(buf, len, d);
+        if (s >= 0) {
+            if (s + 129 <= len) {
+                if (load8(buf + s + 64) == 32) {
+                    _reflog_push_oid_if_valid(buf + s, roots);        # old
+                    _reflog_push_oid_if_valid(buf + s + 65, roots);   # new
+                }
+            }
+        }
+        d = d + 1;
+    }
+    return 0;
+}
+
+# ── File wrappers ──────────────
+
+# ".sit/logs/<refpath>" as a heap cstring. refpath is e.g. "HEAD" or
+# "refs/heads/main" or "refs/remotes/origin/main".
+fn reflog_log_path(refpath) {
+    var rl = strlen(refpath);
+    var p = alloc(10 + rl + 1);
+    memcpy(p, ".sit/logs/", 10);
+    memcpy(p + 10, refpath, rl);
+    store8(p + 10 + rl, 0);
+    return p;
+}
+
+# Append one entry to .sit/logs/<refpath> with caller-supplied identity +
+# timestamp. old_hex == 0 → creation (zeros). Returns 0 on success, -1 on
+# failure. Best-effort: callers log AFTER the ref moves, so a failed append
+# never blocks the operation. reflog_head_move uses this to stamp the HEAD
+# log and the branch log with ONE identical (ts, name, email) per move.
+fn _reflog_append_full(refpath, old_hex, new_hex, msg, name, email, ts) {
+    if (new_hex == 0) { return 0 - 1; }
+    var cap = 200 + strlen(name) + strlen(email) + strlen(msg);
+    var buf = alloc(cap);
+    var llen = reflog_format_line(buf, old_hex, new_hex, name, email, ts, msg);
+    var path = reflog_log_path(refpath);
+    ensure_parent_dirs(path);
+    if (file_append_locked(path, buf, llen) < 0) { return 0 - 1; }
+    return 0;
+}
+
+# Append one entry, resolving identity + timestamp now. Single-ref convenience
+# wrapper around _reflog_append_full (branch-create, fetch remote-tracking).
+fn reflog_append(refpath, old_hex, new_hex, msg) {
+    return _reflog_append_full(refpath, old_hex, new_hex, msg,
+        _reflog_user_name(), _reflog_user_email(), clock_epoch_secs());
+}
+
+# Resolve <ref>@{n}: read .sit/logs/<refpath>, write the new-oid of entry n
+# into out (65 bytes). Returns 1 on success, 0 if no log / out of range.
+fn reflog_read_nth(refpath, n, out) {
+    var path = reflog_log_path(refpath);
+    var pair[16];
+    if (read_file_heap(path, &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+    return _reflog_nth_in_buf(buf, len, n, out);
+}
+
+# ── `sit reflog` command ───────
+
+# Map a user-facing ref label to its log refpath under .sit/logs/. HEAD →
+# "HEAD"; otherwise prefer an existing logs/refs/heads/<label>, then
+# logs/refs/remotes/<label>; default to refs/heads/<label> (yields no
+# entries if absent). Tags are never logged, so no tags branch.
+fn _reflog_log_refpath_for(label) {
+    if (streq(label, "HEAD") == 1) { return "HEAD"; }
+    var ll = strlen(label);
+    var hp = alloc(11 + ll + 1);
+    memcpy(hp, "refs/heads/", 11);
+    memcpy(hp + 11, label, ll);
+    store8(hp + 11 + ll, 0);
+    if (file_exists(reflog_log_path(hp)) == 1) { return hp; }
+    var rp = alloc(13 + ll + 1);
+    memcpy(rp, "refs/remotes/", 13);
+    memcpy(rp + 13, label, ll);
+    store8(rp + 13 + ll, 0);
+    if (file_exists(reflog_log_path(rp)) == 1) { return rp; }
+    return hp;
+}
+
+# sit reflog [-n <count>] [<ref>]
+# Print a ref's movement history newest-first, git-shaped:
+#   <short-new-oid> <ref>@{N}: <message>
+# Defaults to HEAD. Silent (exit 0) when the ref has no log yet.
+fn cmd_reflog() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var ref_label = "HEAD";
+    var refpath = "HEAD";
+    var limit = 0 - 1;                # -1 = no limit
+    var ai = 2;
+    while (ai < argc()) {
+        var a = argv(ai);
+        if (streq(a, "-n") == 1) {
+            if (ai + 1 < argc()) { limit = atoi(argv(ai + 1)); ai = ai + 1; }
+        } else {
+            ref_label = argv_heap(ai);
+            # S-02: the label becomes a .sit/logs/ path component; reject
+            # traversal ('..', leading '/') and control chars. "HEAD" is the
+            # one literal that isn't a refname_valid ref.
+            if (streq(ref_label, "HEAD") == 0) {
+                if (refname_valid(ref_label) == 0) {
+                    eprintln("sit: invalid ref name");
+                    return 1;
+                }
+            }
+            refpath = _reflog_log_refpath_for(ref_label);
+        }
+        ai = ai + 1;
+    }
+
+    var path = reflog_log_path(refpath);
+    var pair[16];
+    if (read_file_heap(path, &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+    var count = _reflog_count_in_buf(buf, len);
+    if (count == 0) { return 0; }
+
+    var label_len = strlen(ref_label);
+    var shown = 0;
+    var d = 0;
+    while (d < count) {
+        var stop = 0;
+        if (limit >= 0) { if (shown >= limit) { stop = 1; } }
+        if (stop == 1) { d = count; }       # terminate (no break with vars)
+        else {
+            var s = _reflog_line_start(buf, len, count - 1 - d);
+            if (s >= 0) {
+                if (s + 77 <= len) {
+                    # Display sanitization: .sit/logs is on-disk data that
+                    # could be corrupt or hand-crafted, so scrub control bytes
+                    # (terminal-escape injection) out of the echoed oid + msg
+                    # before they hit the terminal. Sanitize into a buffer so
+                    # the buffered stdout ordering is preserved (S-21 class).
+                    var oidbuf[16];
+                    _reflog_san_into(&oidbuf, buf + s + 65, 12);
+                    stdout_write(&oidbuf, 12);          # short new-oid
+                    stdout_write(" ", 1);
+                    stdout_write(ref_label, label_len);
+                    stdout_write("@{", 2);
+                    var nb[24];
+                    var nd = write_decimal(&nb, d);
+                    stdout_write(&nb, nd);
+                    stdout_write("}: ", 3);
+                    var mp[16];
+                    if (_reflog_line_msg(buf + s, len - s, &mp) == 1) {
+                        var mlen = load64(&mp + 8);
+                        var sanmsg = alloc(mlen + 1);
+                        _reflog_san_into(sanmsg, load64(&mp), mlen);
+                        stdout_write(sanmsg, mlen);
+                    }
+                    stdout_write("\n", 1);
+                    shown = shown + 1;
+                }
+            }
+            d = d + 1;
+        }
+    }
+    stdout_flush();
+    return 0;
+}

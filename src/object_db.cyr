@@ -564,6 +564,36 @@ fn fsck_walk_refs_dir(dir, roots) {
 #   .sit/refs/heads/<*>, .sit/refs/tags/<*>, .sit/refs/remotes/<*>/<*>
 # plus .sit/HEAD when it's a raw hex (detached) rather than symbolic.
 # Symbolic HEAD targets are already covered by the matching ref file.
+# Add every reflog entry's old+new oid (across all .sit/logs/** files) to
+# `roots`. This is the reflog-reachability half of the v1.1.0 prune grace:
+# an object referenced by any reflog entry is reachable, so `fsck --prune`
+# won't drop the very commits the reflog exists to recover (e.g. the tip a
+# `reset --hard` discarded). Mirrors git fsck's default reflog-as-roots.
+fn fsck_collect_reflog_roots(roots) {
+    if (file_exists(".sit/logs") != 1) { return 0; }
+    var files = vec_new();
+    dir_walk(str_from(".sit/logs"), files);
+    var i = 0;
+    while (i < vec_len(files)) {
+        var fp = vec_get(files, i);
+        var fl = str_len(fp);
+        var fc = alloc(fl + 1);
+        memcpy(fc, str_data(fp), fl);
+        store8(fc + fl, 0);
+        var pair[16];
+        if (read_file_heap(fc, &pair) == 0) {
+            _reflog_collect_oids(load64(&pair), load64(&pair + 8), roots);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Collect ONLY the refs/HEAD roots (heads, tags, remotes, detached HEAD).
+# Reflog roots are collected separately by cmd_fsck via
+# fsck_collect_reflog_roots so the "every object unreachable" prune tripwire
+# can judge corruption from the refs set alone — a stale reflog must not mask
+# a wiped HEAD/refs and let --prune delete a ref-only-reachable branch.
 fn fsck_collect_roots() {
     var roots = vec_new();
     fsck_walk_refs_dir(".sit/refs/heads",   roots);
@@ -763,20 +793,94 @@ fn db_object_delete(db, hex) {
     return patra_exec(db, sql);
 }
 
+# Extract a commit's author timestamp (unix seconds) from its raw body, for
+# the prune age-window check. The ident line is "author NAME <EMAIL> TS TZ";
+# TS is the second-to-last space-delimited token. Returns 0 if no parseable
+# author line (caller then treats the object as undatable). Self-contained
+# (parse_commit_body lives in the later commit.cyr module, out of bundle reach).
+fn _fsck_commit_author_ts(body, len) {
+    var i = 0;
+    var astart = 0 - 1;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (i + 7 > len) { scanning = 0; }
+        else {
+            var at_ls = 0;
+            if (i == 0) { at_ls = 1; }
+            else { if (load8(body + i - 1) == 10) { at_ls = 1; } }
+            if (at_ls == 1) {
+                if (memeq(body + i, "author ", 7) == 1) { astart = i + 7; scanning = 0; }
+            }
+            if (scanning == 1) { i = i + 1; }
+        }
+    }
+    if (astart < 0) { return 0; }
+
+    var aend = astart;
+    var f2 = 1;
+    while (f2 == 1) {
+        if (aend >= len) { f2 = 0; }
+        else { if (load8(body + aend) == 10) { f2 = 0; } else { aend = aend + 1; } }
+    }
+
+    # Walk back over the TZ token to the space before it → that's ts_end.
+    var p = aend - 1;
+    var s1 = 1;
+    while (s1 == 1) {
+        if (p < astart) { s1 = 0; }
+        else { if (load8(body + p) == 32) { s1 = 0; } else { p = p - 1; } }
+    }
+    var ts_end = p;
+    # ts_start = one past the previous space.
+    var ts_start = ts_end;
+    var s2 = 1;
+    while (s2 == 1) {
+        if (ts_start - 1 < astart) { s2 = 0; }
+        else {
+            if (load8(body + ts_start - 1) == 32) { s2 = 0; }
+            else { ts_start = ts_start - 1; }
+        }
+    }
+    if (ts_start >= ts_end) { return 0; }
+
+    var val = 0;
+    var k = ts_start;
+    var okp = 1;
+    while (k < ts_end) {
+        var d = load8(body + k);
+        if (d < 48) { okp = 0; k = ts_end; }
+        else {
+            if (d > 57) { okp = 0; k = ts_end; }
+            else { val = val * 10 + (d - 48); k = k + 1; }
+        }
+    }
+    if (okp == 0) { return 0; }
+    return val;
+}
+
 fn cmd_fsck() {
     if (file_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
 
-    # v0.8.14: `--prune` removes the dangling (unreachable) objects this walk
-    # identifies. Immediate + unrecoverable (sit has no reflog yet — matches
-    # `git gc --prune=now`, not git's default 2-week grace). Refused while a
-    # merge is in progress so a half-finished op's objects can't be dropped.
+    # `--prune` removes dangling (unreachable) objects this walk identifies.
+    # v1.1.0 added two grace mechanisms vs the old unconditional --prune=now:
+    #   (1) reflog reachability — every .sit/logs/** entry's oids are roots
+    #       (fsck_collect_reflog_roots), so a reset-discarded tip is protected
+    #       as long as its reflog entry exists; and
+    #   (2) an age window — a still-dangling object is kept unless it's older
+    #       than the grace window. Datable objects are commits (author ts);
+    #       trees/blobs can't be dated, so a positive window keeps them.
+    # `--prune` uses a 90-day window (git's gc.reflogExpire default); the
+    # legacy immediate behaviour is `--prune-now` (grace 0, like
+    # `git gc --prune=now`). Both are refused mid-merge (.sit/MERGE_HEAD).
     var prune = 0;
+    var grace_days = 90;
     var ai = 2;
     while (ai < argc()) {
         if (streq(argv(ai), "--prune") == 1) { prune = 1; }
+        if (streq(argv(ai), "--prune-now") == 1) { prune = 1; grace_days = 0; }
         ai = ai + 1;
     }
     if (prune == 1) {
@@ -842,9 +946,12 @@ fn cmd_fsck() {
         hi = hi + 1;
     }
 
-    # Reachability pass (v0.8.5).
+    # Reachability pass (v0.8.5). Refs/HEAD roots first (count retained for
+    # the prune corrupt-roots tripwire), then reflog roots appended (v1.1.0).
     var seen = map_new();
     var roots = fsck_collect_roots();
+    var ref_root_count = vec_len(roots);
+    fsck_collect_reflog_roots(roots);
     var ri = 0;
     while (ri < vec_len(roots)) {
         fsck_walk_reachable(vec_get(roots, ri), seen);
@@ -919,18 +1026,65 @@ fn cmd_fsck() {
                 return 1;
             }
         }
+        # Corrupt-roots tripwire: a stale .sit/logs must not stand in for a
+        # wiped HEAD/refs. If there are NO refs/HEAD roots (only reflog roots),
+        # the ref store is broken — pruning would delete any branch that was
+        # never reflogged. Refuse unless there are objects but genuinely no
+        # refs at all is impossible after init (HEAD always resolves once a
+        # commit exists), so an empty ref-root set with objects present is the
+        # corruption signal.
+        if (total > 0) {
+            if (ref_root_count == 0) {
+                eprintln("sit: refusing --prune — no valid refs/HEAD roots (corrupt or missing HEAD/refs?)");
+                return 1;
+            }
+        }
+        # Age window: keep a still-dangling object unless it's older than the
+        # grace window. Only commits carry a timestamp (author ts); trees/blobs
+        # are undatable, so any positive window keeps them (grace 0 deletes
+        # everything dangling — the old --prune=now behaviour).
+        var now = clock_epoch_secs();
+        var grace_secs = grace_days * 86400;
         var pruned = 0;
+        var kept = 0;
         var pi = 0;
         while (pi < vec_len(dangling_hexes)) {
-            if (db_object_delete(db, vec_get(dangling_hexes, pi)) == 0) {
-                pruned = pruned + 1;
+            var dhex = vec_get(dangling_hexes, pi);
+            var keep = 0;
+            if (grace_secs > 0) {
+                # Conservative default under a positive window: KEEP unless we
+                # can positively date the object past the window. Commits are
+                # datable (author ts); an undatable commit (unreadable body or
+                # unparseable ts) is kept just like trees/blobs — never delete
+                # something we can't prove is old.
+                keep = 1;
+                var dstored = map_get(ty_map, dhex);
+                if (dstored == 3) {                 # ty 2 (commit) + 1
+                    var co[24];
+                    if (read_object(dhex, &co) == 0) {
+                        var cts = _fsck_commit_author_ts(load64(&co), load64(&co + 8));
+                        if (cts > 0) {
+                            if (now - cts >= grace_secs) { keep = 0; }
+                        }
+                    }
+                }
+            }
+            if (keep == 1) { kept = kept + 1; }
+            else {
+                if (db_object_delete(db, dhex) == 0) { pruned = pruned + 1; }
             }
             pi = pi + 1;
         }
         patra_flush(db);
         stdout_write("pruned ", 7);
         write_unsigned(pruned);
-        stdout_write(" objects\n", 9);
+        stdout_write(" objects", 8);
+        if (kept > 0) {
+            stdout_write(", kept ", 7);
+            write_unsigned(kept);
+            stdout_write(" within grace", 13);
+        }
+        stdout_write("\n", 1);
     }
 
     if (bad > 0) { return 1; }

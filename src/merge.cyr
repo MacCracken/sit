@@ -587,6 +587,8 @@ fn cmd_merge() {
             return 1;
         }
         materialize_target(&target_hex);
+        reflog_head_move(head_hex, &target_hex,
+            reflog_msg_join("merge ", target_name, ": Fast-forward"));
 
         stdout_write("fast-forward to ", 16);
         stdout_write(&target_hex, 12);
@@ -813,6 +815,8 @@ fn cmd_merge() {
         return 1;
     }
     materialize_target(merge_hex);
+    reflog_head_move(head_copy, merge_hex,
+        reflog_msg_join("merge ", target_name, ": Merge made by the '3-way' strategy"));
 
     stdout_write("merge ", 6);
     stdout_write(merge_hex, 12);

@@ -167,6 +167,31 @@ fn fuzz_ssh_url_parser(rounds) {
     return 0;
 }
 
+# Feed random bytes to the reflog index/parse core as if it were a log
+# buffer. count/nth/msg must never read past `len` or crash on garbage.
+fn fuzz_reflog_index(rounds) {
+    var buf_cap = 4096;
+    var input = alloc(buf_cap);
+    var out = alloc(80);
+    var pair[16];
+    var seed = 7;
+    var i = 0;
+    while (i < rounds) {
+        var size = (seed & 0xFFF) + 1;  # 1..4096
+        if (size > buf_cap) { size = buf_cap; }
+        fill_pseudo_random(input, size, seed);
+        _reflog_count_in_buf(input, size);
+        var n = (seed >> 8) & 0x3F;
+        _reflog_nth_in_buf(input, size, n, out);
+        _reflog_nth_in_buf(input, size, 0, out);
+        _reflog_nth_in_buf(input, size, 0 - 1, out);
+        _reflog_line_msg(input, size, &pair);
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn main() {
     alloc_init();
     println("fuzz: zlib_decompress (10000 rounds)");
@@ -181,6 +206,8 @@ fn main() {
     if (fuzz_ssh_url_parser(100000) != 0) { return 1; }
     println("fuzz: want_frame_decoder (10000000 rounds)");
     if (fuzz_want_frame_decoder(10000000) != 0) { return 1; }
+    println("fuzz: reflog_index (200000 rounds)");
+    if (fuzz_reflog_index(200000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

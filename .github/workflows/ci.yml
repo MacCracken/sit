@@ -422,6 +422,40 @@ jobs:
           "$GITHUB_WORKSPACE/build/sit" log | head -5
           "$GITHUB_WORKSPACE/build/sit" fsck
 
+      - name: Smoke — reflog + @{N} recovery + prune grace (v1.1.0)
+        run: |
+          export HOME=$GITHUB_WORKSPACE/ci-home
+          mkdir -p "$HOME"
+          demo=$(mktemp -d)
+          cd "$demo"
+          export SIT_AUTHOR_NAME="CI Runner"
+          export SIT_AUTHOR_EMAIL="ci@example.com"
+          SIT="$GITHUB_WORKSPACE/build/sit"
+          "$SIT" init
+          echo 1 > f; "$SIT" add f; "$SIT" commit -m one
+          echo 2 >> f; "$SIT" add f; "$SIT" commit -m two
+          echo 3 >> f; "$SIT" add f; "$SIT" commit -m three
+          # reflog records every move; HEAD@{0} is current, newest-first listing
+          "$SIT" reflog | head -5
+          THREE=$(cat .sit/refs/heads/main)
+          FIRST=$("$SIT" reflog | tail -1 | cut -d' ' -f1)
+          # recovery: destructive reset, then undo it via HEAD@{1}
+          "$SIT" reset --hard "$FIRST"
+          "$SIT" reset --hard "HEAD@{1}"
+          NOW=$(cat .sit/refs/heads/main)
+          [ "$NOW" = "$THREE" ] || { echo "reflog recovery failed: $NOW != $THREE"; exit 1; }
+          # protection: discard the tip again and STAY there — reflog still has
+          # the entries, so fsck must report the discarded objects as reachable
+          "$SIT" reset --hard "$FIRST"
+          "$SIT" fsck | grep -q "0 dangling" || { echo "reflog should protect discarded tip from dangling"; exit 1; }
+          # grace: clear the log → the discarded chain is now dangling. --prune
+          # keeps recent commits within the 90-day window; --prune-now sweeps.
+          rm -rf .sit/logs
+          "$SIT" fsck | grep -q "0 dangling" && { echo "expected dangling objects after clearing reflog"; exit 1; }
+          "$SIT" fsck --prune | grep -q "kept" || { echo "expected --prune to keep recent objects within grace"; exit 1; }
+          "$SIT" fsck --prune-now
+          "$SIT" fsck | grep -q "0 bad, 0 dangling" || { echo "integrity must survive prune-now"; exit 1; }
+
       - name: Smoke — integration suite (v0.8.12 shallow clone + log --graph)
         run: |
           export SIT="$GITHUB_WORKSPACE/build/sit"

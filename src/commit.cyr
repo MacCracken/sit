@@ -1008,6 +1008,12 @@ fn cmd_commit() {
         return 1;
     }
 
+    # Reflog: parent_hex (read before the write) is the old tip; 0 → initial.
+    var rl_prefix = "commit: ";
+    if (merge_parent != 0) { rl_prefix = "commit (merge): "; }
+    else { if (parent_hex == 0) { rl_prefix = "commit (initial): "; } }
+    reflog_head_move(parent_hex, commit_hex, reflog_msg_subject(rl_prefix, message));
+
     var branch = current_branch_name();
     stdout_write("[", 1);
     if (branch != 0) { stdout_write(branch, strlen(branch)); }

@@ -371,11 +371,13 @@ fn cmd_reset() {
             syscall(SYS_WRITE, STDERR, "'\n", 2);
             return 1;
         }
+        var rl_old = read_head_ref();
         if (write_head_ref(&hex) != 0) {
             eprintln("sit: failed to update branch ref");
             return 1;
         }
         materialize_target(&hex);
+        reflog_head_move(rl_old, &hex, reflog_msg_subject("reset: moving to ", target));
         stdout_write("HEAD reset --hard to ", 21);
         stdout_write(&hex, 12);
         stdout_write("\n", 1);

@@ -88,7 +88,11 @@ fn refname_valid(name) {
         var c = load8(name + i) & 0xFF;
         if (_ref_is_bad_char(c) == 1) { return 0; }
 
-        # Check for '@{' sequence
+        # Check for '@{' sequence. This rejects '@{' in ref-NAME context so
+        # a name like main@{0} never becomes a .sit/refs/.../main@{0} file.
+        # It does NOT gate '@{N}' in REVISION context — that ordinal reflog
+        # selector is parsed in resolve_reflog_spec (refs.cyr) before any ref
+        # lookup, so `sit reset --hard HEAD@{1}` resolves via .sit/logs/.
         if (c == 64) {
             if (i + 1 < len) {
                 if (load8(name + i + 1) == 123) { return 0; }

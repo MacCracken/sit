@@ -336,7 +336,11 @@ fn refname_valid(name) {
         var c = load8(name + i) & 0xFF;
         if (_ref_is_bad_char(c) == 1) { return 0; }
 
-        # Check for '@{' sequence
+        # Check for '@{' sequence. This rejects '@{' in ref-NAME context so
+        # a name like main@{0} never becomes a .sit/refs/.../main@{0} file.
+        # It does NOT gate '@{N}' in REVISION context — that ordinal reflog
+        # selector is parsed in resolve_reflog_spec (refs.cyr) before any ref
+        # lookup, so `sit reset --hard HEAD@{1}` resolves via .sit/logs/.
         if (c == 64) {
             if (i + 1 < len) {
                 if (load8(name + i + 1) == 123) { return 0; }
@@ -1097,6 +1101,465 @@ fn cmd_config() {
     return 0;
 }
 
+# --- reflog.cyr ---
+
+# reflog.cyr — ref-movement journal (.sit/logs/), git-compatible.
+#
+# Every ref movement appends one line to a per-ref log under .sit/logs/,
+# mirroring the ref tree: .sit/logs/HEAD, .sit/logs/refs/heads/<name>,
+# .sit/logs/refs/remotes/<remote>/<name>. (Tags are not logged, matching
+# git's default.) A branch-tip move that HEAD points at logs TWICE — once
+# to the branch log and once to logs/HEAD — see docs/architecture/005.
+#
+# Line format (byte-compatible with git's SHA-256 reflog):
+#   <old64> SP <new64> SP <name> " <" <email> "> " <unixts> " +0000" TAB <msg> LF
+# Creation uses 64 ASCII '0' for <old64>. Entries are append-only, newest
+# LAST; <ref>@{0} = the last line (current value), @{N} = N moves ago =
+# the NEW oid recorded at line (count-1-N). Identity + timestamp + tz
+# mirror build_commit_signed (commit.cyr) so the journal matches commits.
+#
+# This module is intentionally I/O-thin: the pure formatting / indexing
+# core (reflog_format_line, _reflog_nth_in_buf, _reflog_count_in_buf) is
+# unit-tested directly; the file wrappers (reflog_append, reflog_read_nth)
+# are exercised by the CI smoke suite.
+
+# ── Identity (mirrors build_commit_signed's resolution chain) ──────────
+# env SIT_AUTHOR_* → .sit/config / ~/.sitconfig user.* → fallback.
+# NOTE: commit.cyr and merge.cyr inline this same chain; this is the third
+# copy — a shared author_ident() helper is the natural next refactor.
+fn _reflog_user_name() {
+    var name = getenv("SIT_AUTHOR_NAME");
+    if (name == 0) { name = config_get("user.name"); }
+    if (name == 0) { name = "sit user"; }
+    return name;
+}
+
+fn _reflog_user_email() {
+    var email = getenv("SIT_AUTHOR_EMAIL");
+    if (email == 0) { email = config_get("user.email"); }
+    if (email == 0) { email = "user@localhost"; }
+    return email;
+}
+
+# Copy `len` bytes of message into dst, replacing any control byte
+# (< 0x20 or 0x7f) with a space so the entry stays a single line and
+# can't forge extra reflog records. Returns bytes written (== len).
+fn _reflog_san_into(dst, src, len) {
+    var i = 0;
+    var o = 0;
+    while (i < len) {
+        var c = load8(src + i) & 0xFF;
+        var bad = 0;
+        if (c < 32) { bad = 1; }
+        if (c == 127) { bad = 1; }
+        if (bad == 1) { store8(dst + o, 32); }
+        else { store8(dst + o, c); }
+        o = o + 1;
+        i = i + 1;
+    }
+    return o;
+}
+
+# Format one reflog line into buf. old_hex == 0 → 64 zeros (creation).
+# new_hex must be a 64-char hex cstring. Returns the line length.
+# buf must be sized >= 200 + strlen(name) + strlen(email) + strlen(msg).
+fn reflog_format_line(buf, old_hex, new_hex, name, email, ts, msg) {
+    var pos = 0;
+    if (old_hex == 0) {
+        var z = 0;
+        while (z < 64) { store8(buf + pos, 48); pos = pos + 1; z = z + 1; }
+    } else {
+        memcpy(buf + pos, old_hex, 64); pos = pos + 64;
+    }
+    store8(buf + pos, 32); pos = pos + 1;
+
+    memcpy(buf + pos, new_hex, 64); pos = pos + 64;
+    store8(buf + pos, 32); pos = pos + 1;
+
+    # Identity is sanitized exactly like the message: a control byte (LF/TAB/
+    # …) in SIT_AUTHOR_NAME/EMAIL or a hand-edited config must NOT be able to
+    # forge or shift a reflog line. _reflog_san_into preserves length.
+    var nl = _reflog_san_into(buf + pos, name, strlen(name)); pos = pos + nl;
+    memcpy(buf + pos, " <", 2); pos = pos + 2;
+    var el = _reflog_san_into(buf + pos, email, strlen(email)); pos = pos + el;
+    memcpy(buf + pos, "> ", 2); pos = pos + 2;
+
+    var d = write_decimal(buf + pos, ts); pos = pos + d;
+    memcpy(buf + pos, " +0000", 6); pos = pos + 6;
+
+    store8(buf + pos, 9); pos = pos + 1;            # TAB before message
+    var ml = _reflog_san_into(buf + pos, msg, strlen(msg)); pos = pos + ml;
+    store8(buf + pos, 10); pos = pos + 1;           # LF terminator
+    return pos;
+}
+
+# ── Reflog message builders ──────────────
+
+# "<prefix><first line of message>" as a heap cstring for a reflog entry.
+# The subject stops at the first LF; reflog_append later sanitizes any
+# remaining control bytes. Used for commit/reset entries.
+fn reflog_msg_subject(prefix, message) {
+    var pl = strlen(prefix);
+    var sl = 0;
+    var scanning = 1;
+    while (scanning == 1) {
+        var c = load8(message + sl);
+        if (c == 0) { scanning = 0; }
+        else {
+            if (c == 10) { scanning = 0; }
+            else { sl = sl + 1; }
+        }
+    }
+    var out = alloc(pl + sl + 1);
+    memcpy(out, prefix, pl);
+    memcpy(out + pl, message, sl);
+    store8(out + pl + sl, 0);
+    return out;
+}
+
+# "<a><b><c>" as a heap cstring — e.g. ("merge ", name, ": Fast-forward").
+fn reflog_msg_join(a, b, c) {
+    var al = strlen(a);
+    var bl = strlen(b);
+    var cl = strlen(c);
+    var out = alloc(al + bl + cl + 1);
+    memcpy(out, a, al);
+    memcpy(out + al, b, bl);
+    memcpy(out + al + bl, c, cl);
+    store8(out + al + bl + cl, 0);
+    return out;
+}
+
+# ── Pure indexing core (LF-terminated, append-only log buffers) ────────
+
+# Count entries (LF-terminated lines) in a log buffer.
+fn _reflog_count_in_buf(buf, len) {
+    var i = 0;
+    var c = 0;
+    while (i < len) {
+        if (load8(buf + i) == 10) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+# Byte offset where line `idx` (0-based) starts, or -1 if absent.
+fn _reflog_line_start(buf, len, idx) {
+    if (idx == 0) { return 0; }
+    var i = 0;
+    var seen = 0;
+    var found = 0 - 1;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (i >= len) { scanning = 0; }
+        else {
+            if (load8(buf + i) == 10) {
+                seen = seen + 1;
+                if (seen == idx) { found = i + 1; scanning = 0; }
+            }
+            i = i + 1;
+        }
+    }
+    return found;
+}
+
+# Resolve <ref>@{n} within a log buffer: write the new-oid (field 2) of the
+# entry n moves ago into out (65 bytes, nul-terminated). n == 0 is the last
+# (current) entry. Returns 1 on success, 0 if n is out of range or the
+# target line is malformed. Never reads past `len`.
+fn _reflog_nth_in_buf(buf, len, n, out) {
+    if (n < 0) { return 0; }
+    var c = _reflog_count_in_buf(buf, len);
+    if (n >= c) { return 0; }
+    var target = c - 1 - n;
+    var s = _reflog_line_start(buf, len, target);
+    if (s < 0) { return 0; }
+    # Layout: old(64) SP new(64) SP ... — need new-oid at [s+65, s+129).
+    if (s + 129 > len) { return 0; }
+    if (load8(buf + s + 64) != 32) { return 0; }
+    if (hex_prefix_valid(buf + s + 65, 64) == 0) { return 0; }
+    memcpy(out, buf + s + 65, 64);
+    store8(out + 64, 0);
+    return 1;
+}
+
+# Message field of one line (everything after the first TAB, up to LF).
+# Writes {ptr, len} into out_pair (16 bytes). Returns 1 if a TAB was found,
+# else 0 (ptr/len zeroed). Used by cmd_reflog rendering.
+fn _reflog_line_msg(line, len, out_pair) {
+    var i = 0;
+    var tab = 0 - 1;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (i >= len) { scanning = 0; }
+        else {
+            var c = load8(line + i);
+            if (c == 9) { tab = i; scanning = 0; }
+            else {
+                if (c == 10) { scanning = 0; }
+                else { i = i + 1; }
+            }
+        }
+    }
+    if (tab < 0) { store64(out_pair, 0); store64(out_pair + 8, 0); return 0; }
+    var mstart = tab + 1;
+    var mend = mstart;
+    var scan2 = 1;
+    while (scan2 == 1) {
+        if (mend >= len) { scan2 = 0; }
+        else {
+            if (load8(line + mend) == 10) { scan2 = 0; }
+            else { mend = mend + 1; }
+        }
+    }
+    store64(out_pair, line + mstart);
+    store64(out_pair + 8, mend - mstart);
+    return 1;
+}
+
+# Parse a "<base>@{<N>}" ordinal selector. On success writes the base ref
+# into out (24 bytes: [0]=ptr into `name`, [8]=base byte-length, [16]=N)
+# and returns 1. Returns 0 if the string isn't a well-formed @{N} selector:
+# no "@{", empty base, no closing "}", a non-digit / empty index, or junk
+# after the "}". Only the bare-integer ordinal form is accepted (the
+# @{<date>} time form is intentionally unsupported in 1.1.0). Pure — no I/O.
+fn _reflog_spec_parse(name, out) {
+    var nlen = strlen(name);
+    var at = 0 - 1;
+    var i = 0;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (i + 1 >= nlen) { scanning = 0; }
+        else {
+            if (load8(name + i) == 64) {
+                if (load8(name + i + 1) == 123) { at = i; scanning = 0; }
+                else { i = i + 1; }
+            } else { i = i + 1; }
+        }
+    }
+    if (at <= 0) { return 0; }                 # no "@{" or empty base
+    var j = at + 2;
+    var num = 0;
+    var ndig = 0;
+    var ok = 1;
+    var parsing = 1;
+    while (parsing == 1) {
+        if (j >= nlen) { ok = 0; parsing = 0; }
+        else {
+            var c = load8(name + j);
+            if (c == 125) { parsing = 0; }     # '}'
+            else {
+                if (c < 48) { ok = 0; parsing = 0; }
+                else {
+                    if (c > 57) { ok = 0; parsing = 0; }
+                    else { num = num * 10 + (c - 48); ndig = ndig + 1; j = j + 1; }
+                }
+            }
+        }
+    }
+    if (ok == 0) { return 0; }
+    if (ndig == 0) { return 0; }               # "@{}" rejected
+    if (j != nlen - 1) { return 0; }           # "}" must be the final byte
+    store64(out, name);
+    store64(out + 8, at);
+    store64(out + 16, num);
+    return 1;
+}
+
+# Push a 64-hex oid at `p` into the `roots` vec as a fresh 65-byte cstring,
+# unless it's invalid hex or the all-zeros creation sentinel. Used by fsck
+# to treat reflog entries as reachability roots (prune grace).
+fn _reflog_push_oid_if_valid(p, roots) {
+    if (hex_prefix_valid(p, 64) == 0) { return 0; }
+    var allzero = 1;
+    var k = 0;
+    while (k < 64) {
+        if (load8(p + k) != 48) { allzero = 0; k = 64; }
+        else { k = k + 1; }
+    }
+    if (allzero == 1) { return 0; }
+    var hex = alloc(65);
+    memcpy(hex, p, 64);
+    store8(hex + 64, 0);
+    vec_push(roots, hex);
+    return 0;
+}
+
+# Collect every old+new oid from a reflog buffer into `roots` (skipping the
+# all-zeros creation sentinel). Pure parse over one log file's bytes.
+fn _reflog_collect_oids(buf, len, roots) {
+    var count = _reflog_count_in_buf(buf, len);
+    var d = 0;
+    while (d < count) {
+        var s = _reflog_line_start(buf, len, d);
+        if (s >= 0) {
+            if (s + 129 <= len) {
+                if (load8(buf + s + 64) == 32) {
+                    _reflog_push_oid_if_valid(buf + s, roots);        # old
+                    _reflog_push_oid_if_valid(buf + s + 65, roots);   # new
+                }
+            }
+        }
+        d = d + 1;
+    }
+    return 0;
+}
+
+# ── File wrappers ──────────────
+
+# ".sit/logs/<refpath>" as a heap cstring. refpath is e.g. "HEAD" or
+# "refs/heads/main" or "refs/remotes/origin/main".
+fn reflog_log_path(refpath) {
+    var rl = strlen(refpath);
+    var p = alloc(10 + rl + 1);
+    memcpy(p, ".sit/logs/", 10);
+    memcpy(p + 10, refpath, rl);
+    store8(p + 10 + rl, 0);
+    return p;
+}
+
+# Append one entry to .sit/logs/<refpath> with caller-supplied identity +
+# timestamp. old_hex == 0 → creation (zeros). Returns 0 on success, -1 on
+# failure. Best-effort: callers log AFTER the ref moves, so a failed append
+# never blocks the operation. reflog_head_move uses this to stamp the HEAD
+# log and the branch log with ONE identical (ts, name, email) per move.
+fn _reflog_append_full(refpath, old_hex, new_hex, msg, name, email, ts) {
+    if (new_hex == 0) { return 0 - 1; }
+    var cap = 200 + strlen(name) + strlen(email) + strlen(msg);
+    var buf = alloc(cap);
+    var llen = reflog_format_line(buf, old_hex, new_hex, name, email, ts, msg);
+    var path = reflog_log_path(refpath);
+    ensure_parent_dirs(path);
+    if (file_append_locked(path, buf, llen) < 0) { return 0 - 1; }
+    return 0;
+}
+
+# Append one entry, resolving identity + timestamp now. Single-ref convenience
+# wrapper around _reflog_append_full (branch-create, fetch remote-tracking).
+fn reflog_append(refpath, old_hex, new_hex, msg) {
+    return _reflog_append_full(refpath, old_hex, new_hex, msg,
+        _reflog_user_name(), _reflog_user_email(), clock_epoch_secs());
+}
+
+# Resolve <ref>@{n}: read .sit/logs/<refpath>, write the new-oid of entry n
+# into out (65 bytes). Returns 1 on success, 0 if no log / out of range.
+fn reflog_read_nth(refpath, n, out) {
+    var path = reflog_log_path(refpath);
+    var pair[16];
+    if (read_file_heap(path, &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+    return _reflog_nth_in_buf(buf, len, n, out);
+}
+
+# ── `sit reflog` command ───────
+
+# Map a user-facing ref label to its log refpath under .sit/logs/. HEAD →
+# "HEAD"; otherwise prefer an existing logs/refs/heads/<label>, then
+# logs/refs/remotes/<label>; default to refs/heads/<label> (yields no
+# entries if absent). Tags are never logged, so no tags branch.
+fn _reflog_log_refpath_for(label) {
+    if (streq(label, "HEAD") == 1) { return "HEAD"; }
+    var ll = strlen(label);
+    var hp = alloc(11 + ll + 1);
+    memcpy(hp, "refs/heads/", 11);
+    memcpy(hp + 11, label, ll);
+    store8(hp + 11 + ll, 0);
+    if (file_exists(reflog_log_path(hp)) == 1) { return hp; }
+    var rp = alloc(13 + ll + 1);
+    memcpy(rp, "refs/remotes/", 13);
+    memcpy(rp + 13, label, ll);
+    store8(rp + 13 + ll, 0);
+    if (file_exists(reflog_log_path(rp)) == 1) { return rp; }
+    return hp;
+}
+
+# sit reflog [-n <count>] [<ref>]
+# Print a ref's movement history newest-first, git-shaped:
+#   <short-new-oid> <ref>@{N}: <message>
+# Defaults to HEAD. Silent (exit 0) when the ref has no log yet.
+fn cmd_reflog() {
+    if (file_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var ref_label = "HEAD";
+    var refpath = "HEAD";
+    var limit = 0 - 1;                # -1 = no limit
+    var ai = 2;
+    while (ai < argc()) {
+        var a = argv(ai);
+        if (streq(a, "-n") == 1) {
+            if (ai + 1 < argc()) { limit = atoi(argv(ai + 1)); ai = ai + 1; }
+        } else {
+            ref_label = argv_heap(ai);
+            # S-02: the label becomes a .sit/logs/ path component; reject
+            # traversal ('..', leading '/') and control chars. "HEAD" is the
+            # one literal that isn't a refname_valid ref.
+            if (streq(ref_label, "HEAD") == 0) {
+                if (refname_valid(ref_label) == 0) {
+                    eprintln("sit: invalid ref name");
+                    return 1;
+                }
+            }
+            refpath = _reflog_log_refpath_for(ref_label);
+        }
+        ai = ai + 1;
+    }
+
+    var path = reflog_log_path(refpath);
+    var pair[16];
+    if (read_file_heap(path, &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+    var count = _reflog_count_in_buf(buf, len);
+    if (count == 0) { return 0; }
+
+    var label_len = strlen(ref_label);
+    var shown = 0;
+    var d = 0;
+    while (d < count) {
+        var stop = 0;
+        if (limit >= 0) { if (shown >= limit) { stop = 1; } }
+        if (stop == 1) { d = count; }       # terminate (no break with vars)
+        else {
+            var s = _reflog_line_start(buf, len, count - 1 - d);
+            if (s >= 0) {
+                if (s + 77 <= len) {
+                    # Display sanitization: .sit/logs is on-disk data that
+                    # could be corrupt or hand-crafted, so scrub control bytes
+                    # (terminal-escape injection) out of the echoed oid + msg
+                    # before they hit the terminal. Sanitize into a buffer so
+                    # the buffered stdout ordering is preserved (S-21 class).
+                    var oidbuf[16];
+                    _reflog_san_into(&oidbuf, buf + s + 65, 12);
+                    stdout_write(&oidbuf, 12);          # short new-oid
+                    stdout_write(" ", 1);
+                    stdout_write(ref_label, label_len);
+                    stdout_write("@{", 2);
+                    var nb[24];
+                    var nd = write_decimal(&nb, d);
+                    stdout_write(&nb, nd);
+                    stdout_write("}: ", 3);
+                    var mp[16];
+                    if (_reflog_line_msg(buf + s, len - s, &mp) == 1) {
+                        var mlen = load64(&mp + 8);
+                        var sanmsg = alloc(mlen + 1);
+                        _reflog_san_into(sanmsg, load64(&mp), mlen);
+                        stdout_write(sanmsg, mlen);
+                    }
+                    stdout_write("\n", 1);
+                    shown = shown + 1;
+                }
+            }
+            d = d + 1;
+        }
+    }
+    stdout_flush();
+    return 0;
+}
+
 # --- object_db.cyr ---
 
 # object_db.cyr — patra object store, compression / framing, read commands.
@@ -1665,6 +2128,36 @@ fn fsck_walk_refs_dir(dir, roots) {
 #   .sit/refs/heads/<*>, .sit/refs/tags/<*>, .sit/refs/remotes/<*>/<*>
 # plus .sit/HEAD when it's a raw hex (detached) rather than symbolic.
 # Symbolic HEAD targets are already covered by the matching ref file.
+# Add every reflog entry's old+new oid (across all .sit/logs/** files) to
+# `roots`. This is the reflog-reachability half of the v1.1.0 prune grace:
+# an object referenced by any reflog entry is reachable, so `fsck --prune`
+# won't drop the very commits the reflog exists to recover (e.g. the tip a
+# `reset --hard` discarded). Mirrors git fsck's default reflog-as-roots.
+fn fsck_collect_reflog_roots(roots) {
+    if (file_exists(".sit/logs") != 1) { return 0; }
+    var files = vec_new();
+    dir_walk(str_from(".sit/logs"), files);
+    var i = 0;
+    while (i < vec_len(files)) {
+        var fp = vec_get(files, i);
+        var fl = str_len(fp);
+        var fc = alloc(fl + 1);
+        memcpy(fc, str_data(fp), fl);
+        store8(fc + fl, 0);
+        var pair[16];
+        if (read_file_heap(fc, &pair) == 0) {
+            _reflog_collect_oids(load64(&pair), load64(&pair + 8), roots);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Collect ONLY the refs/HEAD roots (heads, tags, remotes, detached HEAD).
+# Reflog roots are collected separately by cmd_fsck via
+# fsck_collect_reflog_roots so the "every object unreachable" prune tripwire
+# can judge corruption from the refs set alone — a stale reflog must not mask
+# a wiped HEAD/refs and let --prune delete a ref-only-reachable branch.
 fn fsck_collect_roots() {
     var roots = vec_new();
     fsck_walk_refs_dir(".sit/refs/heads",   roots);
@@ -1864,20 +2357,94 @@ fn db_object_delete(db, hex) {
     return patra_exec(db, sql);
 }
 
+# Extract a commit's author timestamp (unix seconds) from its raw body, for
+# the prune age-window check. The ident line is "author NAME <EMAIL> TS TZ";
+# TS is the second-to-last space-delimited token. Returns 0 if no parseable
+# author line (caller then treats the object as undatable). Self-contained
+# (parse_commit_body lives in the later commit.cyr module, out of bundle reach).
+fn _fsck_commit_author_ts(body, len) {
+    var i = 0;
+    var astart = 0 - 1;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (i + 7 > len) { scanning = 0; }
+        else {
+            var at_ls = 0;
+            if (i == 0) { at_ls = 1; }
+            else { if (load8(body + i - 1) == 10) { at_ls = 1; } }
+            if (at_ls == 1) {
+                if (memeq(body + i, "author ", 7) == 1) { astart = i + 7; scanning = 0; }
+            }
+            if (scanning == 1) { i = i + 1; }
+        }
+    }
+    if (astart < 0) { return 0; }
+
+    var aend = astart;
+    var f2 = 1;
+    while (f2 == 1) {
+        if (aend >= len) { f2 = 0; }
+        else { if (load8(body + aend) == 10) { f2 = 0; } else { aend = aend + 1; } }
+    }
+
+    # Walk back over the TZ token to the space before it → that's ts_end.
+    var p = aend - 1;
+    var s1 = 1;
+    while (s1 == 1) {
+        if (p < astart) { s1 = 0; }
+        else { if (load8(body + p) == 32) { s1 = 0; } else { p = p - 1; } }
+    }
+    var ts_end = p;
+    # ts_start = one past the previous space.
+    var ts_start = ts_end;
+    var s2 = 1;
+    while (s2 == 1) {
+        if (ts_start - 1 < astart) { s2 = 0; }
+        else {
+            if (load8(body + ts_start - 1) == 32) { s2 = 0; }
+            else { ts_start = ts_start - 1; }
+        }
+    }
+    if (ts_start >= ts_end) { return 0; }
+
+    var val = 0;
+    var k = ts_start;
+    var okp = 1;
+    while (k < ts_end) {
+        var d = load8(body + k);
+        if (d < 48) { okp = 0; k = ts_end; }
+        else {
+            if (d > 57) { okp = 0; k = ts_end; }
+            else { val = val * 10 + (d - 48); k = k + 1; }
+        }
+    }
+    if (okp == 0) { return 0; }
+    return val;
+}
+
 fn cmd_fsck() {
     if (file_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
 
-    # v0.8.14: `--prune` removes the dangling (unreachable) objects this walk
-    # identifies. Immediate + unrecoverable (sit has no reflog yet — matches
-    # `git gc --prune=now`, not git's default 2-week grace). Refused while a
-    # merge is in progress so a half-finished op's objects can't be dropped.
+    # `--prune` removes dangling (unreachable) objects this walk identifies.
+    # v1.1.0 added two grace mechanisms vs the old unconditional --prune=now:
+    #   (1) reflog reachability — every .sit/logs/** entry's oids are roots
+    #       (fsck_collect_reflog_roots), so a reset-discarded tip is protected
+    #       as long as its reflog entry exists; and
+    #   (2) an age window — a still-dangling object is kept unless it's older
+    #       than the grace window. Datable objects are commits (author ts);
+    #       trees/blobs can't be dated, so a positive window keeps them.
+    # `--prune` uses a 90-day window (git's gc.reflogExpire default); the
+    # legacy immediate behaviour is `--prune-now` (grace 0, like
+    # `git gc --prune=now`). Both are refused mid-merge (.sit/MERGE_HEAD).
     var prune = 0;
+    var grace_days = 90;
     var ai = 2;
     while (ai < argc()) {
         if (streq(argv(ai), "--prune") == 1) { prune = 1; }
+        if (streq(argv(ai), "--prune-now") == 1) { prune = 1; grace_days = 0; }
         ai = ai + 1;
     }
     if (prune == 1) {
@@ -1943,9 +2510,12 @@ fn cmd_fsck() {
         hi = hi + 1;
     }
 
-    # Reachability pass (v0.8.5).
+    # Reachability pass (v0.8.5). Refs/HEAD roots first (count retained for
+    # the prune corrupt-roots tripwire), then reflog roots appended (v1.1.0).
     var seen = map_new();
     var roots = fsck_collect_roots();
+    var ref_root_count = vec_len(roots);
+    fsck_collect_reflog_roots(roots);
     var ri = 0;
     while (ri < vec_len(roots)) {
         fsck_walk_reachable(vec_get(roots, ri), seen);
@@ -2020,18 +2590,65 @@ fn cmd_fsck() {
                 return 1;
             }
         }
+        # Corrupt-roots tripwire: a stale .sit/logs must not stand in for a
+        # wiped HEAD/refs. If there are NO refs/HEAD roots (only reflog roots),
+        # the ref store is broken — pruning would delete any branch that was
+        # never reflogged. Refuse unless there are objects but genuinely no
+        # refs at all is impossible after init (HEAD always resolves once a
+        # commit exists), so an empty ref-root set with objects present is the
+        # corruption signal.
+        if (total > 0) {
+            if (ref_root_count == 0) {
+                eprintln("sit: refusing --prune — no valid refs/HEAD roots (corrupt or missing HEAD/refs?)");
+                return 1;
+            }
+        }
+        # Age window: keep a still-dangling object unless it's older than the
+        # grace window. Only commits carry a timestamp (author ts); trees/blobs
+        # are undatable, so any positive window keeps them (grace 0 deletes
+        # everything dangling — the old --prune=now behaviour).
+        var now = clock_epoch_secs();
+        var grace_secs = grace_days * 86400;
         var pruned = 0;
+        var kept = 0;
         var pi = 0;
         while (pi < vec_len(dangling_hexes)) {
-            if (db_object_delete(db, vec_get(dangling_hexes, pi)) == 0) {
-                pruned = pruned + 1;
+            var dhex = vec_get(dangling_hexes, pi);
+            var keep = 0;
+            if (grace_secs > 0) {
+                # Conservative default under a positive window: KEEP unless we
+                # can positively date the object past the window. Commits are
+                # datable (author ts); an undatable commit (unreadable body or
+                # unparseable ts) is kept just like trees/blobs — never delete
+                # something we can't prove is old.
+                keep = 1;
+                var dstored = map_get(ty_map, dhex);
+                if (dstored == 3) {                 # ty 2 (commit) + 1
+                    var co[24];
+                    if (read_object(dhex, &co) == 0) {
+                        var cts = _fsck_commit_author_ts(load64(&co), load64(&co + 8));
+                        if (cts > 0) {
+                            if (now - cts >= grace_secs) { keep = 0; }
+                        }
+                    }
+                }
+            }
+            if (keep == 1) { kept = kept + 1; }
+            else {
+                if (db_object_delete(db, dhex) == 0) { pruned = pruned + 1; }
             }
             pi = pi + 1;
         }
         patra_flush(db);
         stdout_write("pruned ", 7);
         write_unsigned(pruned);
-        stdout_write(" objects\n", 9);
+        stdout_write(" objects", 8);
+        if (kept > 0) {
+            stdout_write(", kept ", 7);
+            write_unsigned(kept);
+            stdout_write(" within grace", 13);
+        }
+        stdout_write("\n", 1);
     }
 
     if (bad > 0) { return 1; }
@@ -2437,11 +3054,13 @@ fn cmd_reset() {
             syscall(SYS_WRITE, STDERR, "'\n", 2);
             return 1;
         }
+        var rl_old = read_head_ref();
         if (write_head_ref(&hex) != 0) {
             eprintln("sit: failed to update branch ref");
             return 1;
         }
         materialize_target(&hex);
+        reflog_head_move(rl_old, &hex, reflog_msg_subject("reset: moving to ", target));
         stdout_write("HEAD reset --hard to ", 21);
         stdout_write(&hex, 12);
         stdout_write("\n", 1);
@@ -2872,7 +3491,52 @@ fn load_sitignore() {
 # and .sit/refs/remotes/<remote>/<name>. ensure_parent_dirs (util.cyr) is called
 # by every write path so nested names like feature/foo work.
 
+# Resolve a "<base>@{N}" reflog selector to the new-oid recorded N moves
+# ago. Writes 64-hex + nul into out_buf. Returns 1 on success, 0 if `name`
+# isn't a reflog selector or the base has no log / N is out of range. The
+# base's log is found by class: HEAD → logs/HEAD; otherwise logs/refs/heads/
+# <base>, then logs/refs/remotes/<base> (tags aren't logged). Called from
+# resolve_ref_name in REVISION context — distinct from refname_valid, which
+# rejects '@{' in ref-NAME context (so x@{0} never becomes a ref file).
+fn resolve_reflog_spec(name, out_buf) {
+    var spec[24];
+    if (_reflog_spec_parse(name, &spec) == 0) { return 0; }
+    var blen = load64(&spec + 8);
+    var num = load64(&spec + 16);
+    var base = alloc(blen + 1);
+    memcpy(base, name, blen);
+    store8(base + blen, 0);
+
+    if (streq(base, "HEAD") == 1) {
+        return reflog_read_nth("HEAD", num, out_buf);
+    }
+
+    # S-02: the base becomes a .sit/logs/ path component below; reject
+    # traversal ('..', leading '/') and control chars before it does. An
+    # invalid base simply isn't a resolvable selector → fall through (0).
+    if (refname_valid(base) == 0) { return 0; }
+
+    var hp = alloc(11 + blen + 1);
+    memcpy(hp, "refs/heads/", 11);
+    memcpy(hp + 11, base, blen);
+    store8(hp + 11 + blen, 0);
+    if (file_exists(reflog_log_path(hp)) == 1) {
+        return reflog_read_nth(hp, num, out_buf);
+    }
+
+    var rp = alloc(13 + blen + 1);
+    memcpy(rp, "refs/remotes/", 13);
+    memcpy(rp + 13, base, blen);
+    store8(rp + 13 + blen, 0);
+    if (file_exists(reflog_log_path(rp)) == 1) {
+        return reflog_read_nth(rp, num, out_buf);
+    }
+    return 0;
+}
+
 fn resolve_ref_name(name, out_buf) {
+    # Reflog selector <ref>@{N} takes precedence over plain-name lookup.
+    if (resolve_reflog_spec(name, out_buf) == 1) { return 1; }
     if (streq(name, "HEAD") == 1) {
         var h = read_head_ref();
         if (h == 0) { return 0; }
@@ -3030,6 +3694,31 @@ fn write_head_ref(hex) {
     store8(out + 64, 10);
     store8(out + 65, 0);
     if (file_write_all(full, out, 65) < 0) { return 0 - 1; }
+    return 0;
+}
+
+# Record a HEAD movement in the reflog. A branch-tip move that HEAD points
+# at is logged TWICE per git semantics — once to .sit/logs/HEAD and once to
+# the branch log (.sit/logs/refs/heads/<b>); a detached HEAD logs only to
+# .sit/logs/HEAD. Call this AFTER a successful write_head_ref, passing the
+# tip read BEFORE the write as old_hex (0 → creation). Best-effort: a failed
+# append never propagates, so logging can't undo a committed ref move.
+# Lives here (not reflog.cyr) because it reads read_head_ref_path, which is
+# defined later than reflog.cyr in the single-pass dist bundle order.
+fn reflog_head_move(old_hex, new_hex, msg) {
+    # Resolve identity + timestamp ONCE so the HEAD log and the branch log
+    # record an identical (ts, name, email) for this one atomic move (git's
+    # single-timestamp-per-transaction behaviour).
+    var nm = _reflog_user_name();
+    var em = _reflog_user_email();
+    var ts = clock_epoch_secs();
+    _reflog_append_full("HEAD", old_hex, new_hex, msg, nm, em, ts);
+    var branch = read_head_ref_path();
+    if (branch != 0) {
+        if (memeq(branch, "refs/heads/", 11) == 1) {
+            _reflog_append_full(branch, old_hex, new_hex, msg, nm, em, ts);
+        }
+    }
     return 0;
 }
 
@@ -3257,6 +3946,16 @@ fn cmd_branch() {
             eprintln("sit: failed to remove branch ref");
             return 1;
         }
+        # Mirror git: deleting a branch deletes its reflog too. Leaving the
+        # log orphaned would pin the branch's objects against fsck --prune
+        # forever (it walks every .sit/logs/** file) and corrupt <name>@{N}
+        # if the branch were later recreated (append to a stale log). Best-
+        # effort unlink — a missing log (branch never logged) is fine.
+        var dlref = alloc(11 + dnlen + 1);
+        memcpy(dlref, "refs/heads/", 11);
+        memcpy(dlref + 11, dname, dnlen);
+        store8(dlref + 11 + dnlen, 0);
+        sys_unlink(reflog_log_path(dlref));
         stdout_write("deleted branch '", 16);
         stdout_write(dname, dnlen);
         stdout_write("'\n", 2);
@@ -3297,6 +3996,14 @@ fn cmd_branch() {
         eprintln("sit: failed to write branch ref");
         return 1;
     }
+
+    # Reflog the new branch's creation (old=zeros). HEAD doesn't move, so
+    # only the new branch's log gets an entry — not logs/HEAD.
+    var br_ref = alloc(11 + nlen + 1);
+    memcpy(br_ref, "refs/heads/", 11);
+    memcpy(br_ref + 11, name, nlen);
+    store8(br_ref + 11 + nlen, 0);
+    reflog_append(br_ref, 0, head_hex, "branch: Created from HEAD");
 
     stdout_write("created branch '", 16);
     stdout_write(name, nlen);
@@ -3359,6 +4066,12 @@ fn cmd_checkout() {
             eprintln("sit: failed to write branch ref");
             return 1;
         }
+        # Reflog the -b branch creation (old=zeros) to the new branch's log.
+        var nb_ref = alloc(11 + tlen + 1);
+        memcpy(nb_ref, "refs/heads/", 11);
+        memcpy(nb_ref + 11, target, tlen);
+        store8(nb_ref + 11 + tlen, 0);
+        reflog_append(nb_ref, 0, head_hex, "branch: Created from HEAD");
     }
 
     var target_ref_len = 11 + tlen;
@@ -3433,10 +4146,27 @@ fn cmd_checkout() {
 
     materialize_target(target_hex);
 
+    # Capture the old HEAD tip before the symref moves (materialize doesn't
+    # touch refs, so this still resolves the branch we're leaving).
+    var co_old = read_head_ref();
     if (set_head_ref(target_ref) != 0) {
         eprintln("sit: failed to update HEAD");
         return 1;
     }
+
+    # Reflog the branch switch to logs/HEAD only (no branch-tip moved):
+    # "checkout: moving from <old> to <new>".
+    var co_oldname = curr;
+    if (co_oldname == 0) { co_oldname = "HEAD"; }
+    var co_onl = strlen(co_oldname);
+    var co_msg = alloc(30 + co_onl + tlen);
+    var co_mp = 0;
+    memcpy(co_msg + co_mp, "checkout: moving from ", 22); co_mp = co_mp + 22;
+    memcpy(co_msg + co_mp, co_oldname, co_onl); co_mp = co_mp + co_onl;
+    memcpy(co_msg + co_mp, " to ", 4); co_mp = co_mp + 4;
+    memcpy(co_msg + co_mp, target, tlen); co_mp = co_mp + tlen;
+    store8(co_msg + co_mp, 0);
+    reflog_append("HEAD", co_old, target_hex, co_msg);
 
     stdout_write("switched to branch '", 20);
     stdout_write(target, tlen);
@@ -6127,6 +6857,12 @@ fn cmd_commit() {
         return 1;
     }
 
+    # Reflog: parent_hex (read before the write) is the old tip; 0 → initial.
+    var rl_prefix = "commit: ";
+    if (merge_parent != 0) { rl_prefix = "commit (merge): "; }
+    else { if (parent_hex == 0) { rl_prefix = "commit (initial): "; } }
+    reflog_head_move(parent_hex, commit_hex, reflog_msg_subject(rl_prefix, message));
+
     var branch = current_branch_name();
     stdout_write("[", 1);
     if (branch != 0) { stdout_write(branch, strlen(branch)); }
@@ -6751,6 +7487,8 @@ fn cmd_merge() {
             return 1;
         }
         materialize_target(&target_hex);
+        reflog_head_move(head_hex, &target_hex,
+            reflog_msg_join("merge ", target_name, ": Fast-forward"));
 
         stdout_write("fast-forward to ", 16);
         stdout_write(&target_hex, 12);
@@ -6977,6 +7715,8 @@ fn cmd_merge() {
         return 1;
     }
     materialize_target(merge_hex);
+    reflog_head_move(head_copy, merge_hex,
+        reflog_msg_join("merge ", target_name, ": Merge made by the '3-way' strategy"));
 
     stdout_write("merge ", 6);
     stdout_write(merge_hex, 12);
@@ -8085,10 +8825,33 @@ fn write_remote_tracking(remote, branch, hex) {
     memcpy(p + 18 + rl + 1, branch, bl);
     store8(p + 18 + rl + 1 + bl, 0);
     ensure_parent_dirs(p);
+    # Reflog: capture the prior remote-tracking tip before overwriting it.
+    var rt_old = 0;
+    if (file_exists(p) == 1) {
+        var ofd = file_open(p, 0, 0);
+        if (ofd >= 0) {
+            var ob = alloc(80);
+            var on = file_read(ofd, ob, 80);
+            file_close(ofd);
+            if (on >= 64) {
+                if (hex_prefix_valid(ob, 64) == 1) { store8(ob + 64, 0); rt_old = ob; }
+            }
+        }
+    }
     var buf = alloc(66);
     memcpy(buf, hex, 64);
     store8(buf + 64, 10);
-    return file_write_all(p, buf, 65);
+    var wres = file_write_all(p, buf, 65);
+    if (wres >= 0) {
+        var rtref = alloc(13 + rl + 1 + bl + 1);
+        memcpy(rtref, "refs/remotes/", 13);
+        memcpy(rtref + 13, remote, rl);
+        store8(rtref + 13 + rl, 47);
+        memcpy(rtref + 13 + rl + 1, branch, bl);
+        store8(rtref + 13 + rl + 1 + bl, 0);
+        reflog_append(rtref, rt_old, hex, "fetch: storing head");
+    }
+    return wres;
 }
 
 # Return 1 if `ancestor_hex` is reachable from `desc_hex` (ff check).
@@ -8409,6 +9172,7 @@ fn cmd_pull() {
             return 1;
         }
         materialize_target(tip);
+        reflog_head_move(0, tip, reflog_msg_join("pull ", name, ": storing head"));
         stdout_write("initialized from ", 17);
         stdout_write(name, strlen(name));
         stdout_write("/", 1);
@@ -8435,6 +9199,7 @@ fn cmd_pull() {
             return 1;
         }
         materialize_target(tip);
+        reflog_head_move(head_hex, tip, reflog_msg_join("pull ", name, ": Fast-forward"));
         stdout_write("fast-forward to ", 16);
         stdout_write(tip, 12);
         stdout_write("\n", 1);
@@ -8685,6 +9450,7 @@ fn cmd_clone() {
         return 1;
     }
     materialize_target(tip);
+    reflog_head_move(0, tip, reflog_msg_subject("clone: from ", url));
 
     stdout_write("cloned ", 7);
     stdout_write(url, strlen(url));

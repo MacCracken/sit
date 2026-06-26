@@ -4,7 +4,52 @@
 # and .sit/refs/remotes/<remote>/<name>. ensure_parent_dirs (util.cyr) is called
 # by every write path so nested names like feature/foo work.
 
+# Resolve a "<base>@{N}" reflog selector to the new-oid recorded N moves
+# ago. Writes 64-hex + nul into out_buf. Returns 1 on success, 0 if `name`
+# isn't a reflog selector or the base has no log / N is out of range. The
+# base's log is found by class: HEAD → logs/HEAD; otherwise logs/refs/heads/
+# <base>, then logs/refs/remotes/<base> (tags aren't logged). Called from
+# resolve_ref_name in REVISION context — distinct from refname_valid, which
+# rejects '@{' in ref-NAME context (so x@{0} never becomes a ref file).
+fn resolve_reflog_spec(name, out_buf) {
+    var spec[24];
+    if (_reflog_spec_parse(name, &spec) == 0) { return 0; }
+    var blen = load64(&spec + 8);
+    var num = load64(&spec + 16);
+    var base = alloc(blen + 1);
+    memcpy(base, name, blen);
+    store8(base + blen, 0);
+
+    if (streq(base, "HEAD") == 1) {
+        return reflog_read_nth("HEAD", num, out_buf);
+    }
+
+    # S-02: the base becomes a .sit/logs/ path component below; reject
+    # traversal ('..', leading '/') and control chars before it does. An
+    # invalid base simply isn't a resolvable selector → fall through (0).
+    if (refname_valid(base) == 0) { return 0; }
+
+    var hp = alloc(11 + blen + 1);
+    memcpy(hp, "refs/heads/", 11);
+    memcpy(hp + 11, base, blen);
+    store8(hp + 11 + blen, 0);
+    if (file_exists(reflog_log_path(hp)) == 1) {
+        return reflog_read_nth(hp, num, out_buf);
+    }
+
+    var rp = alloc(13 + blen + 1);
+    memcpy(rp, "refs/remotes/", 13);
+    memcpy(rp + 13, base, blen);
+    store8(rp + 13 + blen, 0);
+    if (file_exists(reflog_log_path(rp)) == 1) {
+        return reflog_read_nth(rp, num, out_buf);
+    }
+    return 0;
+}
+
 fn resolve_ref_name(name, out_buf) {
+    # Reflog selector <ref>@{N} takes precedence over plain-name lookup.
+    if (resolve_reflog_spec(name, out_buf) == 1) { return 1; }
     if (streq(name, "HEAD") == 1) {
         var h = read_head_ref();
         if (h == 0) { return 0; }
@@ -162,6 +207,31 @@ fn write_head_ref(hex) {
     store8(out + 64, 10);
     store8(out + 65, 0);
     if (file_write_all(full, out, 65) < 0) { return 0 - 1; }
+    return 0;
+}
+
+# Record a HEAD movement in the reflog. A branch-tip move that HEAD points
+# at is logged TWICE per git semantics — once to .sit/logs/HEAD and once to
+# the branch log (.sit/logs/refs/heads/<b>); a detached HEAD logs only to
+# .sit/logs/HEAD. Call this AFTER a successful write_head_ref, passing the
+# tip read BEFORE the write as old_hex (0 → creation). Best-effort: a failed
+# append never propagates, so logging can't undo a committed ref move.
+# Lives here (not reflog.cyr) because it reads read_head_ref_path, which is
+# defined later than reflog.cyr in the single-pass dist bundle order.
+fn reflog_head_move(old_hex, new_hex, msg) {
+    # Resolve identity + timestamp ONCE so the HEAD log and the branch log
+    # record an identical (ts, name, email) for this one atomic move (git's
+    # single-timestamp-per-transaction behaviour).
+    var nm = _reflog_user_name();
+    var em = _reflog_user_email();
+    var ts = clock_epoch_secs();
+    _reflog_append_full("HEAD", old_hex, new_hex, msg, nm, em, ts);
+    var branch = read_head_ref_path();
+    if (branch != 0) {
+        if (memeq(branch, "refs/heads/", 11) == 1) {
+            _reflog_append_full(branch, old_hex, new_hex, msg, nm, em, ts);
+        }
+    }
     return 0;
 }
 
@@ -389,6 +459,16 @@ fn cmd_branch() {
             eprintln("sit: failed to remove branch ref");
             return 1;
         }
+        # Mirror git: deleting a branch deletes its reflog too. Leaving the
+        # log orphaned would pin the branch's objects against fsck --prune
+        # forever (it walks every .sit/logs/** file) and corrupt <name>@{N}
+        # if the branch were later recreated (append to a stale log). Best-
+        # effort unlink — a missing log (branch never logged) is fine.
+        var dlref = alloc(11 + dnlen + 1);
+        memcpy(dlref, "refs/heads/", 11);
+        memcpy(dlref + 11, dname, dnlen);
+        store8(dlref + 11 + dnlen, 0);
+        sys_unlink(reflog_log_path(dlref));
         stdout_write("deleted branch '", 16);
         stdout_write(dname, dnlen);
         stdout_write("'\n", 2);
@@ -429,6 +509,14 @@ fn cmd_branch() {
         eprintln("sit: failed to write branch ref");
         return 1;
     }
+
+    # Reflog the new branch's creation (old=zeros). HEAD doesn't move, so
+    # only the new branch's log gets an entry — not logs/HEAD.
+    var br_ref = alloc(11 + nlen + 1);
+    memcpy(br_ref, "refs/heads/", 11);
+    memcpy(br_ref + 11, name, nlen);
+    store8(br_ref + 11 + nlen, 0);
+    reflog_append(br_ref, 0, head_hex, "branch: Created from HEAD");
 
     stdout_write("created branch '", 16);
     stdout_write(name, nlen);
@@ -491,6 +579,12 @@ fn cmd_checkout() {
             eprintln("sit: failed to write branch ref");
             return 1;
         }
+        # Reflog the -b branch creation (old=zeros) to the new branch's log.
+        var nb_ref = alloc(11 + tlen + 1);
+        memcpy(nb_ref, "refs/heads/", 11);
+        memcpy(nb_ref + 11, target, tlen);
+        store8(nb_ref + 11 + tlen, 0);
+        reflog_append(nb_ref, 0, head_hex, "branch: Created from HEAD");
     }
 
     var target_ref_len = 11 + tlen;
@@ -565,10 +659,27 @@ fn cmd_checkout() {
 
     materialize_target(target_hex);
 
+    # Capture the old HEAD tip before the symref moves (materialize doesn't
+    # touch refs, so this still resolves the branch we're leaving).
+    var co_old = read_head_ref();
     if (set_head_ref(target_ref) != 0) {
         eprintln("sit: failed to update HEAD");
         return 1;
     }
+
+    # Reflog the branch switch to logs/HEAD only (no branch-tip moved):
+    # "checkout: moving from <old> to <new>".
+    var co_oldname = curr;
+    if (co_oldname == 0) { co_oldname = "HEAD"; }
+    var co_onl = strlen(co_oldname);
+    var co_msg = alloc(30 + co_onl + tlen);
+    var co_mp = 0;
+    memcpy(co_msg + co_mp, "checkout: moving from ", 22); co_mp = co_mp + 22;
+    memcpy(co_msg + co_mp, co_oldname, co_onl); co_mp = co_mp + co_onl;
+    memcpy(co_msg + co_mp, " to ", 4); co_mp = co_mp + 4;
+    memcpy(co_msg + co_mp, target, tlen); co_mp = co_mp + tlen;
+    store8(co_msg + co_mp, 0);
+    reflog_append("HEAD", co_old, target_hex, co_msg);
 
     stdout_write("switched to branch '", 20);
     stdout_write(target, tlen);

@@ -761,10 +761,33 @@ fn write_remote_tracking(remote, branch, hex) {
     memcpy(p + 18 + rl + 1, branch, bl);
     store8(p + 18 + rl + 1 + bl, 0);
     ensure_parent_dirs(p);
+    # Reflog: capture the prior remote-tracking tip before overwriting it.
+    var rt_old = 0;
+    if (file_exists(p) == 1) {
+        var ofd = file_open(p, 0, 0);
+        if (ofd >= 0) {
+            var ob = alloc(80);
+            var on = file_read(ofd, ob, 80);
+            file_close(ofd);
+            if (on >= 64) {
+                if (hex_prefix_valid(ob, 64) == 1) { store8(ob + 64, 0); rt_old = ob; }
+            }
+        }
+    }
     var buf = alloc(66);
     memcpy(buf, hex, 64);
     store8(buf + 64, 10);
-    return file_write_all(p, buf, 65);
+    var wres = file_write_all(p, buf, 65);
+    if (wres >= 0) {
+        var rtref = alloc(13 + rl + 1 + bl + 1);
+        memcpy(rtref, "refs/remotes/", 13);
+        memcpy(rtref + 13, remote, rl);
+        store8(rtref + 13 + rl, 47);
+        memcpy(rtref + 13 + rl + 1, branch, bl);
+        store8(rtref + 13 + rl + 1 + bl, 0);
+        reflog_append(rtref, rt_old, hex, "fetch: storing head");
+    }
+    return wres;
 }
 
 # Return 1 if `ancestor_hex` is reachable from `desc_hex` (ff check).
@@ -1085,6 +1108,7 @@ fn cmd_pull() {
             return 1;
         }
         materialize_target(tip);
+        reflog_head_move(0, tip, reflog_msg_join("pull ", name, ": storing head"));
         stdout_write("initialized from ", 17);
         stdout_write(name, strlen(name));
         stdout_write("/", 1);
@@ -1111,6 +1135,7 @@ fn cmd_pull() {
             return 1;
         }
         materialize_target(tip);
+        reflog_head_move(head_hex, tip, reflog_msg_join("pull ", name, ": Fast-forward"));
         stdout_write("fast-forward to ", 16);
         stdout_write(tip, 12);
         stdout_write("\n", 1);
@@ -1361,6 +1386,7 @@ fn cmd_clone() {
         return 1;
     }
     materialize_target(tip);
+    reflog_head_move(0, tip, reflog_msg_subject("clone: from ", url));
 
     stdout_write("cloned ", 7);
     stdout_write(url, strlen(url));

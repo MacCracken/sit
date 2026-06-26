@@ -61,6 +61,7 @@ fn print_usage() {
     eprintln("  serve <repo> [--listen 127.0.0.1:<port>]  read-only HTTP daemon (sit/v1)");
     eprintln("  commit [-S] [-m] <msg>  record staged changes as a new commit (-S to sign)");
     eprintln("  log [--oneline] [--graph]  show commit history from HEAD");
+    eprintln("  reflog [-n <count>] [<ref>]  show ref movement history (default HEAD)");
     eprintln("  status                  show working tree status");
     eprintln("  diff [--staged|HEAD]    show unstaged / staged / working-vs-HEAD diffs");
     eprintln("  show [--stat] [<hash>]  show a single commit (full diff or per-file stat)");
@@ -101,6 +102,7 @@ fn main() {
     if (streq(cmd, "serve")    == 1) { return cmd_serve(); }
     if (streq(cmd, "commit")   == 1) { return cmd_commit(); }
     if (streq(cmd, "log")      == 1) { return cmd_log(); }
+    if (streq(cmd, "reflog")   == 1) { return cmd_reflog(); }
     if (streq(cmd, "status")   == 1) { return cmd_status(); }
     if (streq(cmd, "diff")     == 1) { return cmd_diff(); }
     if (streq(cmd, "show")     == 1) { return cmd_show(); }
