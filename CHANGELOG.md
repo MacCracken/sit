@@ -4,6 +4,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-06-25 — Reflog + recovery
+
+The first post-1.0 minor: a git-compatible reflog, `@{N}` recovery resolution, the `sit reflog` command, and a reflog-aware `fsck --prune` grace period. Foundational — the recovery net that de-risks the history-rewrite tools (revert / cherry-pick / stash / rebase) queued on the roadmap. Design + invariants: [ADR 0010](docs/adr/0010-reflog-and-recovery.md), [architecture note 005](docs/architecture/005-reflog-two-line-invariant.md).
+
+### Added
+
+- **Reflog (`.sit/logs/`).** Every ref movement appends a git-format line — `<old64> <new64> <name> <email> <unixts> +0000\t<message>` — to a per-ref log mirroring the ref tree (`logs/HEAD`, `logs/refs/heads/<b>`, `logs/refs/remotes/<r>/<b>`). Creation uses a 64-zero old-oid; append-only, newest last. A HEAD-on-branch move logs **twice** (the branch log and `logs/HEAD`); tags are not logged (git parity). Recorded across `commit`, `reset --hard`, `merge` (fast-forward + merge commit), `checkout`, branch / `-b` create, `clone`, `pull`, and `fetch` (remote-tracking). New module `src/reflog.cyr` (in `[lib].modules`, ordered before `object_db.cyr`).
+- **`<ref>@{N}` / `HEAD@{N}` resolution.** The ordinal selector resolves anywhere a revision is accepted (via `resolve_ref_name`), so `sit reset --hard HEAD@{1}` undoes the last reset and `sit log HEAD@{2}` inspects an earlier tip. Integer ordinal form only — the `@{<date>}` time form is rejected in 1.1.0.
+- **`sit reflog [-n <count>] [<ref>]`.** Prints a ref's movement history newest-first (`<short-oid> <ref>@{N}: <message>`), defaulting to HEAD. Brings the command inventory to **27**.
+- **`fsck --prune` grace period + `--prune-now`.** Reflog entry oids become reachability roots, so a reset-discarded tip is protected while its reflog entry exists; plus a **90-day** age window (git's `gc.reflogExpire` default) on still-dangling objects — commits dated by author timestamp, undatable trees/blobs kept. `--prune-now` forces the legacy immediate sweep (grace 0).
+
+### Changed
+
+- **`fsck --prune` is no longer immediate/unrecoverable.** It now honours reflog reachability plus the 90-day grace window instead of `git gc --prune=now` semantics. **Migration**: for the old immediate behaviour, use `sit fsck --prune-now`.
+
+### Security
+
+A pre-release multi-agent adversarial review hardened the new reflog surface before ship (11 findings confirmed, all addressed):
+
+- **Identity sanitization** — `name`/`email` in a reflog line are now scrubbed of control bytes (LF/TAB/…) exactly like the message, so an LF in `SIT_AUTHOR_NAME` or a hand-edited config can no longer forge a second, attacker-shaped reflog entry whose new-oid `@{N}` would resolve.
+- **Ref-label validation** — `sit reflog <label>` and `<base>@{N}` run the label through `refname_valid` (rejecting `..`, leading `/`, control chars, `@{`), closing a path-traversal arbitrary-file read out of `.sit/logs/`.
+- **Output sanitization** — `sit reflog` scrubs the echoed short-oid and message (terminal-escape injection from a crafted/corrupt log; the S-21 class).
+- **`branch -d` deletes the branch's reflog** — no orphaned log left to pin the branch's objects against `--prune` forever or corrupt a recreated branch's `@{N}`.
+- **Corrupt-roots prune tripwire** — `--prune` decides "no roots" from the refs/HEAD set alone, so a stale `.sit/logs/` can't mask a wiped HEAD/refs and let prune delete a ref-only-reachable branch.
+
+### Notes
+
+- Build / **273 unit** / **40 integration** / fuzz (7 harnesses incl. `reflog_index` at 200k rounds, no crashes) / lint green. A new CI smoke step exercises reflog + `@{N}` recovery + the prune grace window end-to-end. DCE binary **2.375 MB** (+~126 KB vs 1.0.4 — the reflog module plus fsck/refs/wire wiring), static (`ldd` → not a dynamic executable). No toolchain/dep change.
+- **Deferred** (per ADR 0010): `reflog expire` / `delete` — reflog entries are currently unbounded, so reflog-protected objects persist until the log is cleared (`--prune` reclaims them only via `--prune-now` or after a manual log clear); and the `@{<date>}` selector. The same unsanitized-identity pattern exists in `commit.cyr` / `merge.cyr` object framing and is flagged for a follow-up hardening pass.
+
 ## [1.0.4] — 2026-06-25 — Ed25519 server certs + 1.0.x hygiene
 
 First post-1.0.3 patch. No new observable surface — consumes a now-fixed upstream gap and clears accumulated drift / stale references. Headlined by Ed25519 `sit serve --tls` support, which the 1.0.3 dep bumps unblocked.
