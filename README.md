@@ -10,12 +10,12 @@ The name is from *smriti* (स्मृति — "that which is remembered"). T
 
 - **Version**: see [`VERSION`](VERSION) (single source of truth) and [`docs/development/state.md`](docs/development/state.md) for the live state snapshot (current version, dep pins, source layout, recent releases).
 - **Language**: Cyrius (toolchain pinned in [`cyrius.cyml`](cyrius.cyml) under `[package].cyrius`).
-- **Commands** (26): `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `merge-base`, `reset`, `commit`, `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `serve`, `log`, `status`, `diff`, `show`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md).
+- **Commands** (27): `init`, `add`, `rm`, `branch`, `checkout`, `tag`, `merge`, `merge-base`, `reset`, `commit`, `config`, `fsck`, `key`, `verify-commit`, `remote`, `fetch`, `pull`, `push`, `clone`, `serve`, `log`, `reflog`, `status`, `diff`, `show`, `cat-file`, `owl-file` — see [docs/guides/getting-started.md](docs/guides/getting-started.md).
 - **Transports**: `file://` (+ bare paths) · `http://` · **`https://`** (first-party TLS 1.3, TOFU-pinned) · `ssh://`. Clone / fetch / push work over all four; `sit serve` is the loopback HTTP daemon (`--tls` for HTTPS, `--stdio` for SSH).
 
 Objects are SHA-256-hashed (via [sigil](https://github.com/MacCracken/sigil)) and zlib-compressed (via [sankoch](https://github.com/MacCracken/sankoch)), stored in a [patra](https://github.com/MacCracken/patra) table with a `COL_BYTES` content column. Trees are recursive and byte-compatible with git's SHA-256 object format. Commits can be ed25519-signed via sigil.
 
-**What works** (the full git-parity surface, stable as of **1.0.0**): the local VCS loop (init → add → commit → branch → merge → tag); ed25519 signed commits + `verify-commit`; `fsck` with integrity + reachability (`dangling`) + `--prune`; git-parity `.sitignore` (negation, `**`, char classes, anchoring); `log --graph`, shallow clone (`--depth N`), and `merge-base` (full-DAG lowest common ancestor); and network sync — clone / fetch / push over HTTP, **HTTPS (first-party Cyrius TLS — no libssl)**, and SSH, with `sit serve` on the host side. Intentionally post-boot — not on the AGNOS critical path.
+**What works** (the full git-parity surface, stable as of **1.0.0**): the local VCS loop (init → add → commit → branch → merge → tag); ed25519 signed commits + `verify-commit`; `fsck` with integrity + reachability (`dangling`) + `--prune`; git-parity `.sitignore` (negation, `**`, char classes, anchoring); `log --graph`, shallow clone (`--depth N`), and `merge-base` (full-DAG lowest common ancestor); and network sync — clone / fetch / push over HTTP, **HTTPS (first-party Cyrius TLS — no libssl)**, and SSH, with `sit serve` on the host side. **1.1.0** adds **reflog + recovery**: a git-compatible `.sit/logs/` journal, `sit reflog`, `<ref>@{N}` resolution (`sit reset --hard HEAD@{1}` undoes a reset), and a reflog-aware `fsck --prune` grace period. Intentionally post-boot — not on the AGNOS critical path.
 
 ## Size and performance
 
@@ -67,7 +67,7 @@ Full walkthrough: [docs/guides/getting-started.md](docs/guides/getting-started.m
 
 ```sh
 cyrius bench tests/sit.bcyr   # SHA-256 / zlib / patra / LCS-diff / .sitignore / blob-hash
-cyrius run tests/sit.fcyr     # fuzz: hash / zlib / hex-decode / URL / ssh-url / want-frame
+cyrius run tests/sit.fcyr     # fuzz: hash / zlib / hex-decode / URL / ssh-url / want-frame / reflog
 ```
 
 ## Docs
