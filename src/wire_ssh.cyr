@@ -539,7 +539,7 @@ fn _wire_ssh_recv_response(rfd, out_body) {
     while (rgo == 1) {
         if (used == cap) {
             if (cap >= WIRE_SSH_RECV_MAX) {
-                fl_free(buf, cap);
+                fl_free(buf);
                 eprintln("sit: ssh response exceeds 16 MiB cap");
                 return 0 - 1;
             }
@@ -547,25 +547,25 @@ fn _wire_ssh_recv_response(rfd, out_body) {
             if (new_cap > WIRE_SSH_RECV_MAX) { new_cap = WIRE_SSH_RECV_MAX; }
             var new_buf = fl_alloc(new_cap);
             if (new_buf == 0) {
-                fl_free(buf, cap);
+                fl_free(buf);
                 eprintln("sit: out of memory growing ssh recv buffer");
                 return 0 - 1;
             }
             memcpy(new_buf, buf, used);
-            fl_free(buf, cap);
+            fl_free(buf);
             buf = new_buf;
             cap = new_cap;
         }
         var rd = sock_recv(rfd, buf + used, cap - used);
         if (is_err_result(rd) == 1) {
-            fl_free(buf, cap);
+            fl_free(buf);
             eprintln("sit: read from ssh stdout failed");
             return 0 - 1;
         }
         var n = payload(rd);
         if (n <= 0) {
             # EOF before response complete — ssh child died.
-            fl_free(buf, cap);
+            fl_free(buf);
             eprintln("sit: ssh session closed before response complete");
             return 0 - 1;
         }
@@ -592,7 +592,7 @@ fn _wire_ssh_recv_response(rfd, out_body) {
                 # Parse Content-Length from the header block.
                 clen = _wire_ssh_parse_content_length(buf, body_off);
                 if (clen < 0) {
-                    fl_free(buf, cap);
+                    fl_free(buf);
                     eprintln("sit: ssh response missing Content-Length");
                     return 0 - 1;
                 }
@@ -658,7 +658,7 @@ fn _wire_ssh_recv_response(rfd, out_body) {
     var body_buf = alloc(clen + 1);
     if (clen > 0) { memcpy(body_buf, buf + body_off, clen); }
     store8(body_buf + clen, 0);
-    fl_free(buf, cap);
+    fl_free(buf);
 
     store64(out_body, body_buf);
     store64(out_body + 8, clen);

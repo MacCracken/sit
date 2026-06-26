@@ -4,6 +4,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.3] — 2026-06-25 — cyrius 6.2.44 toolchain refresh + dep bumps
+
+Toolchain + dependency refresh (same shape as the v1.0.2 / v0.8.11 refreshes). No public-surface change — the full 1.0 git-parity surface stands and the CLI / `.sit/` layout / `/sit/v1/...` wire protocol / `sit_*`/`ann_*` public API remain SemVer-governed. One small required source change: the cyrius 6.2.44 stdlib retired `fl_free`'s second (size) argument, so 30 call sites were updated to the one-arg form (see below).
+
+### Changed
+
+- **Cyrius toolchain `6.2.25 → 6.2.44`** (pinned in `cyrius.cyml [package].cyrius`).
+- **Dependencies** — sakshi `2.4.0 → 2.4.2` (minor-line), sigil `3.9.1 → 3.9.4` (minor-line within major 3 — **audit clean**, sit calls only `hash_data` / `hex_encode` / `hex_decode` / ed25519 verbs; keygen → signed-commit → `verify-commit` confirmed end-to-end), patra `1.12.0 → 1.12.4` (minor-line; no public-surface impact). **sankoch held at `2.4.4`** (already the latest tag).
+- **`fl_free` arity (cyrius 6.2.44 stdlib)** — the freelist API dropped its second `size` parameter; `fl_free(ptr)` is now canonical (the allocator tracks block size internally). Updated **30 call sites** across `src/serve.cyr`, `src/wire_http.cyr`, and `src/wire_ssh.cyr` from `fl_free(ptr, cap)` to `fl_free(ptr)`. No behavior change (the size argument was already redundant); clears 30 `'fl_free' expects 1 argument, got 2` build warnings.
+
+### Notes
+
+- Build / test / lint / fuzz / bench green: **230/230 unit**, lint clean (only the pre-existing advisory long-line / TODO-deferral warnings), fuzz clean (6 harnesses — `zlib_decompress`, `hash_data`, `hex_decode`, `url_validators`, `ssh_url_parser`, `want_frame_decoder` 10M rounds, no crashes), bench flat. DCE binary **2.249 MB** (+~4 KB vs 1.0.2 — 6.2.44 stdlib/dep heft); `ldd` → *not a dynamic executable*.
+- Remaining benign upstream build warnings, DCE-stripped: the `async_*` undefined-function refs (sandhi's async server variant, which sit's synchronous `cmd_serve` never reaches) and the large-static-data note — both originate in vendored stdlib / `lib/sandhi.cyr`, neither reachable from sit.
+- `dist/sit.cyr` regenerated — `serve.cyr` and `wire_http.cyr` are `[lib].modules` source files, so the `fl_free` edits propagate into the bundle (verified no 2-arg `fl_free` remains). No public-API change.
+
 ## [1.0.2] — 2026-06-19 — cyrius 6.2.25 toolchain refresh + dep bumps
 
 Toolchain + dependency refresh (same shape as the v0.8.11 / v0.8.6 refreshes). No `src/*.cyr` changes and no public-surface change — the full 1.0 git-parity surface stands and the CLI / `.sit/` layout / `/sit/v1/...` wire protocol / `sit_*`/`ann_*` public API remain SemVer-governed. One required manifest change: the `random` stdlib module is now declared (see below).

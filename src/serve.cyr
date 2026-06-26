@@ -425,18 +425,18 @@ fn serve_handle_want(cfd, buf, n) {
                             # Already at the ceiling and it still
                             # doesn't fit — refuse rather than
                             # serve a truncated stream.
-                            fl_free(resp, resp_cap);
+                            fl_free(resp);
                             _serve_send_status(cfd, 413, "Payload Too Large");
                             return 0;
                         }
                         var new_resp = fl_alloc(new_cap);
                         if (new_resp == 0) {
-                            fl_free(resp, resp_cap);
+                            fl_free(resp);
                             _serve_send_status(cfd, 500, "Internal Server Error");
                             return 0;
                         }
                         memcpy(new_resp, resp, resp_used);
-                        fl_free(resp, resp_cap);
+                        fl_free(resp);
                         resp = new_resp;
                         resp_cap = new_cap;
                         if (resp_used + frame_len > resp_cap) { grow_done = 0; }
@@ -455,7 +455,7 @@ fn serve_handle_want(cfd, buf, n) {
 
     _serve_send_response(cfd, 200, "OK", "application/octet-stream",
                                  resp, resp_used, 0);
-    fl_free(resp, resp_cap);
+    fl_free(resp);
     return 0;
 }
 

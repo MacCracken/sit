@@ -5,7 +5,7 @@ description = "Sovereign version control — a Cyrius-native git replacement"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sit"
 language = "cyrius"
-cyrius = "6.2.25"
+cyrius = "6.2.44"
 
 [build]
 entry = "src/main.cyr"
@@ -90,7 +90,7 @@ stdlib = [
 
 [deps.sakshi]
 git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.4.0"
+tag = "2.4.2"
 modules = ["dist/sakshi.cyr"]
 
 [deps.sankoch]
@@ -103,11 +103,11 @@ modules = ["dist/sankoch.cyr"]
 # sit uses only hash_data / hex_encode / hex_decode — none affected.
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
-tag = "3.9.1"
+tag = "3.9.4"
 modules = ["dist/sigil.cyr"]
 
 [deps.patra]
 git = "https://github.com/MacCracken/patra.git"
-tag = "1.12.0"
+tag = "1.12.4"
 modules = ["dist/patra.cyr"]
 
