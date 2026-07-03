@@ -1,0 +1,150 @@
+# git_read.cyr — read-only .git/ backend (roadmap 1.2.0).
+#
+# Reads an EXISTING git repository (SHA-1 default / SHA-256, loose objects +
+# refs; packfiles land in bite 2) through the same readers sit uses for its
+# native .sit/ store. Strictly read-only: .git/ is consumed, never mutated —
+# sit stays .sit/-native for its own repos. See ADR 0011 (pending).
+#
+# STORAGE SEAM: sit_repo_open() calls _detect_repo_backend() to set the
+# process-global `_repo_backend`; the three storage-touching primitives
+# (read_object / read_head_ref / resolve_ref_name) dispatch on it. Every layer
+# above them (tree walk, diff, status, log) stays storage-agnostic. The only
+# format divergence a caller could see is object-id WIDTH — handled centrally
+# by _id_hexlen() / _id_rawlen() so the 64-hex / 32-raw literals scattered
+# across the read path collapse to two helpers.
+#
+# One-repo-per-process contract (api.cyr:26-30): the backend is a global, not a
+# per-handle field, matching the existing "sit_repo_open chdirs the process"
+# model. A future multi-handle API would move these onto a repo struct.
+
+# --- Backend state -----------------------------------------------------------
+# _repo_backend: 0 = SIT (.sit/, patra, SHA-256), 1 = GIT (.git/, loose+pack).
+# Default 0 so every pre-1.2.0 code path is byte-identical until a .git/ repo
+# is opened.
+var _repo_backend = 0;
+# _git_hash_algo (GIT mode only): 0 = SHA-1 (git default), 1 = SHA-256.
+var _git_hash_algo = 0;
+
+# --- Active-backend object-id widths ----------------------------------------
+# SIT is always SHA-256 (32 raw / 64 hex). GIT is SHA-1 (20/40) unless the repo
+# declares extensions.objectFormat = sha256 (32/64). These two helpers replace
+# every hardcoded 64 / 32 in the read path.
+fn _id_hexlen() {
+    if (_repo_backend == 1) {
+        if (_git_hash_algo == 1) { return 64; }
+        return 40;
+    }
+    return 64;
+}
+fn _id_rawlen() {
+    if (_repo_backend == 1) {
+        if (_git_hash_algo == 1) { return 32; }
+        return 20;
+    }
+    return 32;
+}
+
+# --- .git/config hash-algo detection ----------------------------------------
+# SHA-256 git repos carry `[extensions]\n\tobjectFormat = sha256` (and
+# repositoryFormatVersion = 1). A whole-file substring scan for "sha256" is
+# sufficient — the token appears nowhere else in a normal config. Best-effort:
+# an unreadable config falls back to SHA-1 (git's default), which is correct
+# for the overwhelming majority of repos.
+fn _git_detect_hash_algo() {
+    var pair[16];
+    if (read_file_heap(".git/config", &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+    var i = 0;
+    var found = 0;
+    while (i + 6 <= len) {
+        if (found == 0) {
+            if (memeq(buf + i, "sha256", 6) == 1) { found = 1; }
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+# --- Loose-object path -------------------------------------------------------
+# .git/objects/<xx>/<rest> — the id split mirrors object_path()'s .sit layout,
+# but the tail is _id_hexlen()-2 chars (38 for SHA-1, 62 for SHA-256) instead
+# of a fixed 62. `buf` must hold at least 13 + 2 + 1 + 62 + 1 = 79 bytes.
+fn _git_object_path(buf, hex) {
+    memcpy(buf, ".git/objects/", 13);
+    store8(buf + 13, load8(hex));
+    store8(buf + 14, load8(hex + 1));
+    store8(buf + 15, 47);
+    var rest = _id_hexlen() - 2;
+    memcpy(buf + 16, hex + 2, rest);
+    store8(buf + 16 + rest, 0);
+    return 16 + rest;
+}
+
+# --- Loose-object read -------------------------------------------------------
+# Reads .git/objects/<xx>/<rest>, zlib-inflates the whole file (git loose
+# objects are one RFC-1950 zlib stream of "<type> <len>\0<content>"), and
+# writes read_object()'s exact 24-byte out contract:
+#   out[0]  = decompressed buffer pointer
+#   out[8]  = decompressed length (framing + content)
+#   out[16] = content offset (first byte past the framing NUL)
+# so every downstream reader (parse_tree, read_blob_content, commit parse) is
+# reused unchanged. Decompression sizing + 16 MiB ceiling + retry-on-
+# BUFFER_TOO_SMALL mirror read_object() so failure modes line up.
+# Returns 0 on success, negative on error.
+fn _git_read_loose(hex, out) {
+    var path[96];
+    _git_object_path(&path, hex);
+
+    var pair[16];
+    if (read_file_heap(&path, &pair) != 0) { return 0 - 1; }
+    var compressed = load64(&pair);
+    var blen = load64(&pair + 8);
+    if (blen <= 0) { return 0 - 2; }
+
+    var dec_cap = blen * 4;
+    if (dec_cap < 4096) { dec_cap = 4096; }
+    if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
+    var decompressed = alloc_or_die(dec_cap);
+    if (decompressed == 0) { return 0 - 3; }
+    var dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
+    if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
+        if (dec_cap < 16 * 1024 * 1024) {
+            dec_cap = 16 * 1024 * 1024;
+            decompressed = alloc_or_die(dec_cap);
+            if (decompressed == 0) { return 0 - 3; }
+            dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
+        }
+    }
+    if (dlen <= 0) { return 0 - 4; }
+
+    var nul = 0;
+    while (nul < dlen) {
+        if (load8(decompressed + nul) == 0) { break; }
+        nul = nul + 1;
+    }
+    if (nul >= dlen) { return 0 - 5; }
+
+    store64(out, decompressed);
+    store64(out + 8, dlen);
+    store64(out + 16, nul + 1);
+    return 0;
+}
+
+# --- Backend detection -------------------------------------------------------
+# Probe order: .sit/ wins over .git/ so a repo that is somehow both stays
+# sit-native (sit never writes .git/). Sets the process-globals and returns the
+# selected backend id, or -1 if neither store is present.
+fn _detect_repo_backend() {
+    if (file_exists(".sit/HEAD") == 1) {
+        _repo_backend = 0;
+        _git_hash_algo = 0;
+        return 0;
+    }
+    if (file_exists(".git/HEAD") == 1) {
+        _repo_backend = 1;
+        _git_hash_algo = _git_detect_hash_algo();
+        return 1;
+    }
+    return 0 - 1;
+}

@@ -75,6 +75,13 @@ fn resolve_hash(prefix, out_buf) {
 #   out[16..24)  content offset (first byte past framing \0)
 # Returns 0 on success, negative on error.
 fn read_object(hex, out) {
+    # Storage seam (roadmap 1.2.0): a .git/ repo has no patra store — objects
+    # are loose files (bite 1) or packed (bite 2). Dispatch on the backend set
+    # by sit_repo_open's _detect_repo_backend. SIT mode (default) is unchanged.
+    if (_repo_backend == 1) {
+        return _git_read_loose(hex, out);
+    }
+
     var db = get_object_db();
     if (db == 0) { return 0 - 1; }
 
