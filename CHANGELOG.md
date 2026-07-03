@@ -4,6 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-07-03 — read-only dist profile (`dist/sit-read.cyr`)
+
+A lean, read-only **`distlib` profile** for consumers that only *report* on a repo — branch / status / diff — and never write or sync: **thoth's status bar** and **owl's gutter markers**. `cyrius distlib read` (a new `[lib.read]` profile in `cyrius.cyml`) emits **`dist/sit-read.cyr`** — the same public `sit_repo_*` API, but built from only the read path (util / validate / config / reflog / git_read / git_pack / object_db / index / refs / tree / diff / commit / merge / api), dropping the signing module and the whole network stack (sign / wire / wire_http / serve). **No source change, no API change** — a packaging-only cut driven entirely by the manifest. The full `dist/sit.cyr` is unchanged and remains the default for consumers that need the write/sync surface.
+
+### Added
+
+- **`[lib.read]` distlib profile → `dist/sit-read.cyr`.** 8.6k lines vs the full bundle's 13.5k. Motivated by a real consumer constraint: vendoring the *full* `dist/sit.cyr` into a Cyrius consumer drags in the network/serve code, which references stdlib globals a consumer's compile doesn't re-export (`serve`'s `HSV_REQ_BUF_SIZE`, TLS's `TLS_OK`) and the unresolved `wire_ssh` transport symbols — forcing the consumer to add shim constants and tolerate wire warnings. The read profile references **none** of those (verified: 0 refs to `HSV_REQ_BUF_SIZE` / `TLS_OK` / `wire_ssh`), so it compiles into a read-only consumer with **no shims and no wire warnings**.
+
+### Notes
+
+- **What the read profile keeps and why:** it retains `reflog` / `index` / `commit` / `merge` because the read-only API genuinely reaches them — `sit_repo_status` honours `.gitignore` + the index, reading `HEAD` parses its commit object into a tree, and ref resolution consults the reflog. Dropping them would silently break status/diff, so the cut is conservative: only `sign` + the network modules (`wire` / `wire_http` / `serve`) come out. Three `sign` symbols (`load_signing_seed` / `sign_commit_body` / `verify_commit_body`) remain **unresolved as dead-path placeholders**, referenced only by `commit`'s signing path which the read API never calls — the same shape as the full bundle intentionally leaving `wire_ssh` unresolved.
+- **Verified downstream:** thoth vendors `dist/sit-read.cyr` (plus sankoch as its own dep) and builds clean — no shim, no wire warnings, no `too many initialized globals`. This is the artifact thoth's `0.13.0` git producer consumes.
+- **Same tests, no new runtime code** — 273 unit / 58 integration / fuzz / lint green, unchanged from 1.2.0; the read profile is a subset of already-covered, already-audited modules. Both `dist/sit.cyr` and `dist/sit-read.cyr` regenerated to carry `v1.3.0`.
+- **Resequencing:** the annotated/signed-tags + ref-ergonomics work previously earmarked for 1.3.0 moves to **1.4.0** (see [roadmap](docs/development/roadmap.md)).
+
 ## [1.2.0] — 2026-07-03 — `.git/` read-mode
 
 sit reads an **existing git repository** read-only — loose objects, packfiles, and refs — behind the *same* public API it exposes for its native `.sit/` repos. A `dist/sit.cyr` consumer (thoth's status bar + tool-call diffs, owl's gutter markers) can now report branch / status / diff on a real-world git repo without shelling out to system `git`. Also folds in the cyrius 6.3.x toolchain refresh and dependency bumps carried since 1.1.0. No FFI, no libgit2 — every layer of git's on-disk format is first-party Cyrius. Design: [ADR 0011](docs/adr/0011-git-read-mode.md).

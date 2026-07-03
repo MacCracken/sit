@@ -43,6 +43,41 @@ modules = [
     "src/api.cyr",
 ]
 
+# `read` profile — `cyrius distlib read` → dist/sit-read.cyr. A LEAN, read-only
+# subset for consumers that only REPORT on a repo (branch / status / diff) and never
+# write or sync: owl's gutter markers, thoth's status bar. It drops the SIGNING module
+# (sign) and the whole NETWORK stack (wire / wire_http / serve) — the parts the
+# read-only sit_repo_* API never executes. It KEEPS reflog / index / commit / merge:
+# those ARE on the read path (status honours .gitignore + the index; reading HEAD parses
+# its commit object → tree; ref resolution touches the reflog), so dropping them would
+# silently break status/diff. The win for read consumers: no dead-code stdlib-global
+# refs (serve's HSV_REQ_BUF_SIZE, TLS's TLS_OK) and no unresolved wire_ssh transport
+# symbols — so the bundle compiles into a consumer with no shims and no wire warnings.
+# (Three sign symbols — load_signing_seed / sign_commit_body / verify_commit_body — stay
+# unresolved as dead-path placeholders, referenced only by commit's signing path which
+# the read API never calls; same shape as the full bundle leaving wire_ssh unresolved.)
+# Same public API (sit_repo_open / _branch / _status / _diff_path + ann_* / sit_status_*),
+# same module ORDER as [lib] (single-pass: each module references only earlier ones). See
+# ADR 0009 (public-API contract) + the consumers table in docs/development/state.md. Keep
+# the module list a subset of [lib], minus {sign, wire, wire_http, serve}.
+[lib.read]
+modules = [
+    "src/util.cyr",
+    "src/validate.cyr",
+    "src/config.cyr",
+    "src/reflog.cyr",
+    "src/git_read.cyr",
+    "src/git_pack.cyr",
+    "src/object_db.cyr",
+    "src/index.cyr",
+    "src/refs.cyr",
+    "src/tree.cyr",
+    "src/diff.cyr",
+    "src/commit.cyr",
+    "src/merge.cyr",
+    "src/api.cyr",
+]
+
 # No libgit2, no C, no FFI. Each layer is first-party Cyrius, benchmarked
 # against its C incumbent.
 #   sankoch — LZ4/DEFLATE/zlib/gzip (git's pack-file compression layer)
