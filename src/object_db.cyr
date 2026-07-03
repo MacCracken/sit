@@ -21,17 +21,23 @@ fn object_path(buf, hex) {
 # Returns 0 if no ref matches.
 fn resolve_hash(prefix, out_buf) {
     var plen = strlen(prefix);
-    if (plen == 64) {
+    var hexlen = _id_hexlen();
+    if (plen == hexlen) {
         # S-01: a full-length hash must still be hex — otherwise the
         # short-circuit here would pass garbage bytes straight through.
-        if (hex_prefix_valid(prefix, 64) == 0) { return 0; }
-        memcpy(out_buf, prefix, 64);
-        store8(out_buf + 64, 0);
+        if (hex_prefix_valid(prefix, hexlen) == 0) { return 0; }
+        memcpy(out_buf, prefix, hexlen);
+        store8(out_buf + hexlen, 0);
         return 1;
     }
 
     # Try as a ref name first (HEAD, tags, branches)
     if (resolve_ref_name(prefix, out_buf) == 1) { return 1; }
+
+    # git mode (roadmap 1.2.0): objects live on the loose/pack filesystem, not
+    # patra. Short-prefix disambiguation over loose fanout + pack .idx is a later
+    # enhancement — a git object must be named by full oid or a ref for now.
+    if (_repo_backend == 1) { return 0; }
 
     if (plen < 4) { return 0 - 2; }
 
@@ -214,7 +220,10 @@ fn write_blob_object(content, content_len) {
 }
 
 fn resolve_and_read(obj_out, hex_out) {
-    if (file_exists(".sit/HEAD") != 1) {
+    # Backend detection (roadmap 1.2.0): read verbs work on a native .sit/ or an
+    # existing .git/ repo; sets the process-global backend that read_object /
+    # resolve_hash dispatch on. Non-repos still error as before.
+    if (_detect_repo_backend() < 0) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }

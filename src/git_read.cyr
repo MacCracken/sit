@@ -148,3 +148,158 @@ fn _detect_repo_backend() {
     }
     return 0 - 1;
 }
+
+# --- Ref backend -------------------------------------------------------------
+# The active store's 5-char directory prefix. ".sit/" and ".git/" are both
+# exactly 5 bytes and the ref/HEAD subpaths are length-identical, so only the
+# middle three bytes ever differ — read_head_ref_path builds the HEAD path from
+# this, and the git-side ref readers below hardcode ".git/".
+fn _repo_dir() {
+    if (_repo_backend == 1) { return ".git/"; }
+    return ".sit/";
+}
+
+# Read a loose ref file .git/<refpath> as a bare OID. Returns a heap cstring of
+# _id_hexlen() hex chars (NUL-terminated) or 0 if the file is absent / not hex.
+# Simplification: a loose ref that is itself a "ref: <path>" symref (rare
+# outside HEAD) is treated as a miss — HEAD is the only symref sit follows.
+fn _git_read_loose_ref(refpath) {
+    var rp_len = strlen(refpath);
+    var full = alloc(5 + rp_len + 1);
+    memcpy(full, ".git/", 5);
+    memcpy(full + 5, refpath, rp_len);
+    store8(full + 5 + rp_len, 0);
+    if (file_exists(full) != 1) { return 0; }
+    var fd = file_open(full, 0, 0);
+    if (fd < 0) { return 0; }
+    var buf = alloc(96);
+    var n = file_read(fd, buf, 96);
+    file_close(fd);
+    var hexlen = _id_hexlen();
+    if (n < hexlen) { return 0; }
+    if (hex_prefix_valid(buf, hexlen) == 0) { return 0; }
+    store8(buf + hexlen, 0);
+    return buf;
+}
+
+# Look up a full refname (e.g. "refs/heads/main") in .git/packed-refs. Writes
+# _id_hexlen() hex chars + NUL into out_buf and returns 1 on hit, else 0. Lines:
+# "<oid> <refname>\n"; '#' header/comment lines and '^' peeled-tag lines are
+# skipped (a ref name resolves to its own object, not a tag's peeled target).
+fn _git_packed_ref_lookup(refname, out_buf) {
+    var pair[16];
+    if (read_file_heap(".git/packed-refs", &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+    var hexlen = _id_hexlen();
+    var rn_len = strlen(refname);
+
+    var pos = 0;
+    var result = 0;
+    while (pos < len) {
+        if (result == 0) {
+            var eol = pos;
+            while (eol < len) {
+                if (load8(buf + eol) == 10) { break; }
+                eol = eol + 1;
+            }
+            var line_len = eol - pos;
+            var first = load8(buf + pos);
+            # A ref line is exactly "<hexlen hex> <refname>": length matches and
+            # a space sits at the OID boundary. '#' (35) and '^' (94) are skipped.
+            if (first != 35) {
+                if (first != 94) {
+                    if (line_len == hexlen + 1 + rn_len) {
+                        if (load8(buf + pos + hexlen) == 32) {
+                            if (hex_prefix_valid(buf + pos, hexlen) == 1) {
+                                if (memeq(buf + pos + hexlen + 1, refname, rn_len) == 1) {
+                                    memcpy(out_buf, buf + pos, hexlen);
+                                    store8(out_buf + hexlen, 0);
+                                    result = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            pos = eol + 1;
+        } else {
+            pos = len;
+        }
+    }
+    return result;
+}
+
+# git-mode read_head_ref: resolve .git/HEAD. Symref → loose ref then packed-refs;
+# detached (bare OID in HEAD) → that OID. Returns heap hex cstring or 0.
+fn _git_read_head_ref() {
+    var ref_path = read_head_ref_path();
+    if (ref_path == 0) {
+        # Detached HEAD: .git/HEAD holds a bare OID (no "ref: " prefix).
+        var pair[16];
+        if (read_file_heap(".git/HEAD", &pair) != 0) { return 0; }
+        var hb = load64(&pair);
+        var hn = load64(&pair + 8);
+        var hexlen = _id_hexlen();
+        if (hn < hexlen) { return 0; }
+        if (hex_prefix_valid(hb, hexlen) == 0) { return 0; }
+        var oid = alloc(hexlen + 1);
+        memcpy(oid, hb, hexlen);
+        store8(oid + hexlen, 0);
+        return oid;
+    }
+    var loose = _git_read_loose_ref(ref_path);
+    if (loose != 0) { return loose; }
+    var out = alloc(96);
+    if (_git_packed_ref_lookup(ref_path, out) == 1) { return out; }
+    return 0;
+}
+
+# Try a full refname (loose then packed-refs), writing hex+NUL into out_buf.
+# Returns 1 on hit, 0 miss.
+fn _git_try_full_ref(refname, out_buf) {
+    var loose = _git_read_loose_ref(refname);
+    if (loose != 0) {
+        var hexlen = _id_hexlen();
+        memcpy(out_buf, loose, hexlen);
+        store8(out_buf + hexlen, 0);
+        return 1;
+    }
+    if (_git_packed_ref_lookup(refname, out_buf) == 1) { return 1; }
+    return 0;
+}
+
+# git-mode resolve_ref_name: HEAD, then refs/tags|heads|remotes/<name> (loose or
+# packed), matching the .sit resolution order. Writes hex+NUL, returns 1/0.
+fn _git_resolve_ref_name(name, out_buf) {
+    if (streq(name, "HEAD") == 1) {
+        var h = read_head_ref();
+        if (h == 0) { return 0; }
+        var hexlen = _id_hexlen();
+        memcpy(out_buf, h, hexlen);
+        store8(out_buf + hexlen, 0);
+        return 1;
+    }
+
+    var name_len = strlen(name);
+
+    var tag_ref = alloc(10 + name_len + 1);
+    memcpy(tag_ref, "refs/tags/", 10);
+    memcpy(tag_ref + 10, name, name_len);
+    store8(tag_ref + 10 + name_len, 0);
+    if (_git_try_full_ref(tag_ref, out_buf) == 1) { return 1; }
+
+    var head_ref = alloc(11 + name_len + 1);
+    memcpy(head_ref, "refs/heads/", 11);
+    memcpy(head_ref + 11, name, name_len);
+    store8(head_ref + 11 + name_len, 0);
+    if (_git_try_full_ref(head_ref, out_buf) == 1) { return 1; }
+
+    var rem_ref = alloc(13 + name_len + 1);
+    memcpy(rem_ref, "refs/remotes/", 13);
+    memcpy(rem_ref + 13, name, name_len);
+    store8(rem_ref + 13 + name_len, 0);
+    if (_git_try_full_ref(rem_ref, out_buf) == 1) { return 1; }
+
+    return 0;
+}

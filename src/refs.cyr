@@ -48,6 +48,10 @@ fn resolve_reflog_spec(name, out_buf) {
 }
 
 fn resolve_ref_name(name, out_buf) {
+    # Storage seam (roadmap 1.2.0): a .git/ repo resolves refs from .git/HEAD,
+    # .git/refs/, and .git/packed-refs. @{N} reflog specs are .sit-only for now.
+    if (_repo_backend == 1) { return _git_resolve_ref_name(name, out_buf); }
+
     # Reflog selector <ref>@{N} takes precedence over plain-name lookup.
     if (resolve_reflog_spec(name, out_buf) == 1) { return 1; }
     if (streq(name, "HEAD") == 1) {
@@ -136,7 +140,13 @@ fn resolve_ref_name(name, out_buf) {
 #   -2  prefix too short
 fn read_head_ref_path() {
     var pair[16];
-    if (read_file_heap(".sit/HEAD", &pair) != 0) { return 0; }
+    # Backend-aware HEAD path: ".sit/HEAD" or ".git/HEAD" (both 9 bytes; the
+    # "ref: <path>" symref format is identical across backends).
+    var hp[12];
+    memcpy(&hp, _repo_dir(), 5);
+    memcpy(&hp + 5, "HEAD", 4);
+    store8(&hp + 9, 0);
+    if (read_file_heap(&hp, &pair) != 0) { return 0; }
     var buf = load64(&pair);
     var len = load64(&pair + 8);
 
@@ -168,6 +178,10 @@ fn read_head_ref_path() {
 
 # Read the ref file pointed at by HEAD. Returns 64-char hex or 0.
 fn read_head_ref() {
+    # Storage seam (roadmap 1.2.0): git refs may be loose or in packed-refs, and
+    # the id width is _id_hexlen(). Dispatch to the git reader before the .sit path.
+    if (_repo_backend == 1) { return _git_read_head_ref(); }
+
     var ref_path = read_head_ref_path();
     if (ref_path == 0) { return 0; }
     var ref_len = strlen(ref_path);

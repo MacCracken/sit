@@ -329,6 +329,8 @@ fn parse_commit_body(body, body_len, out) {
     store64(out + 40, 0);
     store64(out + 48, 0);
 
+    # Object-id hex width per active backend: 64 (sit SHA-256) or 40 (git SHA-1).
+    var hexlen = _id_hexlen();
     var pos = 0;
     var in_headers = 1;
     while (pos < body_len) {
@@ -348,24 +350,28 @@ fn parse_commit_body(body, body_len, out) {
             else {
                 if (line_len > 5) {
                     if (memeq(body + pos, "tree ", 5) == 1) {
-                        var t = alloc_or_die(65);
-                        memcpy(t, body + pos + 5, 64);
-                        store8(t + 64, 0);
-                        store64(out, t);
+                        if (line_len >= 5 + hexlen) {
+                            var t = alloc_or_die(hexlen + 1);
+                            memcpy(t, body + pos + 5, hexlen);
+                            store8(t + hexlen, 0);
+                            store64(out, t);
+                        }
                     }
                 }
                 if (line_len > 7) {
                     if (memeq(body + pos, "parent ", 7) == 1) {
-                        var p = alloc_or_die(65);
-                        memcpy(p, body + pos + 7, 64);
-                        store8(p + 64, 0);
-                        store64(out + 8, p);
-                        # Collect every parent (merge commits have 2+) into a
-                        # vec at out+48 so reachability + ancestor walks follow
-                        # all edges, not just the last one captured at out+8.
-                        var pv = load64(out + 48);
-                        if (pv == 0) { pv = vec_new(); store64(out + 48, pv); }
-                        vec_push(pv, p);
+                        if (line_len >= 7 + hexlen) {
+                            var p = alloc_or_die(hexlen + 1);
+                            memcpy(p, body + pos + 7, hexlen);
+                            store8(p + hexlen, 0);
+                            store64(out + 8, p);
+                            # Collect every parent (merge commits have 2+) into a
+                            # vec at out+48 so reachability + ancestor walks follow
+                            # all edges, not just the last one captured at out+8.
+                            var pv = load64(out + 48);
+                            if (pv == 0) { pv = vec_new(); store64(out + 48, pv); }
+                            vec_push(pv, p);
+                        }
                     }
                     if (memeq(body + pos, "author ", 7) == 1) {
                         var ao[24];

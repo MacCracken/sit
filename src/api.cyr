@@ -31,7 +31,11 @@
 fn sit_repo_open(cwd) {
     if (cwd == 0) { return 0; }
     if (syscall(SYS_CHDIR, cwd) != 0) { return 0; }
-    if (file_exists(".sit/HEAD") != 1) { return 0; }
+    # Storage seam (roadmap 1.2.0): succeed on a native .sit/ OR an existing
+    # .git/ repo; _detect_repo_backend sets the process-global backend that
+    # read_object / read_head_ref / resolve_ref_name dispatch on. Returns -1
+    # when neither store is present.
+    if (_detect_repo_backend() < 0) { return 0; }
     return 1;
 }
 
@@ -90,4 +94,13 @@ fn sit_diff_path(repo, path) {
     }
 
     return compute_file_diff(old_buf, old_len, new_buf, new_len);
+}
+
+# Return the current branch name for the open repo as a heap cstring (e.g.
+# "main"), or 0 if HEAD is detached or not a branch ref. Backend-aware: reads
+# .sit/HEAD or .git/HEAD through the storage seam (roadmap 1.2.0), so it works
+# on both sit-native and existing git repositories. Caller owns the cstring.
+# New public surface (ADR 0009): additive, SemVer-minor.
+fn sit_repo_branch(repo) {
+    return current_branch_name();
 }

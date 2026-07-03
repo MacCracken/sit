@@ -243,6 +243,31 @@ case "$DOUT" in
   *) ok ;;
 esac
 
+# ── 9. .git/ read-mode (roadmap 1.2.0) ─────────────────────────────
+# sit reads an EXISTING git repository (SHA-1 loose objects + refs) read-only,
+# through the same read verbs. Guarded on `git` so a git-less runner skips
+# rather than fails. Covers loose blob read, HEAD→commit resolution, and the
+# packed-refs path (pack-refs prunes the loose branch ref, forcing the
+# .git/packed-refs lookup).
+hr ".git/ read-mode (loose objects + refs)"
+if command -v git >/dev/null 2>&1; then
+  R="$WORK/gitread"; mkdir -p "$R"; cd "$R"
+  git init -q
+  git config user.email itest@sit.local >/dev/null 2>&1
+  git config user.name "Integration Test" >/dev/null 2>&1
+  printf 'hello from git\nsecond line\n' > f.txt
+  git add f.txt
+  git commit -qm "git commit" >/dev/null 2>&1
+  BLOB=$(git rev-parse HEAD:f.txt)
+  HEADC=$(git rev-parse HEAD)
+  assert_eq "$("$SIT" cat-file "$BLOB")" "$(git cat-file blob "$BLOB")" "sit reads a git loose blob by oid"
+  assert_eq "$("$SIT" cat-file HEAD)" "$(git cat-file commit "$HEADC")" "sit resolves git HEAD symref + reads the commit"
+  git pack-refs --all >/dev/null 2>&1
+  assert_eq "$("$SIT" cat-file HEAD)" "$(git cat-file commit "$HEADC")" "sit resolves HEAD via .git/packed-refs after pack-refs"
+else
+  printf '  SKIP: git not installed — .git/ read-mode test skipped\n'
+fi
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

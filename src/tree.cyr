@@ -130,6 +130,8 @@ fn tree_entry_hash(e) { return load64(e + 16); }
 # Parse tree object body. Returns vec of entries.
 fn parse_tree(body, body_len) {
     var entries = vec_new();
+    # Raw hash width per active backend: 32 (sit SHA-256) or 20 (git SHA-1).
+    var rawlen = _id_rawlen();
     var pos = 0;
     while (pos < body_len) {
         var sp = pos;
@@ -156,7 +158,7 @@ fn parse_tree(body, body_len) {
                 memcpy(name, body + sp + 1, name_len);
                 store8(name + name_len, 0);
 
-                if (nu + 1 + 32 > body_len) { pos = body_len; }
+                if (nu + 1 + rawlen > body_len) { pos = body_len; }
                 else {
                     # S-03: reject tree entries whose mode isn't allowlisted or
                     # whose name would let an attacker escape the working tree.
@@ -165,7 +167,7 @@ fn parse_tree(body, body_len) {
                     # flag the mismatch on the outer tree's hash-of-bytes.
                     if (tree_entry_mode_valid(mode) == 1) {
                         if (tree_entry_name_valid(name) == 1) {
-                            var hash_hex = hex_encode(body + nu + 1, 32);
+                            var hash_hex = hex_encode(body + nu + 1, rawlen);
                             var e = alloc_or_die(24);
                             store64(e, mode);
                             store64(e + 8, name);
@@ -173,7 +175,7 @@ fn parse_tree(body, body_len) {
                             vec_push(entries, e);
                         }
                     }
-                    pos = nu + 1 + 32;
+                    pos = nu + 1 + rawlen;
                 }
             }
         }
@@ -259,11 +261,12 @@ fn read_head_tree_entries() {
     var body = buf + coff;
     var body_len = blen - coff;
 
-    if (body_len < 70) { return 0; }
+    var hexlen = _id_hexlen();
+    if (body_len < 6 + hexlen) { return 0; }
     if (memeq(body, "tree ", 5) == 0) { return 0; }
-    var tree_hex = alloc_or_die(65);
-    memcpy(tree_hex, body + 5, 64);
-    store8(tree_hex + 64, 0);
+    var tree_hex = alloc_or_die(hexlen + 1);
+    memcpy(tree_hex, body + 5, hexlen);
+    store8(tree_hex + hexlen, 0);
 
     var out = vec_new();
     flatten_tree(tree_hex, "", out);
