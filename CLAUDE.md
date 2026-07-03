@@ -102,7 +102,7 @@ CYRIUS_DCE=1 cyrius build src/main.cyr build/sit   # dead-code-eliminated releas
 5. **Security check** — any new syscall usage, user input handling, buffer allocation.
 6. **Documentation** — update CHANGELOG, roadmap, `docs/development/state.md`, any ADR the change earned.
 7. **Version check** — `VERSION`, `cyrius.cyml`, CHANGELOG header in sync.
-8. **dist bundle** — if the change touched any `[lib].modules` source file (`src/util.cyr`, `validate.cyr`, `config.cyr`, `reflog.cyr`, `object_db.cyr`, `index.cyr`, `refs.cyr`, `tree.cyr`, `diff.cyr`, `commit.cyr`, `merge.cyr`, `sign.cyr`, `wire.cyr`, `wire_http.cyr`, `serve.cyr`, `api.cyr`), run `cyrius distlib` and commit the regenerated `dist/sit.cyr` **in the same commit** as the source change. CI's `Verify dist/sit.cyr is in sync` step hard-fails otherwise. (`wire_ssh.cyr` / `wire_https.cyr` are NOT in `[lib].modules` — transport internals stay out of the owl-facing bundle.)
+8. **dist bundle** — if the change touched any `[lib].modules` source file (`src/util.cyr`, `validate.cyr`, `config.cyr`, `reflog.cyr`, `git_read.cyr`, `git_pack.cyr`, `object_db.cyr`, `index.cyr`, `refs.cyr`, `tree.cyr`, `diff.cyr`, `commit.cyr`, `merge.cyr`, `sign.cyr`, `wire.cyr`, `wire_http.cyr`, `serve.cyr`, `api.cyr`), run `cyrius distlib` and commit the regenerated `dist/sit.cyr` **in the same commit** as the source change. CI's `Verify dist/sit.cyr is in sync` step hard-fails otherwise. (`wire_ssh.cyr` / `wire_https.cyr` are NOT in `[lib].modules` — transport internals stay out of the owl-facing bundle.)
 9. **Return to step 1.**
 
 ### Security Hardening (before every release)

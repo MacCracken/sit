@@ -3,7 +3,7 @@
 # Reads an EXISTING git repository (SHA-1 default / SHA-256, loose objects +
 # refs; packfiles land in bite 2) through the same readers sit uses for its
 # native .sit/ store. Strictly read-only: .git/ is consumed, never mutated —
-# sit stays .sit/-native for its own repos. See ADR 0011 (pending).
+# sit stays .sit/-native for its own repos. See ADR 0011.
 #
 # STORAGE SEAM: sit_repo_open() calls _detect_repo_backend() to set the
 # process-global `_repo_backend`; the three storage-touching primitives

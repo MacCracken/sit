@@ -1560,6 +1560,702 @@ fn cmd_reflog() {
     return 0;
 }
 
+# --- git_read.cyr ---
+
+# git_read.cyr — read-only .git/ backend (roadmap 1.2.0).
+#
+# Reads an EXISTING git repository (SHA-1 default / SHA-256, loose objects +
+# refs; packfiles land in bite 2) through the same readers sit uses for its
+# native .sit/ store. Strictly read-only: .git/ is consumed, never mutated —
+# sit stays .sit/-native for its own repos. See ADR 0011.
+#
+# STORAGE SEAM: sit_repo_open() calls _detect_repo_backend() to set the
+# process-global `_repo_backend`; the three storage-touching primitives
+# (read_object / read_head_ref / resolve_ref_name) dispatch on it. Every layer
+# above them (tree walk, diff, status, log) stays storage-agnostic. The only
+# format divergence a caller could see is object-id WIDTH — handled centrally
+# by _id_hexlen() / _id_rawlen() so the 64-hex / 32-raw literals scattered
+# across the read path collapse to two helpers.
+#
+# One-repo-per-process contract (api.cyr:26-30): the backend is a global, not a
+# per-handle field, matching the existing "sit_repo_open chdirs the process"
+# model. A future multi-handle API would move these onto a repo struct.
+
+# --- Backend state -----------------------------------------------------------
+# _repo_backend: 0 = SIT (.sit/, patra, SHA-256), 1 = GIT (.git/, loose+pack).
+# Default 0 so every pre-1.2.0 code path is byte-identical until a .git/ repo
+# is opened.
+var _repo_backend = 0;
+# _git_hash_algo (GIT mode only): 0 = SHA-1 (git default), 1 = SHA-256.
+var _git_hash_algo = 0;
+
+# --- Active-backend object-id widths ----------------------------------------
+# SIT is always SHA-256 (32 raw / 64 hex). GIT is SHA-1 (20/40) unless the repo
+# declares extensions.objectFormat = sha256 (32/64). These two helpers replace
+# every hardcoded 64 / 32 in the read path.
+fn _id_hexlen() {
+    if (_repo_backend == 1) {
+        if (_git_hash_algo == 1) { return 64; }
+        return 40;
+    }
+    return 64;
+}
+fn _id_rawlen() {
+    if (_repo_backend == 1) {
+        if (_git_hash_algo == 1) { return 32; }
+        return 20;
+    }
+    return 32;
+}
+
+# --- .git/config hash-algo detection ----------------------------------------
+# SHA-256 git repos carry `[extensions]\n\tobjectFormat = sha256` (and
+# repositoryFormatVersion = 1). A whole-file substring scan for "sha256" is
+# sufficient — the token appears nowhere else in a normal config. Best-effort:
+# an unreadable config falls back to SHA-1 (git's default), which is correct
+# for the overwhelming majority of repos.
+fn _git_detect_hash_algo() {
+    var pair[16];
+    if (read_file_heap(".git/config", &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+    var i = 0;
+    var found = 0;
+    while (i + 6 <= len) {
+        if (found == 0) {
+            if (memeq(buf + i, "sha256", 6) == 1) { found = 1; }
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+# --- Loose-object path -------------------------------------------------------
+# .git/objects/<xx>/<rest> — the id split mirrors object_path()'s .sit layout,
+# but the tail is _id_hexlen()-2 chars (38 for SHA-1, 62 for SHA-256) instead
+# of a fixed 62. `buf` must hold at least 13 + 2 + 1 + 62 + 1 = 79 bytes.
+fn _git_object_path(buf, hex) {
+    memcpy(buf, ".git/objects/", 13);
+    store8(buf + 13, load8(hex));
+    store8(buf + 14, load8(hex + 1));
+    store8(buf + 15, 47);
+    var rest = _id_hexlen() - 2;
+    memcpy(buf + 16, hex + 2, rest);
+    store8(buf + 16 + rest, 0);
+    return 16 + rest;
+}
+
+# --- Loose-object read -------------------------------------------------------
+# Reads .git/objects/<xx>/<rest>, zlib-inflates the whole file (git loose
+# objects are one RFC-1950 zlib stream of "<type> <len>\0<content>"), and
+# writes read_object()'s exact 24-byte out contract:
+#   out[0]  = decompressed buffer pointer
+#   out[8]  = decompressed length (framing + content)
+#   out[16] = content offset (first byte past the framing NUL)
+# so every downstream reader (parse_tree, read_blob_content, commit parse) is
+# reused unchanged. Decompression sizing + 16 MiB ceiling + retry-on-
+# BUFFER_TOO_SMALL mirror read_object() so failure modes line up.
+# Returns 0 on success, negative on error.
+fn _git_read_loose(hex, out) {
+    var path[96];
+    _git_object_path(&path, hex);
+
+    var pair[16];
+    if (read_file_heap(&path, &pair) != 0) { return 0 - 1; }
+    var compressed = load64(&pair);
+    var blen = load64(&pair + 8);
+    if (blen <= 0) { return 0 - 2; }
+
+    var dec_cap = blen * 4;
+    if (dec_cap < 4096) { dec_cap = 4096; }
+    if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
+    var decompressed = alloc_or_die(dec_cap);
+    if (decompressed == 0) { return 0 - 3; }
+    var dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
+    if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
+        if (dec_cap < 16 * 1024 * 1024) {
+            dec_cap = 16 * 1024 * 1024;
+            decompressed = alloc_or_die(dec_cap);
+            if (decompressed == 0) { return 0 - 3; }
+            dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
+        }
+    }
+    if (dlen <= 0) { return 0 - 4; }
+
+    var nul = 0;
+    while (nul < dlen) {
+        if (load8(decompressed + nul) == 0) { break; }
+        nul = nul + 1;
+    }
+    if (nul >= dlen) { return 0 - 5; }
+
+    store64(out, decompressed);
+    store64(out + 8, dlen);
+    store64(out + 16, nul + 1);
+    return 0;
+}
+
+# --- Backend detection -------------------------------------------------------
+# Probe order: .sit/ wins over .git/ so a repo that is somehow both stays
+# sit-native (sit never writes .git/). Sets the process-globals and returns the
+# selected backend id, or -1 if neither store is present.
+fn _detect_repo_backend() {
+    if (file_exists(".sit/HEAD") == 1) {
+        _repo_backend = 0;
+        _git_hash_algo = 0;
+        return 0;
+    }
+    if (file_exists(".git/HEAD") == 1) {
+        _repo_backend = 1;
+        _git_hash_algo = _git_detect_hash_algo();
+        return 1;
+    }
+    return 0 - 1;
+}
+
+# --- Ref backend -------------------------------------------------------------
+# The active store's 5-char directory prefix. ".sit/" and ".git/" are both
+# exactly 5 bytes and the ref/HEAD subpaths are length-identical, so only the
+# middle three bytes ever differ — read_head_ref_path builds the HEAD path from
+# this, and the git-side ref readers below hardcode ".git/".
+fn _repo_dir() {
+    if (_repo_backend == 1) { return ".git/"; }
+    return ".sit/";
+}
+
+# The active backend's ignore-file name. load_sitignore reads this so the
+# working-tree walk honours .gitignore on a git repo (top-level only for v1 —
+# nested .gitignore / info/exclude / global excludes are not consulted).
+fn _ignore_filename() {
+    if (_repo_backend == 1) { return ".gitignore"; }
+    return ".sitignore";
+}
+
+# Read a loose ref file .git/<refpath> as a bare OID. Returns a heap cstring of
+# _id_hexlen() hex chars (NUL-terminated) or 0 if the file is absent / not hex.
+# Simplification: a loose ref that is itself a "ref: <path>" symref (rare
+# outside HEAD) is treated as a miss — HEAD is the only symref sit follows.
+fn _git_read_loose_ref(refpath) {
+    var rp_len = strlen(refpath);
+    var full = alloc(5 + rp_len + 1);
+    memcpy(full, ".git/", 5);
+    memcpy(full + 5, refpath, rp_len);
+    store8(full + 5 + rp_len, 0);
+    if (file_exists(full) != 1) { return 0; }
+    var fd = file_open(full, 0, 0);
+    if (fd < 0) { return 0; }
+    var buf = alloc(96);
+    var n = file_read(fd, buf, 96);
+    file_close(fd);
+    var hexlen = _id_hexlen();
+    if (n < hexlen) { return 0; }
+    if (hex_prefix_valid(buf, hexlen) == 0) { return 0; }
+    store8(buf + hexlen, 0);
+    return buf;
+}
+
+# Look up a full refname (e.g. "refs/heads/main") in .git/packed-refs. Writes
+# _id_hexlen() hex chars + NUL into out_buf and returns 1 on hit, else 0. Lines:
+# "<oid> <refname>\n"; '#' header/comment lines and '^' peeled-tag lines are
+# skipped (a ref name resolves to its own object, not a tag's peeled target).
+fn _git_packed_ref_lookup(refname, out_buf) {
+    var pair[16];
+    if (read_file_heap(".git/packed-refs", &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+    var hexlen = _id_hexlen();
+    var rn_len = strlen(refname);
+
+    var pos = 0;
+    var result = 0;
+    while (pos < len) {
+        if (result == 0) {
+            var eol = pos;
+            while (eol < len) {
+                if (load8(buf + eol) == 10) { break; }
+                eol = eol + 1;
+            }
+            var line_len = eol - pos;
+            var first = load8(buf + pos);
+            # A ref line is exactly "<hexlen hex> <refname>": length matches and
+            # a space sits at the OID boundary. '#' (35) and '^' (94) are skipped.
+            if (first != 35) {
+                if (first != 94) {
+                    if (line_len == hexlen + 1 + rn_len) {
+                        if (load8(buf + pos + hexlen) == 32) {
+                            if (hex_prefix_valid(buf + pos, hexlen) == 1) {
+                                if (memeq(buf + pos + hexlen + 1, refname, rn_len) == 1) {
+                                    memcpy(out_buf, buf + pos, hexlen);
+                                    store8(out_buf + hexlen, 0);
+                                    result = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            pos = eol + 1;
+        } else {
+            pos = len;
+        }
+    }
+    return result;
+}
+
+# git-mode read_head_ref: resolve .git/HEAD. Symref → loose ref then packed-refs;
+# detached (bare OID in HEAD) → that OID. Returns heap hex cstring or 0.
+fn _git_read_head_ref() {
+    var ref_path = read_head_ref_path();
+    if (ref_path == 0) {
+        # Detached HEAD: .git/HEAD holds a bare OID (no "ref: " prefix).
+        var pair[16];
+        if (read_file_heap(".git/HEAD", &pair) != 0) { return 0; }
+        var hb = load64(&pair);
+        var hn = load64(&pair + 8);
+        var hexlen = _id_hexlen();
+        if (hn < hexlen) { return 0; }
+        if (hex_prefix_valid(hb, hexlen) == 0) { return 0; }
+        var oid = alloc(hexlen + 1);
+        memcpy(oid, hb, hexlen);
+        store8(oid + hexlen, 0);
+        return oid;
+    }
+    var loose = _git_read_loose_ref(ref_path);
+    if (loose != 0) { return loose; }
+    var out = alloc(96);
+    if (_git_packed_ref_lookup(ref_path, out) == 1) { return out; }
+    return 0;
+}
+
+# Try a full refname (loose then packed-refs), writing hex+NUL into out_buf.
+# Returns 1 on hit, 0 miss.
+fn _git_try_full_ref(refname, out_buf) {
+    var loose = _git_read_loose_ref(refname);
+    if (loose != 0) {
+        var hexlen = _id_hexlen();
+        memcpy(out_buf, loose, hexlen);
+        store8(out_buf + hexlen, 0);
+        return 1;
+    }
+    if (_git_packed_ref_lookup(refname, out_buf) == 1) { return 1; }
+    return 0;
+}
+
+# git-mode resolve_ref_name: HEAD, then refs/tags|heads|remotes/<name> (loose or
+# packed), matching the .sit resolution order. Writes hex+NUL, returns 1/0.
+fn _git_resolve_ref_name(name, out_buf) {
+    if (streq(name, "HEAD") == 1) {
+        var h = read_head_ref();
+        if (h == 0) { return 0; }
+        var hexlen = _id_hexlen();
+        memcpy(out_buf, h, hexlen);
+        store8(out_buf + hexlen, 0);
+        return 1;
+    }
+
+    var name_len = strlen(name);
+
+    var tag_ref = alloc(10 + name_len + 1);
+    memcpy(tag_ref, "refs/tags/", 10);
+    memcpy(tag_ref + 10, name, name_len);
+    store8(tag_ref + 10 + name_len, 0);
+    if (_git_try_full_ref(tag_ref, out_buf) == 1) { return 1; }
+
+    var head_ref = alloc(11 + name_len + 1);
+    memcpy(head_ref, "refs/heads/", 11);
+    memcpy(head_ref + 11, name, name_len);
+    store8(head_ref + 11 + name_len, 0);
+    if (_git_try_full_ref(head_ref, out_buf) == 1) { return 1; }
+
+    var rem_ref = alloc(13 + name_len + 1);
+    memcpy(rem_ref, "refs/remotes/", 13);
+    memcpy(rem_ref + 13, name, name_len);
+    store8(rem_ref + 13 + name_len, 0);
+    if (_git_try_full_ref(rem_ref, out_buf) == 1) { return 1; }
+
+    return 0;
+}
+
+# --- git_pack.cyr ---
+
+# git_pack.cyr — read-only git packfile decode (roadmap 1.2.0, bite 2).
+#
+# Reads objects out of .git/objects/pack/*.{idx,pack}: binary-search the v2
+# .idx for an oid -> pack offset, parse the pack v2 object header, inflate
+# non-delta objects (sankoch zlib — no new dep), and reconstruct OFS_DELTA /
+# REF_DELTA objects via a self-written copy/insert delta interpreter. Byte
+# formats per gitformat-pack. Ordered AFTER git_read.cyr (uses _id_hexlen /
+# _id_rawlen / _git_read_loose) and BEFORE object_db.cyr (read_object dispatches
+# to _git_read_any) so the single-pass dist bundle stays forward-only.
+#
+# Shifts are written as * / to avoid any dependence on << / >>. All the object
+# out-params use read_object's 24-byte contract {content_ptr, content_len,
+# content_off}; pack objects carry no loose framing, so content_off is 0.
+
+# One-entry pack-file cache: a sit invocation reads many objects from the same
+# pack, so hold the last-loaded pack in memory rather than re-reading per object.
+var _pack_cache_path = 0;
+var _pack_cache_data = 0;
+var _pack_cache_len = 0;
+
+# Delta-chain recursion guard (git's pack.depth default is 50; 64 is slack).
+var _pack_delta_depth = 0;
+
+# Reject an absurd object size from a hostile pack header before allocating.
+var _PACK_MAX_OBJ = 268435456;   # 256 MiB
+
+# --- big-endian readers ------------------------------------------------------
+fn _be32(p) {
+    var v = load8(p) & 0xFF;
+    v = v * 256 + (load8(p + 1) & 0xFF);
+    v = v * 256 + (load8(p + 2) & 0xFF);
+    v = v * 256 + (load8(p + 3) & 0xFF);
+    return v;
+}
+fn _be64(p) {
+    var v = load8(p) & 0xFF;
+    var i = 1;
+    while (i < 8) {
+        v = v * 256 + (load8(p + i) & 0xFF);
+        i = i + 1;
+    }
+    return v;
+}
+
+# Lexicographic compare of n bytes. <0 / 0 / >0 (sign of first differing byte).
+fn _memcmp_n(a, b, n) {
+    var i = 0;
+    var result = 0;
+    while (i < n) {
+        if (result == 0) {
+            var av = load8(a + i) & 0xFF;
+            var bv = load8(b + i) & 0xFF;
+            if (av != bv) { result = av - bv; }
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+# Read one byte at the cursor and advance it.
+fn _next_byte(data, curptr) {
+    var b = load8(data + load64(curptr)) & 0xFF;
+    store64(curptr, load64(curptr) + 1);
+    return b;
+}
+
+# --- .idx v2 lookup ----------------------------------------------------------
+# Binary-search idx_path (v2) for oid_raw (rawlen bytes) -> pack byte offset.
+# Returns the offset (>= 12) on hit, or -1 (miss / unreadable / v1 idx / bad
+# magic). rawlen is 20 (SHA-1) or 32 (SHA-256).
+fn _git_idx_lookup(idx_path, oid_raw, rawlen) {
+    var pr[16];
+    if (read_file_heap(idx_path, &pr) != 0) { return 0 - 1; }
+    var d = load64(&pr);
+    var len = load64(&pr + 8);
+    if (len < 1032) { return 0 - 1; }
+    # magic 0xFF 't' 'O' 'c'; absence => v1 idx (unsupported here).
+    if ((load8(d) & 0xFF) != 255) { return 0 - 1; }
+    if ((load8(d + 1) & 0xFF) != 116) { return 0 - 1; }
+    if ((load8(d + 2) & 0xFF) != 79) { return 0 - 1; }
+    if ((load8(d + 3) & 0xFF) != 99) { return 0 - 1; }
+    if (_be32(d + 4) != 2) { return 0 - 1; }
+
+    var fanout = d + 8;
+    var N = _be32(fanout + 255 * 4);
+    var b0 = load8(oid_raw) & 0xFF;
+    var lo = 0;
+    if (b0 != 0) { lo = _be32(fanout + (b0 - 1) * 4); }
+    var hi = _be32(fanout + b0 * 4);
+    var oid_table = d + 1032;
+
+    var mid = 0;
+    var found = 0 - 1;
+    while (lo < hi) {
+        if (found < 0) {
+            mid = (lo + hi) / 2;
+            var cmp = _memcmp_n(oid_table + mid * rawlen, oid_raw, rawlen);
+            if (cmp == 0) { found = mid; lo = hi; }
+            else {
+                if (cmp < 0) { lo = mid + 1; }
+                else { hi = mid; }
+            }
+        }
+        else { lo = hi; }
+    }
+    if (found < 0) { return 0 - 1; }
+
+    var off_table = oid_table + N * rawlen + N * 4;   # skip oids + CRCs
+    var off32 = _be32(off_table + found * 4);
+    if ((off32 & 2147483648) == 0) { return off32; }
+    var large_table = off_table + N * 4;
+    var idx2 = off32 & 2147483647;
+    return _be64(large_table + idx2 * 8);
+}
+
+# --- pack load (cached) ------------------------------------------------------
+fn _git_load_pack(path, out_pair) {
+    if (_pack_cache_path != 0) {
+        if (streq(_pack_cache_path, path) == 1) {
+            store64(out_pair, _pack_cache_data);
+            store64(out_pair + 8, _pack_cache_len);
+            return 0;
+        }
+    }
+    var pr[16];
+    if (read_file_heap(path, &pr) != 0) { return 0 - 1; }
+    _pack_cache_data = load64(&pr);
+    _pack_cache_len = load64(&pr + 8);
+    var pl = strlen(path);
+    var pc = alloc(pl + 1);
+    memcpy(pc, path, pl);
+    store8(pc + pl, 0);
+    _pack_cache_path = pc;
+    store64(out_pair, _pack_cache_data);
+    store64(out_pair + 8, _pack_cache_len);
+    return 0;
+}
+
+# --- varint decoders (cursor is an i64 slot, advanced in place) --------------
+# Pack object header: byte0 = [cont|3-bit type|4-bit size-low]; continuation
+# bytes add 7 bits each (little-endian). Writes type to out_type, returns size.
+fn _pack_obj_header(data, curptr, out_type) {
+    var c = load8(data + load64(curptr)) & 0xFF;
+    store64(curptr, load64(curptr) + 1);
+    var type = (c / 16) & 7;
+    var size = c & 0x0F;
+    var mult = 16;
+    var cont = c & 0x80;
+    while (cont != 0) {
+        var b = load8(data + load64(curptr)) & 0xFF;
+        store64(curptr, load64(curptr) + 1);
+        size = size + (b & 0x7F) * mult;
+        mult = mult * 128;
+        cont = b & 0x80;
+    }
+    store64(out_type, type);
+    return size;
+}
+
+# OFS_DELTA base-offset varint (the ((ofs+1)<<7)|next biased big-endian scheme).
+fn _ofs_varint(data, curptr) {
+    var b = load8(data + load64(curptr)) & 0xFF;
+    store64(curptr, load64(curptr) + 1);
+    var ofs = b & 0x7F;
+    var cont = b & 0x80;
+    while (cont != 0) {
+        b = load8(data + load64(curptr)) & 0xFF;
+        store64(curptr, load64(curptr) + 1);
+        ofs = (ofs + 1) * 128 + (b & 0x7F);
+        cont = b & 0x80;
+    }
+    return ofs;
+}
+
+# Delta size varint: pure 7-bit little-endian chunks from byte 0.
+fn _delta_varint(data, curptr) {
+    var val = 0;
+    var mult = 1;
+    var cont = 1;
+    while (cont != 0) {
+        var b = load8(data + load64(curptr)) & 0xFF;
+        store64(curptr, load64(curptr) + 1);
+        val = val + (b & 0x7F) * mult;
+        mult = mult * 128;
+        cont = b & 0x80;
+    }
+    return val;
+}
+
+# --- delta apply -------------------------------------------------------------
+# Reconstruct a target object from base + delta instruction stream. Writes the
+# read_object contract into out24 (content_off 0). Returns 0 or negative.
+fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
+    var cur[8];
+    store64(&cur, 0);
+    _delta_varint(delta, &cur);              # base-size (unused sanity field)
+    var result_size = _delta_varint(delta, &cur);
+    if (result_size <= 0) { return 0 - 1; }
+    if (result_size > _PACK_MAX_OBJ) { return 0 - 1; }
+    var out = alloc(result_size);
+    if (out == 0) { return 0 - 2; }
+    var op_out = 0;
+    var err = 0;
+    while (load64(&cur) < delta_len) {
+        if (err == 0) {
+            var op = load8(delta + load64(&cur)) & 0xFF;
+            store64(&cur, load64(&cur) + 1);
+            if ((op & 0x80) != 0) {
+                var coff = 0;
+                var csize = 0;
+                if ((op & 0x01) != 0) { coff = coff + _next_byte(delta, &cur); }
+                if ((op & 0x02) != 0) { coff = coff + _next_byte(delta, &cur) * 256; }
+                if ((op & 0x04) != 0) { coff = coff + _next_byte(delta, &cur) * 65536; }
+                if ((op & 0x08) != 0) { coff = coff + _next_byte(delta, &cur) * 16777216; }
+                if ((op & 0x10) != 0) { csize = csize + _next_byte(delta, &cur); }
+                if ((op & 0x20) != 0) { csize = csize + _next_byte(delta, &cur) * 256; }
+                if ((op & 0x40) != 0) { csize = csize + _next_byte(delta, &cur) * 65536; }
+                if (csize == 0) { csize = 65536; }
+                if (coff + csize > base_len) { err = 0 - 3; }
+                else {
+                    if (op_out + csize > result_size) { err = 0 - 4; }
+                    else {
+                        memcpy(out + op_out, base + coff, csize);
+                        op_out = op_out + csize;
+                    }
+                }
+            }
+            else {
+                if (op != 0) {
+                    var lit = op & 0x7F;
+                    if (op_out + lit > result_size) { err = 0 - 5; }
+                    else {
+                        memcpy(out + op_out, delta + load64(&cur), lit);
+                        store64(&cur, load64(&cur) + lit);
+                        op_out = op_out + lit;
+                    }
+                }
+                else { err = 0 - 6; }
+            }
+        }
+        else { store64(&cur, delta_len); }
+    }
+    if (err != 0) { return err; }
+    if (op_out != result_size) { return 0 - 7; }
+    store64(out24, out);
+    store64(out24 + 8, result_size);
+    store64(out24 + 16, 0);
+    return 0;
+}
+
+# --- pack object reconstruct (recursive for deltas) --------------------------
+# Reconstruct the object at `offset` in the in-memory pack {pdata,plen}. Writes
+# read_object contract into out24 (content_off 0). Recurses through delta bases.
+fn _git_pack_obj(pdata, plen, offset, out24) {
+    var cur[8];
+    store64(&cur, offset);
+    var type_slot[8];
+    var size = _pack_obj_header(pdata, &cur, &type_slot);
+    var type = load64(&type_slot);
+    if (size > _PACK_MAX_OBJ) { return 0 - 10; }
+
+    if (type >= 1) {
+        if (type <= 4) {
+            var body = load64(&cur);
+            var content = alloc(size + 16);
+            if (content == 0) { return 0 - 11; }
+            var got = zlib_decompress(pdata + body, plen - body, content, size + 16);
+            if (got <= 0) { return 0 - 12; }
+            store64(out24, content);
+            store64(out24 + 8, got);
+            store64(out24 + 16, 0);
+            return 0;
+        }
+    }
+
+    if (_pack_delta_depth >= 64) { return 0 - 13; }
+
+    if (type == 6) {
+        var ofs = _ofs_varint(pdata, &cur);
+        var base_off = offset - ofs;
+        if (base_off < 0) { return 0 - 14; }
+        var base24[24];
+        _pack_delta_depth = _pack_delta_depth + 1;
+        var br = _git_pack_obj(pdata, plen, base_off, &base24);
+        _pack_delta_depth = _pack_delta_depth - 1;
+        if (br != 0) { return 0 - 15; }
+        var dbody = load64(&cur);
+        var delta = alloc(size + 16);
+        if (delta == 0) { return 0 - 16; }
+        var dgot = zlib_decompress(pdata + dbody, plen - dbody, delta, size + 16);
+        if (dgot <= 0) { return 0 - 17; }
+        return _git_apply_delta(load64(&base24), load64(&base24 + 8), delta, dgot, out24);
+    }
+
+    if (type == 7) {
+        var rawlen = _id_rawlen();
+        var base_hex = hex_encode(pdata + load64(&cur), rawlen);
+        store64(&cur, load64(&cur) + rawlen);
+        var base24[24];
+        _pack_delta_depth = _pack_delta_depth + 1;
+        var br = _git_read_any(base_hex, &base24);
+        _pack_delta_depth = _pack_delta_depth - 1;
+        if (br != 0) { return 0 - 18; }
+        # normalize base to raw content (loose base carries framing at +16)
+        var bbuf = load64(&base24) + load64(&base24 + 16);
+        var blen = load64(&base24 + 8) - load64(&base24 + 16);
+        var dbody = load64(&cur);
+        var delta = alloc(size + 16);
+        if (delta == 0) { return 0 - 19; }
+        var dgot = zlib_decompress(pdata + dbody, plen - dbody, delta, size + 16);
+        if (dgot <= 0) { return 0 - 20; }
+        return _git_apply_delta(bbuf, blen, delta, dgot, out24);
+    }
+
+    return 0 - 21;
+}
+
+# --- top-level packfile read -------------------------------------------------
+# Look up `hex` across every .git/objects/pack/*.idx; on a hit, reconstruct the
+# object from the matching .pack. Writes read_object contract to out24. Returns
+# 0 on success, negative if not found in any pack (or no pack dir).
+fn _git_read_pack(hex, out24) {
+    var packdir = ".git/objects/pack";
+    if (is_dir(str_from(packdir)) != 1) { return 0 - 1; }
+    var entries = dir_list(str_from(packdir));
+    if (entries == 0) { return 0 - 1; }
+    var n = vec_len(entries);
+    var rawlen = _id_rawlen();
+    var oid_raw[32];
+    if (hex_decode_into(hex, _id_hexlen(), &oid_raw) == 0) { return 0 - 2; }
+    var dlen = strlen(packdir);
+
+    var i = 0;
+    var rc = 0 - 3;
+    var done = 0;
+    while (i < n) {
+        if (done == 0) {
+            var s = vec_get(entries, i);
+            var sd = str_data(s);
+            var sl = str_len(s);
+            if (sl > 4) {
+                if (memeq(sd + sl - 4, ".idx", 4) == 1) {
+                    var ipath = alloc(dlen + 1 + sl + 1);
+                    memcpy(ipath, packdir, dlen);
+                    store8(ipath + dlen, 47);
+                    memcpy(ipath + dlen + 1, sd, sl);
+                    store8(ipath + dlen + 1 + sl, 0);
+                    var offset = _git_idx_lookup(ipath, &oid_raw, rawlen);
+                    if (offset >= 0) {
+                        var nb = sl - 4;   # name minus ".idx"
+                        var ppath = alloc(dlen + 1 + nb + 5 + 1);
+                        memcpy(ppath, packdir, dlen);
+                        store8(ppath + dlen, 47);
+                        memcpy(ppath + dlen + 1, sd, nb);
+                        memcpy(ppath + dlen + 1 + nb, ".pack", 5);
+                        store8(ppath + dlen + 1 + nb + 5, 0);
+                        var pkp[16];
+                        if (_git_load_pack(ppath, &pkp) == 0) {
+                            rc = _git_pack_obj(load64(&pkp), load64(&pkp + 8), offset, out24);
+                            done = 1;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return rc;
+}
+
+# Loose-first, then packfile: the git-mode object read used by read_object and
+# by REF_DELTA base resolution. On-disk (non-thin) packs are self-contained, so
+# a REF_DELTA base is always present as loose or in some pack.
+fn _git_read_any(hex, out24) {
+    if (_git_read_loose(hex, out24) == 0) { return 0; }
+    return _git_read_pack(hex, out24);
+}
+
 # --- object_db.cyr ---
 
 # object_db.cyr — patra object store, compression / framing, read commands.
@@ -1585,17 +2281,23 @@ fn object_path(buf, hex) {
 # Returns 0 if no ref matches.
 fn resolve_hash(prefix, out_buf) {
     var plen = strlen(prefix);
-    if (plen == 64) {
+    var hexlen = _id_hexlen();
+    if (plen == hexlen) {
         # S-01: a full-length hash must still be hex — otherwise the
         # short-circuit here would pass garbage bytes straight through.
-        if (hex_prefix_valid(prefix, 64) == 0) { return 0; }
-        memcpy(out_buf, prefix, 64);
-        store8(out_buf + 64, 0);
+        if (hex_prefix_valid(prefix, hexlen) == 0) { return 0; }
+        memcpy(out_buf, prefix, hexlen);
+        store8(out_buf + hexlen, 0);
         return 1;
     }
 
     # Try as a ref name first (HEAD, tags, branches)
     if (resolve_ref_name(prefix, out_buf) == 1) { return 1; }
+
+    # git mode (roadmap 1.2.0): objects live on the loose/pack filesystem, not
+    # patra. Short-prefix disambiguation over loose fanout + pack .idx is a later
+    # enhancement — a git object must be named by full oid or a ref for now.
+    if (_repo_backend == 1) { return 0; }
 
     if (plen < 4) { return 0 - 2; }
 
@@ -1639,6 +2341,14 @@ fn resolve_hash(prefix, out_buf) {
 #   out[16..24)  content offset (first byte past framing \0)
 # Returns 0 on success, negative on error.
 fn read_object(hex, out) {
+    # Storage seam (roadmap 1.2.0): a .git/ repo has no patra store — objects
+    # are loose files or packed. _git_read_any tries loose then every packfile.
+    # Dispatch on the backend set by sit_repo_open's _detect_repo_backend.
+    # SIT mode (default) is unchanged.
+    if (_repo_backend == 1) {
+        return _git_read_any(hex, out);
+    }
+
     var db = get_object_db();
     if (db == 0) { return 0 - 1; }
 
@@ -1771,7 +2481,10 @@ fn write_blob_object(content, content_len) {
 }
 
 fn resolve_and_read(obj_out, hex_out) {
-    if (file_exists(".sit/HEAD") != 1) {
+    # Backend detection (roadmap 1.2.0): read verbs work on a native .sit/ or an
+    # existing .git/ repo; sets the process-global backend that read_object /
+    # resolve_hash dispatch on. Non-repos still error as before.
+    if (_detect_repo_backend() < 0) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -3401,9 +4114,11 @@ fn is_ignored(path, patterns) {
 # char; a trailing `/` (directory hint) is stripped (dir-only is not enforced —
 # the same simplification as before).
 fn load_sitignore() {
-    if (file_exists(".sitignore") != 1) { return 0; }
+    # Backend-aware ignore file: .sitignore (sit) or .gitignore (git read-mode).
+    var fname = _ignore_filename();
+    if (file_exists(fname) != 1) { return 0; }
     var pair[16];
-    if (read_file_heap(".sitignore", &pair) != 0) { return 0; }
+    if (read_file_heap(fname, &pair) != 0) { return 0; }
     var data = load64(&pair);
     var len = load64(&pair + 8);
 
@@ -3535,6 +4250,10 @@ fn resolve_reflog_spec(name, out_buf) {
 }
 
 fn resolve_ref_name(name, out_buf) {
+    # Storage seam (roadmap 1.2.0): a .git/ repo resolves refs from .git/HEAD,
+    # .git/refs/, and .git/packed-refs. @{N} reflog specs are .sit-only for now.
+    if (_repo_backend == 1) { return _git_resolve_ref_name(name, out_buf); }
+
     # Reflog selector <ref>@{N} takes precedence over plain-name lookup.
     if (resolve_reflog_spec(name, out_buf) == 1) { return 1; }
     if (streq(name, "HEAD") == 1) {
@@ -3623,7 +4342,13 @@ fn resolve_ref_name(name, out_buf) {
 #   -2  prefix too short
 fn read_head_ref_path() {
     var pair[16];
-    if (read_file_heap(".sit/HEAD", &pair) != 0) { return 0; }
+    # Backend-aware HEAD path: ".sit/HEAD" or ".git/HEAD" (both 9 bytes; the
+    # "ref: <path>" symref format is identical across backends).
+    var hp[12];
+    memcpy(&hp, _repo_dir(), 5);
+    memcpy(&hp + 5, "HEAD", 4);
+    store8(&hp + 9, 0);
+    if (read_file_heap(&hp, &pair) != 0) { return 0; }
     var buf = load64(&pair);
     var len = load64(&pair + 8);
 
@@ -3655,6 +4380,10 @@ fn read_head_ref_path() {
 
 # Read the ref file pointed at by HEAD. Returns 64-char hex or 0.
 fn read_head_ref() {
+    # Storage seam (roadmap 1.2.0): git refs may be loose or in packed-refs, and
+    # the id width is _id_hexlen(). Dispatch to the git reader before the .sit path.
+    if (_repo_backend == 1) { return _git_read_head_ref(); }
+
     var ref_path = read_head_ref_path();
     if (ref_path == 0) { return 0; }
     var ref_len = strlen(ref_path);
@@ -4308,6 +5037,8 @@ fn tree_entry_hash(e) { return load64(e + 16); }
 # Parse tree object body. Returns vec of entries.
 fn parse_tree(body, body_len) {
     var entries = vec_new();
+    # Raw hash width per active backend: 32 (sit SHA-256) or 20 (git SHA-1).
+    var rawlen = _id_rawlen();
     var pos = 0;
     while (pos < body_len) {
         var sp = pos;
@@ -4334,7 +5065,7 @@ fn parse_tree(body, body_len) {
                 memcpy(name, body + sp + 1, name_len);
                 store8(name + name_len, 0);
 
-                if (nu + 1 + 32 > body_len) { pos = body_len; }
+                if (nu + 1 + rawlen > body_len) { pos = body_len; }
                 else {
                     # S-03: reject tree entries whose mode isn't allowlisted or
                     # whose name would let an attacker escape the working tree.
@@ -4343,7 +5074,7 @@ fn parse_tree(body, body_len) {
                     # flag the mismatch on the outer tree's hash-of-bytes.
                     if (tree_entry_mode_valid(mode) == 1) {
                         if (tree_entry_name_valid(name) == 1) {
-                            var hash_hex = hex_encode(body + nu + 1, 32);
+                            var hash_hex = hex_encode(body + nu + 1, rawlen);
                             var e = alloc_or_die(24);
                             store64(e, mode);
                             store64(e + 8, name);
@@ -4351,7 +5082,7 @@ fn parse_tree(body, body_len) {
                             vec_push(entries, e);
                         }
                     }
-                    pos = nu + 1 + 32;
+                    pos = nu + 1 + rawlen;
                 }
             }
         }
@@ -4437,11 +5168,12 @@ fn read_head_tree_entries() {
     var body = buf + coff;
     var body_len = blen - coff;
 
-    if (body_len < 70) { return 0; }
+    var hexlen = _id_hexlen();
+    if (body_len < 6 + hexlen) { return 0; }
     if (memeq(body, "tree ", 5) == 0) { return 0; }
-    var tree_hex = alloc_or_die(65);
-    memcpy(tree_hex, body + 5, 64);
-    store8(tree_hex + 64, 0);
+    var tree_hex = alloc_or_die(hexlen + 1);
+    memcpy(tree_hex, body + 5, hexlen);
+    store8(tree_hex + hexlen, 0);
 
     var out = vec_new();
     flatten_tree(tree_hex, "", out);
@@ -4611,6 +5343,8 @@ fn list_working_walk(prefix, fs_path, out, patterns) {
         var skip = 0;
         if (slen == 4) {
             if (memeq(sdata, ".sit", 4) == 1) { skip = 1; }
+            # git read-mode: never descend into a .git/ metadata dir.
+            if (memeq(sdata, ".git", 4) == 1) { skip = 1; }
         }
 
         if (skip == 0) {
@@ -6178,6 +6912,8 @@ fn parse_commit_body(body, body_len, out) {
     store64(out + 40, 0);
     store64(out + 48, 0);
 
+    # Object-id hex width per active backend: 64 (sit SHA-256) or 40 (git SHA-1).
+    var hexlen = _id_hexlen();
     var pos = 0;
     var in_headers = 1;
     while (pos < body_len) {
@@ -6197,24 +6933,28 @@ fn parse_commit_body(body, body_len, out) {
             else {
                 if (line_len > 5) {
                     if (memeq(body + pos, "tree ", 5) == 1) {
-                        var t = alloc_or_die(65);
-                        memcpy(t, body + pos + 5, 64);
-                        store8(t + 64, 0);
-                        store64(out, t);
+                        if (line_len >= 5 + hexlen) {
+                            var t = alloc_or_die(hexlen + 1);
+                            memcpy(t, body + pos + 5, hexlen);
+                            store8(t + hexlen, 0);
+                            store64(out, t);
+                        }
                     }
                 }
                 if (line_len > 7) {
                     if (memeq(body + pos, "parent ", 7) == 1) {
-                        var p = alloc_or_die(65);
-                        memcpy(p, body + pos + 7, 64);
-                        store8(p + 64, 0);
-                        store64(out + 8, p);
-                        # Collect every parent (merge commits have 2+) into a
-                        # vec at out+48 so reachability + ancestor walks follow
-                        # all edges, not just the last one captured at out+8.
-                        var pv = load64(out + 48);
-                        if (pv == 0) { pv = vec_new(); store64(out + 48, pv); }
-                        vec_push(pv, p);
+                        if (line_len >= 7 + hexlen) {
+                            var p = alloc_or_die(hexlen + 1);
+                            memcpy(p, body + pos + 7, hexlen);
+                            store8(p + hexlen, 0);
+                            store64(out + 8, p);
+                            # Collect every parent (merge commits have 2+) into a
+                            # vec at out+48 so reachability + ancestor walks follow
+                            # all edges, not just the last one captured at out+8.
+                            var pv = load64(out + 48);
+                            if (pv == 0) { pv = vec_new(); store64(out + 48, pv); }
+                            vec_push(pv, p);
+                        }
                     }
                     if (memeq(body + pos, "author ", 7) == 1) {
                         var ao[24];
@@ -12634,7 +13374,11 @@ fn cmd_serve() {
 fn sit_repo_open(cwd) {
     if (cwd == 0) { return 0; }
     if (syscall(SYS_CHDIR, cwd) != 0) { return 0; }
-    if (file_exists(".sit/HEAD") != 1) { return 0; }
+    # Storage seam (roadmap 1.2.0): succeed on a native .sit/ OR an existing
+    # .git/ repo; _detect_repo_backend sets the process-global backend that
+    # read_object / read_head_ref / resolve_ref_name dispatch on. Returns -1
+    # when neither store is present.
+    if (_detect_repo_backend() < 0) { return 0; }
     return 1;
 }
 
@@ -12694,3 +13438,90 @@ fn sit_diff_path(repo, path) {
 
     return compute_file_diff(old_buf, old_len, new_buf, new_len);
 }
+
+# Return the current branch name for the open repo as a heap cstring (e.g.
+# "main"), or 0 if HEAD is detached or not a branch ref. Backend-aware: reads
+# .sit/HEAD or .git/HEAD through the storage seam (roadmap 1.2.0), so it works
+# on both sit-native and existing git repositories. Caller owns the cstring.
+# New public surface (ADR 0009): additive, SemVer-minor.
+fn sit_repo_branch(repo) {
+    return current_branch_name();
+}
+
+# A status record is a 16-byte {path_ptr, kind} pair. Internal builder.
+fn _status_push(vec, path, kind) {
+    var rec = alloc(16);
+    store64(rec, path);
+    store64(rec + 8, kind);
+    vec_push(vec, rec);
+    return 0;
+}
+
+# Byte-compare a HEAD blob (named by id `hex`) against working file `path`.
+# Returns 1 if they differ (or either can't be read), 0 if identical. Uses a
+# content compare rather than a re-hash so it needs no hash primitive — which
+# is what lets it work on a git SHA-1 repo without a first-party SHA-1.
+fn _blob_differs_from_file(hex, path) {
+    var hp[16];
+    if (read_blob_content(hex, &hp) != 0) { return 1; }
+    var ob = load64(&hp);
+    var ol = load64(&hp + 8);
+    var wp[16];
+    if (read_file_heap(path, &wp) != 0) { return 1; }
+    var nb = load64(&wp);
+    var nl = load64(&wp + 8);
+    if (ol != nl) { return 1; }
+    if (memeq(ob, nb, ol) == 0) { return 1; }
+    return 0;
+}
+
+# Per-file HEAD-vs-working-tree status for the open repo. Returns a vec of
+# opaque status records — read each with sit_status_path / sit_status_kind.
+# Kinds: 1 = modified, 2 = new (untracked), 3 = deleted. Unmodified files are
+# omitted. Backend-aware (roadmap 1.2.0): works on sit-native and existing git
+# repos. v1 scope is HEAD-vs-worktree only — no staging-index (git .git/index /
+# sit patra index) staged/unstaged split, and untracked honours the top-level
+# ignore file (.gitignore in git mode). New public surface (ADR 0009): additive,
+# SemVer-minor. Caller owns the returned vec.
+fn sit_repo_status(repo) {
+    var out = vec_new();
+    var head_entries = read_head_tree_entries();
+    var work_files = list_working_files();
+
+    # Tracked files: deleted (gone from disk) or modified (content differs).
+    if (head_entries != 0) {
+        var hn = vec_len(head_entries);
+        var i = 0;
+        while (i < hn) {
+            var he = vec_get(head_entries, i);
+            var path = tree_entry_name(he);
+            if (file_exists(path) != 1) {
+                _status_push(out, path, 3);
+            }
+            else {
+                if (_blob_differs_from_file(tree_entry_hash(he), path) == 1) {
+                    _status_push(out, path, 1);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    # Working files absent from HEAD are new (untracked).
+    var wn = vec_len(work_files);
+    var j = 0;
+    while (j < wn) {
+        var wf = vec_get(work_files, j);
+        var tracked = 0;
+        if (head_entries != 0) {
+            if (tree_find(head_entries, wf) != 0) { tracked = 1; }
+        }
+        if (tracked == 0) { _status_push(out, wf, 2); }
+        j = j + 1;
+    }
+    return out;
+}
+
+# Accessors on a status record (mirror the ann_* pattern; opaque layout).
+fn sit_status_path(rec) { return load64(rec); }
+fn sit_status_kind(rec) { return load64(rec + 8); }
