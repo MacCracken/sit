@@ -24,4 +24,4 @@ The script cleans up after itself (`/tmp/sit-example-*` directories) and is idem
 
 `docs/guides/getting-started.md` covers each command individually. This example shows them composing into an actual session — useful when you want to verify a change didn't regress the cross-command flow without reading 300 lines of prose.
 
-When sit adds wire protocol support in v0.5.0, expect a sibling `clone-fetch-push/` example.
+Network sync (clone / fetch / push) shipped in v0.5.0 and is exercised by the in-tree integration suite ([`tests/integration/run.sh`](../../../tests/integration/run.sh)) and documented in [getting-started](../../guides/getting-started.md), rather than as a sibling example directory.

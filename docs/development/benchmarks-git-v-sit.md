@@ -4,6 +4,8 @@ Head-to-head comparison on a real workstation. sit is a first-party Cyrius imple
 
 The point of this document is to be **honest about where sit currently wins, loses, and breaks even against git**, and to track that over time as sigil/sankoch/patra mature. The slow numbers are kept in plain sight; that's how we know which dep needs the next push.
 
+> **Snapshot note**: the numbers and inventory below are a point-in-time comparison (v0.6.x-era) and are not re-run every release. For the *current* version, command inventory, dep pins, and binary metrics see [`state.md`](state.md); per-release benchmark snapshots are under [`../benchmarks/`](../benchmarks/).
+
 ## Setup
 
 - **Host**: Linux 6.18.22-1-lts x86_64

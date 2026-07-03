@@ -92,6 +92,8 @@ Sit's object hashes are byte-identical to git's SHA-256 object hashes for the sa
 
 Output is the raw blob content — the framing (`"blob <len>\0"`) is stripped. Errors on ambiguous prefixes, prefixes shorter than 4 characters, or missing objects.
 
+**Git-aware (1.2.0):** run this inside an existing **git** repository (a `.git/` but no `.sit/`) and `cat-file` reads the object from the git store instead — loose objects *and* packfiles, SHA-1 or SHA-256 — read-only, via the same repo-open path. See [ADR 0011](../adr/0011-git-read-mode.md) and the ["read an existing git repository"](#what-works-today) entry below.
+
 ## View an object — decorated (`owl-file`)
 
 ```sh
@@ -100,7 +102,7 @@ Output is the raw blob content — the framing (`"blob <len>\0"`) is stripped. E
 
 Runs the content through [owl](https://github.com/MacCracken/owl) — bat-like file viewer with syntax highlighting, line numbers, and git-aware gutter markers. Looks for owl at `/usr/local/bin/owl`, `/usr/bin/owl`, `/opt/owl/bin/owl`.
 
-If owl isn't installed (it's currently pre-1.0), `owl-file` prints a notice and falls back to emitting raw content — so the command is usable today, and transparently upgrades to decorated output once owl ships.
+If owl isn't installed (it's currently pre-1.0), `owl-file` prints a notice and falls back to emitting raw content — so the command is usable today, and transparently upgrades to decorated output once owl ships. Like `cat-file`, `owl-file` is git-aware (1.2.0): inside an existing git repo it reads the object from the `.git/` store (loose + packfiles, SHA-1 / SHA-256).
 
 ## Commit
 
@@ -402,7 +404,7 @@ As of v0.8.10 the matcher is git-parity:
 
 Simplifications vs git (documented in `src/index.cyr`): a non-segment `**` (e.g. `a**b`) still crosses `/`; a trailing `/` (`build/`) is allowed but not enforced as directories-only.
 
-**Note**: unlike older sit versions, dotfiles aren't hidden by default anymore — only `.sit/` is hardcoded-skipped. To keep `.git/` out of your sit repo when both coexist, list `.git` in your `.sitignore`.
+**Note**: unlike older sit versions, dotfiles aren't hidden by default anymore — only `.sit/` is hardcoded-skipped. To keep `.git/` out of your sit repo when both coexist, list `.git` in your `.sitignore`. (Separately, since 1.2.0 sit can *read* an existing `.git/` repo read-only — see ["read an existing git repository"](#what-works-today) below — so a `.git/` directory isn't merely clutter.)
 
 ## What works today
 
@@ -437,6 +439,7 @@ Simplifications vs git (documented in `src/index.cyr`): a non-segment `**` (e.g.
 - `sit merge -S <branch>` — signed merge commit (same ed25519 flow as `sit commit -S`)
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
+- **Read an existing git repository (read-only, 1.2.0)** — point sit at a directory with a `.git/` (no `.sit/`) and it transparently opens the git store: `sit cat-file` / `sit owl-file` read git objects — loose *and* packed (packfiles decoded via `.idx` v2 binary search + a first-party OFS/REF delta interpreter), SHA-1 or SHA-256, refs resolved from `HEAD` / `refs/` / `packed-refs`. The `dist/sit.cyr` **library API** (`sit_diff_path`, `sit_repo_branch`, `sit_repo_status`) additionally reports branch / status / diff for consumers like owl + thoth. Read-only — no `.git/` write-back; sit stays `.sit/`-native for its own repos. Modules `src/git_read.cyr` + `src/git_pack.cyr`; see [ADR 0011](../adr/0011-git-read-mode.md).
 
 ## What doesn't yet
 

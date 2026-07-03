@@ -2,64 +2,52 @@
 
 Forward-looking only. **Shipped history lives in [`CHANGELOG.md`](../../CHANGELOG.md)** (the tagged-release source of truth); the **live state snapshot** (current version, dep pins, source layout, command inventory) lives in [`state.md`](state.md). This file is just what's *next*.
 
-## Shipped: 1.0.0 (2026-06-13)
+## Shipped
 
-The first stable release. The full git-parity surface is in place — local VCS loop + `merge-base`; `fsck` integrity/reachability/`--prune`; ed25519 signing; git-parity `.sitignore`; `log --graph`; shallow clone; network sync (clone/fetch/push) over `file://` / `http://` / `https://` (first-party TLS 1.3) / `ssh://`; `dist/sit.cyr` library export. From 1.0 the CLI, `.sit/` layout, `/sit/v1/...` wire protocol, and the `sit_*` / `ann_*` public API are SemVer-governed. Details in [`CHANGELOG.md`](../../CHANGELOG.md); closeout audit at [`../audit/2026-06-13-audit.md`](../audit/2026-06-13-audit.md).
+Rolled up here so the forward sections stay uncluttered — full detail per release in [`CHANGELOG.md`](../../CHANGELOG.md).
 
-## Shipped: 1.1.0 (2026-06-25)
+- **1.0.0** (2026-06-13) — first stable release. Full git-parity surface: local VCS loop + `merge-base`; `fsck` integrity / reachability / `--prune`; ed25519 signing; git-parity `.sitignore`; `log --graph`; shallow clone; network sync over `file://` / `http://` / `https://` (first-party TLS 1.3) / `ssh://`; `dist/sit.cyr` library export. From here the CLI, `.sit/` layout, `/sit/v1/...` wire protocol, and `sit_*` / `ann_*` API are SemVer-governed. Closeout audit: [`../audit/2026-06-13-audit.md`](../audit/2026-06-13-audit.md).
+- **1.1.0** (2026-06-25) — **reflog + recovery.** Git-compatible `.sit/logs/` journal; `sit reflog`; `<ref>@{N}` / `HEAD@{N}` resolution (`sit reset --hard HEAD@{1}` undoes a reset); reflog-aware `fsck --prune` grace (reflog-as-roots + 90-day window, `--prune-now` for the legacy sweep). [ADR 0010](../adr/0010-reflog-and-recovery.md) · [arch 005](../architecture/005-reflog-two-line-invariant.md).
+- **1.2.0** (2026-07-03) — **`.git/` read-mode.** Reads an existing git repo (SHA-1 + SHA-256) read-only — loose objects + packfiles (`.idx` v2 + a first-party OFS/REF delta interpreter) + refs (`HEAD` / `refs/` / `packed-refs`) — behind the same `sit_repo_open` / `sit_diff_path` public API, plus new `sit_repo_branch` / `sit_repo_status` accessors. So `dist/sit.cyr` consumers (thoth, owl) report branch / status / diff on real-world git repos without shelling out to system `git`. Read-only (no `.git/` write-back — sit stays `.sit/`-native); no FFI (the delta interpreter is self-written). Folds in the cyrius `6.2.44 → 6.3.36` toolchain + dep refresh. [ADR 0011](../adr/0011-git-read-mode.md) (scoping [ADR 0004](../adr/0004-sha256-only.md)).
 
-**Reflog + recovery.** Git-compatible `.sit/logs/` journal (recorded across commit / reset / merge / checkout / branch-create / clone / pull / fetch); `sit reflog`; `<ref>@{N}` / `HEAD@{N}` resolution (`sit reset --hard HEAD@{1}` undoes a reset); reflog-aware `fsck --prune` grace (reflog-as-roots + 90-day window) with `--prune-now` for the legacy immediate sweep. The recovery net that de-risks the rewrite tools below. Design: [ADR 0010](../adr/0010-reflog-and-recovery.md) · invariants: [arch 005](../architecture/005-reflog-two-line-invariant.md) · full detail in [`CHANGELOG.md`](../../CHANGELOG.md#110--2026-06-25--reflog--recovery).
+## SemVer tiers (post-1.0)
 
-**Reflog follow-ups (forward):**
-- `reflog expire` / `delete` — entries are currently unbounded, so `fsck --prune` reclaims reflogged objects only via `--prune-now` (or a manual log clear) until expiry exists. A small `1.x` (new `reflog` subcommand surface).
-- `@{<date>}` selector — only the integer `@{N}` ordinal ships today.
-- Hardening pass on the same unsanitized-identity pattern in `commit.cyr` / `merge.cyr` object framing (the reflog path was hardened in 1.1.0; the commit/merge ident chain is the remaining instance) — a no-surface `1.0.x` security patch.
-
-## Shipped: 1.2.0 (2026-07-03)
-
-**`.git/` read-mode.** sit reads an existing git repository (SHA-1 + SHA-256) read-only — loose objects + packfiles (`.idx` v2 + a first-party OFS/REF delta interpreter, recursive chains) + refs (`HEAD` / `refs/` / `packed-refs`) — behind the same `sit_repo_open` / `sit_diff_path` public API as `.sit/` repos, plus new `sit_repo_branch` / `sit_repo_status` accessors. So `dist/sit.cyr` consumers (thoth's status bar + diffs, owl's gutter markers) report branch / status / diff on real-world git repos without shelling out to system `git`. Read-only (no `.git/` write-back — sit stays `.sit/`-native); no FFI — the delta interpreter is self-written, so the "needs sankoch delta primitives" gate below turned out unnecessary. Folds in the cyrius `6.2.44 → 6.3.36` toolchain + dep refresh. The keystone interop capability, requested by thoth. Design: [ADR 0011](../adr/0011-git-read-mode.md) (scoping [ADR 0004](../adr/0004-sha256-only.md)); full detail in [`CHANGELOG.md`](../../CHANGELOG.md).
-
-**`.git/` read-mode follow-ups (forward, new surface):**
-- CLI `sit status` / `log` / `diff` on git repos — the 1.2.0 *library* API works on git; the CLI commands stay `.sit`-gated (needs a shared `_compute_status_records()` in `diff.cyr` so it doesn't back-reference `api.cyr` in single-pass dist order). A `1.x.0` when CLI parity is wanted.
-- `@{N}` on git (parse git's `.git/logs/`); nested `.gitignore` / `info/exclude` (only the top-level `.gitignore` is honoured today).
-
-## After v1.0.0
-
-Post-1.0, versioning is SemVer-disciplined (the [1.0.0 commitment](../../CHANGELOG.md)), which is what sorts the backlog into tiers:
-
-- **Patch (`1.0.x`)** — no new *observable* surface: bug fixes, perf, internal refactors, toolchain/dep bumps, consuming upstream fixes. Safe to take blindly.
-- **Minor (`1.1.0`, `1.2.0`, …)** — new *backward-compatible* surface: a command, flag, config key, public-API symbol, or wire capability. Each themed minor below is its own `1.x.0`.
+- **Patch (`1.x.y`)** — no new *observable* surface: bug fixes, perf, internal refactors, toolchain/dep bumps, consuming upstream fixes. Safe to take blindly.
+- **Minor (`1.x.0`)** — new *backward-compatible* surface: a command, flag, config key, public-API symbol, or wire capability.
 - **Major (`2.0.0`)** — reserved for a breaking change to the CLI, `.sit/` layout, wire protocol, or public API. None planned.
 
-The weight tends to track the tier (surface-adding work is the heavier work), with two instructive exceptions called out below: the Myers diff fallback is heavy but adds no surface (→ patch), and bearer-over-SSH is light but adds surface (→ minor). Nothing here blocks anything else; the ordering is a recommendation, not a contract. Each ships under the usual test/fuzz/bench gates.
+Nothing below blocks anything else; the ordering is a recommendation, not a contract. Each ships under the usual test / fuzz / bench gates.
 
-### `1.0.x` — patch line (no new surface)
+## `1.2.x` — patch line + carried follow-ups (no new surface)
 
-Bug fixes, perf, internal work, and dep consumption — nothing a caller observes beyond "faster" / "handles bigger inputs". Shipped patch work moves to the [CHANGELOG](../../CHANGELOG.md) (e.g. 1.0.1: the Myers diff fallback for large files, the `lcs_diff` minimality fix it surfaced, and the ADR-0003 no-upward-discovery test; 1.0.2 + 1.0.3: cyrius toolchain refreshes — `6.2.2 → 6.2.25 → 6.2.44` — and dep bumps, consuming the `random`-stdlib keygen fix and the `fl_free` one-arg API change; 1.0.4: **Ed25519 server-cert consumption** — the `tls_native` gap fixed upstream (sigil 3.9.x X.509 parser), plus serve-banner drift guard and clone host-scan hardening).
+Consumption, hardening, and deferred no-surface work. The dep **pins are already current** (bumped in 1.2.0); what remains is the *wiring*.
 
-- **Consume upstream + dependency fixes** as they land (a dep bump + dropping a workaround, no sit-code change). These are filed on the deps' roadmaps — watch their CHANGELOGs:
-  - **patra `patra_insert_row_or_ignore` (BYTES write path)** — ✅ **shipped upstream in patra 1.12.6** (sit's request, filed 2026-06-25). Now consumable: bump the patra pin `1.12.4 → 1.12.6` and route `db_object_insert_raw` through the or-ignore insert to **unblock P-11** (`sit add` index upsert without a full rewrite; drops the inner `db_object_has` probe — one B+ tree op per object on clone/push/add instead of two). A no-new-surface `1.x` patch. The STR-column SQL-interpolation guard (`hex_prefix_valid`) is separable and already covered by patra `patra_bind_text` (1.10.3).
-  - **sankoch `zlib_decompress_with_ratio_cap`** — ✅ **shipped upstream in sankoch 2.4.5** (sit's request, filed 2026-06-25): a one-call ratio-capped decompress (distinct from the absolute 16 MB ceiling). Consumable via a pin bump `2.4.4 → 2.4.5` + routing the wire/fsck inflate paths through the ratio-capped variant — defense-in-depth against decompression bombs on untrusted objects. A no-new-surface `1.x` patch.
-  - **sankoch match-finder / SIMD** — the 2.x match-finder / SIMD work that targets the `add-1MB` `zlib_compress` floor (~140 ms) and moves the v0.6.x scoreboard. *(Already on sankoch's roadmap as deferred — gated on a wire-identical match-finder speedup.)*
+- **Wire patra `patra_insert_row_or_ignore` (P-11).** Pin is current (patra 1.12.7 ships it). Route `db_object_insert_raw` through the or-ignore insert so `sit add` upserts the index without a full rewrite and drops the inner `db_object_has` probe — one B+ tree op per object on clone / push / add instead of two.
+- **Wire sankoch `zlib_decompress_with_ratio_cap`.** Pin is current (sankoch 2.4.8 ships it). Route the wire / fsck inflate paths through the ratio-capped variant — defense-in-depth against decompression bombs on untrusted objects, distinct from the absolute 16 MiB ceiling. (Now also relevant to the `.git/` packfile read path.)
+- **Reflog `expire` / `delete` + `@{<date>}` selector** *(carried from 1.1.0).* Reflog entries are unbounded today, so `fsck --prune` reclaims reflogged objects only via `--prune-now`; expiry closes that. `@{<date>}` complements the integer `@{N}` ordinal.
+- **Unsanitized-identity hardening in `commit.cyr` / `merge.cyr`** *(carried from 1.1.0; security patch).* The reflog ident chain was hardened in 1.1.0; the commit / merge object-framing ident path is the remaining instance of the same pattern.
+- **Nested `.gitignore` / `info/exclude`** for `.git/` read-mode. Only the top-level `.gitignore` is honoured today.
+- **sankoch match-finder / SIMD** *(upstream-pending perf).* Targets the `add-1MB` `zlib_compress` floor (~140 ms). On sankoch's roadmap, gated on a wire-identical speedup.
 
-**On hold — keep sandhi.** Dropping sandhi for a hand-rolled `net`-direct loopback HTTP/1.0 server (surface minimization) is deliberately *not* on the patch line: a future cyrius change is expected to make `stdlib`/`lib` consumption easier, which changes both the trade-off and the likely implementation. Until that lands, sit keeps consuming sandhi's `sandhi_server_*` surface and we wait.
+## Minor line — `1.3.0` onward (new surface, themed)
 
-### Minor line — `1.2.0` onward (new surface, themed)
-
-Each is a self-contained `1.x.0`; the heavier ones earn their own slot. The reflog shipped first (1.1.0), then `.git/` read-mode (1.2.0) — the keystone interop capability, requested by thoth. **Next: `1.3.0` — annotated & signed tags.**
+Each is a self-contained `1.x.0`; the heavier ones earn their own slot. **Next: `1.3.0`.**
 
 - **`1.3.0` — Annotated & signed tags + ref ergonomics** *(light; high git-parity value).* Annotated tags (a real tag object with tagger + message, not just a lightweight ref); **ed25519-signed tags** (reuse the sitsig machinery from signed commits); `sit mv` (rename in working tree + index); `sit describe` (nearest tag + offset). Completes the tag + signing story; low risk — a good cadence-setter for the minor line.
-- **`1.4.0` — History tools** *(medium; reflog-backed).* `sit revert` (inverse commit); `sit cherry-pick` (apply a commit onto HEAD via the existing 3-way merge + `merge-base`); `sit stash` (save / restore the working tree). Safe to ship now that the reflog (1.1.0) makes them recoverable.
-- **`1.5.0` — TLS trust hardening** *(medium).* HTTPS **CA-chain + hostname verification** (opt-in: `http.sslVerify` / `http.caBundle`, system store via `tls_native_set_ca_system`; TOFU stays the default); **mTLS** (client certs — `tls_native_new_server` + verify primitives already exist); **non-loopback `sit serve`** (lift the `127.0.0.1` lock, gated on `--tls`, refuse non-loopback plain HTTP); **bearer auth over SSH** (`_ssh_handle_auth_token` stub → real). A cohesive transport-trust minor.
+- **`1.4.0` — History tools** *(medium; reflog-backed).* `sit revert` (inverse commit); `sit cherry-pick` (apply a commit onto HEAD via the existing 3-way merge + `merge-base`); `sit stash` (save / restore the working tree). Safe now that the reflog (1.1.0) makes them recoverable.
+- **`1.5.0` — TLS trust hardening** *(medium).* HTTPS **CA-chain + hostname verification** (opt-in: `http.sslVerify` / `http.caBundle`, system store via `tls_native_set_ca_system`; TOFU stays the default); **mTLS** (client certs — the `tls_native` verify primitives already exist); **non-loopback `sit serve`** (lift the `127.0.0.1` lock, gated on `--tls`, refuse non-loopback plain HTTP); **bearer auth over SSH** (`_ssh_handle_auth_token` stub → real). A cohesive transport-trust minor.
 - **`1.6.0` — Wider merge + inspection.** **Octopus / N-way merge** (`cmd_merge` → N branches; `find_merge_base` already walks N parents correctly); **`sit blame`** (per-line last-touch — also a natural `dist/sit.cyr` library export for owl, alongside `sit_diff_path`); **`.sitignore` directory-only (`build/`) enforcement** (closes the last documented git-parity gap).
+- **`.git/` CLI parity** *(new surface; unscheduled).* `sit status` / `log` / `diff` and `@{N}` on git repos — the 1.2.0 *library* API already works on git; the CLI commands stay `.sit`-gated. Needs a shared `_compute_status_records()` in `diff.cyr` so it doesn't back-reference `api.cyr` in single-pass dist order. A `1.x.0` when a consumer wants CLI parity.
 
-### Heavier / unscheduled (their own minors when their time comes)
+## Heavier / unscheduled (their own minors when their time comes)
 
-- **`sit rebase`** — the heaviest rewrite tool; depends on the reflog (1.1.0) for safety and shares cherry-pick's apply machinery (1.3.0). A `1.x.0` of its own.
-- **Pack bundles + `gc` / repack** — batched, delta-compressed object transfer (a new negotiated wire capability → minor) plus on-disk repacking; both tie to sankoch delta primitives + patra storage-shape work that isn't ready. The delta primitives are shared with **`1.2.0` `.git/` read-mode** (packfile decode) — whichever lands the sankoch delta work first unblocks the other.
+- **`sit rebase`** — the heaviest rewrite tool; depends on the reflog (1.1.0) for safety and shares cherry-pick's apply machinery (1.4.0). A `1.x.0` of its own.
+- **Pack bundles + `gc` / repack** — batched, delta-compressed object transfer (a new negotiated wire capability → minor) plus on-disk repacking. The git-delta *read* interpreter now exists (1.2.0, `src/git_pack.cyr`); what remains is delta *generation* + on-disk repack + the wire capability, tied to patra storage-shape work that isn't ready.
 - **Hooks** (`pre-commit`, `pre-push`, …) — a `1.x.0` if a consumer asks.
 
-*(`.git/` read-mode was promoted out of this section into [`1.2.0`](#minor-line--110-onward-new-surface-themed) — it's now a scheduled minor right after the reflog.)*
+## On hold — keep sandhi
+
+Dropping sandhi for a hand-rolled `net`-direct loopback HTTP/1.0 server (surface minimization) is deliberately *not* scheduled: a future cyrius change is expected to make `stdlib` / `lib` consumption easier, which changes both the trade-off and the likely implementation. Until that lands, sit keeps consuming sandhi's `sandhi_server_*` surface.
 
 ---
 

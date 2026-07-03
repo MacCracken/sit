@@ -32,8 +32,10 @@ Which sites use which path:
 The `dist/sit.cyr` bundle is compiled **single-pass**: a `[lib].modules` entry may only reference symbols defined in an *earlier* entry (the main build via `src/lib.cyr` is two-pass and wouldn't catch a violation — but CI's `Verify dist/sit.cyr is in sync` step builds the bundle). `fsck` (in `object_db.cyr`) treats reflog entry oids as reachability roots, so it calls `_reflog_collect_oids`. That forces the order:
 
 ```
-util → validate → config → reflog → object_db → index → refs → …
+util → validate → config → reflog → git_read → git_pack → object_db → index → refs → …
 ```
+
+(The 1.2.0 `.git/` read modules `git_read.cyr` / `git_pack.cyr` sit between `reflog` and `object_db`; like `object_db` they come after `reflog`, and `object_db`'s `read_object` dispatches into `git_pack`'s `_git_read_any`, so they must precede it.)
 
 Consequences for anyone editing `src/reflog.cyr`:
 
