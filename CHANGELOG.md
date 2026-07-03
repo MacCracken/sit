@@ -4,6 +4,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-07-03 — `.git/` read-mode
+
+sit reads an **existing git repository** read-only — loose objects, packfiles, and refs — behind the *same* public API it exposes for its native `.sit/` repos. A `dist/sit.cyr` consumer (thoth's status bar + tool-call diffs, owl's gutter markers) can now report branch / status / diff on a real-world git repo without shelling out to system `git`. Also folds in the cyrius 6.3.x toolchain refresh and dependency bumps carried since 1.1.0. No FFI, no libgit2 — every layer of git's on-disk format is first-party Cyrius. Design: [ADR 0011](docs/adr/0011-git-read-mode.md).
+
+### Added
+
+- **`.git/` read-mode (read-only).** `sit_repo_open` detects `.git/` vs `.sit/` and routes object reads + ref resolution to the right backend through a storage seam, so every layer above it (tree walk, commit parse, diff, status) stays storage-agnostic. Reads:
+  - **Objects** — loose (`.git/objects/xx/…`, zlib) and **packed** (`.idx` v2 binary-search lookup, pack v2 decode, and a first-party OFS_DELTA / REF_DELTA copy-insert **delta interpreter** with recursive base chains). No new dependency: zlib is sankoch, the delta interpreter is self-written.
+  - **Refs** — `.git/HEAD` (symref + detached), `.git/refs/`, and `.git/packed-refs`.
+  - **Hash** — SHA-1 (git default) and SHA-256 repos (`extensions.objectFormat`); object-id width is centralised so the 20-byte / 40-hex vs 32 / 64 difference is two helpers, not scattered literals.
+  - New modules `src/git_read.cyr` + `src/git_pack.cyr` (both in `[lib].modules`, ordered before `object_db.cyr`).
+- **Public API (ADR 0009, additive):** `sit_repo_branch(repo)` (current branch name) and `sit_repo_status(repo)` (per-file HEAD-vs-worktree status — modified / new / deleted; honours `.gitignore`) with `sit_status_path` / `sit_status_kind` accessors. The existing `sit_repo_open` / `sit_diff_path` now work on git repos unchanged — owl's single `sit_diff_path` call and thoth's branch/status light up on real git repos with no consumer-side branching.
+- CLI `sit cat-file` / `sit owl-file` read git objects (loose + packed) by oid or ref.
+
+### Changed
+
+- **Toolchain + dependency refresh.** cyrius `6.2.44 → 6.3.36`; sakshi `2.4.2 → 2.4.3`, sankoch `2.4.4 → 2.4.8`, sigil `3.9.4 → 3.9.9`, patra `1.12.4 → 1.12.7`. Added the `sync` stdlib module (a patra 1.12.7 transitive — its cross-handle / cross-process tail-page cache guard).
+
+### Notes
+
+- **273 unit / 58 integration** — git read-mode covered loose + packed (depth-5 delta chains) + refs + `packed-refs` + SHA-256 repos + a `dist/sit.cyr`-linked library-API probe — plus fuzz / lint green. Validated end-to-end against real `git`-created repos: branch / status / diff match `git status --porcelain` and `git cat-file` byte-for-byte. Single static binary, no dynamic dependencies (`ldd` → not a dynamic executable). `dist/sit.cyr` regenerated to carry `git_read` + `git_pack`.
+- **Scope**: `.git/` is read-only — sit stays `.sit/`-native for its own repos; no `.git/` write-back. `sit_repo_status` is HEAD-vs-worktree (no git staging-index parsing). SHA-1 is never *computed* (objects are looked up by id), so no first-party SHA-1 is required and sit's SHA-256-only trust boundary ([ADR 0004](docs/adr/0004-sha256-only.md), scoped by 0011) is unchanged.
+- **Deferred** to a future minor (new observable surface): CLI `sit status` / `log` / `diff` on git repos, and `@{N}` on git.
+
 ## [1.1.0] — 2026-06-25 — Reflog + recovery
 
 The first post-1.0 minor: a git-compatible reflog, `@{N}` recovery resolution, the `sit reflog` command, and a reflog-aware `fsck --prune` grace period. Foundational — the recovery net that de-risks the history-rewrite tools (revert / cherry-pick / stash / rebase) queued on the roadmap. Design + invariants: [ADR 0010](docs/adr/0010-reflog-and-recovery.md), [architecture note 005](docs/architecture/005-reflog-two-line-invariant.md).

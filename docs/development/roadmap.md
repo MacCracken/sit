@@ -15,6 +15,14 @@ The first stable release. The full git-parity surface is in place — local VCS 
 - `@{<date>}` selector — only the integer `@{N}` ordinal ships today.
 - Hardening pass on the same unsanitized-identity pattern in `commit.cyr` / `merge.cyr` object framing (the reflog path was hardened in 1.1.0; the commit/merge ident chain is the remaining instance) — a no-surface `1.0.x` security patch.
 
+## Shipped: 1.2.0 (2026-07-03)
+
+**`.git/` read-mode.** sit reads an existing git repository (SHA-1 + SHA-256) read-only — loose objects + packfiles (`.idx` v2 + a first-party OFS/REF delta interpreter, recursive chains) + refs (`HEAD` / `refs/` / `packed-refs`) — behind the same `sit_repo_open` / `sit_diff_path` public API as `.sit/` repos, plus new `sit_repo_branch` / `sit_repo_status` accessors. So `dist/sit.cyr` consumers (thoth's status bar + diffs, owl's gutter markers) report branch / status / diff on real-world git repos without shelling out to system `git`. Read-only (no `.git/` write-back — sit stays `.sit/`-native); no FFI — the delta interpreter is self-written, so the "needs sankoch delta primitives" gate below turned out unnecessary. Folds in the cyrius `6.2.44 → 6.3.36` toolchain + dep refresh. The keystone interop capability, requested by thoth. Design: [ADR 0011](../adr/0011-git-read-mode.md) (scoping [ADR 0004](../adr/0004-sha256-only.md)); full detail in [`CHANGELOG.md`](../../CHANGELOG.md).
+
+**`.git/` read-mode follow-ups (forward, new surface):**
+- CLI `sit status` / `log` / `diff` on git repos — the 1.2.0 *library* API works on git; the CLI commands stay `.sit`-gated (needs a shared `_compute_status_records()` in `diff.cyr` so it doesn't back-reference `api.cyr` in single-pass dist order). A `1.x.0` when CLI parity is wanted.
+- `@{N}` on git (parse git's `.git/logs/`); nested `.gitignore` / `info/exclude` (only the top-level `.gitignore` is honoured today).
+
 ## After v1.0.0
 
 Post-1.0, versioning is SemVer-disciplined (the [1.0.0 commitment](../../CHANGELOG.md)), which is what sorts the backlog into tiers:
@@ -38,9 +46,8 @@ Bug fixes, perf, internal work, and dep consumption — nothing a caller observe
 
 ### Minor line — `1.2.0` onward (new surface, themed)
 
-Each is a self-contained `1.x.0`; the heavier ones earn their own slot. The reflog shipped first (1.1.0) because it de-risks every history-rewrite tool that follows; `.git/` read-mode (the keystone interop capability, requested by thoth) is the next slot.
+Each is a self-contained `1.x.0`; the heavier ones earn their own slot. The reflog shipped first (1.1.0), then `.git/` read-mode (1.2.0) — the keystone interop capability, requested by thoth. **Next: `1.3.0` — annotated & signed tags.**
 
-- **`1.2.0` — `.git/` read-mode** *(heavy; high interop value; promoted from unscheduled).* Read an *existing git repository* (not just sit-native `.sit/`), so sit's `dist/sit.cyr` consumers (thoth's status bar + tool-call diffs, owl's gutter markers) report branch / status / diff on real-world git repos without shelling out to system `git`. Read-only: **SHA-1** object IDs alongside the existing SHA-256 (git's default mode is SHA-1; sit is SHA-256-native), loose-object decode (sankoch zlib — already in hand) + **packfile + `.idx`** decode with delta resolution (shares the sankoch delta primitives the pack-bundles item below needs), and `.git/HEAD` + `.git/refs/` + `packed-refs` parsing. Surfaces through the SAME `sit_repo_open` / `sit_diff_path` / branch+status accessors (storage-agnostic for callers); `.git/` **write-back stays out of scope** — sit stays `.sit/`-native for its own repos. **Dependency:** the packfile/delta half needs sankoch's delta primitives, still pending as of the 1.1.0 cut — so the loose-object + refs half (SHA-1 IDs, `.git/HEAD`/`refs/`/`packed-refs`, zlib loose decode) lands first and packfile decode follows within the minor once the sankoch work is ready. Requested by thoth.
 - **`1.3.0` — Annotated & signed tags + ref ergonomics** *(light; high git-parity value).* Annotated tags (a real tag object with tagger + message, not just a lightweight ref); **ed25519-signed tags** (reuse the sitsig machinery from signed commits); `sit mv` (rename in working tree + index); `sit describe` (nearest tag + offset). Completes the tag + signing story; low risk — a good cadence-setter for the minor line.
 - **`1.4.0` — History tools** *(medium; reflog-backed).* `sit revert` (inverse commit); `sit cherry-pick` (apply a commit onto HEAD via the existing 3-way merge + `merge-base`); `sit stash` (save / restore the working tree). Safe to ship now that the reflog (1.1.0) makes them recoverable.
 - **`1.5.0` — TLS trust hardening** *(medium).* HTTPS **CA-chain + hostname verification** (opt-in: `http.sslVerify` / `http.caBundle`, system store via `tls_native_set_ca_system`; TOFU stays the default); **mTLS** (client certs — `tls_native_new_server` + verify primitives already exist); **non-loopback `sit serve`** (lift the `127.0.0.1` lock, gated on `--tls`, refuse non-loopback plain HTTP); **bearer auth over SSH** (`_ssh_handle_auth_token` stub → real). A cohesive transport-trust minor.
