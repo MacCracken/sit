@@ -5,7 +5,7 @@ description = "Sovereign version control — a Cyrius-native git replacement"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sit"
 language = "cyrius"
-cyrius = "6.2.44"
+cyrius = "6.3.36"
 
 [build]
 entry = "src/main.cyr"
@@ -49,11 +49,20 @@ modules = [
 [deps]
 # Transitive stdlib resolution (cyrius v5.10.x SLOT 19) doesn't follow
 # through enum / constant references — sandhi pulls TLS_EARLY_DATA_*,
-# fdlopen_*, base64 (via tls/ws shim transitives), and sigil pulls
+# fdlopen_*, base64 (via tls/ws shim transitives), sigil pulls
 # u256_* / ct_eq_bytes_lens / _keccak_* / shake256 (via its crypto
-# primitives). All explicit until the cyrius transitive arc closes those
-# follow-through gaps. `bayan` is the cyrius 6.x omnibus bundle that
-# folded the old base64 / json / bigint stdlib modules into one.
+# primitives), and patra pulls `sync` (the cross-handle / cross-process
+# tail-page cache guard added in 1.12.7). All explicit until the cyrius
+# transitive arc closes those follow-through gaps. `bayan` is the cyrius
+# 6.x omnibus bundle that folded the old base64 / json / bigint stdlib
+# modules into one.
+#
+# `sync` + `thread` both export mutex_* on Linux (both futex-backed and
+# functionally identical — see lib/sync.cyr's header), so the build emits
+# three benign `duplicate fn 'mutex_*' (last definition wins)` warnings;
+# either definition is correct. `thread` can NOT be dropped to silence
+# them — sigil (parallel-hash path) and sandhi both reference its spawn
+# machinery (thread_join / thread_spawn / chan_*).
 stdlib = [
     "slice",
     "string",
@@ -72,6 +81,7 @@ stdlib = [
     "tagged",
     "fnptr",
     "thread",
+    "sync",
     "freelist",
     "bayan",
     "ct",
@@ -91,12 +101,12 @@ stdlib = [
 
 [deps.sakshi]
 git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.4.2"
+tag = "2.4.3"
 modules = ["dist/sakshi.cyr"]
 
 [deps.sankoch]
 git = "https://github.com/MacCracken/sankoch.git"
-tag = "2.4.4"
+tag = "2.4.8"
 modules = ["dist/sankoch.cyr"]
 
 # sigil 3.x: ct_eq retired (cyrius stdlib `ct_eq_bytes_lens` is canonical);
@@ -104,11 +114,11 @@ modules = ["dist/sankoch.cyr"]
 # sit uses only hash_data / hex_encode / hex_decode — none affected.
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
-tag = "3.9.4"
+tag = "3.9.9"
 modules = ["dist/sigil.cyr"]
 
 [deps.patra]
 git = "https://github.com/MacCracken/patra.git"
-tag = "1.12.4"
+tag = "1.12.7"
 modules = ["dist/patra.cyr"]
 
