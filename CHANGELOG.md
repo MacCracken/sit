@@ -4,6 +4,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-07-03 — chdir-free `sit_repo_open` (AGNOS-native read API)
+
+The library `sit_repo_open` (`src/api.cyr`) no longer `chdir`s — it reads the repo at the
+process's current working directory. **Behavior-preserving** for every real consumer (all pass
+`sit_repo_open(".")`, where `chdir(".")` was already a no-op: owl's gutter markers, thoth's status
+bar, this repo's `git_probe` integration test), and it makes the **read profile AGNOS-native**.
+
+### Fixed
+- **`sit_repo_open` dropped `syscall(SYS_CHDIR, cwd)`.** AGNOS's frozen syscall floor has no chdir
+  (nor `openat`/`getcwd`), so the raw `SYS_CHDIR` reference was a hard undefined-variable error when
+  a Cyrius consumer compiled `dist/sit-read.cyr` for `--agnos` — regressing that consumer's AGNOS
+  build lane (e.g. thoth's, which had to sed-neutralise the line in its vendored copy). The chdir was
+  never load-bearing (all consumers open the repo they are already in), so removing it is behavior-
+  preserving AND lets the read API run on AGNOS. Both dist profiles regenerated.
+
+### Changed (API contract, non-breaking in practice)
+- `sit_repo_open(cwd)`'s `cwd` argument is now **advisory** — pass `"."`; reads are cwd-relative and
+  it no longer changes directory. To operate on a repo elsewhere, `chdir` into it before calling (the
+  CLI does this in its `cmd_*`). No consumer relied on the old chdir-by-path (all pass `"."`), so no
+  migration is needed; documented on the function + in ADR 0009's stable surface.
+
+### Notes
+- 273 unit / 58 integration unchanged (git_probe verified: chdir-free open reads branch/status at cwd
+  byte-correct vs `git`). serve capabilities banner + both dist profiles bumped to 1.3.1.
+
 ## [1.3.0] — 2026-07-03 — read-only dist profile (`dist/sit-read.cyr`)
 
 A lean, read-only **`distlib` profile** for consumers that only *report* on a repo — branch / status / diff — and never write or sync: **thoth's status bar** and **owl's gutter markers**. `cyrius distlib read` (a new `[lib.read]` profile in `cyrius.cyml`) emits **`dist/sit-read.cyr`** — the same public `sit_repo_*` API, but built from only the read path (util / validate / config / reflog / git_read / git_pack / object_db / index / refs / tree / diff / commit / merge / api), dropping the signing module and the whole network stack (sign / wire / wire_http / serve). **No behavior or API change** — the only source edit is the mandatory per-release version-stamp bump in `serve_build_capabilities()` (`1.2.0` → `1.3.0`, asserted == VERSION by CI); the cut itself is driven entirely by the manifest. The full `dist/sit.cyr` is otherwise unchanged and remains the default for consumers that need the write/sync surface.
