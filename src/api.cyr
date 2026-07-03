@@ -104,3 +104,81 @@ fn sit_diff_path(repo, path) {
 fn sit_repo_branch(repo) {
     return current_branch_name();
 }
+
+# A status record is a 16-byte {path_ptr, kind} pair. Internal builder.
+fn _status_push(vec, path, kind) {
+    var rec = alloc(16);
+    store64(rec, path);
+    store64(rec + 8, kind);
+    vec_push(vec, rec);
+    return 0;
+}
+
+# Byte-compare a HEAD blob (named by id `hex`) against working file `path`.
+# Returns 1 if they differ (or either can't be read), 0 if identical. Uses a
+# content compare rather than a re-hash so it needs no hash primitive — which
+# is what lets it work on a git SHA-1 repo without a first-party SHA-1.
+fn _blob_differs_from_file(hex, path) {
+    var hp[16];
+    if (read_blob_content(hex, &hp) != 0) { return 1; }
+    var ob = load64(&hp);
+    var ol = load64(&hp + 8);
+    var wp[16];
+    if (read_file_heap(path, &wp) != 0) { return 1; }
+    var nb = load64(&wp);
+    var nl = load64(&wp + 8);
+    if (ol != nl) { return 1; }
+    if (memeq(ob, nb, ol) == 0) { return 1; }
+    return 0;
+}
+
+# Per-file HEAD-vs-working-tree status for the open repo. Returns a vec of
+# opaque status records — read each with sit_status_path / sit_status_kind.
+# Kinds: 1 = modified, 2 = new (untracked), 3 = deleted. Unmodified files are
+# omitted. Backend-aware (roadmap 1.2.0): works on sit-native and existing git
+# repos. v1 scope is HEAD-vs-worktree only — no staging-index (git .git/index /
+# sit patra index) staged/unstaged split, and untracked honours the top-level
+# ignore file (.gitignore in git mode). New public surface (ADR 0009): additive,
+# SemVer-minor. Caller owns the returned vec.
+fn sit_repo_status(repo) {
+    var out = vec_new();
+    var head_entries = read_head_tree_entries();
+    var work_files = list_working_files();
+
+    # Tracked files: deleted (gone from disk) or modified (content differs).
+    if (head_entries != 0) {
+        var hn = vec_len(head_entries);
+        var i = 0;
+        while (i < hn) {
+            var he = vec_get(head_entries, i);
+            var path = tree_entry_name(he);
+            if (file_exists(path) != 1) {
+                _status_push(out, path, 3);
+            }
+            else {
+                if (_blob_differs_from_file(tree_entry_hash(he), path) == 1) {
+                    _status_push(out, path, 1);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    # Working files absent from HEAD are new (untracked).
+    var wn = vec_len(work_files);
+    var j = 0;
+    while (j < wn) {
+        var wf = vec_get(work_files, j);
+        var tracked = 0;
+        if (head_entries != 0) {
+            if (tree_find(head_entries, wf) != 0) { tracked = 1; }
+        }
+        if (tracked == 0) { _status_push(out, wf, 2); }
+        j = j + 1;
+    }
+    return out;
+}
+
+# Accessors on a status record (mirror the ann_* pattern; opaque layout).
+fn sit_status_path(rec) { return load64(rec); }
+fn sit_status_kind(rec) { return load64(rec + 8); }

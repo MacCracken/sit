@@ -159,6 +159,14 @@ fn _repo_dir() {
     return ".sit/";
 }
 
+# The active backend's ignore-file name. load_sitignore reads this so the
+# working-tree walk honours .gitignore on a git repo (top-level only for v1 —
+# nested .gitignore / info/exclude / global excludes are not consulted).
+fn _ignore_filename() {
+    if (_repo_backend == 1) { return ".gitignore"; }
+    return ".sitignore";
+}
+
 # Read a loose ref file .git/<refpath> as a bare OID. Returns a heap cstring of
 # _id_hexlen() hex chars (NUL-terminated) or 0 if the file is absent / not hex.
 # Simplification: a loose ref that is itself a "ref: <path>" symref (rare

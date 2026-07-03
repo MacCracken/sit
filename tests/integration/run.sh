@@ -264,6 +264,11 @@ if command -v git >/dev/null 2>&1; then
   assert_eq "$("$SIT" cat-file HEAD)" "$(git cat-file commit "$HEADC")" "sit resolves git HEAD symref + reads the commit"
   git pack-refs --all >/dev/null 2>&1
   assert_eq "$("$SIT" cat-file HEAD)" "$(git cat-file commit "$HEADC")" "sit resolves HEAD via .git/packed-refs after pack-refs"
+  # Pack the objects too (loose removed) — exercises the .idx v2 lookup + pack
+  # v2 header parse + zlib inflate path.
+  git repack -ad >/dev/null 2>&1
+  assert_eq "$("$SIT" cat-file "$BLOB")" "$(git cat-file blob "$BLOB")" "sit reads a packed blob (.idx lookup + inflate)"
+  assert_eq "$("$SIT" cat-file HEAD)" "$(git cat-file commit "$HEADC")" "sit reads a packed commit via HEAD"
 else
   printf '  SKIP: git not installed — .git/ read-mode test skipped\n'
 fi

@@ -1,0 +1,377 @@
+# git_pack.cyr — read-only git packfile decode (roadmap 1.2.0, bite 2).
+#
+# Reads objects out of .git/objects/pack/*.{idx,pack}: binary-search the v2
+# .idx for an oid -> pack offset, parse the pack v2 object header, inflate
+# non-delta objects (sankoch zlib — no new dep), and reconstruct OFS_DELTA /
+# REF_DELTA objects via a self-written copy/insert delta interpreter. Byte
+# formats per gitformat-pack. Ordered AFTER git_read.cyr (uses _id_hexlen /
+# _id_rawlen / _git_read_loose) and BEFORE object_db.cyr (read_object dispatches
+# to _git_read_any) so the single-pass dist bundle stays forward-only.
+#
+# Shifts are written as * / to avoid any dependence on << / >>. All the object
+# out-params use read_object's 24-byte contract {content_ptr, content_len,
+# content_off}; pack objects carry no loose framing, so content_off is 0.
+
+# One-entry pack-file cache: a sit invocation reads many objects from the same
+# pack, so hold the last-loaded pack in memory rather than re-reading per object.
+var _pack_cache_path = 0;
+var _pack_cache_data = 0;
+var _pack_cache_len = 0;
+
+# Delta-chain recursion guard (git's pack.depth default is 50; 64 is slack).
+var _pack_delta_depth = 0;
+
+# Reject an absurd object size from a hostile pack header before allocating.
+var _PACK_MAX_OBJ = 268435456;   # 256 MiB
+
+# --- big-endian readers ------------------------------------------------------
+fn _be32(p) {
+    var v = load8(p) & 0xFF;
+    v = v * 256 + (load8(p + 1) & 0xFF);
+    v = v * 256 + (load8(p + 2) & 0xFF);
+    v = v * 256 + (load8(p + 3) & 0xFF);
+    return v;
+}
+fn _be64(p) {
+    var v = load8(p) & 0xFF;
+    var i = 1;
+    while (i < 8) {
+        v = v * 256 + (load8(p + i) & 0xFF);
+        i = i + 1;
+    }
+    return v;
+}
+
+# Lexicographic compare of n bytes. <0 / 0 / >0 (sign of first differing byte).
+fn _memcmp_n(a, b, n) {
+    var i = 0;
+    var result = 0;
+    while (i < n) {
+        if (result == 0) {
+            var av = load8(a + i) & 0xFF;
+            var bv = load8(b + i) & 0xFF;
+            if (av != bv) { result = av - bv; }
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+# Read one byte at the cursor and advance it.
+fn _next_byte(data, curptr) {
+    var b = load8(data + load64(curptr)) & 0xFF;
+    store64(curptr, load64(curptr) + 1);
+    return b;
+}
+
+# --- .idx v2 lookup ----------------------------------------------------------
+# Binary-search idx_path (v2) for oid_raw (rawlen bytes) -> pack byte offset.
+# Returns the offset (>= 12) on hit, or -1 (miss / unreadable / v1 idx / bad
+# magic). rawlen is 20 (SHA-1) or 32 (SHA-256).
+fn _git_idx_lookup(idx_path, oid_raw, rawlen) {
+    var pr[16];
+    if (read_file_heap(idx_path, &pr) != 0) { return 0 - 1; }
+    var d = load64(&pr);
+    var len = load64(&pr + 8);
+    if (len < 1032) { return 0 - 1; }
+    # magic 0xFF 't' 'O' 'c'; absence => v1 idx (unsupported here).
+    if ((load8(d) & 0xFF) != 255) { return 0 - 1; }
+    if ((load8(d + 1) & 0xFF) != 116) { return 0 - 1; }
+    if ((load8(d + 2) & 0xFF) != 79) { return 0 - 1; }
+    if ((load8(d + 3) & 0xFF) != 99) { return 0 - 1; }
+    if (_be32(d + 4) != 2) { return 0 - 1; }
+
+    var fanout = d + 8;
+    var N = _be32(fanout + 255 * 4);
+    var b0 = load8(oid_raw) & 0xFF;
+    var lo = 0;
+    if (b0 != 0) { lo = _be32(fanout + (b0 - 1) * 4); }
+    var hi = _be32(fanout + b0 * 4);
+    var oid_table = d + 1032;
+
+    var mid = 0;
+    var found = 0 - 1;
+    while (lo < hi) {
+        if (found < 0) {
+            mid = (lo + hi) / 2;
+            var cmp = _memcmp_n(oid_table + mid * rawlen, oid_raw, rawlen);
+            if (cmp == 0) { found = mid; lo = hi; }
+            else {
+                if (cmp < 0) { lo = mid + 1; }
+                else { hi = mid; }
+            }
+        }
+        else { lo = hi; }
+    }
+    if (found < 0) { return 0 - 1; }
+
+    var off_table = oid_table + N * rawlen + N * 4;   # skip oids + CRCs
+    var off32 = _be32(off_table + found * 4);
+    if ((off32 & 2147483648) == 0) { return off32; }
+    var large_table = off_table + N * 4;
+    var idx2 = off32 & 2147483647;
+    return _be64(large_table + idx2 * 8);
+}
+
+# --- pack load (cached) ------------------------------------------------------
+fn _git_load_pack(path, out_pair) {
+    if (_pack_cache_path != 0) {
+        if (streq(_pack_cache_path, path) == 1) {
+            store64(out_pair, _pack_cache_data);
+            store64(out_pair + 8, _pack_cache_len);
+            return 0;
+        }
+    }
+    var pr[16];
+    if (read_file_heap(path, &pr) != 0) { return 0 - 1; }
+    _pack_cache_data = load64(&pr);
+    _pack_cache_len = load64(&pr + 8);
+    var pl = strlen(path);
+    var pc = alloc(pl + 1);
+    memcpy(pc, path, pl);
+    store8(pc + pl, 0);
+    _pack_cache_path = pc;
+    store64(out_pair, _pack_cache_data);
+    store64(out_pair + 8, _pack_cache_len);
+    return 0;
+}
+
+# --- varint decoders (cursor is an i64 slot, advanced in place) --------------
+# Pack object header: byte0 = [cont|3-bit type|4-bit size-low]; continuation
+# bytes add 7 bits each (little-endian). Writes type to out_type, returns size.
+fn _pack_obj_header(data, curptr, out_type) {
+    var c = load8(data + load64(curptr)) & 0xFF;
+    store64(curptr, load64(curptr) + 1);
+    var type = (c / 16) & 7;
+    var size = c & 0x0F;
+    var mult = 16;
+    var cont = c & 0x80;
+    while (cont != 0) {
+        var b = load8(data + load64(curptr)) & 0xFF;
+        store64(curptr, load64(curptr) + 1);
+        size = size + (b & 0x7F) * mult;
+        mult = mult * 128;
+        cont = b & 0x80;
+    }
+    store64(out_type, type);
+    return size;
+}
+
+# OFS_DELTA base-offset varint (the ((ofs+1)<<7)|next biased big-endian scheme).
+fn _ofs_varint(data, curptr) {
+    var b = load8(data + load64(curptr)) & 0xFF;
+    store64(curptr, load64(curptr) + 1);
+    var ofs = b & 0x7F;
+    var cont = b & 0x80;
+    while (cont != 0) {
+        b = load8(data + load64(curptr)) & 0xFF;
+        store64(curptr, load64(curptr) + 1);
+        ofs = (ofs + 1) * 128 + (b & 0x7F);
+        cont = b & 0x80;
+    }
+    return ofs;
+}
+
+# Delta size varint: pure 7-bit little-endian chunks from byte 0.
+fn _delta_varint(data, curptr) {
+    var val = 0;
+    var mult = 1;
+    var cont = 1;
+    while (cont != 0) {
+        var b = load8(data + load64(curptr)) & 0xFF;
+        store64(curptr, load64(curptr) + 1);
+        val = val + (b & 0x7F) * mult;
+        mult = mult * 128;
+        cont = b & 0x80;
+    }
+    return val;
+}
+
+# --- delta apply -------------------------------------------------------------
+# Reconstruct a target object from base + delta instruction stream. Writes the
+# read_object contract into out24 (content_off 0). Returns 0 or negative.
+fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
+    var cur[8];
+    store64(&cur, 0);
+    _delta_varint(delta, &cur);              # base-size (unused sanity field)
+    var result_size = _delta_varint(delta, &cur);
+    if (result_size <= 0) { return 0 - 1; }
+    if (result_size > _PACK_MAX_OBJ) { return 0 - 1; }
+    var out = alloc(result_size);
+    if (out == 0) { return 0 - 2; }
+    var op_out = 0;
+    var err = 0;
+    while (load64(&cur) < delta_len) {
+        if (err == 0) {
+            var op = load8(delta + load64(&cur)) & 0xFF;
+            store64(&cur, load64(&cur) + 1);
+            if ((op & 0x80) != 0) {
+                var coff = 0;
+                var csize = 0;
+                if ((op & 0x01) != 0) { coff = coff + _next_byte(delta, &cur); }
+                if ((op & 0x02) != 0) { coff = coff + _next_byte(delta, &cur) * 256; }
+                if ((op & 0x04) != 0) { coff = coff + _next_byte(delta, &cur) * 65536; }
+                if ((op & 0x08) != 0) { coff = coff + _next_byte(delta, &cur) * 16777216; }
+                if ((op & 0x10) != 0) { csize = csize + _next_byte(delta, &cur); }
+                if ((op & 0x20) != 0) { csize = csize + _next_byte(delta, &cur) * 256; }
+                if ((op & 0x40) != 0) { csize = csize + _next_byte(delta, &cur) * 65536; }
+                if (csize == 0) { csize = 65536; }
+                if (coff + csize > base_len) { err = 0 - 3; }
+                else {
+                    if (op_out + csize > result_size) { err = 0 - 4; }
+                    else {
+                        memcpy(out + op_out, base + coff, csize);
+                        op_out = op_out + csize;
+                    }
+                }
+            }
+            else {
+                if (op != 0) {
+                    var lit = op & 0x7F;
+                    if (op_out + lit > result_size) { err = 0 - 5; }
+                    else {
+                        memcpy(out + op_out, delta + load64(&cur), lit);
+                        store64(&cur, load64(&cur) + lit);
+                        op_out = op_out + lit;
+                    }
+                }
+                else { err = 0 - 6; }
+            }
+        }
+        else { store64(&cur, delta_len); }
+    }
+    if (err != 0) { return err; }
+    if (op_out != result_size) { return 0 - 7; }
+    store64(out24, out);
+    store64(out24 + 8, result_size);
+    store64(out24 + 16, 0);
+    return 0;
+}
+
+# --- pack object reconstruct (recursive for deltas) --------------------------
+# Reconstruct the object at `offset` in the in-memory pack {pdata,plen}. Writes
+# read_object contract into out24 (content_off 0). Recurses through delta bases.
+fn _git_pack_obj(pdata, plen, offset, out24) {
+    var cur[8];
+    store64(&cur, offset);
+    var type_slot[8];
+    var size = _pack_obj_header(pdata, &cur, &type_slot);
+    var type = load64(&type_slot);
+    if (size > _PACK_MAX_OBJ) { return 0 - 10; }
+
+    if (type >= 1) {
+        if (type <= 4) {
+            var body = load64(&cur);
+            var content = alloc(size + 16);
+            if (content == 0) { return 0 - 11; }
+            var got = zlib_decompress(pdata + body, plen - body, content, size + 16);
+            if (got <= 0) { return 0 - 12; }
+            store64(out24, content);
+            store64(out24 + 8, got);
+            store64(out24 + 16, 0);
+            return 0;
+        }
+    }
+
+    if (_pack_delta_depth >= 64) { return 0 - 13; }
+
+    if (type == 6) {
+        var ofs = _ofs_varint(pdata, &cur);
+        var base_off = offset - ofs;
+        if (base_off < 0) { return 0 - 14; }
+        var base24[24];
+        _pack_delta_depth = _pack_delta_depth + 1;
+        var br = _git_pack_obj(pdata, plen, base_off, &base24);
+        _pack_delta_depth = _pack_delta_depth - 1;
+        if (br != 0) { return 0 - 15; }
+        var dbody = load64(&cur);
+        var delta = alloc(size + 16);
+        if (delta == 0) { return 0 - 16; }
+        var dgot = zlib_decompress(pdata + dbody, plen - dbody, delta, size + 16);
+        if (dgot <= 0) { return 0 - 17; }
+        return _git_apply_delta(load64(&base24), load64(&base24 + 8), delta, dgot, out24);
+    }
+
+    if (type == 7) {
+        var rawlen = _id_rawlen();
+        var base_hex = hex_encode(pdata + load64(&cur), rawlen);
+        store64(&cur, load64(&cur) + rawlen);
+        var base24[24];
+        _pack_delta_depth = _pack_delta_depth + 1;
+        var br = _git_read_any(base_hex, &base24);
+        _pack_delta_depth = _pack_delta_depth - 1;
+        if (br != 0) { return 0 - 18; }
+        # normalize base to raw content (loose base carries framing at +16)
+        var bbuf = load64(&base24) + load64(&base24 + 16);
+        var blen = load64(&base24 + 8) - load64(&base24 + 16);
+        var dbody = load64(&cur);
+        var delta = alloc(size + 16);
+        if (delta == 0) { return 0 - 19; }
+        var dgot = zlib_decompress(pdata + dbody, plen - dbody, delta, size + 16);
+        if (dgot <= 0) { return 0 - 20; }
+        return _git_apply_delta(bbuf, blen, delta, dgot, out24);
+    }
+
+    return 0 - 21;
+}
+
+# --- top-level packfile read -------------------------------------------------
+# Look up `hex` across every .git/objects/pack/*.idx; on a hit, reconstruct the
+# object from the matching .pack. Writes read_object contract to out24. Returns
+# 0 on success, negative if not found in any pack (or no pack dir).
+fn _git_read_pack(hex, out24) {
+    var packdir = ".git/objects/pack";
+    if (is_dir(str_from(packdir)) != 1) { return 0 - 1; }
+    var entries = dir_list(str_from(packdir));
+    if (entries == 0) { return 0 - 1; }
+    var n = vec_len(entries);
+    var rawlen = _id_rawlen();
+    var oid_raw[32];
+    if (hex_decode_into(hex, _id_hexlen(), &oid_raw) == 0) { return 0 - 2; }
+    var dlen = strlen(packdir);
+
+    var i = 0;
+    var rc = 0 - 3;
+    var done = 0;
+    while (i < n) {
+        if (done == 0) {
+            var s = vec_get(entries, i);
+            var sd = str_data(s);
+            var sl = str_len(s);
+            if (sl > 4) {
+                if (memeq(sd + sl - 4, ".idx", 4) == 1) {
+                    var ipath = alloc(dlen + 1 + sl + 1);
+                    memcpy(ipath, packdir, dlen);
+                    store8(ipath + dlen, 47);
+                    memcpy(ipath + dlen + 1, sd, sl);
+                    store8(ipath + dlen + 1 + sl, 0);
+                    var offset = _git_idx_lookup(ipath, &oid_raw, rawlen);
+                    if (offset >= 0) {
+                        var nb = sl - 4;   # name minus ".idx"
+                        var ppath = alloc(dlen + 1 + nb + 5 + 1);
+                        memcpy(ppath, packdir, dlen);
+                        store8(ppath + dlen, 47);
+                        memcpy(ppath + dlen + 1, sd, nb);
+                        memcpy(ppath + dlen + 1 + nb, ".pack", 5);
+                        store8(ppath + dlen + 1 + nb + 5, 0);
+                        var pkp[16];
+                        if (_git_load_pack(ppath, &pkp) == 0) {
+                            rc = _git_pack_obj(load64(&pkp), load64(&pkp + 8), offset, out24);
+                            done = 1;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return rc;
+}
+
+# Loose-first, then packfile: the git-mode object read used by read_object and
+# by REF_DELTA base resolution. On-disk (non-thin) packs are self-contained, so
+# a REF_DELTA base is always present as loose or in some pack.
+fn _git_read_any(hex, out24) {
+    if (_git_read_loose(hex, out24) == 0) { return 0; }
+    return _git_read_pack(hex, out24);
+}

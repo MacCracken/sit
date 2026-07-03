@@ -63,6 +63,8 @@ fn list_working_walk(prefix, fs_path, out, patterns) {
         var skip = 0;
         if (slen == 4) {
             if (memeq(sdata, ".sit", 4) == 1) { skip = 1; }
+            # git read-mode: never descend into a .git/ metadata dir.
+            if (memeq(sdata, ".git", 4) == 1) { skip = 1; }
         }
 
         if (skip == 0) {
