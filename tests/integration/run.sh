@@ -15,6 +15,17 @@ SIT="${SIT:-$ROOT/build/sit}"
 [ -x "$SIT" ] || { echo "sit binary not found at $SIT — build with 'cyrius build src/main.cyr build/sit'"; exit 1; }
 
 WORK=$(mktemp -d -t sit-itest.XXXXXX)
+
+# Build the .git/ read-mode library probe (against the shipped dist/sit.cyr
+# bundle) BEFORE HOME is isolated below — cyrius needs the real HOME to find
+# its toolchain. Empty if the toolchain isn't on this runner (binary-only CI).
+GIT_PROBE=""
+if command -v cyrius >/dev/null 2>&1; then
+  if ( cd "$ROOT" && cyrius build tests/integration/git_probe.cyr "$WORK/git_probe" ) >/dev/null 2>&1; then
+    GIT_PROBE="$WORK/git_probe"
+  fi
+fi
+
 export HOME="$WORK/home"; mkdir -p "$HOME"
 export SIT_AUTHOR_NAME="Integration Test"
 export SIT_AUTHOR_EMAIL="itest@sit.local"
@@ -269,6 +280,46 @@ if command -v git >/dev/null 2>&1; then
   git repack -ad >/dev/null 2>&1
   assert_eq "$("$SIT" cat-file "$BLOB")" "$(git cat-file blob "$BLOB")" "sit reads a packed blob (.idx lookup + inflate)"
   assert_eq "$("$SIT" cat-file HEAD)" "$(git cat-file commit "$HEADC")" "sit reads a packed commit via HEAD"
+
+  # SHA-256 git repos (extensions.objectFormat=sha256): 64-hex ids / 32-byte
+  # raw hashes — exercises the _id_hexlen=64 / _id_rawlen=32 backend path,
+  # loose and packed. Skipped if the local git predates sha256 support.
+  R="$WORK/gitsha256"; mkdir -p "$R"; cd "$R"
+  if git init -q --object-format=sha256 2>/dev/null; then
+    git config user.email itest@sit.local >/dev/null 2>&1
+    git config user.name "Integration Test" >/dev/null 2>&1
+    printf 'sha256 content\nsecond line\n' > s.txt
+    git add s.txt && git commit -qm "sha256" >/dev/null 2>&1
+    S256=$(git rev-parse HEAD:s.txt)
+    assert_eq "${#S256}" "64" "sha256 repo yields 64-hex oids"
+    assert_eq "$("$SIT" cat-file "$S256")" "$(git cat-file blob "$S256")" "sit reads a SHA-256 loose blob"
+    git repack -ad >/dev/null 2>&1
+    assert_eq "$("$SIT" cat-file "$S256")" "$(git cat-file blob "$S256")" "sit reads a SHA-256 packed blob (.idx rawlen=32)"
+  else
+    printf '  SKIP: git lacks --object-format=sha256\n'
+  fi
+
+  # Library surface (consumer bundle): run the probe built above against
+  # dist/sit.cyr — the same include owl/thoth use — and assert sit_repo_branch
+  # / sit_repo_status match the working tree.
+  if [ -n "$GIT_PROBE" ]; then
+    R="$WORK/gitapi"; mkdir -p "$R"; cd "$R"
+    git init -q
+    git config user.email itest@sit.local >/dev/null 2>&1
+    git config user.name "Integration Test" >/dev/null 2>&1
+    printf 'orig\n' > tracked.txt; printf 'bye\n' > gone.txt
+    git add -A && git commit -qm base >/dev/null 2>&1
+    printf 'orig\nCHANGED\n' > tracked.txt   # modified
+    rm gone.txt                               # deleted
+    printf 'fresh\n' > fresh.txt              # new (untracked)
+    APIOUT=$("$GIT_PROBE" 2>/dev/null)
+    assert_contains "$APIOUT" "BRANCH "               "probe: sit_repo_branch returns a branch"
+    assert_contains "$APIOUT" "STATUS M tracked.txt"  "probe: sit_repo_status reports modified"
+    assert_contains "$APIOUT" "STATUS D gone.txt"     "probe: sit_repo_status reports deleted"
+    assert_contains "$APIOUT" "STATUS N fresh.txt"    "probe: sit_repo_status reports new"
+  else
+    printf '  SKIP: library-API probe unavailable (cyrius toolchain not found)\n'
+  fi
 else
   printf '  SKIP: git not installed — .git/ read-mode test skipped\n'
 fi

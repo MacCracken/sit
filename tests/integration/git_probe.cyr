@@ -1,0 +1,42 @@
+# git_probe.cyr — integration probe for the .git/ read-mode LIBRARY surface.
+#
+# Built by tests/integration/run.sh against the SHIPPED consumer bundle
+# (dist/sit.cyr — the same include owl/thoth use), then run inside a git
+# fixture. Exercises sit_repo_open / sit_repo_branch / sit_repo_status on a
+# real .git/ repo and prints a parseable report the suite asserts against
+# `git status`. Not part of the product; lives with the tests.
+include "dist/sit.cyr"
+
+fn kchar(k) {
+    if (k == 1) { return "M"; }
+    if (k == 2) { return "N"; }
+    if (k == 3) { return "D"; }
+    return "?";
+}
+
+fn main() {
+    if (sit_repo_open(".") == 0) { eprintln("PROBE-FAIL-OPEN"); return 1; }
+
+    var br = sit_repo_branch(1);
+    stdout_write("BRANCH ", 7);
+    if (br != 0) { stdout_write(br, strlen(br)); }
+    stdout_write("\n", 1);
+
+    var st = sit_repo_status(1);
+    var n = vec_len(st);
+    var i = 0;
+    while (i < n) {
+        var rec = vec_get(st, i);
+        stdout_write("STATUS ", 7);
+        stdout_write(kchar(sit_status_kind(rec)), 1);
+        stdout_write(" ", 1);
+        var p = sit_status_path(rec);
+        stdout_write(p, strlen(p));
+        stdout_write("\n", 1);
+        i = i + 1;
+    }
+    stdout_flush();
+    return 0;
+}
+
+var r = main(); syscall(SYS_EXIT, r);
