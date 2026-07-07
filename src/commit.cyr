@@ -146,12 +146,12 @@ fn materialize_target(target_hex) {
         var cpath = tree_entry_name(ce);
         if (tree_flat_path_valid(cpath) == 1) {
             if (tree_find(target_entries, cpath) == 0) {
-                if (file_exists(cpath) == 1) {
+                if (sf_exists(cpath) == 1) {
                     # S-16: refuse to declare success when a stale file the
                     # target says shouldn't exist couldn't be removed —
                     # otherwise `sit status` after checkout would still see
                     # it as tracked.
-                    if (sys_unlink(cpath) != 0) {
+                    if (sf_unlink(cpath) != 0) {
                         syscall(SYS_WRITE, STDERR, "sit: cannot remove stale path '", 31);
                         syscall(SYS_WRITE, STDERR, cpath, strlen(cpath));
                         syscall(SYS_WRITE, STDERR, "' — materialize aborted\n", 24);
@@ -196,7 +196,7 @@ fn materialize_target(target_hex) {
             # S-16: file_write_all returns < 0 on any write or open failure
             # (permissions, ENOSPC, EROFS). Same partial-tree problem as the
             # blob-read failure above; abort with a clear pointer to the path.
-            if (file_write_all(tpath, load64(&tp), load64(&tp + 8)) < 0) {
+            if (sf_write_all(tpath, load64(&tp), load64(&tp + 8)) < 0) {
                 syscall(SYS_WRITE, STDERR, "sit: cannot write '", 19);
                 syscall(SYS_WRITE, STDERR, tpath, strlen(tpath));
                 syscall(SYS_WRITE, STDERR, "' — materialize aborted (working tree may be partial)\n", 55);
@@ -771,7 +771,7 @@ fn print_graph(start_hex, limit) {
 }
 
 fn cmd_log() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -838,7 +838,7 @@ fn cmd_log() {
     # commits whose parents were not fetched. When the walk reaches one,
     # stop cleanly instead of erroring on the absent parent object.
     var shallow = map_new();
-    if (file_exists(".sit/shallow") == 1) {
+    if (sf_exists(".sit/shallow") == 1) {
         var spair[16];
         if (read_file_heap(".sit/shallow", &spair) == 0) {
             var sbuf = load64(&spair);
@@ -955,7 +955,7 @@ fn cmd_commit() {
         return 1;
     }
 
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -995,7 +995,7 @@ fn cmd_commit() {
             # S-16: a stale MERGE_HEAD silently turns the NEXT `sit commit` into
             # an unintended 2-parent merge. Refuse to declare success on the
             # commit if we couldn't clear it.
-            if (sys_unlink(".sit/MERGE_HEAD") != 0) {
+            if (sf_unlink(".sit/MERGE_HEAD") != 0) {
                 eprintln("sit: commit object written but failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove the file manually");
                 return 1;
             }

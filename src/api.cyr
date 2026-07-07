@@ -44,6 +44,11 @@ fn sit_repo_open(cwd) {
     # that read_object / read_head_ref / resolve_ref_name dispatch on. Returns -1
     # when neither store is present.
     if (_detect_repo_backend() < 0) { return 0; }
+    # Set the repo root so subsequent reads resolve on agnos (which has no
+    # cwd). Linux stays BYTE-IDENTICAL: consumers pass "." and sit_abs
+    # treats a "." root as no-prefix (and an absolute root only prefixes
+    # repo-relative paths). A non-"." absolute cwd enables agnos resolution.
+    sit_set_repo_root(cwd);
     return 1;
 }
 
@@ -89,7 +94,7 @@ fn sit_diff_path(repo, path) {
     var new_buf = 0;
     var new_len = 0;
     var wp[16];
-    if (file_exists(path) == 1) {
+    if (sf_exists(path) == 1) {
         if (read_file_heap(path, &wp) == 0) {
             new_buf = load64(&wp);
             new_len = load64(&wp + 8);
@@ -160,7 +165,7 @@ fn sit_repo_status(repo) {
         while (i < hn) {
             var he = vec_get(head_entries, i);
             var path = tree_entry_name(he);
-            if (file_exists(path) != 1) {
+            if (sf_exists(path) != 1) {
                 _status_push(out, path, 3);
             }
             else {

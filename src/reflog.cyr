@@ -325,7 +325,7 @@ fn _reflog_append_full(refpath, old_hex, new_hex, msg, name, email, ts) {
     var llen = reflog_format_line(buf, old_hex, new_hex, name, email, ts, msg);
     var path = reflog_log_path(refpath);
     ensure_parent_dirs(path);
-    if (file_append_locked(path, buf, llen) < 0) { return 0 - 1; }
+    if (sf_append_locked(path, buf, llen) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -360,12 +360,12 @@ fn _reflog_log_refpath_for(label) {
     memcpy(hp, "refs/heads/", 11);
     memcpy(hp + 11, label, ll);
     store8(hp + 11 + ll, 0);
-    if (file_exists(reflog_log_path(hp)) == 1) { return hp; }
+    if (sf_exists(reflog_log_path(hp)) == 1) { return hp; }
     var rp = alloc(13 + ll + 1);
     memcpy(rp, "refs/remotes/", 13);
     memcpy(rp + 13, label, ll);
     store8(rp + 13 + ll, 0);
-    if (file_exists(reflog_log_path(rp)) == 1) { return rp; }
+    if (sf_exists(reflog_log_path(rp)) == 1) { return rp; }
     return hp;
 }
 
@@ -374,7 +374,7 @@ fn _reflog_log_refpath_for(label) {
 #   <short-new-oid> <ref>@{N}: <message>
 # Defaults to HEAD. Silent (exit 0) when the ref has no log yet.
 fn cmd_reflog() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }

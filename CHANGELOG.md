@@ -4,6 +4,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.2] — 2026-07-06 — repo-root-relative FS layer (fully AGNOS-native, no `chdir` anywhere)
+
+Completes 1.3.1's chdir-free `sit_repo_open` into a full **repo-root-relative FS layer** — ALL of sit
+(object store, refs, index, reflog, serve, clone) resolves paths against an explicit repo root instead
+of the process cwd. AGNOS has no `chdir`/`getcwd`/`openat` (CWD is userland-owned), so this makes the
+**entire library AGNOS-compilable** (a downstream `--agnos` build hard-failed at `SYS_CHDIR`).
+
+### Changed
+- **`src/util.cyr`**: `_repo_root` (0 = Linux default → no prefix) + `sit_abs()`/`sit_abs_str()` (the one
+  prefix point; absolute paths and the `.`/null root pass through unchanged) + `sit_set_repo_root()` +
+  thin `sf_*` FS wrappers (`sf_exists`/`sf_write_all`/`sf_open`/`sf_read_all`/`sf_mkdir`/`sf_unlink`/
+  `sf_rmdir`/`sf_stat`/`sf_dir_list`/`sf_patra_open`) that funnel repo-relative FS access through `sit_abs`.
+  `ensure_dir`/`ensure_parent_dirs`/`read_file_heap` prefix internally.
+- **~130 FS-access sites** across 16 `src/*.cyr` routed through the wrappers (name-swap; args unchanged).
+- **All 3 `syscall(SYS_CHDIR, …)` removed** — `serve`/`clone` call `sit_set_repo_root(path)` and let
+  `sit_abs` prefix; zero `SYS_CHDIR` remains (the AGNOS compile blocker).
+
+### Behavior-preserving on Linux (verified)
+- `_repo_root` defaults 0 → `sit_abs` is a no-op → paths byte-identical. **273 unit + 58 integration +
+  fuzz all pass, 0 failed** — including the clone/push/shallow/`.git`-read lanes that open repos on
+  *external* paths (exactly what the chdir→abs-path change touched). `dist/sit.cyr` regenerated (deterministic).
+
 ## [1.3.1] — 2026-07-03 — chdir-free `sit_repo_open` (AGNOS-native read API)
 
 The library `sit_repo_open` (`src/api.cyr`) no longer `chdir`s — it reads the repo at the

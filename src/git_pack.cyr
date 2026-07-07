@@ -322,7 +322,7 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
 fn _git_read_pack(hex, out24) {
     var packdir = ".git/objects/pack";
     if (is_dir(str_from(packdir)) != 1) { return 0 - 1; }
-    var entries = dir_list(str_from(packdir));
+    var entries = sf_dir_list(str_from(packdir));
     if (entries == 0) { return 0 - 1; }
     var n = vec_len(entries);
     var rawlen = _id_rawlen();

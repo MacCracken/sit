@@ -154,7 +154,7 @@ Run a closeout pass before tagging `X.Y.0` or `X.0.0`. Ship as the last patch of
 - All struct fields are 8 bytes (`i64`), accessed via `load64` / `store64` with offset.
 - Heap allocation via `fl_alloc()` / `fl_free()` (freelist) for data with individual lifetimes.
 - Bump allocation via `alloc()` for long-lived data (vec, str internals).
-- Enum values for constants — don't consume `gvar_toks` slots (256 initialized globals limit).
+- Enum values for constants — don't consume `gvar_toks` slots (4,096 initialized globals limit).
 - Heap-allocate large buffers — `var buf[256000]` bloats the binary by 256KB.
 - `break` in while loops with `var` declarations is unreliable — use flag + `continue`.
 - No negative literals — write `(0 - N)` not `-N`.
@@ -162,7 +162,8 @@ Run a closeout pass before tagging `X.Y.0` or `X.0.0`. Ship as the last patch of
 - Reserved names to avoid as variables: `match`, `in`, `pub`.
 - `return;` without value is invalid — always `return 0;`.
 - All `var` declarations are function-scoped — no block scoping.
-- Max limits per compilation unit: 4,096 variables, 1,024 functions, 256 initialized globals.
+- Max limits per compilation unit: 4,096 variables, 1,024 functions, 4,096 initialized globals.
+- Counting rule: only a top-level `var NAME = <non-literal>;` (call / identifier / expression initializer) consumes an initialized-globals slot; a bare integer-literal init (`var x = 42;`) takes the static-init fast path and enum members are const-folded, so neither counts. See the cyrius guide's **Global Initializers** section (`docs/guides/cyrius-guide.md` in the cyrius repo).
 - Cyrius does **two-pass compilation** — include order in `src/lib.cyr` is logical grouping only; forward references resolve across the full source set.
 
 ## CI / Release

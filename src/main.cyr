@@ -4,7 +4,10 @@
 include "src/lib.cyr"
 
 fn cmd_init() {
-    var reinit = file_exists(".sit/HEAD");
+    # init always runs in the target repo directory; make that explicit.
+    # On Linux a "." root is a sit_abs no-op → byte-identical behavior.
+    sit_set_repo_root(".");
+    var reinit = sf_exists(".sit/HEAD");
 
     if (ensure_dir(".sit") != 0) {
         eprintln("sit: failed to create .sit");
@@ -24,7 +27,7 @@ fn cmd_init() {
     }
 
     var head = "ref: refs/heads/main\n";
-    if (file_write_all(".sit/HEAD", head, 21) < 0) {
+    if (sf_write_all(".sit/HEAD", head, 21) < 0) {
         eprintln("sit: failed to write .sit/HEAD");
         return 1;
     }

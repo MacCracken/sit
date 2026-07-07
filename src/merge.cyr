@@ -180,15 +180,15 @@ fn write_merge_head(hex) {
     memcpy(buf, hex, 64);
     store8(buf + 64, 10);
     store8(buf + 65, 0);
-    if (file_write_all(".sit/MERGE_HEAD", buf, 65) < 0) { return 0 - 1; }
+    if (sf_write_all(".sit/MERGE_HEAD", buf, 65) < 0) { return 0 - 1; }
     return 0;
 }
 
 # Read `.sit/MERGE_HEAD` if it exists. Returns heap-allocated 64-char hex
 # cstring, or 0 if no merge is in progress.
 fn read_merge_head() {
-    if (file_exists(".sit/MERGE_HEAD") != 1) { return 0; }
-    var fd = file_open(".sit/MERGE_HEAD", 0, 0);
+    if (sf_exists(".sit/MERGE_HEAD") != 1) { return 0; }
+    var fd = sf_open(".sit/MERGE_HEAD", 0, 0);
     if (fd < 0) { return 0; }
     var buf = alloc_or_die(80);
     var n = file_read(fd, buf, 80);
@@ -251,7 +251,7 @@ fn write_conflict_file(path, ours_hex, theirs_hex, branch_name) {
     store8(out + pos, 10); pos = pos + 1;
 
     ensure_parent_dirs(path);
-    if (file_write_all(path, out, pos) < 0) { return 0 - 1; }
+    if (sf_write_all(path, out, pos) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -388,7 +388,7 @@ fn find_merge_base(a_hex, b_hex) {
 # are resolved through resolve_hash (branch / tag / hex-prefix). Exposes the
 # LCA so the merge base is testable independent of a full `sit merge`.
 fn cmd_merge_base() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -503,7 +503,7 @@ fn build_merge_commit_signed(tree_hex, p1_hex, p2_hex, message, seed) {
 
 # Find a tree entry's hash_hex for a given path, or 0 if absent.
 fn cmd_merge() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -514,7 +514,7 @@ fn cmd_merge() {
 
     # --abort: restore working tree to HEAD, clear MERGE_HEAD.
     if (streq(argv(2), "--abort") == 1) {
-        if (file_exists(".sit/MERGE_HEAD") != 1) {
+        if (sf_exists(".sit/MERGE_HEAD") != 1) {
             eprintln("sit: no merge in progress");
             return 1;
         }
@@ -529,7 +529,7 @@ fn cmd_merge() {
         }
         # S-16: a stale MERGE_HEAD silently turns the next commit into a
         # 2-parent merge. Same cliff as cmd_commit's clear path.
-        if (sys_unlink(".sit/MERGE_HEAD") != 0) {
+        if (sf_unlink(".sit/MERGE_HEAD") != 0) {
             eprintln("sit: failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove manually");
             return 1;
         }
@@ -741,7 +741,7 @@ fn cmd_merge() {
             ensure_parent_dirs(mpath);
             var mp[16];
             if (read_blob_content(mhex, &mp) == 0) {
-                file_write_all(mpath, load64(&mp), load64(&mp + 8));
+                sf_write_all(mpath, load64(&mp), load64(&mp + 8));
             }
             mi = mi + 1;
         }

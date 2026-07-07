@@ -6,6 +6,124 @@
 var SEEK_SET = 0;
 var SEEK_END = 2;
 
+# ================================================================
+# Repo-root prefixing (agnos support).
+# ================================================================
+# AGNOS's frozen syscall floor has NO chdir/getcwd/openat — "CWD is
+# userland-owned, absolute paths" (ABI §3.2). sit historically leaned
+# on process-cwd (`chdir` into the repo, then read ".sit/..." relative).
+# That is portability-hostile. The fix: carry an explicit repo root and
+# funnel every repo-relative FS access through sit_abs(), which prefixes
+# it.
+#
+# `_repo_root` == 0 is the LINUX DEFAULT: no prefix, cwd-relative,
+# byte-identical to pre-refactor behavior. On agnos, entry points set it
+# to an absolute repo-root cstring so reads resolve without a cwd.
+var _repo_root = 0;
+
+# Store the repo root (an absolute-path cstring), or 0 to clear it.
+fn sit_set_repo_root(root) {
+    _repo_root = root;
+    return 0;
+}
+
+# The ONE prefix point. Rules, in order:
+#   (1) rel already absolute (byte 0 == '/') → return UNCHANGED.
+#       (cert/token/HOME paths pass straight through.)
+#   (2) _repo_root == 0 (Linux default) → return rel UNCHANGED
+#       (preserves cwd-relative behavior exactly — a true no-op).
+#   (3) else → heap-alloc "<_repo_root>/<rel>" and return it.
+#       Caller-owns the result.
+# On Linux and for already-absolute paths this is a no-op, so the whole
+# change is behavior-preserving there.
+fn sit_abs(rel) {
+    if (rel == 0) { return rel; }
+    if (load8(rel) == 47) { return rel; }            # '/'
+    if (_repo_root == 0) { return rel; }
+    # A "." root means "current directory" — prefixing "./" is redundant
+    # and would break Linux byte-for-byte parity. Treat it as no-prefix so
+    # cmd_init's explicit sit_set_repo_root(".") stays a Linux no-op.
+    if (load8(_repo_root) == 46) { if (load8(_repo_root + 1) == 0) { return rel; } }
+    var rlen = strlen(_repo_root);
+    var plen = strlen(rel);
+    # "<root>" + "/" + "<rel>" + NUL
+    var out = alloc_or_die(rlen + 1 + plen + 1);
+    memcpy(out, _repo_root, rlen);
+    store8(out + rlen, 47);                          # '/'
+    memcpy(out + rlen + 1, rel, plen);
+    store8(out + rlen + 1 + plen, 0);
+    return out;
+}
+
+# Str-aware variant of sit_abs for FS primitives that take a Str
+# (e.g. dir_list). Applies the same prefixing rules to the Str's bytes
+# and returns a new Str; a no-op case returns the input Str unchanged.
+fn sit_abs_str(rel) {
+    if (rel == 0) { return rel; }
+    var data = str_data(rel);
+    if (str_len(rel) > 0) { if (load8(data) == 47) { return rel; } }
+    if (_repo_root == 0) { return rel; }
+    return str_from(sit_abs(str_cstr(rel)));
+}
+
+# ----------------------------------------------------------------
+# sit-owned FS wrappers (sf_*). Every repo FS access funnels through
+# one of these so the prefixing lives in a single place. The inner
+# calls keep the real stdlib names — the sf_ names are new, so no
+# self-shadowing. Absolute/HOME/cert/token paths pass through sit_abs
+# unchanged (rule 1), and on Linux (_repo_root == 0) every wrapper is a
+# transparent forward (rule 2).
+# ----------------------------------------------------------------
+fn sf_exists(p) {
+    return file_exists(sit_abs(p));
+}
+
+fn sf_write_all(p, buf, len) {
+    return file_write_all(sit_abs(p), buf, len);
+}
+
+fn sf_open(p, flags, mode) {
+    return file_open(sit_abs(p), flags, mode);
+}
+
+fn sf_read_all(p, buf, maxlen) {
+    return file_read_all(sit_abs(p), buf, maxlen);
+}
+
+fn sf_append_locked(p, buf, len) {
+    return file_append_locked(sit_abs(p), buf, len);
+}
+
+fn sf_mkdir(p, mode) {
+    return sys_mkdir(sit_abs(p), mode);
+}
+
+# NOTE: no sf_ensure_dir / sf_ensure_parent_dirs / sf_read_file_heap —
+# those three sit-owned fns prefix INTERNALLY (see below), so their
+# existing callers stay unchanged. Wrapping them here would double-prefix.
+
+fn sf_unlink(p) {
+    return sys_unlink(sit_abs(p));
+}
+
+fn sf_rmdir(p) {
+    return sys_rmdir(sit_abs(p));
+}
+
+fn sf_stat(p, buf) {
+    return sys_stat(sit_abs(p), buf);
+}
+
+# dir_list takes a Str; route through the Str-aware prefixer.
+fn sf_dir_list(p) {
+    return dir_list(sit_abs_str(p));
+}
+
+# patra_open takes a cstring path (external dep).
+fn sf_patra_open(p) {
+    return patra_open(sit_abs(p));
+}
+
 fn eprintln(s) {
     var len = strlen(s);
     syscall(SYS_WRITE, STDERR, s, len);
@@ -66,8 +184,10 @@ fn alloc_or_die(size) {
 }
 
 # mkdir(path, 0o755), tolerating EEXIST (-17).
+# sit-owned: prefixes `path` with the repo root (sit_abs) INTERNALLY so
+# every caller (incl. ensure_parent_dirs) can pass a repo-relative path.
 fn ensure_dir(path) {
-    var r = sys_mkdir(path, 0x1ED);
+    var r = sys_mkdir(sit_abs(path), 0x1ED);
     if (r == 0) { return 0; }
     if (r == 0 - 17) { return 0; }
     return r;
@@ -75,6 +195,9 @@ fn ensure_dir(path) {
 
 # Walk `path`, mkdir every '/'-delimited directory prefix. Used by ref writers
 # so `.sit/refs/heads/feature/foo` creates `.sit/refs/heads/feature/` on demand.
+# sit-owned: each derived segment is repo-relative and gets prefixed by
+# ensure_dir's internal sit_abs — so this fn stays cwd-relative here and
+# must NOT prefix `path` itself (that would double-prefix each segment).
 fn ensure_parent_dirs(path) {
     var len = strlen(path);
     var i = 0;
@@ -212,8 +335,10 @@ fn write_sanitized(fd, bytes, len) {
 
 # Read an entire file into a heap buffer. Writes (ptr, len) to out_pair.
 # Returns 0 on success, negative on failure.
+# sit-owned: prefixes `path` with the repo root (sit_abs) INTERNALLY so
+# its many callers need no change.
 fn read_file_heap(path, out_pair) {
-    var fd = file_open(path, 0, 0);
+    var fd = file_open(sit_abs(path), 0, 0);
     if (fd < 0) { return 0 - 1; }
     var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
     syscall(SYS_LSEEK, fd, 0, SEEK_SET);

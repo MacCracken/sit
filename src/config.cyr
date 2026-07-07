@@ -46,7 +46,7 @@ fn config_parse_value(data, start, stop, key, key_len) {
 
 # Look up `key` in a single config file. Returns heap cstring value or 0.
 fn config_file_get(path, key) {
-    if (file_exists(path) != 1) { return 0; }
+    if (sf_exists(path) != 1) { return 0; }
     var pair[16];
     if (read_file_heap(path, &pair) != 0) { return 0; }
     var data = load64(&pair);
@@ -103,7 +103,7 @@ fn config_file_set(path, key, value) {
 
     var data = 0;
     var len = 0;
-    if (file_exists(path) == 1) {
+    if (sf_exists(path) == 1) {
         var pair[16];
         if (read_file_heap(path, &pair) == 0) {
             data = load64(&pair);
@@ -169,13 +169,13 @@ fn config_file_set(path, key, value) {
         out_pos = out_pos + 1;
     }
 
-    if (file_write_all(path, out, out_pos) < 0) { return 0 - 1; }
+    if (sf_write_all(path, out, out_pos) < 0) { return 0 - 1; }
     return 0;
 }
 
 # Print every non-blank, non-comment line of a config file to stdout.
 fn config_file_list(path) {
-    if (file_exists(path) != 1) { return 0; }
+    if (sf_exists(path) != 1) { return 0; }
     var pair[16];
     if (read_file_heap(path, &pair) != 0) { return 0; }
     var data = load64(&pair);
@@ -211,7 +211,7 @@ fn config_file_list(path) {
 # Returns 0 on success, -1 on I/O failure, -2 if the key wasn't present.
 fn config_file_unset(path, key) {
     var key_len = strlen(key);
-    if (file_exists(path) != 1) { return 0 - 2; }
+    if (sf_exists(path) != 1) { return 0 - 2; }
     var pair[16];
     if (read_file_heap(path, &pair) != 0) { return 0 - 1; }
     var data = load64(&pair);
@@ -248,7 +248,7 @@ fn config_file_unset(path, key) {
         pos = le + 1;
     }
     if (removed == 0) { return 0 - 2; }
-    if (file_write_all(path, out, out_pos) < 0) { return 0 - 1; }
+    if (sf_write_all(path, out, out_pos) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -276,7 +276,7 @@ fn cmd_config() {
         store8(path + hlen + 11, 0);
     }
     else {
-        if (file_exists(".sit/HEAD") != 1) {
+        if (sf_exists(".sit/HEAD") != 1) {
             eprintln("sit: not a sit repository (run 'sit init')");
             return 1;
         }

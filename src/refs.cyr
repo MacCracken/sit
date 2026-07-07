@@ -33,7 +33,7 @@ fn resolve_reflog_spec(name, out_buf) {
     memcpy(hp, "refs/heads/", 11);
     memcpy(hp + 11, base, blen);
     store8(hp + 11 + blen, 0);
-    if (file_exists(reflog_log_path(hp)) == 1) {
+    if (sf_exists(reflog_log_path(hp)) == 1) {
         return reflog_read_nth(hp, num, out_buf);
     }
 
@@ -41,7 +41,7 @@ fn resolve_reflog_spec(name, out_buf) {
     memcpy(rp, "refs/remotes/", 13);
     memcpy(rp + 13, base, blen);
     store8(rp + 13 + blen, 0);
-    if (file_exists(reflog_log_path(rp)) == 1) {
+    if (sf_exists(reflog_log_path(rp)) == 1) {
         return reflog_read_nth(rp, num, out_buf);
     }
     return 0;
@@ -71,8 +71,8 @@ fn resolve_ref_name(name, out_buf) {
     # S-11: all three ref-file readers below validate that the first 64 bytes
     # are actual hex before accepting. A garbage or attacker-crafted ref is
     # treated as "no such ref" rather than flowed through as a "hash".
-    if (file_exists(tag_path) == 1) {
-        var tfd = file_open(tag_path, 0, 0);
+    if (sf_exists(tag_path) == 1) {
+        var tfd = sf_open(tag_path, 0, 0);
         if (tfd >= 0) {
             var tbuf = alloc(80);
             var tn = file_read(tfd, tbuf, 80);
@@ -91,8 +91,8 @@ fn resolve_ref_name(name, out_buf) {
     memcpy(head_path, ".sit/refs/heads/", 16);
     memcpy(head_path + 16, name, name_len);
     store8(head_path + 16 + name_len, 0);
-    if (file_exists(head_path) == 1) {
-        var hfd = file_open(head_path, 0, 0);
+    if (sf_exists(head_path) == 1) {
+        var hfd = sf_open(head_path, 0, 0);
         if (hfd >= 0) {
             var hbuf = alloc(80);
             var hn = file_read(hfd, hbuf, 80);
@@ -112,8 +112,8 @@ fn resolve_ref_name(name, out_buf) {
     memcpy(rem_path, ".sit/refs/remotes/", 18);
     memcpy(rem_path + 18, name, name_len);
     store8(rem_path + 18 + name_len, 0);
-    if (file_exists(rem_path) == 1) {
-        var rfd = file_open(rem_path, 0, 0);
+    if (sf_exists(rem_path) == 1) {
+        var rfd = sf_open(rem_path, 0, 0);
         if (rfd >= 0) {
             var rbuf = alloc(80);
             var rn = file_read(rfd, rbuf, 80);
@@ -190,8 +190,8 @@ fn read_head_ref() {
     memcpy(full + 5, ref_path, ref_len);
     store8(full + 5 + ref_len, 0);
 
-    if (file_exists(full) != 1) { return 0; }
-    var fd = file_open(full, 0, 0);
+    if (sf_exists(full) != 1) { return 0; }
+    var fd = sf_open(full, 0, 0);
     if (fd < 0) { return 0; }
     var buf = alloc(80);
     var n = file_read(fd, buf, 80);
@@ -220,7 +220,7 @@ fn write_head_ref(hex) {
     memcpy(out, hex, 64);
     store8(out + 64, 10);
     store8(out + 65, 0);
-    if (file_write_all(full, out, 65) < 0) { return 0 - 1; }
+    if (sf_write_all(full, out, 65) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -273,7 +273,7 @@ fn set_head_ref(ref_path) {
     memcpy(buf + 5, ref_path, rlen);
     store8(buf + 5 + rlen, 10);
     store8(buf + total, 0);
-    if (file_write_all(".sit/HEAD", buf, total) < 0) { return 0 - 1; }
+    if (sf_write_all(".sit/HEAD", buf, total) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -286,14 +286,14 @@ fn set_head_ref(ref_path) {
 #   [8..16)  base_end   (exclusive base line index)
 #   [16..24) replacement lines vec (each element is a line-tuple pointer)
 fn cmd_tag() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
 
     if (argc() < 3) {
-        if (file_exists(".sit/refs/tags") != 1) { return 0; }
-        var raw = dir_list(str_from(".sit/refs/tags"));
+        if (sf_exists(".sit/refs/tags") != 1) { return 0; }
+        var raw = sf_dir_list(str_from(".sit/refs/tags"));
         var names = vec_new();
         var n = vec_len(raw);
         var i = 0;
@@ -330,13 +330,13 @@ fn cmd_tag() {
         memcpy(dpath, ".sit/refs/tags/", 15);
         memcpy(dpath + 15, dname, dnlen);
         store8(dpath + 15 + dnlen, 0);
-        if (file_exists(dpath) != 1) {
+        if (sf_exists(dpath) != 1) {
             syscall(SYS_WRITE, STDERR, "sit: tag '", 10);
             syscall(SYS_WRITE, STDERR, dname, dnlen);
             syscall(SYS_WRITE, STDERR, "' not found\n", 12);
             return 1;
         }
-        if (sys_unlink(dpath) != 0) {
+        if (sf_unlink(dpath) != 0) {
             eprintln("sit: failed to remove tag ref");
             return 1;
         }
@@ -358,7 +358,7 @@ fn cmd_tag() {
     memcpy(path + 15, name, nlen);
     store8(path + 15 + nlen, 0);
 
-    if (file_exists(path) == 1) {
+    if (sf_exists(path) == 1) {
         syscall(SYS_WRITE, STDERR, "sit: tag '", 10);
         syscall(SYS_WRITE, STDERR, name, nlen);
         syscall(SYS_WRITE, STDERR, "' already exists\n", 17);
@@ -393,7 +393,7 @@ fn cmd_tag() {
     memcpy(buf, target_hex, 64);
     store8(buf + 64, 10);
     store8(buf + 65, 0);
-    if (file_write_all(path, buf, 65) < 0) {
+    if (sf_write_all(path, buf, 65) < 0) {
         eprintln("sit: failed to write tag ref");
         return 1;
     }
@@ -405,14 +405,14 @@ fn cmd_tag() {
 }
 
 fn cmd_branch() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
 
     if (argc() < 3) {
-        if (file_exists(".sit/refs/heads") != 1) { return 0; }
-        var raw = dir_list(str_from(".sit/refs/heads"));
+        if (sf_exists(".sit/refs/heads") != 1) { return 0; }
+        var raw = sf_dir_list(str_from(".sit/refs/heads"));
         var names = vec_new();
         var n = vec_len(raw);
         var i = 0;
@@ -456,7 +456,7 @@ fn cmd_branch() {
         memcpy(dpath, ".sit/refs/heads/", 16);
         memcpy(dpath + 16, dname, dnlen);
         store8(dpath + 16 + dnlen, 0);
-        if (file_exists(dpath) != 1) {
+        if (sf_exists(dpath) != 1) {
             syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
             syscall(SYS_WRITE, STDERR, dname, dnlen);
             syscall(SYS_WRITE, STDERR, "' not found\n", 12);
@@ -469,7 +469,7 @@ fn cmd_branch() {
                 return 1;
             }
         }
-        if (sys_unlink(dpath) != 0) {
+        if (sf_unlink(dpath) != 0) {
             eprintln("sit: failed to remove branch ref");
             return 1;
         }
@@ -482,7 +482,7 @@ fn cmd_branch() {
         memcpy(dlref, "refs/heads/", 11);
         memcpy(dlref + 11, dname, dnlen);
         store8(dlref + 11 + dnlen, 0);
-        sys_unlink(reflog_log_path(dlref));
+        sf_unlink(reflog_log_path(dlref));
         stdout_write("deleted branch '", 16);
         stdout_write(dname, dnlen);
         stdout_write("'\n", 2);
@@ -501,7 +501,7 @@ fn cmd_branch() {
     memcpy(path + 16, name, nlen);
     store8(path + 16 + nlen, 0);
 
-    if (file_exists(path) == 1) {
+    if (sf_exists(path) == 1) {
         syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
         syscall(SYS_WRITE, STDERR, name, nlen);
         syscall(SYS_WRITE, STDERR, "' already exists\n", 17);
@@ -519,7 +519,7 @@ fn cmd_branch() {
     memcpy(buf, head_hex, 64);
     store8(buf + 64, 10);
     store8(buf + 65, 0);
-    if (file_write_all(path, buf, 65) < 0) {
+    if (sf_write_all(path, buf, 65) < 0) {
         eprintln("sit: failed to write branch ref");
         return 1;
     }
@@ -541,7 +541,7 @@ fn cmd_branch() {
 # True if there are any staged or unstaged changes vs HEAD. Untracked files
 # are not considered dirty (they don't block checkout unless they collide).
 fn cmd_checkout() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -573,7 +573,7 @@ fn cmd_checkout() {
         memcpy(new_branch, ".sit/refs/heads/", 16);
         memcpy(new_branch + 16, target, tlen);
         store8(new_branch + 16 + tlen, 0);
-        if (file_exists(new_branch) == 1) {
+        if (sf_exists(new_branch) == 1) {
             syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
             syscall(SYS_WRITE, STDERR, target, tlen);
             syscall(SYS_WRITE, STDERR, "' already exists\n", 17);
@@ -589,7 +589,7 @@ fn cmd_checkout() {
         memcpy(buf, head_hex, 64);
         store8(buf + 64, 10);
         store8(buf + 65, 0);
-        if (file_write_all(new_branch, buf, 65) < 0) {
+        if (sf_write_all(new_branch, buf, 65) < 0) {
             eprintln("sit: failed to write branch ref");
             return 1;
         }
@@ -612,7 +612,7 @@ fn cmd_checkout() {
     memcpy(target_path + 5, target_ref, target_ref_len);
     store8(target_path + 5 + target_ref_len, 0);
 
-    if (file_exists(target_path) != 1) {
+    if (sf_exists(target_path) != 1) {
         syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
         syscall(SYS_WRITE, STDERR, target, tlen);
         syscall(SYS_WRITE, STDERR, "' not found\n", 12);
@@ -635,7 +635,7 @@ fn cmd_checkout() {
         return 1;
     }
 
-    var target_fd = file_open(target_path, 0, 0);
+    var target_fd = sf_open(target_path, 0, 0);
     if (target_fd < 0) {
         eprintln("sit: cannot read target branch ref");
         return 1;

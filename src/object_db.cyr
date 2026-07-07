@@ -394,7 +394,7 @@ fn type_code_of(type_str, type_len) {
 # get_object_db() instead.
 fn object_db_open() {
     patra_init();
-    var db = patra_open(".sit/objects.patra");
+    var db = sf_patra_open(".sit/objects.patra");
     if (db == 0) { return 0; }
     patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
     return db;
@@ -429,9 +429,9 @@ fn get_object_db() {
 # the patra table. No-op if no legacy files present. Deletes loose files
 # + empty 2-char directories as they're migrated.
 fn object_db_migrate_from_loose(db) {
-    if (file_exists(".sit/objects") != 1) { return 0; }
+    if (sf_exists(".sit/objects") != 1) { return 0; }
 
-    var dirs = dir_list(str_from(".sit/objects"));
+    var dirs = sf_dir_list(str_from(".sit/objects"));
     var dn = vec_len(dirs);
     var di = 0;
     while (di < dn) {
@@ -445,7 +445,7 @@ fn object_db_migrate_from_loose(db) {
             memcpy(sub_path + 13, sdata, 2);
             store8(sub_path + 15, 0);
 
-            var files = dir_list(str_from(sub_path));
+            var files = sf_dir_list(str_from(sub_path));
             var fn_ct = vec_len(files);
             var fi = 0;
             while (fi < fn_ct) {
@@ -511,12 +511,12 @@ fn object_db_migrate_from_loose(db) {
                         patra_insert_row(db, "objects", 7, 3,
                             &types, &ivals, &sptrs, &slens, &bptrs, &blens);
 
-                        sys_unlink(loose_path);
+                        sf_unlink(loose_path);
                     }
                 }
                 fi = fi + 1;
             }
-            sys_rmdir(sub_path);
+            sf_rmdir(sub_path);
         }
         di = di + 1;
     }
@@ -559,7 +559,7 @@ fn fsck_read_ref_tip(path) {
 # silently skipped — the integrity pass surfaces unreachable objects,
 # and a broken ref shows up there as a dangling chain.
 fn fsck_walk_refs_dir(dir, roots) {
-    if (file_exists(dir) != 1) { return 0; }
+    if (sf_exists(dir) != 1) { return 0; }
     var files = vec_new();
     dir_walk(str_from(dir), files);
     var i = 0;
@@ -587,7 +587,7 @@ fn fsck_walk_refs_dir(dir, roots) {
 # won't drop the very commits the reflog exists to recover (e.g. the tip a
 # `reset --hard` discarded). Mirrors git fsck's default reflog-as-roots.
 fn fsck_collect_reflog_roots(roots) {
-    if (file_exists(".sit/logs") != 1) { return 0; }
+    if (sf_exists(".sit/logs") != 1) { return 0; }
     var files = vec_new();
     dir_walk(str_from(".sit/logs"), files);
     var i = 0;
@@ -617,7 +617,7 @@ fn fsck_collect_roots() {
     fsck_walk_refs_dir(".sit/refs/tags",    roots);
     fsck_walk_refs_dir(".sit/refs/remotes", roots);
 
-    if (file_exists(".sit/HEAD") == 1) {
+    if (sf_exists(".sit/HEAD") == 1) {
         var pair[16];
         if (read_file_heap(".sit/HEAD", &pair) == 0) {
             var data = load64(&pair);
@@ -876,7 +876,7 @@ fn _fsck_commit_author_ts(body, len) {
 }
 
 fn cmd_fsck() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -901,7 +901,7 @@ fn cmd_fsck() {
         ai = ai + 1;
     }
     if (prune == 1) {
-        if (file_exists(".sit/MERGE_HEAD") == 1) {
+        if (sf_exists(".sit/MERGE_HEAD") == 1) {
             eprintln("sit: refusing --prune during an in-progress merge (.sit/MERGE_HEAD present)");
             return 1;
         }

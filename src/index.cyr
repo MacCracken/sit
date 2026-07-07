@@ -24,7 +24,7 @@ fn cmd_add() {
     var path = argv_heap(arg_idx);
     var path_len = strlen(path);
 
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -39,7 +39,7 @@ fn cmd_add() {
         }
     }
 
-    var fd = file_open(path, 0, 0);
+    var fd = sf_open(path, 0, 0);
     if (fd < 0) {
         syscall(SYS_WRITE, STDERR, "sit: cannot open '", 18);
         syscall(SYS_WRITE, STDERR, path, path_len);
@@ -95,7 +95,7 @@ fn cmd_add() {
 # On error: emits message to stderr and returns non-zero for main to return.
 fn index_db_open() {
     patra_init();
-    var db = patra_open(".sit/index.patra");
+    var db = sf_patra_open(".sit/index.patra");
     if (db == 0) { return 0; }
     # Idempotent — second call returns "already exists", which we ignore.
     patra_exec(db, "CREATE TABLE entries (path STR, hash_hex STR)");
@@ -120,7 +120,7 @@ fn get_index_db() {
 # Migrate legacy plaintext .sit/index (v0.1 format) into the patra table.
 # No-op if the plaintext file is absent. Deletes it on successful migration.
 fn index_migrate_from_plaintext(db) {
-    if (file_exists(".sit/index") != 1) { return 0; }
+    if (sf_exists(".sit/index") != 1) { return 0; }
     var pair[16];
     if (read_file_heap(".sit/index", &pair) != 0) { return 0; }
     var data = load64(&pair);
@@ -172,7 +172,7 @@ fn index_migrate_from_plaintext(db) {
             }
         }
     }
-    sys_unlink(".sit/index");
+    sf_unlink(".sit/index");
     return 0;
 }
 
@@ -247,8 +247,8 @@ fn entry_path(e) { return load64(e + 32); }
 # Auto-migrates plaintext .sit/index from v0.1 layout if present.
 fn parse_index() {
     # Nothing to load if neither file exists
-    if (file_exists(".sit/index.patra") != 1) {
-        if (file_exists(".sit/index") != 1) { return 0; }
+    if (sf_exists(".sit/index.patra") != 1) {
+        if (sf_exists(".sit/index") != 1) { return 0; }
     }
 
     var db = get_index_db();
@@ -347,7 +347,7 @@ fn dedupe_entries(entries) {
 #   8..16:  name ptr (heap, null-term; leaf name only)
 #   16..24: hash bytes ptr (heap, 32 raw bytes)
 fn cmd_reset() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -438,7 +438,7 @@ fn cmd_rm() {
         eprintln("usage: sit rm [--cached] <path>");
         return 1;
     }
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -496,8 +496,8 @@ fn cmd_rm() {
     }
 
     if (cached == 0) {
-        if (file_exists(path) == 1) {
-            if (sys_unlink(path) != 0) {
+        if (sf_exists(path) == 1) {
+            if (sf_unlink(path) != 0) {
                 syscall(SYS_WRITE, STDERR, "sit: failed to remove '", 23);
                 syscall(SYS_WRITE, STDERR, path, path_len);
                 syscall(SYS_WRITE, STDERR, "'\n", 2);
@@ -720,7 +720,7 @@ fn is_ignored(path, patterns) {
 fn load_sitignore() {
     # Backend-aware ignore file: .sitignore (sit) or .gitignore (git read-mode).
     var fname = _ignore_filename();
-    if (file_exists(fname) != 1) { return 0; }
+    if (sf_exists(fname) != 1) { return 0; }
     var pair[16];
     if (read_file_heap(fname, &pair) != 0) { return 0; }
     var data = load64(&pair);

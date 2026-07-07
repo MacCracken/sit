@@ -23,7 +23,7 @@ fn is_dirty() {
             var head_ent = tree_find(head_entries, path);
             if (head_ent == 0) { return 1; }
             if (streq(tree_entry_hash(head_ent), idx_hex) == 0) { return 1; }
-            if (file_exists(path) == 1) {
+            if (sf_exists(path) == 1) {
                 var wh = hash_file_as_blob(path);
                 if (wh != 0) {
                     if (streq(wh, idx_hex) == 0) { return 1; }
@@ -50,7 +50,7 @@ fn is_dirty() {
 # creates "src" and "src/lib".
 # Write "ref: <ref_path>\n" to .sit/HEAD. Returns 0 on success.
 fn list_working_walk(prefix, fs_path, out, patterns) {
-    var raw = dir_list(str_from(fs_path));
+    var raw = sf_dir_list(str_from(fs_path));
     var n = vec_len(raw);
     var fs_path_len = strlen(fs_path);
     var prefix_len = strlen(prefix);
@@ -157,7 +157,7 @@ fn print_name_section(title, title_len, names) {
 }
 
 fn cmd_status() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -192,7 +192,7 @@ fn cmd_status() {
             }
             if (label != 0) { push_status_item(staged, label, path); }
 
-            if (file_exists(path) == 1) {
+            if (sf_exists(path) == 1) {
                 var working_hex = hash_file_as_blob(path);
                 if (working_hex != 0) {
                     if (streq(working_hex, idx_hash_hex) == 0) {
@@ -840,7 +840,7 @@ fn read_blob_content(hex, out_pair) {
 }
 
 fn cmd_diff() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -979,7 +979,7 @@ fn cmd_diff() {
                 var path = tree_entry_name(he);
                 var head_hex = tree_entry_hash(he);
 
-                if (file_exists(path) == 1) {
+                if (sf_exists(path) == 1) {
                     var working_hex = hash_file_as_blob(path);
                     if (working_hex != 0) {
                         if (streq(head_hex, working_hex) == 0) {
@@ -1080,7 +1080,7 @@ fn cmd_diff() {
             }
         }
         else {
-            if (file_exists(path) == 1) {
+            if (sf_exists(path) == 1) {
                 var working_hex = hash_file_as_blob(path);
                 if (working_hex != 0) {
                     if (streq(working_hex, idx_hash_hex) == 0) {
@@ -1110,7 +1110,7 @@ fn cmd_diff() {
 
 # Load a commit's tree and return its flattened entries. Returns 0 on error.
 fn cmd_show() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }

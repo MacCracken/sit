@@ -763,8 +763,8 @@ fn write_remote_tracking(remote, branch, hex) {
     ensure_parent_dirs(p);
     # Reflog: capture the prior remote-tracking tip before overwriting it.
     var rt_old = 0;
-    if (file_exists(p) == 1) {
-        var ofd = file_open(p, 0, 0);
+    if (sf_exists(p) == 1) {
+        var ofd = sf_open(p, 0, 0);
         if (ofd >= 0) {
             var ob = alloc(80);
             var on = file_read(ofd, ob, 80);
@@ -777,7 +777,7 @@ fn write_remote_tracking(remote, branch, hex) {
     var buf = alloc(66);
     memcpy(buf, hex, 64);
     store8(buf + 64, 10);
-    var wres = file_write_all(p, buf, 65);
+    var wres = sf_write_all(p, buf, 65);
     if (wres >= 0) {
         var rtref = alloc(13 + rl + 1 + bl + 1);
         memcpy(rtref, "refs/remotes/", 13);
@@ -864,7 +864,7 @@ fn cmd_remote_add() {
 }
 
 fn cmd_remote_list() {
-    if (file_exists(".sit/config") != 1) { return 0; }
+    if (sf_exists(".sit/config") != 1) { return 0; }
     var pair[16];
     if (read_file_heap(".sit/config", &pair) != 0) { return 0; }
     var data = load64(&pair);
@@ -1066,7 +1066,7 @@ fn do_fetch(name, branch) {
 }
 
 fn cmd_fetch() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository");
         return 1;
     }
@@ -1085,7 +1085,7 @@ fn cmd_fetch() {
 # `sit merge` manually rather than attempting an automatic 3-way here — keeps
 # the semantics narrow and predictable.
 fn cmd_pull() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository");
         return 1;
     }
@@ -1173,7 +1173,7 @@ fn _write_shallow_file(boundary) {
         off = off + 65;
         i = i + 1;
     }
-    if (file_write_all(".sit/shallow", buf, total) < 0) {
+    if (sf_write_all(".sit/shallow", buf, total) < 0) {
         eprintln("sit: warning — failed to write .sit/shallow (log may error at boundary)");
     }
     return 0;
@@ -1321,7 +1321,7 @@ fn cmd_clone() {
     }
     # Reject non-empty target to avoid clobbering. dir_list returns entries including
     # '.' / '..' in some stdlib variants; count anything else as populated.
-    var listing = dir_list(str_from(target));
+    var listing = sf_dir_list(str_from(target));
     var ln = vec_len(listing);
     var li = 0;
     var real_entries = 0;
@@ -1344,10 +1344,12 @@ fn cmd_clone() {
         return 1;
     }
 
-    if (syscall(SYS_CHDIR, target) != 0) {
-        eprintln("sit: cannot chdir into target");
-        return 1;
-    }
+    # Set the repo root to the freshly-created target so the inline init +
+    # subsequent fetch/config .sit/ paths resolve via sit_abs. Replaces the
+    # old chdir — agnos has no chdir. On Linux `target` is a real path →
+    # reads/writes land under it, preserving the pre-refactor chdir behavior
+    # without touching process cwd.
+    sit_set_repo_root(target);
 
     # Inline init — same shape as cmd_init.
     ensure_dir(".sit");
@@ -1355,7 +1357,7 @@ fn cmd_clone() {
     ensure_dir(".sit/refs");
     ensure_dir(".sit/refs/heads");
     var head = "ref: refs/heads/main\n";
-    if (file_write_all(".sit/HEAD", head, 21) < 0) {
+    if (sf_write_all(".sit/HEAD", head, 21) < 0) {
         eprintln("sit: failed to write .sit/HEAD");
         return 1;
     }
@@ -1397,7 +1399,7 @@ fn cmd_clone() {
 }
 
 fn cmd_push() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository");
         return 1;
     }

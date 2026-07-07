@@ -14,6 +14,124 @@
 var SEEK_SET = 0;
 var SEEK_END = 2;
 
+# ================================================================
+# Repo-root prefixing (agnos support).
+# ================================================================
+# AGNOS's frozen syscall floor has NO chdir/getcwd/openat — "CWD is
+# userland-owned, absolute paths" (ABI §3.2). sit historically leaned
+# on process-cwd (`chdir` into the repo, then read ".sit/..." relative).
+# That is portability-hostile. The fix: carry an explicit repo root and
+# funnel every repo-relative FS access through sit_abs(), which prefixes
+# it.
+#
+# `_repo_root` == 0 is the LINUX DEFAULT: no prefix, cwd-relative,
+# byte-identical to pre-refactor behavior. On agnos, entry points set it
+# to an absolute repo-root cstring so reads resolve without a cwd.
+var _repo_root = 0;
+
+# Store the repo root (an absolute-path cstring), or 0 to clear it.
+fn sit_set_repo_root(root) {
+    _repo_root = root;
+    return 0;
+}
+
+# The ONE prefix point. Rules, in order:
+#   (1) rel already absolute (byte 0 == '/') → return UNCHANGED.
+#       (cert/token/HOME paths pass straight through.)
+#   (2) _repo_root == 0 (Linux default) → return rel UNCHANGED
+#       (preserves cwd-relative behavior exactly — a true no-op).
+#   (3) else → heap-alloc "<_repo_root>/<rel>" and return it.
+#       Caller-owns the result.
+# On Linux and for already-absolute paths this is a no-op, so the whole
+# change is behavior-preserving there.
+fn sit_abs(rel) {
+    if (rel == 0) { return rel; }
+    if (load8(rel) == 47) { return rel; }            # '/'
+    if (_repo_root == 0) { return rel; }
+    # A "." root means "current directory" — prefixing "./" is redundant
+    # and would break Linux byte-for-byte parity. Treat it as no-prefix so
+    # cmd_init's explicit sit_set_repo_root(".") stays a Linux no-op.
+    if (load8(_repo_root) == 46) { if (load8(_repo_root + 1) == 0) { return rel; } }
+    var rlen = strlen(_repo_root);
+    var plen = strlen(rel);
+    # "<root>" + "/" + "<rel>" + NUL
+    var out = alloc_or_die(rlen + 1 + plen + 1);
+    memcpy(out, _repo_root, rlen);
+    store8(out + rlen, 47);                          # '/'
+    memcpy(out + rlen + 1, rel, plen);
+    store8(out + rlen + 1 + plen, 0);
+    return out;
+}
+
+# Str-aware variant of sit_abs for FS primitives that take a Str
+# (e.g. dir_list). Applies the same prefixing rules to the Str's bytes
+# and returns a new Str; a no-op case returns the input Str unchanged.
+fn sit_abs_str(rel) {
+    if (rel == 0) { return rel; }
+    var data = str_data(rel);
+    if (str_len(rel) > 0) { if (load8(data) == 47) { return rel; } }
+    if (_repo_root == 0) { return rel; }
+    return str_from(sit_abs(str_cstr(rel)));
+}
+
+# ----------------------------------------------------------------
+# sit-owned FS wrappers (sf_*). Every repo FS access funnels through
+# one of these so the prefixing lives in a single place. The inner
+# calls keep the real stdlib names — the sf_ names are new, so no
+# self-shadowing. Absolute/HOME/cert/token paths pass through sit_abs
+# unchanged (rule 1), and on Linux (_repo_root == 0) every wrapper is a
+# transparent forward (rule 2).
+# ----------------------------------------------------------------
+fn sf_exists(p) {
+    return file_exists(sit_abs(p));
+}
+
+fn sf_write_all(p, buf, len) {
+    return file_write_all(sit_abs(p), buf, len);
+}
+
+fn sf_open(p, flags, mode) {
+    return file_open(sit_abs(p), flags, mode);
+}
+
+fn sf_read_all(p, buf, maxlen) {
+    return file_read_all(sit_abs(p), buf, maxlen);
+}
+
+fn sf_append_locked(p, buf, len) {
+    return file_append_locked(sit_abs(p), buf, len);
+}
+
+fn sf_mkdir(p, mode) {
+    return sys_mkdir(sit_abs(p), mode);
+}
+
+# NOTE: no sf_ensure_dir / sf_ensure_parent_dirs / sf_read_file_heap —
+# those three sit-owned fns prefix INTERNALLY (see below), so their
+# existing callers stay unchanged. Wrapping them here would double-prefix.
+
+fn sf_unlink(p) {
+    return sys_unlink(sit_abs(p));
+}
+
+fn sf_rmdir(p) {
+    return sys_rmdir(sit_abs(p));
+}
+
+fn sf_stat(p, buf) {
+    return sys_stat(sit_abs(p), buf);
+}
+
+# dir_list takes a Str; route through the Str-aware prefixer.
+fn sf_dir_list(p) {
+    return dir_list(sit_abs_str(p));
+}
+
+# patra_open takes a cstring path (external dep).
+fn sf_patra_open(p) {
+    return patra_open(sit_abs(p));
+}
+
 fn eprintln(s) {
     var len = strlen(s);
     syscall(SYS_WRITE, STDERR, s, len);
@@ -74,8 +192,10 @@ fn alloc_or_die(size) {
 }
 
 # mkdir(path, 0o755), tolerating EEXIST (-17).
+# sit-owned: prefixes `path` with the repo root (sit_abs) INTERNALLY so
+# every caller (incl. ensure_parent_dirs) can pass a repo-relative path.
 fn ensure_dir(path) {
-    var r = sys_mkdir(path, 0x1ED);
+    var r = sys_mkdir(sit_abs(path), 0x1ED);
     if (r == 0) { return 0; }
     if (r == 0 - 17) { return 0; }
     return r;
@@ -83,6 +203,9 @@ fn ensure_dir(path) {
 
 # Walk `path`, mkdir every '/'-delimited directory prefix. Used by ref writers
 # so `.sit/refs/heads/feature/foo` creates `.sit/refs/heads/feature/` on demand.
+# sit-owned: each derived segment is repo-relative and gets prefixed by
+# ensure_dir's internal sit_abs — so this fn stays cwd-relative here and
+# must NOT prefix `path` itself (that would double-prefix each segment).
 fn ensure_parent_dirs(path) {
     var len = strlen(path);
     var i = 0;
@@ -220,8 +343,10 @@ fn write_sanitized(fd, bytes, len) {
 
 # Read an entire file into a heap buffer. Writes (ptr, len) to out_pair.
 # Returns 0 on success, negative on failure.
+# sit-owned: prefixes `path` with the repo root (sit_abs) INTERNALLY so
+# its many callers need no change.
 fn read_file_heap(path, out_pair) {
-    var fd = file_open(path, 0, 0);
+    var fd = file_open(sit_abs(path), 0, 0);
     if (fd < 0) { return 0 - 1; }
     var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
     syscall(SYS_LSEEK, fd, 0, SEEK_SET);
@@ -803,7 +928,7 @@ fn config_parse_value(data, start, stop, key, key_len) {
 
 # Look up `key` in a single config file. Returns heap cstring value or 0.
 fn config_file_get(path, key) {
-    if (file_exists(path) != 1) { return 0; }
+    if (sf_exists(path) != 1) { return 0; }
     var pair[16];
     if (read_file_heap(path, &pair) != 0) { return 0; }
     var data = load64(&pair);
@@ -860,7 +985,7 @@ fn config_file_set(path, key, value) {
 
     var data = 0;
     var len = 0;
-    if (file_exists(path) == 1) {
+    if (sf_exists(path) == 1) {
         var pair[16];
         if (read_file_heap(path, &pair) == 0) {
             data = load64(&pair);
@@ -926,13 +1051,13 @@ fn config_file_set(path, key, value) {
         out_pos = out_pos + 1;
     }
 
-    if (file_write_all(path, out, out_pos) < 0) { return 0 - 1; }
+    if (sf_write_all(path, out, out_pos) < 0) { return 0 - 1; }
     return 0;
 }
 
 # Print every non-blank, non-comment line of a config file to stdout.
 fn config_file_list(path) {
-    if (file_exists(path) != 1) { return 0; }
+    if (sf_exists(path) != 1) { return 0; }
     var pair[16];
     if (read_file_heap(path, &pair) != 0) { return 0; }
     var data = load64(&pair);
@@ -968,7 +1093,7 @@ fn config_file_list(path) {
 # Returns 0 on success, -1 on I/O failure, -2 if the key wasn't present.
 fn config_file_unset(path, key) {
     var key_len = strlen(key);
-    if (file_exists(path) != 1) { return 0 - 2; }
+    if (sf_exists(path) != 1) { return 0 - 2; }
     var pair[16];
     if (read_file_heap(path, &pair) != 0) { return 0 - 1; }
     var data = load64(&pair);
@@ -1005,7 +1130,7 @@ fn config_file_unset(path, key) {
         pos = le + 1;
     }
     if (removed == 0) { return 0 - 2; }
-    if (file_write_all(path, out, out_pos) < 0) { return 0 - 1; }
+    if (sf_write_all(path, out, out_pos) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -1033,7 +1158,7 @@ fn cmd_config() {
         store8(path + hlen + 11, 0);
     }
     else {
-        if (file_exists(".sit/HEAD") != 1) {
+        if (sf_exists(".sit/HEAD") != 1) {
             eprintln("sit: not a sit repository (run 'sit init')");
             return 1;
         }
@@ -1431,7 +1556,7 @@ fn _reflog_append_full(refpath, old_hex, new_hex, msg, name, email, ts) {
     var llen = reflog_format_line(buf, old_hex, new_hex, name, email, ts, msg);
     var path = reflog_log_path(refpath);
     ensure_parent_dirs(path);
-    if (file_append_locked(path, buf, llen) < 0) { return 0 - 1; }
+    if (sf_append_locked(path, buf, llen) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -1466,12 +1591,12 @@ fn _reflog_log_refpath_for(label) {
     memcpy(hp, "refs/heads/", 11);
     memcpy(hp + 11, label, ll);
     store8(hp + 11 + ll, 0);
-    if (file_exists(reflog_log_path(hp)) == 1) { return hp; }
+    if (sf_exists(reflog_log_path(hp)) == 1) { return hp; }
     var rp = alloc(13 + ll + 1);
     memcpy(rp, "refs/remotes/", 13);
     memcpy(rp + 13, label, ll);
     store8(rp + 13 + ll, 0);
-    if (file_exists(reflog_log_path(rp)) == 1) { return rp; }
+    if (sf_exists(reflog_log_path(rp)) == 1) { return rp; }
     return hp;
 }
 
@@ -1480,7 +1605,7 @@ fn _reflog_log_refpath_for(label) {
 #   <short-new-oid> <ref>@{N}: <message>
 # Defaults to HEAD. Silent (exit 0) when the ref has no log yet.
 fn cmd_reflog() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -1701,12 +1826,12 @@ fn _git_read_loose(hex, out) {
 # sit-native (sit never writes .git/). Sets the process-globals and returns the
 # selected backend id, or -1 if neither store is present.
 fn _detect_repo_backend() {
-    if (file_exists(".sit/HEAD") == 1) {
+    if (sf_exists(".sit/HEAD") == 1) {
         _repo_backend = 0;
         _git_hash_algo = 0;
         return 0;
     }
-    if (file_exists(".git/HEAD") == 1) {
+    if (sf_exists(".git/HEAD") == 1) {
         _repo_backend = 1;
         _git_hash_algo = _git_detect_hash_algo();
         return 1;
@@ -1742,8 +1867,8 @@ fn _git_read_loose_ref(refpath) {
     memcpy(full, ".git/", 5);
     memcpy(full + 5, refpath, rp_len);
     store8(full + 5 + rp_len, 0);
-    if (file_exists(full) != 1) { return 0; }
-    var fd = file_open(full, 0, 0);
+    if (sf_exists(full) != 1) { return 0; }
+    var fd = sf_open(full, 0, 0);
     if (fd < 0) { return 0; }
     var buf = alloc(96);
     var n = file_read(fd, buf, 96);
@@ -2203,7 +2328,7 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
 fn _git_read_pack(hex, out24) {
     var packdir = ".git/objects/pack";
     if (is_dir(str_from(packdir)) != 1) { return 0 - 1; }
-    var entries = dir_list(str_from(packdir));
+    var entries = sf_dir_list(str_from(packdir));
     if (entries == 0) { return 0 - 1; }
     var n = vec_len(entries);
     var rawlen = _id_rawlen();
@@ -2655,7 +2780,7 @@ fn type_code_of(type_str, type_len) {
 # get_object_db() instead.
 fn object_db_open() {
     patra_init();
-    var db = patra_open(".sit/objects.patra");
+    var db = sf_patra_open(".sit/objects.patra");
     if (db == 0) { return 0; }
     patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
     return db;
@@ -2690,9 +2815,9 @@ fn get_object_db() {
 # the patra table. No-op if no legacy files present. Deletes loose files
 # + empty 2-char directories as they're migrated.
 fn object_db_migrate_from_loose(db) {
-    if (file_exists(".sit/objects") != 1) { return 0; }
+    if (sf_exists(".sit/objects") != 1) { return 0; }
 
-    var dirs = dir_list(str_from(".sit/objects"));
+    var dirs = sf_dir_list(str_from(".sit/objects"));
     var dn = vec_len(dirs);
     var di = 0;
     while (di < dn) {
@@ -2706,7 +2831,7 @@ fn object_db_migrate_from_loose(db) {
             memcpy(sub_path + 13, sdata, 2);
             store8(sub_path + 15, 0);
 
-            var files = dir_list(str_from(sub_path));
+            var files = sf_dir_list(str_from(sub_path));
             var fn_ct = vec_len(files);
             var fi = 0;
             while (fi < fn_ct) {
@@ -2772,12 +2897,12 @@ fn object_db_migrate_from_loose(db) {
                         patra_insert_row(db, "objects", 7, 3,
                             &types, &ivals, &sptrs, &slens, &bptrs, &blens);
 
-                        sys_unlink(loose_path);
+                        sf_unlink(loose_path);
                     }
                 }
                 fi = fi + 1;
             }
-            sys_rmdir(sub_path);
+            sf_rmdir(sub_path);
         }
         di = di + 1;
     }
@@ -2820,7 +2945,7 @@ fn fsck_read_ref_tip(path) {
 # silently skipped — the integrity pass surfaces unreachable objects,
 # and a broken ref shows up there as a dangling chain.
 fn fsck_walk_refs_dir(dir, roots) {
-    if (file_exists(dir) != 1) { return 0; }
+    if (sf_exists(dir) != 1) { return 0; }
     var files = vec_new();
     dir_walk(str_from(dir), files);
     var i = 0;
@@ -2848,7 +2973,7 @@ fn fsck_walk_refs_dir(dir, roots) {
 # won't drop the very commits the reflog exists to recover (e.g. the tip a
 # `reset --hard` discarded). Mirrors git fsck's default reflog-as-roots.
 fn fsck_collect_reflog_roots(roots) {
-    if (file_exists(".sit/logs") != 1) { return 0; }
+    if (sf_exists(".sit/logs") != 1) { return 0; }
     var files = vec_new();
     dir_walk(str_from(".sit/logs"), files);
     var i = 0;
@@ -2878,7 +3003,7 @@ fn fsck_collect_roots() {
     fsck_walk_refs_dir(".sit/refs/tags",    roots);
     fsck_walk_refs_dir(".sit/refs/remotes", roots);
 
-    if (file_exists(".sit/HEAD") == 1) {
+    if (sf_exists(".sit/HEAD") == 1) {
         var pair[16];
         if (read_file_heap(".sit/HEAD", &pair) == 0) {
             var data = load64(&pair);
@@ -3137,7 +3262,7 @@ fn _fsck_commit_author_ts(body, len) {
 }
 
 fn cmd_fsck() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -3162,7 +3287,7 @@ fn cmd_fsck() {
         ai = ai + 1;
     }
     if (prune == 1) {
-        if (file_exists(".sit/MERGE_HEAD") == 1) {
+        if (sf_exists(".sit/MERGE_HEAD") == 1) {
             eprintln("sit: refusing --prune during an in-progress merge (.sit/MERGE_HEAD present)");
             return 1;
         }
@@ -3421,7 +3546,7 @@ fn cmd_add() {
     var path = argv_heap(arg_idx);
     var path_len = strlen(path);
 
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -3436,7 +3561,7 @@ fn cmd_add() {
         }
     }
 
-    var fd = file_open(path, 0, 0);
+    var fd = sf_open(path, 0, 0);
     if (fd < 0) {
         syscall(SYS_WRITE, STDERR, "sit: cannot open '", 18);
         syscall(SYS_WRITE, STDERR, path, path_len);
@@ -3492,7 +3617,7 @@ fn cmd_add() {
 # On error: emits message to stderr and returns non-zero for main to return.
 fn index_db_open() {
     patra_init();
-    var db = patra_open(".sit/index.patra");
+    var db = sf_patra_open(".sit/index.patra");
     if (db == 0) { return 0; }
     # Idempotent — second call returns "already exists", which we ignore.
     patra_exec(db, "CREATE TABLE entries (path STR, hash_hex STR)");
@@ -3517,7 +3642,7 @@ fn get_index_db() {
 # Migrate legacy plaintext .sit/index (v0.1 format) into the patra table.
 # No-op if the plaintext file is absent. Deletes it on successful migration.
 fn index_migrate_from_plaintext(db) {
-    if (file_exists(".sit/index") != 1) { return 0; }
+    if (sf_exists(".sit/index") != 1) { return 0; }
     var pair[16];
     if (read_file_heap(".sit/index", &pair) != 0) { return 0; }
     var data = load64(&pair);
@@ -3569,7 +3694,7 @@ fn index_migrate_from_plaintext(db) {
             }
         }
     }
-    sys_unlink(".sit/index");
+    sf_unlink(".sit/index");
     return 0;
 }
 
@@ -3644,8 +3769,8 @@ fn entry_path(e) { return load64(e + 32); }
 # Auto-migrates plaintext .sit/index from v0.1 layout if present.
 fn parse_index() {
     # Nothing to load if neither file exists
-    if (file_exists(".sit/index.patra") != 1) {
-        if (file_exists(".sit/index") != 1) { return 0; }
+    if (sf_exists(".sit/index.patra") != 1) {
+        if (sf_exists(".sit/index") != 1) { return 0; }
     }
 
     var db = get_index_db();
@@ -3744,7 +3869,7 @@ fn dedupe_entries(entries) {
 #   8..16:  name ptr (heap, null-term; leaf name only)
 #   16..24: hash bytes ptr (heap, 32 raw bytes)
 fn cmd_reset() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -3835,7 +3960,7 @@ fn cmd_rm() {
         eprintln("usage: sit rm [--cached] <path>");
         return 1;
     }
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -3893,8 +4018,8 @@ fn cmd_rm() {
     }
 
     if (cached == 0) {
-        if (file_exists(path) == 1) {
-            if (sys_unlink(path) != 0) {
+        if (sf_exists(path) == 1) {
+            if (sf_unlink(path) != 0) {
                 syscall(SYS_WRITE, STDERR, "sit: failed to remove '", 23);
                 syscall(SYS_WRITE, STDERR, path, path_len);
                 syscall(SYS_WRITE, STDERR, "'\n", 2);
@@ -4117,7 +4242,7 @@ fn is_ignored(path, patterns) {
 fn load_sitignore() {
     # Backend-aware ignore file: .sitignore (sit) or .gitignore (git read-mode).
     var fname = _ignore_filename();
-    if (file_exists(fname) != 1) { return 0; }
+    if (sf_exists(fname) != 1) { return 0; }
     var pair[16];
     if (read_file_heap(fname, &pair) != 0) { return 0; }
     var data = load64(&pair);
@@ -4236,7 +4361,7 @@ fn resolve_reflog_spec(name, out_buf) {
     memcpy(hp, "refs/heads/", 11);
     memcpy(hp + 11, base, blen);
     store8(hp + 11 + blen, 0);
-    if (file_exists(reflog_log_path(hp)) == 1) {
+    if (sf_exists(reflog_log_path(hp)) == 1) {
         return reflog_read_nth(hp, num, out_buf);
     }
 
@@ -4244,7 +4369,7 @@ fn resolve_reflog_spec(name, out_buf) {
     memcpy(rp, "refs/remotes/", 13);
     memcpy(rp + 13, base, blen);
     store8(rp + 13 + blen, 0);
-    if (file_exists(reflog_log_path(rp)) == 1) {
+    if (sf_exists(reflog_log_path(rp)) == 1) {
         return reflog_read_nth(rp, num, out_buf);
     }
     return 0;
@@ -4274,8 +4399,8 @@ fn resolve_ref_name(name, out_buf) {
     # S-11: all three ref-file readers below validate that the first 64 bytes
     # are actual hex before accepting. A garbage or attacker-crafted ref is
     # treated as "no such ref" rather than flowed through as a "hash".
-    if (file_exists(tag_path) == 1) {
-        var tfd = file_open(tag_path, 0, 0);
+    if (sf_exists(tag_path) == 1) {
+        var tfd = sf_open(tag_path, 0, 0);
         if (tfd >= 0) {
             var tbuf = alloc(80);
             var tn = file_read(tfd, tbuf, 80);
@@ -4294,8 +4419,8 @@ fn resolve_ref_name(name, out_buf) {
     memcpy(head_path, ".sit/refs/heads/", 16);
     memcpy(head_path + 16, name, name_len);
     store8(head_path + 16 + name_len, 0);
-    if (file_exists(head_path) == 1) {
-        var hfd = file_open(head_path, 0, 0);
+    if (sf_exists(head_path) == 1) {
+        var hfd = sf_open(head_path, 0, 0);
         if (hfd >= 0) {
             var hbuf = alloc(80);
             var hn = file_read(hfd, hbuf, 80);
@@ -4315,8 +4440,8 @@ fn resolve_ref_name(name, out_buf) {
     memcpy(rem_path, ".sit/refs/remotes/", 18);
     memcpy(rem_path + 18, name, name_len);
     store8(rem_path + 18 + name_len, 0);
-    if (file_exists(rem_path) == 1) {
-        var rfd = file_open(rem_path, 0, 0);
+    if (sf_exists(rem_path) == 1) {
+        var rfd = sf_open(rem_path, 0, 0);
         if (rfd >= 0) {
             var rbuf = alloc(80);
             var rn = file_read(rfd, rbuf, 80);
@@ -4393,8 +4518,8 @@ fn read_head_ref() {
     memcpy(full + 5, ref_path, ref_len);
     store8(full + 5 + ref_len, 0);
 
-    if (file_exists(full) != 1) { return 0; }
-    var fd = file_open(full, 0, 0);
+    if (sf_exists(full) != 1) { return 0; }
+    var fd = sf_open(full, 0, 0);
     if (fd < 0) { return 0; }
     var buf = alloc(80);
     var n = file_read(fd, buf, 80);
@@ -4423,7 +4548,7 @@ fn write_head_ref(hex) {
     memcpy(out, hex, 64);
     store8(out + 64, 10);
     store8(out + 65, 0);
-    if (file_write_all(full, out, 65) < 0) { return 0 - 1; }
+    if (sf_write_all(full, out, 65) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -4476,7 +4601,7 @@ fn set_head_ref(ref_path) {
     memcpy(buf + 5, ref_path, rlen);
     store8(buf + 5 + rlen, 10);
     store8(buf + total, 0);
-    if (file_write_all(".sit/HEAD", buf, total) < 0) { return 0 - 1; }
+    if (sf_write_all(".sit/HEAD", buf, total) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -4489,14 +4614,14 @@ fn set_head_ref(ref_path) {
 #   [8..16)  base_end   (exclusive base line index)
 #   [16..24) replacement lines vec (each element is a line-tuple pointer)
 fn cmd_tag() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
 
     if (argc() < 3) {
-        if (file_exists(".sit/refs/tags") != 1) { return 0; }
-        var raw = dir_list(str_from(".sit/refs/tags"));
+        if (sf_exists(".sit/refs/tags") != 1) { return 0; }
+        var raw = sf_dir_list(str_from(".sit/refs/tags"));
         var names = vec_new();
         var n = vec_len(raw);
         var i = 0;
@@ -4533,13 +4658,13 @@ fn cmd_tag() {
         memcpy(dpath, ".sit/refs/tags/", 15);
         memcpy(dpath + 15, dname, dnlen);
         store8(dpath + 15 + dnlen, 0);
-        if (file_exists(dpath) != 1) {
+        if (sf_exists(dpath) != 1) {
             syscall(SYS_WRITE, STDERR, "sit: tag '", 10);
             syscall(SYS_WRITE, STDERR, dname, dnlen);
             syscall(SYS_WRITE, STDERR, "' not found\n", 12);
             return 1;
         }
-        if (sys_unlink(dpath) != 0) {
+        if (sf_unlink(dpath) != 0) {
             eprintln("sit: failed to remove tag ref");
             return 1;
         }
@@ -4561,7 +4686,7 @@ fn cmd_tag() {
     memcpy(path + 15, name, nlen);
     store8(path + 15 + nlen, 0);
 
-    if (file_exists(path) == 1) {
+    if (sf_exists(path) == 1) {
         syscall(SYS_WRITE, STDERR, "sit: tag '", 10);
         syscall(SYS_WRITE, STDERR, name, nlen);
         syscall(SYS_WRITE, STDERR, "' already exists\n", 17);
@@ -4596,7 +4721,7 @@ fn cmd_tag() {
     memcpy(buf, target_hex, 64);
     store8(buf + 64, 10);
     store8(buf + 65, 0);
-    if (file_write_all(path, buf, 65) < 0) {
+    if (sf_write_all(path, buf, 65) < 0) {
         eprintln("sit: failed to write tag ref");
         return 1;
     }
@@ -4608,14 +4733,14 @@ fn cmd_tag() {
 }
 
 fn cmd_branch() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
 
     if (argc() < 3) {
-        if (file_exists(".sit/refs/heads") != 1) { return 0; }
-        var raw = dir_list(str_from(".sit/refs/heads"));
+        if (sf_exists(".sit/refs/heads") != 1) { return 0; }
+        var raw = sf_dir_list(str_from(".sit/refs/heads"));
         var names = vec_new();
         var n = vec_len(raw);
         var i = 0;
@@ -4659,7 +4784,7 @@ fn cmd_branch() {
         memcpy(dpath, ".sit/refs/heads/", 16);
         memcpy(dpath + 16, dname, dnlen);
         store8(dpath + 16 + dnlen, 0);
-        if (file_exists(dpath) != 1) {
+        if (sf_exists(dpath) != 1) {
             syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
             syscall(SYS_WRITE, STDERR, dname, dnlen);
             syscall(SYS_WRITE, STDERR, "' not found\n", 12);
@@ -4672,7 +4797,7 @@ fn cmd_branch() {
                 return 1;
             }
         }
-        if (sys_unlink(dpath) != 0) {
+        if (sf_unlink(dpath) != 0) {
             eprintln("sit: failed to remove branch ref");
             return 1;
         }
@@ -4685,7 +4810,7 @@ fn cmd_branch() {
         memcpy(dlref, "refs/heads/", 11);
         memcpy(dlref + 11, dname, dnlen);
         store8(dlref + 11 + dnlen, 0);
-        sys_unlink(reflog_log_path(dlref));
+        sf_unlink(reflog_log_path(dlref));
         stdout_write("deleted branch '", 16);
         stdout_write(dname, dnlen);
         stdout_write("'\n", 2);
@@ -4704,7 +4829,7 @@ fn cmd_branch() {
     memcpy(path + 16, name, nlen);
     store8(path + 16 + nlen, 0);
 
-    if (file_exists(path) == 1) {
+    if (sf_exists(path) == 1) {
         syscall(SYS_WRITE, STDERR, "sit: branch '", 13);
         syscall(SYS_WRITE, STDERR, name, nlen);
         syscall(SYS_WRITE, STDERR, "' already exists\n", 17);
@@ -5304,7 +5429,7 @@ fn is_dirty() {
             var head_ent = tree_find(head_entries, path);
             if (head_ent == 0) { return 1; }
             if (streq(tree_entry_hash(head_ent), idx_hex) == 0) { return 1; }
-            if (file_exists(path) == 1) {
+            if (sf_exists(path) == 1) {
                 var wh = hash_file_as_blob(path);
                 if (wh != 0) {
                     if (streq(wh, idx_hex) == 0) { return 1; }
@@ -5331,7 +5456,7 @@ fn is_dirty() {
 # creates "src" and "src/lib".
 # Write "ref: <ref_path>\n" to .sit/HEAD. Returns 0 on success.
 fn list_working_walk(prefix, fs_path, out, patterns) {
-    var raw = dir_list(str_from(fs_path));
+    var raw = sf_dir_list(str_from(fs_path));
     var n = vec_len(raw);
     var fs_path_len = strlen(fs_path);
     var prefix_len = strlen(prefix);
@@ -5438,7 +5563,7 @@ fn print_name_section(title, title_len, names) {
 }
 
 fn cmd_status() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -5473,7 +5598,7 @@ fn cmd_status() {
             }
             if (label != 0) { push_status_item(staged, label, path); }
 
-            if (file_exists(path) == 1) {
+            if (sf_exists(path) == 1) {
                 var working_hex = hash_file_as_blob(path);
                 if (working_hex != 0) {
                     if (streq(working_hex, idx_hash_hex) == 0) {
@@ -6121,7 +6246,7 @@ fn read_blob_content(hex, out_pair) {
 }
 
 fn cmd_diff() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -6260,7 +6385,7 @@ fn cmd_diff() {
                 var path = tree_entry_name(he);
                 var head_hex = tree_entry_hash(he);
 
-                if (file_exists(path) == 1) {
+                if (sf_exists(path) == 1) {
                     var working_hex = hash_file_as_blob(path);
                     if (working_hex != 0) {
                         if (streq(head_hex, working_hex) == 0) {
@@ -6361,7 +6486,7 @@ fn cmd_diff() {
             }
         }
         else {
-            if (file_exists(path) == 1) {
+            if (sf_exists(path) == 1) {
                 var working_hex = hash_file_as_blob(path);
                 if (working_hex != 0) {
                     if (streq(working_hex, idx_hash_hex) == 0) {
@@ -6391,7 +6516,7 @@ fn cmd_diff() {
 
 # Load a commit's tree and return its flattened entries. Returns 0 on error.
 fn cmd_show() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -6730,12 +6855,12 @@ fn materialize_target(target_hex) {
         var cpath = tree_entry_name(ce);
         if (tree_flat_path_valid(cpath) == 1) {
             if (tree_find(target_entries, cpath) == 0) {
-                if (file_exists(cpath) == 1) {
+                if (sf_exists(cpath) == 1) {
                     # S-16: refuse to declare success when a stale file the
                     # target says shouldn't exist couldn't be removed —
                     # otherwise `sit status` after checkout would still see
                     # it as tracked.
-                    if (sys_unlink(cpath) != 0) {
+                    if (sf_unlink(cpath) != 0) {
                         syscall(SYS_WRITE, STDERR, "sit: cannot remove stale path '", 31);
                         syscall(SYS_WRITE, STDERR, cpath, strlen(cpath));
                         syscall(SYS_WRITE, STDERR, "' — materialize aborted\n", 24);
@@ -6780,7 +6905,7 @@ fn materialize_target(target_hex) {
             # S-16: file_write_all returns < 0 on any write or open failure
             # (permissions, ENOSPC, EROFS). Same partial-tree problem as the
             # blob-read failure above; abort with a clear pointer to the path.
-            if (file_write_all(tpath, load64(&tp), load64(&tp + 8)) < 0) {
+            if (sf_write_all(tpath, load64(&tp), load64(&tp + 8)) < 0) {
                 syscall(SYS_WRITE, STDERR, "sit: cannot write '", 19);
                 syscall(SYS_WRITE, STDERR, tpath, strlen(tpath));
                 syscall(SYS_WRITE, STDERR, "' — materialize aborted (working tree may be partial)\n", 55);
@@ -7355,7 +7480,7 @@ fn print_graph(start_hex, limit) {
 }
 
 fn cmd_log() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -7422,7 +7547,7 @@ fn cmd_log() {
     # commits whose parents were not fetched. When the walk reaches one,
     # stop cleanly instead of erroring on the absent parent object.
     var shallow = map_new();
-    if (file_exists(".sit/shallow") == 1) {
+    if (sf_exists(".sit/shallow") == 1) {
         var spair[16];
         if (read_file_heap(".sit/shallow", &spair) == 0) {
             var sbuf = load64(&spair);
@@ -7539,7 +7664,7 @@ fn cmd_commit() {
         return 1;
     }
 
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -7579,7 +7704,7 @@ fn cmd_commit() {
             # S-16: a stale MERGE_HEAD silently turns the NEXT `sit commit` into
             # an unintended 2-parent merge. Refuse to declare success on the
             # commit if we couldn't clear it.
-            if (sys_unlink(".sit/MERGE_HEAD") != 0) {
+            if (sf_unlink(".sit/MERGE_HEAD") != 0) {
                 eprintln("sit: commit object written but failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove the file manually");
                 return 1;
             }
@@ -7821,15 +7946,15 @@ fn write_merge_head(hex) {
     memcpy(buf, hex, 64);
     store8(buf + 64, 10);
     store8(buf + 65, 0);
-    if (file_write_all(".sit/MERGE_HEAD", buf, 65) < 0) { return 0 - 1; }
+    if (sf_write_all(".sit/MERGE_HEAD", buf, 65) < 0) { return 0 - 1; }
     return 0;
 }
 
 # Read `.sit/MERGE_HEAD` if it exists. Returns heap-allocated 64-char hex
 # cstring, or 0 if no merge is in progress.
 fn read_merge_head() {
-    if (file_exists(".sit/MERGE_HEAD") != 1) { return 0; }
-    var fd = file_open(".sit/MERGE_HEAD", 0, 0);
+    if (sf_exists(".sit/MERGE_HEAD") != 1) { return 0; }
+    var fd = sf_open(".sit/MERGE_HEAD", 0, 0);
     if (fd < 0) { return 0; }
     var buf = alloc_or_die(80);
     var n = file_read(fd, buf, 80);
@@ -7892,7 +8017,7 @@ fn write_conflict_file(path, ours_hex, theirs_hex, branch_name) {
     store8(out + pos, 10); pos = pos + 1;
 
     ensure_parent_dirs(path);
-    if (file_write_all(path, out, pos) < 0) { return 0 - 1; }
+    if (sf_write_all(path, out, pos) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -8029,7 +8154,7 @@ fn find_merge_base(a_hex, b_hex) {
 # are resolved through resolve_hash (branch / tag / hex-prefix). Exposes the
 # LCA so the merge base is testable independent of a full `sit merge`.
 fn cmd_merge_base() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -8144,7 +8269,7 @@ fn build_merge_commit_signed(tree_hex, p1_hex, p2_hex, message, seed) {
 
 # Find a tree entry's hash_hex for a given path, or 0 if absent.
 fn cmd_merge() {
-    if (file_exists(".sit/HEAD") != 1) {
+    if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
         return 1;
     }
@@ -8155,7 +8280,7 @@ fn cmd_merge() {
 
     # --abort: restore working tree to HEAD, clear MERGE_HEAD.
     if (streq(argv(2), "--abort") == 1) {
-        if (file_exists(".sit/MERGE_HEAD") != 1) {
+        if (sf_exists(".sit/MERGE_HEAD") != 1) {
             eprintln("sit: no merge in progress");
             return 1;
         }
@@ -8170,7 +8295,7 @@ fn cmd_merge() {
         }
         # S-16: a stale MERGE_HEAD silently turns the next commit into a
         # 2-parent merge. Same cliff as cmd_commit's clear path.
-        if (sys_unlink(".sit/MERGE_HEAD") != 0) {
+        if (sf_unlink(".sit/MERGE_HEAD") != 0) {
             eprintln("sit: failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove manually");
             return 1;
         }
@@ -8382,7 +8507,7 @@ fn cmd_merge() {
             ensure_parent_dirs(mpath);
             var mp[16];
             if (read_blob_content(mhex, &mp) == 0) {
-                file_write_all(mpath, load64(&mp), load64(&mp + 8));
+                sf_write_all(mpath, load64(&mp), load64(&mp + 8));
             }
             mi = mi + 1;
         }
@@ -8515,6 +8640,11 @@ fn sit_repo_open(cwd) {
     # that read_object / read_head_ref / resolve_ref_name dispatch on. Returns -1
     # when neither store is present.
     if (_detect_repo_backend() < 0) { return 0; }
+    # Set the repo root so subsequent reads resolve on agnos (which has no
+    # cwd). Linux stays BYTE-IDENTICAL: consumers pass "." and sit_abs
+    # treats a "." root as no-prefix (and an absolute root only prefixes
+    # repo-relative paths). A non-"." absolute cwd enables agnos resolution.
+    sit_set_repo_root(cwd);
     return 1;
 }
 
@@ -8560,7 +8690,7 @@ fn sit_diff_path(repo, path) {
     var new_buf = 0;
     var new_len = 0;
     var wp[16];
-    if (file_exists(path) == 1) {
+    if (sf_exists(path) == 1) {
         if (read_file_heap(path, &wp) == 0) {
             new_buf = load64(&wp);
             new_len = load64(&wp + 8);
@@ -8631,7 +8761,7 @@ fn sit_repo_status(repo) {
         while (i < hn) {
             var he = vec_get(head_entries, i);
             var path = tree_entry_name(he);
-            if (file_exists(path) != 1) {
+            if (sf_exists(path) != 1) {
                 _status_push(out, path, 3);
             }
             else {
