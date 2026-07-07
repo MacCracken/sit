@@ -26,6 +26,17 @@ of the process cwd. AGNOS has no `chdir`/`getcwd`/`openat` (CWD is userland-owne
   fuzz all pass, 0 failed** — including the clone/push/shallow/`.git`-read lanes that open repos on
   *external* paths (exactly what the chdir→abs-path change touched). `dist/sit.cyr` regenerated (deterministic).
 
+### Fixed (post-refactor, CI-caught)
+- **`serve` advertised zero refs when its cwd wasn't the repo → SSH clone failed with `remote has no
+  such branch`.** The ~130-site sweep routed the single-level `sf_dir_list` wrapper but missed the
+  *recursive* `dir_walk` walker at three sites: `serve_emit_refs_subtree` (ref advertisement,
+  `src/serve.cyr`) and `fsck_walk_refs_dir` / `fsck_collect_reflog_roots` (`src/object_db.cyr`). Each
+  had a repo-root-relative `sf_exists` guard directly above a cwd-relative `dir_walk` below — so the
+  guard passed while the walk read the process cwd and came up empty. Tests run with cwd = the repo,
+  so it never surfaced locally; the CI `ssh clone` smoke (server cwd = `$HOME`) did. Now each walks
+  `sit_abs(dir)`. Verified out-of-cwd via `serve --stdio`: refs advertise (`refs/heads/main`) and
+  objects serve (`200 OK`); 273 unit tests still green.
+
 ## [1.3.1] — 2026-07-03 — chdir-free `sit_repo_open` (AGNOS-native read API)
 
 The library `sit_repo_open` (`src/api.cyr`) no longer `chdir`s — it reads the repo at the

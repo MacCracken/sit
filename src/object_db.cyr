@@ -561,7 +561,7 @@ fn fsck_read_ref_tip(path) {
 fn fsck_walk_refs_dir(dir, roots) {
     if (sf_exists(dir) != 1) { return 0; }
     var files = vec_new();
-    dir_walk(str_from(dir), files);
+    dir_walk(str_from(sit_abs(dir)), files);   # abs: cwd-independent (fsck off-cwd / agnos)
     var i = 0;
     while (i < vec_len(files)) {
         var fp_str = vec_get(files, i);
@@ -589,7 +589,7 @@ fn fsck_walk_refs_dir(dir, roots) {
 fn fsck_collect_reflog_roots(roots) {
     if (sf_exists(".sit/logs") != 1) { return 0; }
     var files = vec_new();
-    dir_walk(str_from(".sit/logs"), files);
+    dir_walk(str_from(sit_abs(".sit/logs")), files);   # abs: cwd-independent
     var i = 0;
     while (i < vec_len(files)) {
         var fp = vec_get(files, i);
