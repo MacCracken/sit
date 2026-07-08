@@ -193,10 +193,18 @@ fn _ssh_find_binary() {
                 store8(cand + seg_len, 47);             # '/'
                 memcpy(cand + seg_len + 1, "ssh", 3);
                 store8(cand + seg_len + 4, 0);
-                # access(path, X_OK=1). 0 = ok.
+                # access(path, X_OK=1). 0 = ok. Linux-host-only: the SSH
+                # wire transport shells out to `ssh` (fork/exec/pipe), which
+                # agnos sit never does — and SYS_ACCESS is undefined on the
+                # agnos target (syscalls.cyr includes no agnos peer). Gate the
+                # executability probe so this file has no eager undefined-var
+                # reference on --agnos; the whole spawn path stays unreachable
+                # there via wire_ssh_open. See ADR 0008.
+#ifndef CYRIUS_TARGET_AGNOS
                 if (syscall(SYS_ACCESS, cand, 1) == 0) {
                     return cand;
                 }
+#endif
             }
             start = i + 1;
         }
@@ -263,6 +271,17 @@ fn _ssh_port_str(port) {
 #
 # Returns a wire_ssh handle (40 bytes) on success, 0 on failure.
 fn wire_ssh_open(url) {
+#ifdef CYRIUS_TARGET_AGNOS
+    # The SSH transport shells out to the `ssh` binary via fork/exec (see
+    # the child branch below) — a Linux-host capability. agnos has no
+    # fork/exec, so sys_fork / sys_dup2 / sys_execve are undefined on the
+    # agnos target, and sit on agnos speaks the local + HTTP transports
+    # only. Exclude the whole spawn body here (textually, not just at
+    # runtime — the compiler's reachable-undefined check is static) and
+    # fail cleanly for ssh:// URLs. See ADR 0008.
+    eprintln("sit: ssh:// transport is unsupported on agnos (no fork/exec)");
+    return 0;
+#else
     var u_cell = alloc(8); store64(u_cell, 0);
     var h_cell = alloc(8); store64(h_cell, 0);
     var p_cell = alloc(8); store64(p_cell, 0);
@@ -409,6 +428,7 @@ fn wire_ssh_open(url) {
         return 0;
     }
     return h;
+#endif
 }
 
 fn wire_ssh_close(h) {

@@ -5,7 +5,7 @@ description = "Sovereign version control — a Cyrius-native git replacement"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sit"
 language = "cyrius"
-cyrius = "6.3.36"
+cyrius = "6.4.21"
 
 [build]
 entry = "src/main.cyr"

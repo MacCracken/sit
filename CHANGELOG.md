@@ -4,6 +4,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.3] — 2026-07-08 — AGNOS SSH-transport gating + cyrius `6.4.21`
+
+Closes the last AGNOS compile blocker in the wire layer and refreshes the toolchain to the current
+cyrius line. `1.3.2` made the whole library repo-root-relative; the one remaining Linux-ism was the
+SSH transport's `ssh`-binary spawn path (`fork`/`exec`/`access`), which a `--agnos` build hard-failed
+on at `SYS_ACCESS`. AGNOS has no `fork`/`exec`/`access` (its process model is `spawn`/`execwait`, not
+POSIX fork-exec), and AGNOS `sit` never shells out to `ssh` — so the fix gates the spawn path out of
+the AGNOS build entirely. Unblocks `sit` in the agnos-dev docker image.
+
+### Changed
+- **Cyrius toolchain `6.3.36 → 6.4.21`** (`cyrius.cyml [package].cyrius`). The 6.4.x line adds the AGNOS
+  syscall peer `lib/syscalls_x86_64_agnos.cyr` (6.4.2) — so `sys_pipe`/`sys_close`/`sys_waitpid`/
+  `sys_exit` now resolve on `--agnos` — and raises the `cyrius distlib` per-module read cap 256 KB → 1 MB
+  (6.4.10). sit's consumed surface (sigil `hash_data`/`hex_*`/ed25519, sankoch zlib, patra object store)
+  is unchanged; git-crate dep pins (sakshi/sankoch/sigil/patra) held. `cyrius.lock` re-resolved.
+
+### Fixed
+- **`src/wire_ssh.cyr` — AGNOS `--agnos` build hard-failed at `undefined variable 'SYS_ACCESS'`.** Two
+  distinct AGNOS-target gaps, gated two ways:
+  - `_ssh_find_binary`'s `access(2, X_OK)` executability probe (`syscall(SYS_ACCESS, …)`) — `SYS_ACCESS`
+    is undefined on AGNOS. An undefined *variable* is an **eager** name-resolution error (fires on every
+    compiled fn, reachable or not), so a `#ifndef CYRIUS_TARGET_AGNOS` guard removes the reference. The
+    `access(X_OK)` executability semantics are preserved verbatim on Linux (not swapped for a weaker
+    `open()` existence check).
+  - `wire_ssh_open`'s spawn body (`sys_fork`/`sys_dup2`/`sys_execve`) — undefined on AGNOS and statically
+    **reachable** from `main` via `wire.cyr`, so a runtime early-return can't suppress the
+    reachable-undefined-function error (reachability is static over the call graph). The whole spawn body
+    is `#ifdef CYRIUS_TARGET_AGNOS` → clean `return 0` (ssh:// unsupported on AGNOS) `#else <spawn> #endif`,
+    textually excluding the fork/exec calls. **Linux behavior is byte-identical** (the `#else` branch is
+    the prior code verbatim). Verified: `cyrius build --agnos src/main.cyr` → OK; the AGNOS binary runs
+    under mirshi (`init` / `status` clean).
+
+### Verified
+- **273 unit + integration pass, 0 failed** (`cyrius test tests/sit.tcyr`); native + `--agnos` builds
+  both green; `serve` capabilities stamp bumped `1.3.2 → 1.3.3` (CI version-consistency assertion).
+  Both dist bundles regenerated at v1.3.3 (`dist/sit.cyr` 13620 lines, `dist/sit-read.cyr` 8748 lines —
+  the read profile was stale at 1.3.1 and is now re-synced).
+
 ## [1.3.2] — 2026-07-06 — repo-root-relative FS layer (fully AGNOS-native, no `chdir` anywhere)
 
 Completes 1.3.1's chdir-free `sit_repo_open` into a full **repo-root-relative FS layer** — ALL of sit
