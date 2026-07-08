@@ -336,8 +336,10 @@ fn cmd_owl_file() {
 
     # O_WRONLY | O_CREAT | O_EXCL = 1 | 64 | 128 = 193. Mode 0o600 = 0x180.
     # O_EXCL refuses to follow a pre-existing symlink and refuses EEXIST,
-    # closing the TOCTOU window.
-    var tfd = sys_open(tmppath, 193, 0x180);
+    # closing the TOCTOU window. file_open (io.cyr) is the length-carrying
+    # bridge — sys_open(tmppath, 193, 0x180) verbatim on Linux/macOS; on agnos
+    # it strlen()s the path and maps to AO_* (O_EXCL unavailable there).
+    var tfd = file_open(tmppath, 193, 0x180);
     if (tfd < 0) {
         eprintln("sit: cannot create tempfile");
         return 1;
@@ -347,7 +349,7 @@ fn cmd_owl_file() {
         # S-16: best-effort tempfile cleanup. Tempfiles live in
         # $XDG_RUNTIME_DIR/sit/ so a leak gets reaped eventually; a stderr
         # warning makes it loud rather than silent.
-        if (sys_unlink(tmppath) != 0) {
+        if (xunlink(tmppath) != 0) {
             eprintln("sit: warning: failed to remove owl tempfile after write error");
         }
         eprintln("sit: cannot write tempfile");
@@ -360,7 +362,7 @@ fn cmd_owl_file() {
         eprintln("sit: owl not installed — emitting raw content");
         eprintln("sit:   (owl is pre-1.0; https://github.com/MacCracken/owl)");
         stdout_write(content, content_len);
-        if (sys_unlink(tmppath) != 0) {
+        if (xunlink(tmppath) != 0) {
             eprintln("sit: warning: failed to remove owl tempfile");
         }
         return 0;
@@ -370,7 +372,7 @@ fn cmd_owl_file() {
     vec_push(args, owl);
     vec_push(args, tmppath);
     var rc = exec_vec(args);
-    if (sys_unlink(tmppath) != 0) {
+    if (xunlink(tmppath) != 0) {
         eprintln("sit: warning: failed to remove owl tempfile after exec");
     }
     return rc;

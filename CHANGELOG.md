@@ -4,6 +4,66 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.4] — 2026-07-08 — AGNOS FS-syscall ABI + cyrius `6.4.25` + dep refresh
+
+Makes sit's low-level filesystem operations ABI-correct on AGNOS (they compiled
+`--agnos` but silently miscompiled at runtime off Linux) and refreshes the
+toolchain plus every git-crate dependency to the current line. The **patra**
+bump (`→ 1.12.9`) is the last-mile unblock for the AGNOS object-write path — its
+`.patra` opens are now ABI-correct — so `init` / `add` / `status` all run under
+mirshi on the AGNOS binary. **Linux/macOS behaviour is unchanged throughout.**
+
+### Changed
+- **Cyrius toolchain `6.4.21 → 6.4.25`** (`cyrius.cyml [package].cyrius`) — the
+  current 6.4.x line; clears the manifest-vs-`cycc` pin-drift warning. sit's
+  consumed surface is unchanged. `cyrius.lock` re-resolved (105 deps locked).
+- **Dependency refresh — all git-crate pins to latest:**
+  - **patra `1.12.7 → 1.12.9`** — `.patra` file opens now work on AGNOS. patra
+    routes its five path-taking opens through the stdlib `file_open` ABI bridge
+    (its own `1.12.9` fix) instead of raw `sys_open`, which on AGNOS misread the
+    Linux flags as a byte length → `patra: cannot open or create file`. This is
+    what unblocks `sit add` / `commit` on AGNOS. Linux behaviour unchanged.
+  - **sigil `3.9.9 → 3.10.0`** — additive only (native UEFI Authenticode PE
+    signing); sit calls `hash_data` / `hex_encode` / `hex_decode` / ed25519
+    verbs only — none affected.
+  - **sankoch `2.4.8 → 2.4.9`** and **sakshi `2.4.3 → 2.4.4`** — patch refresh,
+    no public-surface impact for sit.
+  Both dist profiles regenerated at 1.3.4 (`dist/sit.cyr`, `dist/sit-read.cyr`);
+  the `serve_build_capabilities()` version stamp tracks VERSION (`"sit":"1.3.4"`).
+
+### Fixed
+- **AGNOS FS-syscall ABI: sit's low-level path syscalls were Linux-shaped and
+  miscompiled off Linux.** `--agnos` builds (cyrius only warns on arity) but
+  every raw `sys_*` that takes a path was wrong at runtime under mirshi: agnos
+  carries an explicit byte length and reorders flags (`sys_open(name, namelen,
+  flags)`, `sys_stat(path, pathlen, statbuf)`, `sys_mkdir/rmdir/unlink(path,
+  pathlen)`), so a Linux-shaped `sys_open(path, flags, mode)` landed `flags` in
+  `namelen` — a silent miscompile (no `ud2`). Same conversion class fixed in
+  darshini. Routed every site through the stdlib's portable length-carrying
+  wrappers (io.cyr `file_open` / `xstat` / `xunlink`, agnos-aware since cyrius
+  6.2.26) plus two sit-local bridges (`sit_mkdir` / `sit_rmdir`) for the mkdir/
+  rmdir shapes the stdlib doesn't yet cover:
+  - `src/util.cyr` — `sf_stat`→`xstat`, `sf_unlink`→`xunlink`, `sf_mkdir` +
+    `ensure_dir`→`sit_mkdir`, `sf_rmdir`→`sit_rmdir`.
+  - `src/sign.cyr` (signing-key create), `src/object_db.cyr` (owl tempfile),
+    `src/wire_https.cyr` (known-hosts write) — raw `sys_open`→`file_open`
+    (Linux/macOS mode + `O_EXCL` preserved verbatim; agnos maps flags→`AO_*`).
+  - `src/object_db.cyr` — three direct `sys_unlink(tmppath)`→`xunlink`.
+  - `src/validate.cyr` `path_is_symlink` / `path_lstat_kind` and
+    `src/serve.cyr` serve-token perm check — the raw Linux `newfstatat` (#262)
+    now has an `#ifdef CYRIUS_TARGET_AGNOS` branch using length-carrying
+    `sys_stat` (agnos has no lstat — symlink detection degrades to its
+    following-`stat`, an accepted degradation matching darshini's fallback).
+  Directory enumeration (`sf_dir_list`→stdlib `dir_list`) already carried an
+  agnos branch (cyrius 6.2.23), so it was left as-is. **Linux/macOS behaviour is
+  byte-identical** (every agnos branch is `#`-guarded; non-agnos falls through
+  to the prior call). Verified: `cyrius test` 273/273, and `init` / `add` /
+  `status` run under mirshi (`--root`) on the agnos binary — the object-write
+  path is unblocked by the patra `1.12.9` bump (see Changed). (A patra readback
+  under mirshi can still surface `patra: cannot read header` — patra's
+  `patra_hdr_read` expects a single full-page 16 KB `sys_read`, fragile against
+  mirshi's partial reads; that is a patra/mirshi concern, not sit's call-shape.)
+
 ## [1.3.3] — 2026-07-08 — AGNOS SSH-transport gating + cyrius `6.4.21`
 
 Closes the last AGNOS compile blocker in the wire layer and refreshes the toolchain to the current

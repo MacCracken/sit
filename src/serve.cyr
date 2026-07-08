@@ -98,7 +98,7 @@ fn serve_build_capabilities() {
     # TODO: derive from VERSION at build time once cyrius exposes a
     # source-level VERSION constant — the manifest ${file:VERSION} is
     # build-metadata only. Until then it is bumped by hand at each tag.
-    str_builder_add_cstr(sb, "{\"sit\":\"1.3.3\",\"max_body\":");
+    str_builder_add_cstr(sb, "{\"sit\":\"1.3.4\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[");
     if (_serve_require_auth == 1) {
@@ -487,6 +487,20 @@ fn _serve_load_token(path) {
         eprintln("sit: refusing to follow symlink for serve token");
         return 0;
     }
+#ifdef CYRIUS_TARGET_AGNOS
+    # agnos: length-carrying sys_stat; mode at STAT_MODE (per-target offset).
+    # agnos's file_open ignores the create mode (the frozen floor chooses it),
+    # so a token file may not read back as exactly 0600 — the strict check then
+    # fails closed below, matching this loader's "strictly enforced or absent,
+    # never a silent no-auth" posture (cmd_serve refuses to start). agnos
+    # `sit serve` auth stays unavailable until the ABI grows settable modes.
+    var stbuf[128];
+    if (sys_stat(path, strlen(path), &stbuf) < 0) {
+        eprintln("sit: cannot stat serve token");
+        return 0;
+    }
+    var mode = load32(&stbuf + STAT_MODE);
+#else
     var stbuf[144];
     var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, 0);
     if (rc < 0) {
@@ -494,6 +508,7 @@ fn _serve_load_token(path) {
         return 0;
     }
     var mode = load32(&stbuf + 24);
+#endif
     var perm = mode & 0xFFF;
     if (perm != 384) {        # 0600 octal = 384 decimal
         eprintln("sit: serve token file must be mode 0600");

@@ -226,7 +226,11 @@ fn cmd_key_generate() {
         eprintln("sit: refusing to overwrite symlink at signing key path");
         return 1;
     }
-    var fd = sys_open(priv_path, O_WRONLY | O_CREAT | O_TRUNC | 0x80, 0x180);
+    # file_open (io.cyr) is the length-carrying bridge: on Linux/macOS it is
+    # sys_open(path, flags, mode) verbatim (0600 + O_EXCL preserved); on agnos
+    # it strlen()s the path and maps the flags to AO_* (agnos has no O_EXCL, so
+    # the TOCTOU guard degrades to the path_is_symlink check above — accepted).
+    var fd = file_open(priv_path, O_WRONLY | O_CREAT | O_TRUNC | 0x80, 0x180);
     if (fd < 0) { eprintln("sit: cannot write signing key"); return 1; }
     syscall(SYS_WRITE, fd, seed_hex, 64);
     syscall(SYS_WRITE, fd, "\n", 1);

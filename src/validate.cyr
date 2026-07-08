@@ -482,6 +482,18 @@ var VAL_AT_FDCWD = 0 - 100;
 var VAL_AT_SYMLINK_NOFOLLOW = 256;
 
 fn path_is_symlink(path) {
+#ifdef CYRIUS_TARGET_AGNOS
+    # agnos's frozen ABI has no lstat / newfstatat (§4.1 exposes only the
+    # symlink-FOLLOWING sys_stat), so a planted symlink resolves to its target
+    # and cannot be flagged here. Report 0 (not-a-symlink) for any path that
+    # exists, -1 if stat fails — preserving the contract while the S-12 guard
+    # degrades to a no-op on agnos (whose single-user capability floor has no
+    # attacker-writable symlink-plant vector today). Accepted degradation,
+    # matching darshini's lstat→stat fallback.
+    var abuf[128];
+    if (sys_stat(path, strlen(path), &abuf) < 0) { return 0 - 1; }
+    return 0;
+#else
     var stbuf[144];
     var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, VAL_AT_SYMLINK_NOFOLLOW);
     if (rc < 0) { return 0 - 1; }
@@ -489,6 +501,7 @@ fn path_is_symlink(path) {
     var fmt = mode & 0xF000;
     if (fmt == 0xA000) { return 1; }
     return 0;
+#endif
 }
 
 # Return the file-type bits (S_IFMT-masked mode) for a path via lstat, or -1
@@ -497,9 +510,18 @@ fn path_is_symlink(path) {
 # S-25's "does target already exist as something other than a dir".
 
 fn path_lstat_kind(path) {
+#ifdef CYRIUS_TARGET_AGNOS
+    # No lstat on agnos (see path_is_symlink): sys_stat FOLLOWS symlinks, so a
+    # symlink-to-dir reports 0x4000 (dir), not 0xA000 (symlink). Accepted
+    # degradation. STAT_MODE is the agnos struct-stat mode offset (per-target).
+    var abuf[128];
+    if (sys_stat(path, strlen(path), &abuf) < 0) { return 0 - 1; }
+    return load32(&abuf + STAT_MODE) & 0xF000;
+#else
     var stbuf[144];
     var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, VAL_AT_SYMLINK_NOFOLLOW);
     if (rc < 0) { return 0 - 1; }
     var mode = load32(&stbuf + 24);
     return mode & 0xF000;
+#endif
 }

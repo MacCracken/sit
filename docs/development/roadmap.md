@@ -23,8 +23,8 @@ Nothing below blocks anything else; the ordering is a recommendation, not a cont
 
 Consumption, hardening, and deferred no-surface work. The dep **pins are already current** (bumped in 1.2.0); what remains is the *wiring*.
 
-- **Wire patra `patra_insert_row_or_ignore` (P-11).** Pin is current (patra 1.12.7 ships it). Route `db_object_insert_raw` through the or-ignore insert so `sit add` upserts the index without a full rewrite and drops the inner `db_object_has` probe — one B+ tree op per object on clone / push / add instead of two.
-- **Wire sankoch `zlib_decompress_with_ratio_cap`.** Pin is current (sankoch 2.4.8 ships it). Route the wire / fsck inflate paths through the ratio-capped variant — defense-in-depth against decompression bombs on untrusted objects, distinct from the absolute 16 MiB ceiling. (Now also relevant to the `.git/` packfile read path.)
+- **Wire patra `patra_insert_row_or_ignore` (P-11).** Pin is current (patra 1.12.9 ships it). Route `db_object_insert_raw` through the or-ignore insert so `sit add` upserts the index without a full rewrite and drops the inner `db_object_has` probe — one B+ tree op per object on clone / push / add instead of two.
+- **Wire sankoch `zlib_decompress_with_ratio_cap`.** Pin is current (sankoch 2.4.9 ships it). Route the wire / fsck inflate paths through the ratio-capped variant — defense-in-depth against decompression bombs on untrusted objects, distinct from the absolute 16 MiB ceiling. (Now also relevant to the `.git/` packfile read path.)
 - **Reflog `expire` / `delete` + `@{<date>}` selector** *(carried from 1.1.0).* Reflog entries are unbounded today, so `fsck --prune` reclaims reflogged objects only via `--prune-now`; expiry closes that. `@{<date>}` complements the integer `@{N}` ordinal.
 - **Unsanitized-identity hardening in `commit.cyr` / `merge.cyr`** *(carried from 1.1.0; security patch).* The reflog ident chain was hardened in 1.1.0; the commit / merge object-framing ident path is the remaining instance of the same pattern.
 - **Nested `.gitignore` / `info/exclude`** for `.git/` read-mode. Only the top-level `.gitignore` is honoured today.

@@ -105,7 +105,10 @@ fn _tofu_record_pin(host, port, pin_hex) {
     memcpy(buf + pos, pin_hex, 64); pos = pos + 64;
     store8(buf + pos, 10); pos = pos + 1;
 
-    var fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0x180);   # 0600
+    # file_open (io.cyr) is the length-carrying bridge: sys_open(path, flags,
+    # 0x180) verbatim on Linux/macOS (0600 preserved); on agnos it strlen()s
+    # the path and maps the flags to AO_* so the known-hosts write is ABI-safe.
+    var fd = file_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0x180);   # 0600
     if (fd < 0) { return 0 - 1; }
     syscall(SYS_WRITE, fd, buf, pos);
     sys_close(fd);

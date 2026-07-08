@@ -67,12 +67,46 @@ fn sit_abs_str(rel) {
 }
 
 # ----------------------------------------------------------------
+# Portable directory create/remove (agnos ABI bridge).
+# ----------------------------------------------------------------
+# Linux/macOS and agnos disagree on the mkdir/rmdir call shape:
+#   - Linux/macOS: sys_mkdir(path, mode)   / sys_rmdir(path)
+#   - agnos:       sys_mkdir(path, pathlen) / sys_rmdir(path, pathlen)
+# agnos's frozen floor carries an explicit byte length (no NUL scan in the
+# kernel) and picks the directory mode itself, so a raw Linux-shaped
+# sys_mkdir(path, 0755) lands 0755 in `pathlen` — a silent ABI miscompile.
+# The stdlib bridges open/stat/unlink (io.cyr's file_open / xstat / xunlink)
+# but does NOT yet bridge mkdir/rmdir, so sit carries these two here; if the
+# stdlib grows xmkdir/xrmdir they fold out. `path` is already repo-absolute
+# (callers pass sit_abs(...)). The #ifdef wraps the whole branch — an early
+# `return` does NOT stop the compiler type-checking the code that follows it
+# (see lib/io.cyr's v6.2.25 wrapper-set note), so both shapes are #-guarded.
+fn sit_mkdir(path, mode) {
+#ifdef CYRIUS_TARGET_AGNOS
+    return sys_mkdir(path, strlen(path));
+#else
+    return sys_mkdir(path, mode);
+#endif
+}
+
+fn sit_rmdir(path) {
+#ifdef CYRIUS_TARGET_AGNOS
+    return sys_rmdir(path, strlen(path));
+#else
+    return sys_rmdir(path);
+#endif
+}
+
+# ----------------------------------------------------------------
 # sit-owned FS wrappers (sf_*). Every repo FS access funnels through
 # one of these so the prefixing lives in a single place. The inner
-# calls keep the real stdlib names — the sf_ names are new, so no
-# self-shadowing. Absolute/HOME/cert/token paths pass through sit_abs
-# unchanged (rule 1), and on Linux (_repo_root == 0) every wrapper is a
-# transparent forward (rule 2).
+# calls use the portable, length-carrying wrappers (io.cyr's file_open /
+# xstat / xunlink, plus sit_mkdir / sit_rmdir above) so the same call is
+# ABI-correct on Linux/macOS AND agnos — a raw Linux-shaped sys_open /
+# sys_stat / sys_unlink would silently miscompile off Linux (agnos reads
+# its 2nd arg as a byte length). Absolute/HOME/cert/token paths pass
+# through sit_abs unchanged (rule 1), and on Linux (_repo_root == 0) every
+# wrapper is a transparent forward (rule 2).
 # ----------------------------------------------------------------
 fn sf_exists(p) {
     return file_exists(sit_abs(p));
@@ -95,7 +129,7 @@ fn sf_append_locked(p, buf, len) {
 }
 
 fn sf_mkdir(p, mode) {
-    return sys_mkdir(sit_abs(p), mode);
+    return sit_mkdir(sit_abs(p), mode);
 }
 
 # NOTE: no sf_ensure_dir / sf_ensure_parent_dirs / sf_read_file_heap —
@@ -103,15 +137,15 @@ fn sf_mkdir(p, mode) {
 # existing callers stay unchanged. Wrapping them here would double-prefix.
 
 fn sf_unlink(p) {
-    return sys_unlink(sit_abs(p));
+    return xunlink(sit_abs(p));
 }
 
 fn sf_rmdir(p) {
-    return sys_rmdir(sit_abs(p));
+    return sit_rmdir(sit_abs(p));
 }
 
 fn sf_stat(p, buf) {
-    return sys_stat(sit_abs(p), buf);
+    return xstat(sit_abs(p), buf);
 }
 
 # dir_list takes a Str; route through the Str-aware prefixer.
@@ -187,7 +221,7 @@ fn alloc_or_die(size) {
 # sit-owned: prefixes `path` with the repo root (sit_abs) INTERNALLY so
 # every caller (incl. ensure_parent_dirs) can pass a repo-relative path.
 fn ensure_dir(path) {
-    var r = sys_mkdir(sit_abs(path), 0x1ED);
+    var r = sit_mkdir(sit_abs(path), 0x1ED);
     if (r == 0) { return 0; }
     if (r == 0 - 17) { return 0; }
     return r;
