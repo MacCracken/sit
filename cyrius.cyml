@@ -5,7 +5,7 @@ description = "Sovereign version control — a Cyrius-native git replacement"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sit"
 language = "cyrius"
-cyrius = "6.4.25"
+cyrius = "6.5.4"
 
 [build]
 entry = "src/main.cyr"
@@ -94,12 +94,21 @@ modules = [
 # 6.x omnibus bundle that folded the old base64 / json / bigint stdlib
 # modules into one.
 #
-# `sync` + `thread` both export mutex_* on Linux (both futex-backed and
-# functionally identical — see lib/sync.cyr's header), so the build emits
-# three benign `duplicate fn 'mutex_*' (last definition wins)` warnings;
-# either definition is correct. `thread` can NOT be dropped to silence
-# them — sigil (parallel-hash path) and sandhi both reference its spawn
-# machinery (thread_join / thread_spawn / chan_*).
+# `sync` + `thread` USED to both export mutex_* on Linux, which emitted
+# three benign `duplicate fn 'mutex_*' (last definition wins)` warnings.
+# As of cyrius 6.5.4 `lib/thread.cyr` no longer defines them — `sync` is
+# the sole owner (6 defs) — so the build is warning-free on that front.
+# `thread` still can NOT be dropped: sigil references `thread_join`
+# (parallel-hash path) and sandhi references the channel machinery
+# (`chan_new` / `chan_send`).
+#
+# `thread_local` is declared explicitly as of 1.3.5 even though 6.5.4 resolves
+# it transitively. Both sigil (>= 3.12.1, crypto-bank slot) and patra (1.12.12,
+# which moved its five TLS slots off hardcoded indices) now call
+# `thread_local_alloc` / `_get` / `_set` on hot paths. An undeclared module of
+# this class is a RUNTIME failure, not a build error — exactly how the missing
+# `random` module made `sit key generate` SIGILL at v1.0.2 — so it is declared
+# rather than left to the transitive arc.
 stdlib = [
     "slice",
     "string",
@@ -118,6 +127,7 @@ stdlib = [
     "tagged",
     "fnptr",
     "thread",
+    "thread_local",
     "sync",
     "freelist",
     "bayan",
@@ -138,24 +148,31 @@ stdlib = [
 
 [deps.sakshi]
 git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.4.4"
+tag = "2.4.7"
 modules = ["dist/sakshi.cyr"]
 
 [deps.sankoch]
 git = "https://github.com/MacCracken/sankoch.git"
-tag = "2.4.9"
+tag = "2.7.6"
 modules = ["dist/sankoch.cyr"]
 
 # sigil 3.x: ct_eq retired (cyrius stdlib `ct_eq_bytes_lens` is canonical);
 # TRUST_COMMUNITY enum slot 2 retired; -D SIGIL_BATCH_PARALLEL flag removed.
-# sit uses only hash_data / hex_encode / hex_decode — none affected.
+# sit's consumed surface is 10 symbols — none affected by the above:
+#   hash_data, hex_encode, hex_decode, hex_decode_into, hex_is_valid,
+#   ed25519_keypair, ed25519_sign, ed25519_verify, ed25519_generate_keypair,
+#   pem_decode_certs (serve.cyr's --tls PEM chain loader).
+# The whole PE/authenticode, argon2, blake2b and trust-store surface is
+# unreferenced by sit — sigil's security fixes in those areas are off our path.
+# sigil >= 3.12.1 needs cyrius >= 6.4.65 (thread_local_alloc); the 6.5.4 pin
+# above clears that floor.
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
-tag = "3.10.0"
+tag = "3.12.2"
 modules = ["dist/sigil.cyr"]
 
 [deps.patra]
 git = "https://github.com/MacCracken/patra.git"
-tag = "1.12.9"
+tag = "1.12.12"
 modules = ["dist/patra.cyr"]
 

@@ -85,6 +85,59 @@ fn test_sankoch_zlib_roundtrip() {
     return 0;
 }
 
+# Regression: objects larger than sankoch's 1 MiB DEFLATE_BLOCK_SIZE.
+#
+# sankoch <= 2.7.5 resumed each 1 MiB chunk at `block_end` while the block
+# encoder had legitimately overshot it by up to LZ77_MAX_MATCH (258) bytes,
+# so the overshoot was encoded twice and the stream decoded longer than it
+# went in. sit compresses every object through this path (zlib_compress at
+# object_db.cyr), so any blob over ~1 MiB was silently corrupted on write.
+# Fixed in sankoch 2.7.6; this test pins the boundary so a future compression
+# bump cannot regress it. The pre-existing roundtrip test above uses an
+# 88-byte string and never reached the chunker, which is why this went
+# unnoticed through 1.3.4.
+#
+# Sizes chosen to bracket the boundary: just under (no second block), exactly
+# 1 MiB (first block is already final), and 2.5 MiB (two crossings). Only the
+# last one reproduced the corruption.
+fn _zlib_fill_pattern(buf, n) {
+    # Compressible but not degenerate: a rolling byte pattern with enough
+    # repetition that LZ77 finds real matches across the block boundary.
+    var i = 0;
+    while (i < n) {
+        var v = (i * 7) + (i / 251);
+        store8(buf + i, v - ((v / 251) * 251));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _zlib_roundtrip_size(n, label) {
+    var src = alloc(n);
+    _zlib_fill_pattern(src, n);
+
+    var cap = n + (n / 2) + 1024;
+    var dst = alloc(cap);
+    var clen = zlib_compress(src, n, dst, cap);
+    assert_gt(clen, 0, label);
+
+    var out_cap = n + 4096;
+    var out = alloc(out_cap);
+    var dlen = zlib_decompress(dst, clen, out, out_cap);
+    assert_eq(dlen, n, label);
+    assert_eq(memeq(out, src, n), 1, label);
+    return 0;
+}
+
+fn test_sankoch_zlib_large_object() {
+    test_group("sankoch zlib >1MiB block-boundary roundtrip");
+
+    _zlib_roundtrip_size(524288, "512 KiB roundtrips (under chunker boundary)");
+    _zlib_roundtrip_size(1048576, "1 MiB roundtrips (at chunker boundary)");
+    _zlib_roundtrip_size(2621440, "2.5 MiB roundtrips (crosses boundary twice)");
+    return 0;
+}
+
 fn test_patra_col_bytes_small() {
     test_group("patra COL_BYTES small roundtrip");
 
@@ -728,6 +781,7 @@ fn main() {
     test_blob_framing_git_compatible();
     test_hex_roundtrip();
     test_sankoch_zlib_roundtrip();
+    test_sankoch_zlib_large_object();
     test_patra_col_bytes_small();
     test_patra_col_bytes_overflow();
     test_ed25519_sign_verify_roundtrip();

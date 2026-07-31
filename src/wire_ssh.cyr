@@ -439,8 +439,17 @@ fn wire_ssh_close(h) {
     if (rfd > 0) { sys_close(rfd); }
     var pid = _ssh_handle_pid(h);
     if (pid > 0) {
+#ifndef CYRIUS_TARGET_AGNOS
+        # Reap the ssh child. Gated out on agnos for the same reason the
+        # spawn body in wire_ssh_open is: agnos has no fork/exec, so
+        # wire_ssh_open early-returns 0 there and no handle ever carries a
+        # pid — this branch is dead on that target. It still has to go
+        # textually, because agnos' sys_waitpid is 1-arg (`sys_waitpid(pid)`)
+        # against Linux's 3-arg (`pid, status_ptr, options`) and the arity
+        # check is static, not reachability-based. See ADR 0008.
         var status_buf[1];
         sys_waitpid(pid, &status_buf, 0);
+#endif
     }
     return 0;
 }

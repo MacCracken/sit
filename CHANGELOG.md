@@ -4,6 +4,188 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.5] — 2026-07-31 — sankoch `2.7.6` (>1 MiB object corruption) + cyrius `6.5.4` + AGNOS ssh-reap ABI
+
+Nominally a toolchain and dependency refresh, but the sankoch bump carries a
+**silent data-corruption fix that affects every sit release up to and including
+1.3.4**: a compressible object larger than 1 MiB could be written to the object
+store as a zlib stream that does not decode back to its input. See **Security**
+below — this is the reason to take this release. Cyrius `6.5.4` additionally promotes
+syscall-arity mismatches from a warning to a hard error, which caught the last
+Linux-shaped syscall in the ssh transport (`wire_ssh_close`'s child reap).
+
+No public-API change: both dist bundles are byte-identical to 1.3.4 apart from
+the version stamp, so downstream consumers (owl, thoth) are unaffected.
+**Linux/macOS behaviour is otherwise unchanged.**
+
+### Security
+- **Compressible objects larger than 1 MiB could be silently corrupted on write
+  (all releases ≤ 1.3.4).** sit compresses every object it stores through a
+  single call site —
+  `zlib_compress` at [`src/object_db.cyr:176`](src/object_db.cyr) — which routes
+  into sankoch's batch DEFLATE chunker. In sankoch ≤ 2.7.5 that chunker resumed
+  each 1 MiB block at `block_end` while the block encoder had legitimately
+  overshot it by up to `LZ77_MAX_MATCH` (258) bytes, so the overshoot was
+  encoded **twice**. The resulting stream decodes longer than the input and
+  fails its own checksum. Both Huffman paths were affected (sit compresses at
+  level 6, the dynamic path), so no level was a workaround. Fixed upstream in
+  **sankoch 2.7.6** — the chunker now resumes at where the encoder actually
+  stopped (`_deflate_block_reached`) and emits a closing empty final block when
+  the overshoot consumed the tail before any block carried `BFINAL`.
+
+  Verified by direct A/B repro against both pins (same program, same input,
+  `zlib_compress` → `zlib_decompress` → byte-compare):
+
+  | Input | sankoch 2.4.9 (1.3.4's pin) | sankoch 2.7.6 (1.3.5) |
+  |---|---|---|
+  | 512 KiB | OK roundtrip | OK roundtrip |
+  | 1 MiB exactly | OK roundtrip | OK roundtrip |
+  | 2.5 MiB | **decompress fails — corrupt** | OK roundtrip |
+
+  The threshold is *strictly greater than* 1 MiB (`DEFLATE_BLOCK_SIZE`): at
+  exactly 1 MiB the first block is already final and no second block is emitted.
+  Because sit compresses the *framed* object (`<type> <len>\0<content>`), the
+  practical trigger is a blob a few bytes under 1 MiB or larger. Commits and
+  trees are far below the threshold and were never affected.
+
+  The corruption is **data-dependent, not size-deterministic**: it requires an
+  LZ77 match that begins just below a block boundary and extends past it, so
+  incompressible content over 1 MiB (already-compressed archives, media,
+  encrypted blobs) stores and reads back fine, while compressible content of the
+  same size does not. A repo can therefore hold large files and still be clean —
+  run `fsck` rather than inferring from file sizes.
+
+  The defect is older than the 2.4.9 pin: the same `sp = block_end` chunker is
+  present in every sankoch sit has vendored back to the v0.8.x line, so any
+  release in roughly **v0.8.0 – v1.3.4** could produce it.
+
+  **Impact on existing repositories.** Corruption happened at *write* time, so
+  upgrading does not repair objects already on disk — a repo written by
+  sit ≤ 1.3.4 that ever committed a >1 MiB file still holds bad objects.
+  `sit fsck` detects them: `read_object` cannot decompress the stream, so each
+  is reported as `unreadable <hex>` on stderr and counted in the `bad` total.
+
+  ```bash
+  sit fsck
+  ```
+
+  If `fsck` reports `unreadable` objects, the affected blobs must be re-added
+  from the working tree (or re-fetched from a remote whose copy predates the
+  bug or was written by a fixed sit) — the compressed bytes carry no recoverable
+  copy of the lost content. Note that `fsck --prune` will **not** remove them:
+  it refuses to run when `bad > 0`, exactly to avoid deleting around corruption.
+
+### Changed
+- **Cyrius toolchain `6.4.25 → 6.5.4`** (`cyrius.cyml [package].cyrius`) — the
+  current 6.5.x line; clears the manifest-vs-wrapper pin drift. Two knock-on
+  effects on sit's build, both improvements:
+  - **Syscall-arity checking is now a hard error**, not a warning. This is what
+    caught the `sys_waitpid` bug below — under `6.4.25` the `--agnos` build
+    emitted a warning and produced a binary with a miscompiled call.
+  - **`lib/thread.cyr` no longer defines `mutex_*`** — `sync` is now the sole
+    owner (6 definitions). The three benign
+    `duplicate fn 'mutex_*' (last definition wins)` warnings sit had carried
+    since the `sync` pull-in are **gone**. `thread` still cannot be dropped from
+    `[deps].stdlib`: sigil references `thread_join` (parallel-hash path) and
+    sandhi references the channel machinery (`chan_new` / `chan_send`). The
+    stale rationale comment in `cyrius.cyml` was rewritten to match.
+  - `cyrius.lock` re-resolved: **105 → 65 deps locked** (4 commit-pinned). The
+    6.5 line no longer over-pulls stdlib transitives; sit's `[deps].stdlib` list
+    is unchanged and every consumed symbol still resolves.
+- **Dependency refresh — all git-crate pins to latest:**
+  - **sankoch `2.4.9 → 2.7.6`** — a three-minor jump (2.5 / 2.6 / 2.7 lines)
+    through git's compression layer, carrying the >1 MiB corruption fix in
+    **Security** above. sit's consumed surface is three symbols
+    (`zlib_compress`, `zlib_decompress`, `ERR_BUFFER_TOO_SMALL`); none changed
+    arity, and the public API is additive across all three minors (new zstd /
+    tar / ZIP containers sit does not use). Two behavioural changes worth
+    noting even though they are off sit's path: xz streams with
+    `--check=sha256` now fail closed with `ERR_UNSUPPORTED_FORMAT` (2.5.9), and
+    `zstd_decompress` now decodes all frames of a concatenated `.zst` rather
+    than returning frame 1 as success (2.5.10). One change *does* newly reach
+    sit: 2.5.10 extended sankoch's 16 MiB `DECOMPRESS_MAX_OUTPUT` ceiling to
+    cover stored (uncompressed) DEFLATE blocks. Eight of sit's nine
+    `zlib_decompress` sites already cap their destination at exactly 16 MiB and
+    hit the buffer check first, so they are unaffected; the three in
+    [`src/git_pack.cyr`](src/git_pack.cyr) size their buffer from the pack
+    header instead, so a **git packfile object over 16 MiB built from stored
+    blocks** now fails closed with `-ERR_OUTPUT_LIMIT` where 2.4.9 decoded it.
+    Huffman-coded objects that large already failed this way, so this only
+    closes the stored-block loophole — it is a clean read failure, never
+    corruption, and needs no code change. `_PACK_MAX_OBJ` (256 MiB) gained a
+    comment recording that sankoch's 16 MiB ceiling, not it, is the effective
+    bound. Compression is marginally faster, decompression flat — see the
+    benchmark table below.
+  - **sigil `3.10.0 → 3.12.2`** — sit's consumed surface is ten symbols
+    (`hash_data`, `hex_encode`, `hex_decode`, `hex_decode_into`, `hex_is_valid`,
+    the four ed25519 verbs, and `pem_decode_certs` for `serve --tls`), all
+    unchanged in arity across all 45 call sites. The range's security fixes
+    (authenticode byte-range, PE-parser hardening, a 144-byte leak) are entirely
+    off sit's path. **3.12.1 requires cyrius ≥ 6.4.65**, cleared by the pin
+    above, and moves sigil's crypto-bank off hardcoded thread-local slot 8 —
+    permanently closing a collision class with patra (slots 0–4) that sit was
+    uniquely exposed to by linking both. SHA-256 known-answer and ed25519
+    sign/verify roundtrip tests pass unchanged; `key generate` → `commit -S` →
+    `verify-commit` verified end-to-end.
+  - **patra `1.12.9 → 1.12.12`** — object-store patch refresh; both `COL_BYTES`
+    roundtrip tests (small + overflow-page) pass unchanged.
+  - **sakshi `2.4.4 → 2.4.7`** — test-harness patch refresh, no public-surface
+    impact for sit.
+  Both dist profiles regenerated at 1.3.5 (`dist/sit.cyr` 13,697 lines,
+  `dist/sit-read.cyr` 8,806 lines); the `serve_build_capabilities()` version
+  stamp tracks VERSION (`"sit":"1.3.5"`).
+- **`[deps].stdlib` gains `thread_local`.** sigil (≥ 3.12.1, crypto-bank slot)
+  and patra (1.12.12, which migrated its five thread-local slots off hardcoded
+  indices) both now call `thread_local_alloc` / `_get` / `_set` on hot paths.
+  cyrius 6.5.4 resolves the module transitively, so this is declaration hygiene
+  rather than a live fix — but an undeclared module of this class fails at
+  *runtime*, not build time, which is exactly how the missing `random` module
+  made `sit key generate` SIGILL (exit 132) at v1.0.2. Declared rather than left
+  to the transitive arc; `key generate` → `commit -S` → `verify-commit` verified.
+
+### Added
+- **`test_sankoch_zlib_large_object`** (`tests/sit.tcyr`) — pins sankoch's 1 MiB
+  `DEFLATE_BLOCK_SIZE` chunker boundary with 512 KiB / 1 MiB / 2.5 MiB
+  compress → decompress → byte-compare roundtrips. The pre-existing zlib
+  roundtrip group compresses an 88-byte string and never reaches the chunker,
+  which is why the corruption above survived to 1.3.4. Confirmed to **fail
+  against sankoch 2.4.9 and pass against 2.7.6** using the same fill pattern, so
+  it is a genuine regression test rather than a tautology. Unit assertions
+  273 → 282.
+
+### Fixed
+- **AGNOS ssh-reap ABI: `wire_ssh_close` called `sys_waitpid` with the Linux
+  3-argument shape.** agnos declares `sys_waitpid(pid)` (1 arg) against Linux's
+  `sys_waitpid(pid, status_ptr, options)` (3 args), so
+  `sys_waitpid(pid, &status_buf, 0)` was wrong on that target. v1.3.3 gated the
+  ssh **spawn** path (`fork` / `exec` / `access`) out of the `--agnos` build but
+  the **reap** in `wire_ssh_close` sits after that `#endif` and was missed. The
+  call is dead code on agnos — `wire_ssh_open` early-returns `0` there, so no
+  handle ever carries a pid — but the arity check is *static*, not
+  reachability-based, so it has to go textually. Wrapped the reap in
+  `#ifndef CYRIUS_TARGET_AGNOS`, matching the gating style `wire_ssh_open`
+  already uses. Completes the AGNOS syscall-ABI sweep started in 1.3.3 (ssh
+  spawn) and continued in 1.3.4 (FS syscalls). **Linux behaviour byte-identical**
+  — the `#ifndef` removes code only on agnos. `cyrius build --agnos` → OK, and
+  `CYRIUS_DCE=1 cyrius build --agnos` → OK.
+
+### Verification
+- 282 unit / 58 integration pass, 0 failed; `cyrius run tests/sit.fcyr` reports
+  no crashes across all seven harnesses (including `want_frame_decoder` at 10M
+  rounds); `cyrius audit` green.
+- `cyrius build --agnos` and `CYRIUS_DCE=1 cyrius build --agnos` both OK.
+- `dist/sit.cyr` / `dist/sit-read.cyr` diff vs 1.3.4 is **three lines** — two
+  `# Version:` headers and the capabilities stamp. No public-API change.
+- Benchmarks (`cyrius bench`), against the last recorded runs — the compression
+  and hashing paths are the ones the sankoch/sigil bumps touch:
+
+  | Benchmark | Prior | 1.3.5 | Delta |
+  |---|---|---|---|
+  | `zlib-compress-65536B` | 1.158 ms (v0.6.12) | 1.110 ms | ~4% faster |
+  | `zlib-decompress-65536B` | 346 µs (v0.6.12) | 348.8 µs | flat (noise) |
+  | `sha256-65536B` | 195 µs (v0.9.0) | 194.5 µs | flat |
+  | `blob-hash-1048576B` | 5.189 ms (v0.9.0) | 5.129 ms | flat |
+
 ## [1.3.4] — 2026-07-08 — AGNOS FS-syscall ABI + cyrius `6.4.25` + dep refresh
 
 Makes sit's low-level filesystem operations ABI-correct on AGNOS (they compiled
