@@ -487,6 +487,13 @@ fn build_merge_commit_signed(tree_hex, p1_hex, p2_hex, message, seed) {
     var email = getenv("SIT_AUTHOR_EMAIL");
     if (email == 0) { email = config_get("user.email"); }
     if (email == 0) { email = "user@localhost"; }
+    # S-27: strip ident crud (control bytes, `<`, `>`) BEFORE the object is
+    # framed — a newline here forges a header line in the commit body.
+    # Re-fall-back if sanitizing emptied the field entirely.
+    name = ident_sanitized(name);
+    email = ident_sanitized(email);
+    if (strlen(name) == 0) { name = "sit user"; }
+    if (strlen(email) == 0) { email = "user@localhost"; }
     var ts = clock_epoch_secs();
 
     var name_len = strlen(name);

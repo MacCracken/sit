@@ -19,6 +19,13 @@ fn build_commit_signed(tree_hex, parent_hex, message, seed) {
     var email = getenv("SIT_AUTHOR_EMAIL");
     if (email == 0) { email = config_get("user.email"); }
     if (email == 0) { email = "user@localhost"; }
+    # S-27: strip ident crud (control bytes, `<`, `>`) BEFORE the object is
+    # framed — a newline here forges a header line in the commit body.
+    # Re-fall-back if sanitizing emptied the field entirely.
+    name = ident_sanitized(name);
+    email = ident_sanitized(email);
+    if (strlen(name) == 0) { name = "sit user"; }
+    if (strlen(email) == 0) { email = "user@localhost"; }
     var ts = clock_epoch_secs();
 
     var name_len = strlen(name);
@@ -869,22 +876,9 @@ fn cmd_log() {
     # Shallow-clone awareness (v0.8.12): `.sit/shallow` lists boundary
     # commits whose parents were not fetched. When the walk reaches one,
     # stop cleanly instead of erroring on the absent parent object.
-    var shallow = map_new();
-    if (sf_exists(".sit/shallow") == 1) {
-        var spair[16];
-        if (read_file_heap(".sit/shallow", &spair) == 0) {
-            var sbuf = load64(&spair);
-            var slen = load64(&spair + 8);
-            var sp = 0;
-            while (sp + 64 <= slen) {
-                var hh = alloc_or_die(65);
-                memcpy(hh, sbuf + sp, 64);
-                store8(hh + 64, 0);
-                map_set(shallow, hh, 1);
-                sp = sp + 65;
-            }
-        }
-    }
+    # S-27: shared with fsck's walk — `load_shallow_set` lives in object_db.cyr
+    # (earlier in the include chain). This was an inline duplicate of it.
+    var shallow = load_shallow_set();
 
     var first = 1;
     var shown = 0;

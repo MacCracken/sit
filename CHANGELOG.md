@@ -4,6 +4,87 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-08-18 — `fsck` reports missing objects; commit identities can't forge headers
+
+Two integrity fixes that belong together: one manufactures a corrupt repository,
+the other is why sit couldn't see it.
+
+**Why this is a minor and not a patch**: `fsck` gains a new output line
+(`missing <oid>`) and, more importantly, **now exits non-zero on a repository it
+previously called clean**. That is an observable behaviour change — a CI job
+running `sit fsck` on an already-broken repo will start failing, correctly.
+Nothing else changes; there is no new command, flag, or API symbol.
+
+> The `1.4.0` slot was previously pencilled in for annotated & signed tags. That
+> themed line shifts down one (tags → `1.5.0`, history tools → `1.6.0`, TLS trust
+> → `1.7.0`, wider merge → `1.8.0`); see [the roadmap](docs/development/roadmap.md).
+
+### Fixed
+
+- **`fsck` did not report a MISSING object.** It enumerated only objects that are
+  **in** the store, flagging unreadable ones as `unreadable <hex>`. An object
+  that is simply **absent** — a commit whose `parent` or `tree` names an oid the
+  store does not contain — was never enumerated at all, and
+  `fsck_walk_reachable` silently skipped what it could not read. The canonical
+  broken-repo shape therefore reported **`0 bad, 0 dangling`** and exited 0.
+
+  The walk now records referents it cannot resolve and `cmd_fsck` splits them:
+  present in the store → already reported `unreadable` by the integrity pass
+  (not double-counted); absent → reported as **`missing <oid>`** and counted
+  toward `bad`, which also makes the existing `--prune` tripwire cover it (
+  pruning a repo that is already missing objects would compound the damage).
+
+  ⚠ **Shallow clones are exempt, and the test suite is what said so.** A
+  `clone --depth N` boundary commit's parents are absent *by design*; the first
+  cut of this change reported them as missing and the existing `--depth 1`
+  scenario failed immediately. `.sit/shallow` is now consulted during the walk,
+  matching how git treats `.git/shallow`.
+- **A newline in a commit identity forged a header line in the object.**
+  `write_sanitized` guards every *display* path (S-21), but the commit and merge
+  builders memcpy the author/committer name and email straight into the object
+  body, where the ident line is `author <NAME> <<EMAIL>> <ts> +0000\n`. Verified:
+  `SIT_AUTHOR_NAME=$'evil\nparent <64-hex>'` produced a commit object carrying a
+  **fabricated `parent`** — two of them, author and committer — which every
+  downstream parent walk then believes. And because that forged parent doesn't
+  exist, `fsck` called the repo clean; the two fixes in this release are the same
+  bug seen from both ends.
+
+  New `ident_sanitized()` drops control bytes (including NL/CR) plus the `<` and
+  `>` that delimit the email, before framing — mirroring git's ident "crud"
+  removal — with a re-fallback if sanitizing empties the field.
+
+  ⚠ **Scope is narrower than it looks and the fix is not urgent**: the
+  `.sit/config` route was already closed, because the config parser is
+  line-based and `user.name` can never carry a newline. The live vector is the
+  `SIT_AUTHOR_NAME` / `SIT_AUTHOR_EMAIL` environment variables — self-inflicted.
+  Fixed anyway, because a forged parent is repository corruption regardless of
+  who caused it, and "the parser happens to stop it" is not a guarantee.
+
+### Changed
+
+- **`load_shallow_set()` extracted** to `object_db.cyr` (earlier in the include
+  chain, so the single-pass dist bundle stays forward-only). `cmd_log` had an
+  inline copy of the same loader; it now shares this one.
+- **Toolchain pin `6.5.24` → `6.5.26`** (latest published; clears the
+  manifest-vs-wrapper drift warning). Source needed no change to build or pass,
+  and the tree is already clean under the 6.5.26 formatter. Since 1.3.6 this pin
+  is the **single lever for every dependency**, so it also confirms the folded
+  set: sakshi `2.4.10`, sankoch `2.7.7`, sigil `3.12.9`, patra `1.13.0` — all
+  four resolve byte-identical to the snapshot.
+
+  ⚠ **sankoch `2.7.8` is deliberately NOT here.** It was cut in this same
+  session but is not yet folded into a cyrius release, and the pin can only
+  select what the snapshot ships. Nothing in 2.7.8 affects sit — it is a
+  toolchain catch-up with zero source change, ten byte-identical bundles — so
+  there is nothing to wait for; sit picks it up on the next fold.
+
+### Added
+
+- **`tests/integration/run.sh` scenario 13** — five assertions. The three that
+  pin the new behaviour all fail against a pre-fix binary: the forged-parent
+  check finds **2** injected lines, `fsck` prints no `missing`, and it exits
+  **0**. The shallow-exemption assertion passes on both, as a don't-regress guard.
+
 ## [1.3.9] — 2026-08-18 — the deferred findings, closed
 
 Clears the entire deferred queue from the 2026-08-18 deep audit. 1.3.8 shipped

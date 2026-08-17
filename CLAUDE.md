@@ -185,7 +185,7 @@ Run a closeout pass before tagging `X.Y.0` or `X.0.0`. Ship as the last patch of
 - [`docs/architecture/`](docs/architecture/) — non-obvious constraints and quirks a reader can't derive from the code. **Skim this before writing new code** — e.g. [001](docs/architecture/001-args-stack-buffer-lifetime.md) documents a stdlib `args.cyr` lifetime hazard that silently affects any `argv(n)` usage.
 - [`docs/guides/`](docs/guides/) — task-oriented how-tos. [Getting started](docs/guides/getting-started.md) covers build + every shipped command.
 - [`docs/examples/`](docs/examples/) — runnable examples. [`local-vcs-loop/`](docs/examples/local-vcs-loop/) is the canonical end-to-end walkthrough.
-- [`docs/development/roadmap.md`](docs/development/roadmap.md) — released work + forward-looking backlog. Single source of truth for what sit is doing next.
+- [`docs/development/roadmap.md`](docs/development/roadmap.md) — **forward-looking backlog only**. Single source of truth for what sit does next. Items are grouped by *kind of work*, not by version number (version-keyed headings rot the moment a release ships); only the themed minor line carries versions, because those are scope commitments. **When an item ships, delete it** — CHANGELOG is the record, and struck-through entries are not.
 - [`docs/development/state.md`](docs/development/state.md) — live state snapshot, refreshed every release.
 - [`CHANGELOG.md`](CHANGELOG.md) — tagged-release source of truth for all changes.
 

@@ -449,6 +449,46 @@ printf 'content\n' > x.txt; "$SIT" add x.txt >/dev/null; "$SIT" commit -m one >/
 assert_contains "$("$SIT" fsck)" "0 bad" "baseline fsck clean before prune check"
 assert_eq "$("$SIT" fsck --prune-now >/dev/null 2>&1; echo $?)" "0" "fsck --prune-now succeeds on a well-formed repo"
 
+# ── 13. S-27 regressions (1.4.0 integrity) ─────────────────────────
+hr "S-27 regressions (fsck missing + ident sanitization)"
+
+# 13a. A newline in SIT_AUTHOR_NAME forged a `parent` header line in the commit
+# object — verified pre-fix — and fsck then called the repo clean. Identity
+# components are now stripped of control bytes and `<`/`>` before framing.
+R="$WORK/s27ident"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+FORGED="1111111111111111111111111111111111111111111111111111111111111111"
+printf 'x\n' > f.txt; "$SIT" add f.txt >/dev/null
+SIT_AUTHOR_NAME="$(printf 'evil\nparent %s' "$FORGED")" "$SIT" commit -m one >/dev/null 2>&1
+IDH=$(tr -d '\n' < .sit/refs/heads/main)
+assert_eq "$("$SIT" cat-file "$IDH" | grep -c "^parent $FORGED")" "0" \
+  "newline in author name cannot forge a parent header"
+assert_contains "$("$SIT" fsck)" "0 bad" "repo written with a hostile ident is still structurally clean"
+
+# 13b. fsck must REPORT a referent that is absent from the store. Previously an
+# object not in the store was never enumerated and the walk silently skipped it,
+# so this exact shape reported `0 bad, 0 dangling` and exited 0.
+R="$WORK/s27missing"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'y\n' > g.txt; "$SIT" add g.txt >/dev/null; "$SIT" commit -m base >/dev/null
+# Hand-write a HEAD pointing at a commit id that was never stored.
+printf '%s\n' "$FORGED" > .sit/refs/heads/main
+MISSOUT=$("$SIT" fsck 2>&1); MISSRC=$?
+assert_contains "$MISSOUT" "missing $FORGED" "fsck reports an absent referent as missing"
+assert_eq "$MISSRC" "1" "fsck exits non-zero when an object is missing"
+
+# 13c. A shallow clone's boundary parents are absent BY DESIGN and must NOT be
+# reported — this is the distinction that makes 13b safe. Covered by the
+# `--depth 1` scenario above; asserted here as an explicit pairing.
+R="$WORK/s27shallow"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf '1\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c1 >/dev/null
+printf '2\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c2 >/dev/null
+cd "$WORK"; "$SIT" clone --depth 1 "file://$WORK/s27shallow" s27sc >/dev/null 2>&1
+cd "$WORK/s27sc" 2>/dev/null && {
+  assert_contains "$("$SIT" fsck)" "0 bad" "shallow boundary parents are not reported missing"
+}
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
