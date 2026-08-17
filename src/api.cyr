@@ -43,12 +43,24 @@ fn sit_repo_open(cwd) {
     # .git/ repo at the cwd; _detect_repo_backend sets the process-global backend
     # that read_object / read_head_ref / resolve_ref_name dispatch on. Returns -1
     # when neither store is present.
-    if (_detect_repo_backend() < 0) { return 0; }
-    # Set the repo root so subsequent reads resolve on agnos (which has no
-    # cwd). Linux stays BYTE-IDENTICAL: consumers pass "." and sit_abs
-    # treats a "." root as no-prefix (and an absolute root only prefixes
-    # repo-relative paths). A non-"." absolute cwd enables agnos resolution.
+    # S-26: set the repo root BEFORE probing for the backend.
+    #
+    # `_detect_repo_backend` probes via `sf_exists(".sit/HEAD")` /
+    # `sf_exists(".git/HEAD")`, and `sf_exists` resolves through `sit_abs`,
+    # which needs the root. Detecting first meant the probe ran against the
+    # PROCESS cwd while every later read resolved against `cwd` — so a consumer
+    # passing a real path (rather than ".") detected the backend of whatever
+    # directory the process happened to be in. Invisible on Linux today because
+    # every in-tree consumer passes "." (which sit_abs treats as no-prefix), and
+    # exactly the case AGNOS needs, since it has no cwd at all.
+    #
+    # On failure the root is cleared again so a rejected open leaves no state
+    # behind for the next call.
     sit_set_repo_root(cwd);
+    if (_detect_repo_backend() < 0) {
+        sit_set_repo_root(0);
+        return 0;
+    }
     return 1;
 }
 

@@ -234,6 +234,11 @@ fn read_merge_head() {
     var n = file_read(fd, buf, 80);
     file_close(fd);
     if (n < 64) { return 0; }
+    # S-26: `.sit/MERGE_HEAD` is on-disk state that can arrive from outside the
+    # process (a repo handed over mid-merge, a restored backup). Its 64 bytes are
+    # memcpy'd verbatim into a commit's `parent` header, so gate them as hex the
+    # way every other ref consumer does rather than trusting the file.
+    if (hex_prefix_valid(buf, 64) == 0) { return 0; }
     store8(buf + 64, 0);
     return buf;
 }
@@ -781,7 +786,19 @@ fn cmd_merge() {
             ensure_parent_dirs(mpath);
             var mp[16];
             if (read_blob_content(mhex, &mp) == 0) {
-                sf_write_all(mpath, load64(&mp), load64(&mp + 8));
+                # S-26: this is the CONFLICT path — the auto-merged files are
+                # written alongside the conflict-marker ones, and the command
+                # then exits non-zero telling the user to resolve. A silently
+                # dropped write here leaves a cleanly-merged file at its OLD
+                # content while the user is told only that OTHER paths
+                # conflicted, so they resolve those, commit, and lose this
+                # file's merge without ever seeing an error. Mirrors the S-16
+                # return-checking the clean-merge path at :299 already does.
+                if (sf_write_all(mpath, load64(&mp), load64(&mp + 8)) < 0) {
+                    syscall(SYS_WRITE, STDERR, "sit: cannot write auto-merged file '", 36);
+                    syscall(SYS_WRITE, STDERR, mpath, strlen(mpath));
+                    syscall(SYS_WRITE, STDERR, "' — resolve manually before committing\n", 39);
+                }
             }
             mi = mi + 1;
         }

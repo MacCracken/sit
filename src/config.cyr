@@ -367,7 +367,13 @@ fn cmd_config() {
         if (global == 1) { val = config_file_get(path, key); }
         else             { val = config_get(key); }
         if (val == 0) { return 1; }
-        stdout_write(val, strlen(val));
+        # S-26: scrub control bytes before echoing to the terminal. `sit config`
+        # writes go through config_value_valid, but a config file can arrive
+        # from outside the process (cloned repo, tarball, shared checkout), so
+        # the value READ back is not necessarily one sit wrote. Same defence
+        # S-21 already applies to commit author identities.
+        stdout_flush();
+        write_sanitized(STDOUT, val, strlen(val));
         stdout_write("\n", 1);
         return 0;
     }

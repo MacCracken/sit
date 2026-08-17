@@ -24,22 +24,11 @@ Nothing below blocks anything else; the ordering is a recommendation, not a cont
 Consumption, hardening, and deferred no-surface work. The deps **already ship every symbol below**; what remains is the *wiring*. As of 1.3.6 there are no dep pins to bump — sakshi / sankoch / sigil / patra are `[deps].stdlib` leaves and the `cyrius` pin in `[package]` selects all four (see [`state.md`](state.md#dependencies-current-versions) for why the git blocks were removed and must not return).
 
 - **Wire patra `patra_insert_row_or_ignore` (P-11).** Available (patra 1.12.6+ ships it; 1.13.0 current). Route `db_object_insert_raw` through the or-ignore insert so `sit add` upserts the index without a full rewrite and drops the inner `db_object_has` probe — one B+ tree op per object on clone / push / add instead of two.
-- **The ten deferred findings from the 2026-08-18 deep audit** *(carried; see
-  [`docs/audit/2026-08-18-audit.md`](../audit/2026-08-18-audit.md) § Deferred).*
-  Every CRITICAL and HIGH from that audit shipped in 1.3.8; these are the
-  confirmed MEDIUM/LOW remainder, none memory-safety. Highest value first:
-  `lcs_diff`'s per-dimension guard fires before the cell-count check, so sit
-  **refuses to diff any add/delete of a >8192-line file** (functional, users hit
-  this); `fsck --prune-now` can delete reachable objects when `parse_tree`
-  silently drops a malformed entry; `sit_repo_branch` hands raw unsanitized
-  `.git/HEAD` bytes (control/ANSI) to owl and thoth; the wire commit-chain walk
-  has no allocation cap; object ids from commit bodies reach the *remote-handle*
-  SQL path, which does not pass through the `read_object` gate added in 1.3.8;
-  `sit_repo_open` detects the backend before setting the repo root; `git_pack`
-  has two raw `is_dir()` calls bypassing the `sit_abs` seam (AGNOS-relevant);
-  plus four LOWs (`group_hunks` `2 * ctx` overflow, `-U0` spurious context line,
-  config values echoed without control-char sanitization, `ssh_remote_read_raw`
-  missing its HTTP sibling's validation).
+- ~~**The ten deferred findings from the 2026-08-18 deep audit**~~ — **all
+  closed in 1.3.9.** The audit backlog is empty; see the CHANGELOG entry for
+  what each turned out to be. One (`sit_repo_branch` control/ANSI bytes) needed
+  no new code — the `refname_valid` gate added in 1.3.8 already covered it,
+  verified rather than assumed.
 - **Memoize `_wildmatch`** *(carried from the 2026-08-18 audit).* 1.3.8 bounded
   the catastrophic backtracking with a per-match step budget, which fixes the
   DoS but leaves the matcher worst-case exponential. The real fix is memoization

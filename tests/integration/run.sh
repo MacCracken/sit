@@ -409,6 +409,46 @@ timeout 20 "$SIT" config dup.key "$BIGVAL" >/dev/null 2>&1
 assert_eq "$?" "0" "config set with many duplicate keys succeeds"
 assert_eq "$("$SIT" config dup.key)" "$BIGVAL" "config value round-trips after duplicate-key rewrite"
 
+# ── 12. S-26 regressions (deferred-findings sweep) ─────────────────
+hr "S-26 regressions (deferred-findings sweep)"
+
+# 12a. MEDIUM: lcs_diff's per-dimension 8192 guard fired before the cell-count
+# test, so adding or deleting a file of >8192 lines was pushed to the Myers
+# fallback, whose edit-distance cap cannot represent it — sit printed a header
+# and ZERO content lines. The table is 1 x (n+1) here: ~64 KB, trivially fine.
+R="$WORK/s26diff"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'seed\n' > seed.txt; "$SIT" add seed.txt >/dev/null; "$SIT" commit -m seed >/dev/null
+awk 'BEGIN{for(i=1;i<=8193;i++) print "line " i}' > big.txt
+"$SIT" add big.txt >/dev/null; "$SIT" commit -m big >/dev/null
+assert_eq "$("$SIT" show | grep -c '^+line')" "8193" "8193-line file addition diffs in full (was 0 lines)"
+
+# 12b. LOW: -U0 emitted a spurious leading context line on every hunk after the
+# first, because the hunk-close path pushed into `pending` without the ctx trim.
+R="$WORK/s26u0"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+awk 'BEGIN{for(i=1;i<=40;i++) print "L" i}' > f.txt
+"$SIT" add f.txt >/dev/null; "$SIT" commit -m base >/dev/null
+awk 'BEGIN{for(i=1;i<=40;i++){ if(i==6) print "CHANGED6"; else if(i==31) print "CHANGED31"; else print "L" i}}' > f.txt
+"$SIT" add f.txt >/dev/null; "$SIT" commit -m edit >/dev/null
+assert_eq "$("$SIT" show -U0 | grep '^@@' | tr '\n' ' ')" "@@ -6 +6 @@ @@ -31 +31 @@ " \
+  "-U0 emits zero context (matches GNU diff -U0)"
+
+# 12c. LOW: `-U<N>` was unbounded, so ctx >= 2^62 overflowed `2 * ctx` negative
+# and the trim loop spun ~4.6e18 times.
+timeout 20 "$SIT" show -U4611686018427387904 >/dev/null 2>&1
+assert_eq "$?" "0" "huge -U<N> does not hang (2*ctx overflow)"
+
+# 12d. MEDIUM: parse_tree silently drops entries with a non-allowlisted mode,
+# so their objects were invisible to fsck's reachability walk, reported
+# dangling, and DELETED by --prune-now while a live tree still referenced them.
+# fsck must now refuse to prune when a reachable tree has unparseable entries.
+R="$WORK/s26fsck"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'content\n' > x.txt; "$SIT" add x.txt >/dev/null; "$SIT" commit -m one >/dev/null
+assert_contains "$("$SIT" fsck)" "0 bad" "baseline fsck clean before prune check"
+assert_eq "$("$SIT" fsck --prune-now >/dev/null 2>&1; echo $?)" "0" "fsck --prune-now succeeds on a well-formed repo"
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -982,6 +982,9 @@ fn cmd_fsck() {
     # Reachability pass (v0.8.5). Refs/HEAD roots first (count retained for
     # the prune corrupt-roots tripwire), then reflog roots appended (v1.1.0).
     var seen = map_new();
+    # S-26: parse_tree silently discards entries with a bad mode or unsafe name,
+    # so their objects are never enqueued below. Track that across the walk.
+    tree_dropped_reset();
     var roots = fsck_collect_roots();
     var ref_root_count = vec_len(roots);
     fsck_collect_reflog_roots(roots);
@@ -1048,6 +1051,18 @@ fn cmd_fsck() {
         # reflog to recover them. Refuse while any object is bad/unreadable.
         if (bad > 0) {
             eprintln("sit: refusing --prune with bad/unreadable objects — resolve integrity first");
+            return 1;
+        }
+        # S-26: the same data-loss shape, one level down. An UNREADABLE object
+        # orphans its subgraph (guarded above); an object that reads fine but
+        # whose tree body carries an entry parse_tree discards — a non-allowlisted
+        # mode like 100755, or a name like `.git` — orphans that entry's blob or
+        # subtree just as thoroughly, while `bad` stays 0 and the walk reports it
+        # as merely `dangling`. Pruning then deleted an object a live tree still
+        # references. A malformed tree is structural corruption; refuse.
+        if (tree_dropped_count() > 0) {
+            eprintln("sit: refusing --prune — a reachable tree has unparseable entries (bad mode or unsafe name)");
+            eprintln("sit:   their objects cannot be proven reachable and would be deleted while still referenced");
             return 1;
         }
         # If EVERY object is unreachable, the roots are almost certainly broken

@@ -123,6 +123,14 @@ fn build_tree(entries, prefix_len) {
 # Parse .sit/HEAD. If symbolic (`ref: refs/heads/<branch>\n`), returns the
 # ref path (heap cstring, e.g. "refs/heads/main"). Returns 0 on missing HEAD,
 # detached (raw hex), or malformed content.
+# S-26: count of tree entries `parse_tree` silently discarded (bad mode or
+# unsafe name). fsck resets this before its walk and treats a non-zero value as
+# structural corruption, because a discarded entry's object is invisible to the
+# reachability walk and would otherwise be pruned while still referenced.
+var _tree_dropped_entries = 0;
+fn tree_dropped_reset() { _tree_dropped_entries = 0; return 0; }
+fn tree_dropped_count() { return _tree_dropped_entries; }
+
 fn tree_entry_mode(e) { return load64(e); }
 fn tree_entry_name(e) { return load64(e + 8); }
 fn tree_entry_hash(e) { return load64(e + 16); }
@@ -163,8 +171,25 @@ fn parse_tree(body, body_len) {
                     # S-03: reject tree entries whose mode isn't allowlisted or
                     # whose name would let an attacker escape the working tree.
                     # Silent drop here means a malicious subtree is treated as
-                    # empty — materialize_target won't act on it, and fsck will
-                    # flag the mismatch on the outer tree's hash-of-bytes.
+                    # empty — materialize_target won't act on it.
+                    #
+                    # S-26: the drop must not stay silent for FSCK. A dropped
+                    # entry is never enqueued by fsck_walk_reachable, so the
+                    # blob or subtree it names is reported `dangling` even though
+                    # a live tree still references it — and `fsck --prune-now`
+                    # then DELETED it, breaking clone/checkout of that history
+                    # with no reflog recovery path. Neither existing tripwire
+                    # caught it: `bad` stayed 0 (both objects read fine) and the
+                    # all-unreachable check does not apply.
+                    #
+                    # Reachable without local access: `_serve_rehash_and_insert`
+                    # validates framing, type and SHA-256 but never parses a tree
+                    # body, so a pushed tree carrying e.g. a `100755` entry is
+                    # accepted, and its blob with it.
+                    #
+                    # The counter lets fsck treat "this tree has entries I could
+                    # not parse" as a structural defect and refuse to prune.
+                    var kept = 0;
                     if (tree_entry_mode_valid(mode) == 1) {
                         if (tree_entry_name_valid(name) == 1) {
                             var hash_hex = hex_encode(body + nu + 1, rawlen);
@@ -173,8 +198,10 @@ fn parse_tree(body, body_len) {
                             store64(e + 8, name);
                             store64(e + 16, hash_hex);
                             vec_push(entries, e);
+                            kept = 1;
                         }
                     }
+                    if (kept == 0) { _tree_dropped_entries = _tree_dropped_entries + 1; }
                     pos = nu + 1 + rawlen;
                 }
             }

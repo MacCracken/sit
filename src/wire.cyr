@@ -111,6 +111,12 @@ fn db_object_has(db, hex) {
 # Read compressed bytes + type code from an opened db by hex.
 # Layout at out: 0..8 = compressed_ptr, 8..16 = clen, 16..24 = ty.
 fn db_object_read_raw(db, hex, out) {
+    # S-26: gate the id before it becomes a SQL literal. 1.3.8 closed this in
+    # `read_object` (the local-store path), but the wire layer talks to a
+    # SEPARATE patra handle and never went through that gate — so an id lifted
+    # from a remote's commit body reached this literal unvalidated, and the
+    # unconditional 64-byte memcpy made a shorter string an out-of-bounds read.
+    if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
     var sql = alloc(128);
     memcpy(sql, "SELECT content, ty FROM objects WHERE hash = '", 46);
     memcpy(sql + 46, hex, 64);
@@ -374,6 +380,12 @@ var _wire_walk_depth = 0;
 # (not params) so the four walk_reachable_phased call sites stay unchanged —
 # same idiom as `_wire_walk_depth`.
 var _wire_clone_depth = 0;
+
+# S-26: ceiling on objects enumerated by one clone / fetch / push. The remote
+# controls the graph and nothing is freed mid-walk, so an advertised synthetic
+# history would otherwise allocate without bound. 10M is above the whole Linux
+# kernel repository's object count; a legitimate transfer never approaches it.
+var SIT_MAX_WIRE_OBJECTS = 10000000;
 var _wire_shallow_boundary = 0;
 
 # Helper: store a copy of a 24-byte raw struct into the cache, keyed by hex.
@@ -435,7 +447,21 @@ fn walk_reachable_phased(src, root_hex, out, seen, raw_cache) {
     store8(hex_copy + 64, 0);
     vec_push(queue, hex_copy);
     vec_push(qdepth, 0);
+    # S-26: cap the objects one clone/fetch may enumerate.
+    #
+    # A REMOTE controls the commit graph this walks, and every visited id is
+    # retained in `seen`, `out` and `raw_cache` for the life of the operation —
+    # nothing is freed mid-walk. A hostile server advertising a synthetic
+    # history therefore drives unbounded allocation on the client with no
+    # ceiling but the machine's memory. The shallow-clone depth cap only applies
+    # when `--depth` was passed.
+    var visited = 0;
     while (vec_len(queue) > 0) {
+        visited = visited + 1;
+        if (visited > SIT_MAX_WIRE_OBJECTS) {
+            eprintln("sit: remote history exceeds the transfer object limit — refusing");
+            return 0 - 1;
+        }
         var cur = vec_get(queue, vec_len(queue) - 1);
         var cdep = vec_get(qdepth, vec_len(qdepth) - 1);
         vec_pop(queue);
@@ -1036,7 +1062,10 @@ fn do_fetch(name, branch) {
     # For OBJ_SRC_DB the batch hooks are no-ops so the work degrades to
     # the same SQL reads in slightly different order.
     var raw_cache = map_new();
-    walk_reachable_phased(src, remote_tip, hashes, seen, raw_cache);
+    # S-26: a walk that hit the object cap returns -1 with a partial `hashes`.
+    # Proceeding would copy that partial set and then move the ref, producing a
+    # repo whose tip has missing ancestors — worse than the DoS. Abort instead.
+    if (walk_reachable_phased(src, remote_tip, hashes, seen, raw_cache) != 0) { return 1; }
     var copied = copy_objects(src, dst_db, hashes, raw_cache);
 
     if (src_db_local != 0) { patra_close(src_db_local); }
@@ -1485,7 +1514,7 @@ fn cmd_push() {
     # codepath identical in shape to do_fetch + the http push path.
     var raw_cache = map_new();
     var src = obj_src_for_db(src_db);
-    walk_reachable_phased(src, local_tip, hashes, seen, raw_cache);
+    if (walk_reachable_phased(src, local_tip, hashes, seen, raw_cache) != 0) { return 1; }   # S-26
     var copied = copy_objects(src, dst_db, hashes, raw_cache);
 
     patra_close(dst_db);
@@ -1547,7 +1576,7 @@ fn _do_push_http(name, branch, url, src_db, local_tip) {
     var hashes = vec_new();
     var raw_cache = map_new();
     var src = obj_src_for_db(src_db);
-    walk_reachable_phased(src, local_tip, hashes, seen, raw_cache);
+    if (walk_reachable_phased(src, local_tip, hashes, seen, raw_cache) != 0) { return 1; }   # S-26
 
     # Push each object. The server idempotently returns 200 for
     # already-present hashes (per ADR 0006's spirit; serve_handle_put_object
@@ -1676,7 +1705,7 @@ fn _do_push_ssh(name, branch, url, src_db, local_tip) {
     var hashes = vec_new();
     var raw_cache = map_new();
     var src = obj_src_for_db(src_db);
-    walk_reachable_phased(src, local_tip, hashes, seen, raw_cache);
+    if (walk_reachable_phased(src, local_tip, hashes, seen, raw_cache) != 0) { return 1; }   # S-26
 
     var n = vec_len(hashes);
     var i = 0;

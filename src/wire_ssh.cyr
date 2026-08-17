@@ -878,6 +878,11 @@ fn ssh_remote_resolve_branch(h, branch) {
 # {ptr, len, ty} into raw_out (24-byte cell). Returns 0 on success,
 # negative on miss / error.
 fn ssh_remote_read_raw(h, hex, raw_out) {
+    # S-26: match the HTTP sibling's gate (wire_http.cyr's
+    # `http_remote_read_raw`), which this path had drifted from. The 64 bytes
+    # below are memcpy'd into a request URL sent to the remote, and the
+    # unconditional copy made a shorter string an out-of-bounds read.
+    if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
     var path_len = 18 + 64;
     var path = alloc(path_len + 1);
     memcpy(path, "/sit/v1/objects/", 16);

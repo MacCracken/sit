@@ -4,6 +4,108 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.9] — 2026-08-18 — the deferred findings, closed
+
+Clears the entire deferred queue from the 2026-08-18 deep audit. 1.3.8 shipped
+every CRITICAL and HIGH and named ten MEDIUM/LOW findings it deliberately left;
+this release fixes all of them, plus the three sub-items they expanded into.
+**The audit backlog is now empty.**
+
+The headline is a plain functional bug, not a security one: **sit refused to
+diff any file over 8192 lines that was added or deleted.**
+
+### Fixed — correctness
+
+- **MEDIUM — sit would not diff a file of more than 8192 added/deleted lines.**
+  `lcs_diff`'s S-07 overflow guard capped **each dimension** at 8192 before
+  computing the cell count. For a pure addition `n1 == 0`, so the DP table is
+  `1 x (n+1)` — 8194 cells, ~64 KB, trivially in budget — but the per-dimension
+  cap still forced the Myers fallback, whose edit-distance cap (4096) cannot
+  represent an 8193-line insertion. Myers refused, and sit printed a header,
+  `diff table exceeds cap; file too large`, and **zero content lines**.
+
+  Verified at the exact boundary: 8192 lines diffed fine, 8193 produced nothing.
+  It hit `sit show`, `sit diff`, `sit diff --staged` and `sit_diff_path` — so
+  owl and thoth too — for any large file added or removed. Replaced with an
+  overflow-safe test of the **real product** by division, so the multiply only
+  runs once it is proven to fit. 8193- and 20000-line additions now diff in full.
+- **LOW — `-U0` did not produce a zero-context patch.** The hunk-close path
+  pushed into `pending` without the ctx trim the open path applies, so at
+  `ctx == 0` `pending` never drained and every hunk after the first inherited a
+  leading context line. sit emitted `@@ -30,2 +30,2 @@` where GNU `diff -U0`
+  emits `@@ -31 +31 @@`. Output now matches GNU diff exactly.
+- **LOW — `-U<N>` was unbounded and could hang.** At `ctx >= 2^62` the `2 * ctx`
+  comparison overflowed negative, sending the first context line into the
+  hunk-close branch where `while (k < ctx) vec_pop(hunk)` spun ~4.6e18 times.
+  `ctx` is now clamped at the `group_hunks` choke point, covering both callers.
+- **LOW — a failed auto-merge write was silently ignored on the conflict path.**
+  Files that merged cleanly are written alongside the conflict-marker ones, and
+  a dropped write left such a file at its **old** content while the user was
+  told only that *other* paths conflicted — so they resolve those, commit, and
+  lose the merge with no error ever shown. Now reports to stderr, matching the
+  S-16 checking the clean-merge path already does.
+
+### Security
+
+- **MEDIUM — `fsck --prune-now` could delete objects a live tree still
+  references.** `parse_tree` silently discards entries with a non-allowlisted
+  mode (e.g. `100755`) or an unsafe name (e.g. `.git`), so `fsck_walk_reachable`
+  never enqueues what they point at; the object is reported `dangling` and
+  pruned. Neither existing tripwire fired — `bad` stays 0 because both objects
+  read fine, and the all-unreachable check does not apply. Reachable remotely:
+  `_serve_rehash_and_insert` validates framing, type and SHA-256 but never
+  parses a tree body, so such a tree can simply be pushed. `parse_tree` now
+  counts its drops and `fsck` refuses to prune when a reachable tree has
+  unparseable entries — a malformed tree is structural corruption, not garbage.
+- **MEDIUM — unvalidated object ids reached the *remote-handle* SQL path.**
+  1.3.8 gated `read_object` (the local store), but the wire layer talks to a
+  separate patra handle: `db_object_read_raw` interpolated an id lifted from a
+  remote's commit body into a SQL literal with no gate, and its unconditional
+  64-byte copy made a short string an out-of-bounds read. Now gated.
+  **LOW —** `ssh_remote_read_raw` had drifted from its HTTP sibling and omitted
+  the same check; realigned.
+- **MEDIUM — a remote could drive unbounded client allocation.** The
+  clone/fetch/push reachability walk had no object cap, and nothing is freed
+  mid-walk, so a server advertising a synthetic history allocated until the
+  machine gave out (the `--depth` cap only applies when passed). Bounded by
+  `SIT_MAX_WIRE_OBJECTS` (10M — above the whole Linux kernel repo). The four
+  call sites now **propagate** the failure: a walk that hits the cap must abort
+  the operation, because copying a partial object set and then moving the ref
+  would leave a repo whose tip has missing ancestors — worse than the DoS.
+- **MEDIUM — `sit_repo_open` probed the wrong directory.** It ran
+  `_detect_repo_backend()` **before** `sit_set_repo_root(cwd)`, but the probe
+  goes through `sf_exists` → `sit_abs`, which needs the root. A consumer passing
+  a real path (rather than `"."`) detected the backend of whatever directory the
+  process happened to be in, then read from `cwd`. Invisible on Linux today
+  because every in-tree consumer passes `"."`, and precisely the case AGNOS
+  needs. Order swapped; the root is cleared again if the open fails.
+  **MEDIUM —** `git_pack`'s pack-directory probe used a raw cwd-relative
+  `is_dir()` that bypassed the same seam; routed through `sit_abs_str`.
+- **LOW — config values were echoed to the terminal unsanitized.** Writes go
+  through `config_value_valid`, but a config file can arrive from outside the
+  process, so a value read back is not necessarily one sit wrote. Now routed
+  through `write_sanitized`, the S-21 defence already applied to commit authors.
+- **LOW — `read_merge_head` returned 64 unvalidated bytes** that are memcpy'd
+  into a commit's `parent` header. Now hex-gated like every other ref consumer.
+
+### Closed by the 1.3.8 fixes (verified, no new code)
+
+- `sit_repo_branch` returning raw control/ANSI bytes to owl and thoth. It flows
+  through `current_branch_name` → `read_head_ref_path`, which 1.3.8 gated with
+  `refname_valid`; `_ref_is_bad_char` already rejects every byte `< 32` and 127.
+  Confirmed against an ANSI-poisoned `.git/HEAD`: rejected, no escape bytes
+  reach output. Recorded rather than re-fixed.
+
+### Added
+
+- **`tests/integration/run.sh` scenario 12** — five S-26 assertions. Three fail
+  against a pre-fix binary with exactly the reported symptoms: the 8193-line
+  diff yields **0** content lines, `-U0` emits `@@ -30,2 +30,2 @@`, and the huge
+  `-U<N>` **times out**. ⚠ The two fsck assertions pass on both builds — they
+  guard that a well-formed repo still prunes; provoking the refusal needs a
+  crafted malformed tree, which is not shell-constructible, so that path is
+  covered by code review rather than by this test.
+
 ## [1.3.8] — 2026-08-18 — deep audit: `sit merge` crashed on an ordinary merge, plus 14 more fixes
 
 A second, much wider audit pass run immediately after 1.3.7: **10 independent
