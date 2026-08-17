@@ -34,15 +34,22 @@ jobs:
           echo "CYRIUS_HOME=$HOME/.cyrius" >> "$GITHUB_ENV"
 
       - name: Resolve dependencies
-        # Two-step resolution under cyrius 5.11.x:
-        #   1. Stdlib (the [deps].stdlib array) — install.sh laid these out
-        #      at $HOME/.cyrius/versions/$VER/lib/ and symlinked them to
-        #      $HOME/.cyrius/lib. cc5's preprocessor reads from ./lib/
-        #      specifically, so we cp -rL the stdlib into the project lib/.
-        #      `cyrius update` would also work but is fragile across CI
-        #      $HOME shapes; the direct cp is exactly what the build needs.
-        #   2. `cyrius deps` resolves [deps.X] git crates (sakshi/sankoch/
-        #      sigil/patra) into lib/ alongside the stdlib.
+        # Stdlib-only resolution as of v1.3.6. Every module sit consumes —
+        # including sakshi / sankoch / sigil / patra — is a `[deps].stdlib`
+        # leaf folded into the toolchain snapshot; there are no `[deps.X]`
+        # git crates left (see cyrius.cyml's note on why a git pin on a
+        # folded module downgrades consumers and drops it from the
+        # dist/sit.deps sidecar).
+        #
+        # install.sh lays the snapshot out at $HOME/.cyrius/versions/$VER/lib/
+        # and symlinks it to $HOME/.cyrius/lib. cc5's preprocessor reads from
+        # ./lib/ specifically, so we cp -rL the stdlib into the project lib/.
+        # `cyrius update` would also work but is fragile across CI $HOME
+        # shapes; the direct cp is exactly what the build needs.
+        #
+        # `cyrius deps` is retained as a no-op guard: it exits clean with zero
+        # git deps today, and fails loudly if one is ever re-added without the
+        # lib/ layout to match.
         run: |
           mkdir -p lib
           cp -rL "$HOME/.cyrius/lib/"* lib/

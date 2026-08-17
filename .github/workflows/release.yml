@@ -44,9 +44,10 @@ jobs:
           echo "CYRIUS_HOME=$HOME/.cyrius" >> "$GITHUB_ENV"
 
       - name: Resolve deps
-        # Two-step: cp stdlib from install.sh's $HOME/.cyrius/lib into the
-        # project ./lib/ (where cc5's preprocessor reads from), then add
-        # [deps.X] git crates via `cyrius deps`. See ci.yml for rationale.
+        # Stdlib-only as of v1.3.6 — cp the snapshot from install.sh's
+        # $HOME/.cyrius/lib into the project ./lib/ (where cc5's preprocessor
+        # reads from). No `[deps.X]` git crates remain; `cyrius deps` is kept
+        # as a no-op guard. See ci.yml for the full rationale.
         run: |
           mkdir -p lib
           cp -rL "$HOME/.cyrius/lib/"* lib/

@@ -4,6 +4,104 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.6] — 2026-08-17 — cyrius `6.5.24` + deps to latest, and the four first-party layers stop being git deps
+
+A toolchain and dependency refresh whose substance is a **packaging correction**:
+`sakshi` / `sankoch` / `sigil` / `patra` are all folded into the cyrius stdlib
+snapshot, and carrying `[deps.<name>]` git pins for them was actively wrong for a
+project that publishes a bundle. The pins are gone; all four are now `[deps].stdlib`
+leaves. See **Fixed** — this is the reason to take this release.
+
+No behaviour change and no public-API change: both dist bundles are byte-identical
+to 1.3.5 apart from the version stamp, so downstream consumers (owl, thoth) are
+unaffected.
+
+### Fixed
+
+- **A git pin on a stdlib-folded module downgrades every consumer downstream of
+  it, and drops the module from the bundle's dep sidecar.** Through 1.3.5 sit
+  declared its four first-party layers as `[deps.<name>]` git blocks. Both failure
+  modes were live:
+
+  1. **The pin overrides the fold.** `cyrius deps` overlays a git dep's resolution
+     *on top of* the `lib sync --full` snapshot on every build, recursing through
+     sibling manifests — so the pin does not merely select a version for sit, it
+     pushes that file onto anything reaching sit transitively. The only signal is
+     an unnamed `N bundled lib(s) differ` shadow warning, and `deps --verify`
+     cannot catch it because the lock is written *from disk* and therefore records
+     the hash of the downgraded file. patra hit this four levels deep (its 1.13.0)
+     and sigil independently (3.12.7); both dropped their pins for this reason.
+
+  2. **The bundle sidecar loses the module.** On a bundle-publishing project a git
+     dep makes `cyrius distlib` reclassify the module out of the stdlib leaves.
+     Measured at 1.3.5's shape: `dist/sit.cyr` referenced **27 symbols** across
+     sigil / sankoch / patra (`patra_*`, `zlib_compress` / `zlib_decompress`,
+     `hash_data`, `hex_*`, `ed25519_*`, `pem_decode_certs`) while `dist/sit.deps`
+     listed only the 34 stdlib leaves and **none of the three modules that define
+     them** — so a consumer building from bundle + sidecar could not resolve them
+     and had to hand-declare the deps. kavach hit the same reclassification.
+
+  Both are closed by moving all four into `[deps].stdlib`. `dist/sit.deps` now
+  declares 38 leaves including `sakshi` / `sankoch` / `sigil` / `patra`; `cyrius.lock`
+  drops from 4 commit-pinned entries to none, and the toolchain pin in `[package]`
+  becomes the single lever for all four versions. The `[deps.<name>]` shape must not
+  come back — the rationale is recorded inline in `cyrius.cyml`.
+
+### Changed
+
+- **Toolchain pin `6.5.4` → `6.5.24`** (20 patch releases). Source needed no changes
+  to build or pass. The folded versions this snapshot ships are exactly the current
+  latest of each, which is what the dep bumps below resolve to:
+
+  | Dep | 1.3.5 | 1.3.6 | Folded by |
+  |---|---|---|---|
+  | sakshi | 2.4.7 | **2.4.10** | cyrius 6.5.16 |
+  | sankoch | 2.7.6 | **2.7.7** | cyrius 6.5.17 |
+  | sigil | 3.12.2 | **3.12.9** | cyrius 6.5.22 |
+  | patra | 1.12.12 | **1.13.0** | cyrius 6.5.20 |
+
+- **Binary 14.84 MB → 2.84 MB** (2,977,624 bytes, DCE, still statically linked with
+  no dynamic dependencies). Entirely from sigil 3.12.9, which localised the banked
+  RSA sign / verify and bignum workspaces and removed 9.53 MiB of `.bss`. sit
+  references none of that surface; the reduction is inherited, not earned here.
+
+- **CI / release workflows**: the "Resolve dependencies" step comments no longer
+  describe `[deps.X]` git crates. `cyrius deps` is retained as a no-op guard that
+  fails loudly if a git dep is ever re-added without a matching `lib/` layout.
+
+### Verified
+
+Each dep bump was checked against its actual diff rather than its changelog, per the
+rule that a routine refresh in the compression or storage layer can hide an integrity
+fix (the >1 MiB corruption sankoch 2.7.6 carried into 1.3.5 is the precedent).
+
+- **patra 1.12.12 → 1.13.0 is a minor bump with zero logic change.** Diffing the two
+  published bundles gives **three** hunks: the version stamp, `#ifdef` / `#else` /
+  `#endif` directives indented to their block in `_wal_gen_salts`, and one
+  continuation-line indent in a `row_read_int` call. No storage-format change is
+  possible from that diff. (The indented-directive hunk is the one that could bite —
+  `_wal_gen_salts` uses `#ifdef` to select between `sys_getrandom`, a raw syscall and
+  the agnos `SYS_TIME_UNIX` fallback — but cyrius's preprocessor is not
+  column-sensitive, and sit builds and passes on both Linux and `--agnos`.)
+- **sankoch 2.7.6 → 2.7.7 does not touch the compression core.** The diff is purely
+  additive in the ZIP layer — 11 new functions, all `zip_*` / `_zip_*` plus
+  `_sankoch_alloc_via`. No change to deflate / inflate / zlib / LZ77 / Huffman, which
+  is sit's entire consumed data path (`zlib_compress` at `src/object_db.cyr:176`).
+- **sigil 3.12.2 → 3.12.9 spans a breaking rename and four RSA security releases,
+  both off sit's path.** 3.12.8 renamed the 14 bare `err_*` constructors to
+  `sigil_err_*`; sit's own source references no `err_*` symbol. 3.12.3–3.12.6 fixed a
+  forged-signature bypass in banked RSA PKCS#1 v1.5 and PSS *verify*; sit signs and
+  verifies with **ed25519 only** and never calls the RSA surface. All 10 sigil symbols
+  sit consumes are still defined and behaviour-identical, pinned by the existing
+  SHA-256 known-answer and ed25519 sign/verify roundtrip tests.
+- **cyrius 6.5.20's `switch` / `match` miscompile does not apply.** That fix covers a
+  case body left by anything other than `return`; sit contains no `switch` statement
+  (the string appears only in comments and help text).
+
+- 282 unit / 58 integration / fuzz (7 harnesses, 10.3M+ rounds) / lint (0 warnings) /
+  audit / benchmarks all green. `--agnos` builds clean with and without DCE. Both dist
+  profiles regenerated at 1.3.6, byte-identical to 1.3.5 apart from the version stamp.
+
 ## [1.3.5] — 2026-07-31 — sankoch `2.7.6` (>1 MiB object corruption) + cyrius `6.5.4` + AGNOS ssh-reap ABI
 
 Nominally a toolchain and dependency refresh, but the sankoch bump carries a

@@ -5,7 +5,7 @@ description = "Sovereign version control — a Cyrius-native git replacement"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sit"
 language = "cyrius"
-cyrius = "6.5.4"
+cyrius = "6.5.24"
 
 [build]
 entry = "src/main.cyr"
@@ -83,6 +83,10 @@ modules = [
 #   sankoch — LZ4/DEFLATE/zlib/gzip (git's pack-file compression layer)
 #   sigil   — hashing + trust verification (git's SHA layer)
 #   patra   — B+ tree / WAL object store (git's .git/objects layer)
+#   sakshi  — structured logging (reached transitively via patra / sandhi)
+#
+# As of 1.3.6 all four are stdlib leaves, not git deps — the `cyrius` pin in
+# [package] selects their versions. See the note in [deps].stdlib below.
 [deps]
 # Transitive stdlib resolution (cyrius v5.10.x SLOT 19) doesn't follow
 # through enum / constant references — sandhi pulls TLS_EARLY_DATA_*,
@@ -109,6 +113,36 @@ modules = [
 # this class is a RUNTIME failure, not a build error — exactly how the missing
 # `random` module made `sit key generate` SIGILL at v1.0.2 — so it is declared
 # rather than left to the transitive arc.
+#
+# ── sakshi / sankoch / sigil / patra live HERE as of 1.3.6 ──────────────
+# All four are folded into the cyrius stdlib snapshot (`lib/<name>.cyr` ships
+# in `lib sync --full`), so they are stdlib leaves, not git deps. They were
+# `[deps.<name>]` git blocks through 1.3.5; that shape was actively wrong for
+# a project that publishes a bundle, in two ways:
+#
+#   1. A git pin OVERRIDES the folded module for everything downstream of it.
+#      The pin does not merely select a version for sit — `cyrius deps` overlays
+#      a git dep's resolution ON TOP of the snapshot on every build, recursing
+#      through sibling manifests, so a stale pin pushes the older file onto any
+#      consumer that reaches sit transitively. The only signal is an unnamed
+#      "N bundled lib(s) differ" shadow warning, and `deps --verify` cannot
+#      catch it because the lock is written FROM DISK — it records the hash of
+#      the downgraded file. patra hit this four levels deep (1.13.0) and sigil
+#      independently (3.12.7); both dropped their pins for exactly this reason.
+#
+#   2. On a bundle-publishing project a git dep makes `cyrius distlib`
+#      reclassify the module out of the stdlib leaves, so it is DROPPED from
+#      the `dist/sit.deps` sidecar. Measured at 1.3.5's shape: `dist/sit.cyr`
+#      referenced 27 symbols across sigil / sankoch / patra (patra_*, zlib_*,
+#      hash_data, hex_*, ed25519_*, pem_decode_certs) while the sidecar listed
+#      only the 34 stdlib leaves and none of the three modules defining them —
+#      so a consumer building from bundle + sidecar could not resolve them and
+#      had to hand-declare the deps. kavach hit the same reclassification.
+#
+# ⚠ Do NOT re-add these as `[deps.<name>]` git blocks. Pinning a version here
+# means pinning the toolchain — that is the correct and only lever, and the
+# `cyrius` pin in [package] is where it lives. Versions folded by 6.5.24:
+# sakshi 2.4.10, sankoch 2.7.7, sigil 3.12.9, patra 1.13.0.
 stdlib = [
     "slice",
     "string",
@@ -144,35 +178,22 @@ stdlib = [
     "ws",
     "http",
     "sandhi",
+    # ── the four first-party layers, folded (see the note above) ──
+    # sakshi  — structured logging (pulled transitively by patra: sakshi_error,
+    #           sakshi_set_level; sit calls neither directly)
+    "sakshi",
+    # sankoch — LZ4/DEFLATE/zlib/gzip; sit uses zlib_compress / zlib_decompress
+    "sankoch",
+    # sigil   — hashing + signing. sit's consumed surface is 10 symbols:
+    #           hash_data, hex_encode, hex_decode, hex_decode_into, hex_is_valid,
+    #           ed25519_keypair, ed25519_sign, ed25519_verify,
+    #           ed25519_generate_keypair, pem_decode_certs (serve.cyr's --tls
+    #           PEM chain loader). The PE/authenticode, argon2, blake2b, RSA and
+    #           trust-store surface is unreferenced by sit — including the
+    #           3.12.3–3.12.6 RSA verify forged-signature bypass, which is off
+    #           sit's path entirely (sit signs with ed25519, never RSA).
+    "sigil",
+    # patra   — B+ tree / WAL object store (.sit/objects.patra, .sit/index.patra)
+    "patra",
 ]
-
-[deps.sakshi]
-git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.4.7"
-modules = ["dist/sakshi.cyr"]
-
-[deps.sankoch]
-git = "https://github.com/MacCracken/sankoch.git"
-tag = "2.7.6"
-modules = ["dist/sankoch.cyr"]
-
-# sigil 3.x: ct_eq retired (cyrius stdlib `ct_eq_bytes_lens` is canonical);
-# TRUST_COMMUNITY enum slot 2 retired; -D SIGIL_BATCH_PARALLEL flag removed.
-# sit's consumed surface is 10 symbols — none affected by the above:
-#   hash_data, hex_encode, hex_decode, hex_decode_into, hex_is_valid,
-#   ed25519_keypair, ed25519_sign, ed25519_verify, ed25519_generate_keypair,
-#   pem_decode_certs (serve.cyr's --tls PEM chain loader).
-# The whole PE/authenticode, argon2, blake2b and trust-store surface is
-# unreferenced by sit — sigil's security fixes in those areas are off our path.
-# sigil >= 3.12.1 needs cyrius >= 6.4.65 (thread_local_alloc); the 6.5.4 pin
-# above clears that floor.
-[deps.sigil]
-git = "https://github.com/MacCracken/sigil.git"
-tag = "3.12.2"
-modules = ["dist/sigil.cyr"]
-
-[deps.patra]
-git = "https://github.com/MacCracken/patra.git"
-tag = "1.12.12"
-modules = ["dist/patra.cyr"]
 
