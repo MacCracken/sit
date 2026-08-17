@@ -1140,13 +1140,13 @@ fn http_remote_read_both(h, hex, raw_out, deco_out) {
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
     var decompressed = alloc(dec_cap);
     if (decompressed == 0) { return 0 - 2; }
-    var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+    var dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
     if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
         if (dec_cap < 16 * 1024 * 1024) {
             dec_cap = 16 * 1024 * 1024;
             decompressed = alloc(dec_cap);
             if (decompressed == 0) { return 0 - 2; }
-            dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+            dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
         }
     }
     if (dlen <= 0) { return 0 - 3; }

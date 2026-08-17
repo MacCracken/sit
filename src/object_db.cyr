@@ -146,13 +146,13 @@ fn read_object(hex, out) {
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
     var decompressed = alloc_or_die(dec_cap);
     if (decompressed == 0) { return 0 - 6; }
-    var dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
+    var dlen = zlib_decompress_with_ratio_cap(compressed, blen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
     if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
         if (dec_cap < 16 * 1024 * 1024) {
             dec_cap = 16 * 1024 * 1024;
             decompressed = alloc_or_die(dec_cap);
             if (decompressed == 0) { return 0 - 6; }
-            dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
+            dlen = zlib_decompress_with_ratio_cap(compressed, blen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
         }
     }
     if (dlen <= 0) { return 0 - 7; }
@@ -408,11 +408,42 @@ fn type_code_of(type_str, type_len) {
 # Used by the wire protocol when it needs an explicit handle (push/fetch
 # open both ends with named locals); hot read paths should go through
 # get_object_db() instead.
+# P-11a: the `objects` table carries a B-tree index on `hash`.
+#
+# Without one, patra's `_patra_query_exec` cannot take its indexed-WHERE path and
+# falls back to a FULL TABLE SCAN — so every `read_object`, `db_object_has` and
+# `resolve_hash` was O(rows). Measured before this landed, with an identical 50
+# commit reads and only the table size varying:
+#
+#     ~300 objects  -> log -n 50 : 14, 15, 15 ms
+#     ~1200 objects -> log -n 50 : 44, 43, 45 ms
+#
+# 4x the table for 3x the time on the same work — the signature of a scan. It made
+# `log` / `status` / `diff` / `clone` quadratic in repository size, which the
+# 100-commit benchmark fixture understates badly.
+#
+# The index is ALSO the precondition for `patra_insert_row_or_ignore`: its
+# conflict probe needs `SCH_IDX_ROOT`, and with no index it silently falls
+# through and always inserts. Wiring or-ignore without this would have written
+# duplicate rows rather than deduping.
+#
+# `CREATE INDEX` rebuilds the tree over every existing row, so it must run ONCE,
+# not per open. `.sit/objects.indexed` is the marker; it is written only after a
+# successful build, so an interrupted migration simply retries next open. Fresh
+# repos build an empty tree (free); pre-1.4.1 repos pay one rebuild on first open.
+fn _ensure_object_index(db) {
+    if (sf_exists(".sit/objects.indexed") == 1) { return 0; }
+    if (patra_exec(db, "CREATE INDEX ON objects (hash)") != 0) { return 0 - 1; }
+    if (sf_write_all(".sit/objects.indexed", "1\n", 2) < 0) { return 0 - 1; }
+    return 0;
+}
+
 fn object_db_open() {
     patra_init();
     var db = sf_patra_open(".sit/objects.patra");
     if (db == 0) { return 0; }
     patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
+    _ensure_object_index(db);
     return db;
 }
 
@@ -489,12 +520,12 @@ fn object_db_migrate_from_loose(db) {
                         if (dec_cap < 4096) { dec_cap = 4096; }
                         if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
                         var decompressed = alloc_or_die(dec_cap);
-                        var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+                        var dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
                         if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
                             if (dec_cap < 16 * 1024 * 1024) {
                                 dec_cap = 16 * 1024 * 1024;
                                 decompressed = alloc_or_die(dec_cap);
-                                dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+                                dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
                             }
                         }
                         var type_code = 0;

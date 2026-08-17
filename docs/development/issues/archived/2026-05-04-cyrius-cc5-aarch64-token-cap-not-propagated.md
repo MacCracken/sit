@@ -87,6 +87,6 @@ x86_64 release artifacts ship unchanged; aarch64 is absent from the GitHub relea
 
 ## Cross-reference
 
-- [`archived/2026-04-25-cyrius-fixup-table-cap.md`](archived/2026-04-25-cyrius-fixup-table-cap.md) — the original cap-raise issue. v5.8.46 resolution narrative names the x86_64 layout shift only; the aarch64 peer was not in scope of that ship.
+- [`archived/2026-04-25-cyrius-fixup-table-cap.md`](2026-04-25-cyrius-fixup-table-cap.md) — the original cap-raise issue. v5.8.46 resolution narrative names the x86_64 layout shift only; the aarch64 peer was not in scope of that ship.
 - cyrius CHANGELOG `[5.8.46]` — token-cap raise + new `needed M, cap is N` diagnostic. The diagnostic message format change is the second smoking gun (cc5_aarch64 still emits the old format).
-- sit release workflow: [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — best-effort aarch64 swallowing now in place.
+- sit release workflow: [`.github/workflows/release.yml`](../../../../.github/workflows/release.yml) — best-effort aarch64 swallowing now in place.

@@ -186,13 +186,13 @@ fn _git_read_loose(hex, out) {
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
     var decompressed = alloc_or_die(dec_cap);
     if (decompressed == 0) { return 0 - 3; }
-    var dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
+    var dlen = zlib_decompress_with_ratio_cap(compressed, blen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
     if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
         if (dec_cap < 16 * 1024 * 1024) {
             dec_cap = 16 * 1024 * 1024;
             decompressed = alloc_or_die(dec_cap);
             if (decompressed == 0) { return 0 - 3; }
-            dlen = zlib_decompress(compressed, blen, decompressed, dec_cap);
+            dlen = zlib_decompress_with_ratio_cap(compressed, blen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
         }
     }
     if (dlen <= 0) { return 0 - 4; }

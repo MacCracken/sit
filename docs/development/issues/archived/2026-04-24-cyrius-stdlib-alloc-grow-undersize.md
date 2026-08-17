@@ -13,7 +13,7 @@ Verification on sit, post-bump:
 - Full sit test suite: 101/101 passing.
 - No sit-side `fl_alloc` consumer-side workaround needed; the upstream fix landed before v0.6.1 shipped, so the workaround proposed below was not committed.
 
-A separate failure surfaced from the same triage — `read_object` returns "unreadable" for ~20% of objects on the same fixture even after the allocator fix lands. That symptom was originally folded into this issue under a "may or may not be the same bug" framing. The 5.6.35 verification falsified the one-bug hypothesis: bit-for-bit identical bad-object set with the upstream allocator fix as with the locally-patched allocator. The unreadable-at-scale failure is tracked as its own open issue at [`../2026-04-24-read-object-unreadable-at-scale.md`](../2026-04-24-read-object-unreadable-at-scale.md).
+A separate failure surfaced from the same triage — `read_object` returns "unreadable" for ~20% of objects on the same fixture even after the allocator fix lands. That symptom was originally folded into this issue under a "may or may not be the same bug" framing. The 5.6.35 verification falsified the one-bug hypothesis: bit-for-bit identical bad-object set with the upstream allocator fix as with the locally-patched allocator. The unreadable-at-scale failure is tracked as its own open issue at [`../2026-04-24-read-object-unreadable-at-scale.md`](2026-04-24-read-object-unreadable-at-scale.md).
 
 ## Original report
 

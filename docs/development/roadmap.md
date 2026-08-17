@@ -4,7 +4,7 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.4.0`. The `1.3.x` line was consumed almost entirely by audit work (1.3.6–1.3.9: a toolchain/dependency correction plus two security audits — see [`../audit/`](../audit/)), and `1.4.0` closed the last two integrity gaps those audits surfaced. **The audit backlog is empty.** The themed minor line below shifted **+1** when `1.4.0` was spent on integrity rather than tags; `1.5.0` is the next themed slot and the first feature work since `1.3.0`.
+**Where we are**: `1.4.1`. The `1.3.x` line went almost entirely to audit work (two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two integrity gaps; `1.4.1` wired the two dependency capabilities that had been sitting unused — and in doing so found that `objects.hash` had **no index**, so every object lookup was a full table scan. Both audit backlogs are empty. The themed minor line shifted **+1** when `1.4.0` went to integrity rather than tags.
 
 ---
 
@@ -20,22 +20,37 @@ Nothing below blocks anything else; ordering within a section is a recommendatio
 
 ## Patch line — correctness & hardening (no new surface)
 
-### Wiring capability the dependencies already ship
+### `1.4.x` — mapped patch line
 
-Both symbols exist in the current folded versions; only the sit-side call is missing.
+Ordered. Nothing here adds observable surface, so each can ship as it lands.
 
-- **`patra_insert_row_or_ignore` (P-11).** Route `db_object_insert_raw` through the or-ignore insert so `sit add` upserts without a full rewrite and drops the inner `db_object_has` probe — one B+ tree op per object on clone / push / add instead of two.
-- **`zlib_decompress_with_ratio_cap`.** Route the wire / fsck / `.git/` packfile inflate paths through the ratio-capped variant — defence-in-depth against decompression bombs on untrusted objects, distinct from the absolute 16 MiB ceiling.
+- **`1.4.2` — the residual object-lookup curve.** 1.4.1 indexed `objects.hash`
+  and `log -n 50` went 44 → 35 ms across a 4× table — better, but **still not
+  flat**, so patra's indexed-WHERE path keeps some per-lookup growth. Profile it,
+  and if the cost is upstream, file it on patra with the reproducer already
+  written (`docs/development/benchmarks-git-v-sit.md` has the method). This is the
+  single largest remaining perf lever: it gates `clone` (8.64× git), `log`
+  (6.33×), `status` and `diff` simultaneously, and it grows with repo size, so the
+  100-commit fixture understates it.
+- **`1.4.3` — index `entries.path` in `index.patra`.** The staging index has the
+  same bare-`CREATE TABLE` shape `objects` had. `parse_index` scans deliberately
+  (it wants every row, ordered), but any `WHERE path = …` lookup is on the scan
+  path. Verify whether `cmd_add` / `cmd_rm` / `cmd_reset` do point lookups before
+  adding an index — the win is unproven, unlike `objects` where it was measured.
+- **`1.4.4` — larger benchmark fixture.** Every number in the head-to-head comes
+  from a 100-commit / 100-file repo, which is small enough to hide exactly the
+  quadratic behaviour 1.4.1 found. A 5k-commit fixture would have surfaced the
+  missing index years earlier. Add one as an opt-in bench tier.
+- **Nested `.gitignore` / `info/exclude`** for `.git/` read-mode. Only the
+  top-level `.gitignore` is honoured today (`_ignore_filename`, `git_read.cyr`).
+- **Reflog `expire` / `delete` + `@{<date>}` selector** *(carried from 1.1.0)*.
+  Entries are unbounded, so `fsck --prune` reclaims reflog-protected objects only
+  via `--prune-now`; expiry closes that.
 
 ### Test & tooling debt
 
 - **Fuzz targets for the remaining unfuzzed parsers.** *(From the 2026-08-17 audit, whose central lesson was that the one module with no fuzz target held every serious finding.)* `parse_tree`, `parse_commit_body`, `_git_packed_ref_lookup` and `_wildmatch` all parse untrusted bytes and have unit tests but no harness. None showed a defect under review — which is exactly what was true of the pack reader before anyone looked properly.
 - **Memoize `_wildmatch`.** 1.3.8 bounded the catastrophic backtracking with a per-match step budget. That fixes the DoS but leaves the matcher worst-case exponential — it simply cannot spend more than the budget proving it. The real fix is memoization over (pattern offset, string offset). The obstacle is cost: the memo table would be allocated and zeroed per (pattern, path) pair on `is_ignored`, which is a measured benchmark (`is_ignored-200pat`). Likely shape — memoize only when the pattern carries ≥3 star groups, so the common 0–2 star patterns keep today's allocation-free fast path.
-
-### Feature gaps in shipped surface
-
-- **Nested `.gitignore` / `info/exclude`** for `.git/` read-mode. Only the top-level `.gitignore` is honoured today (`_ignore_filename`, `src/git_read.cyr`).
-- **Reflog `expire` / `delete` + `@{<date>}` selector.** *(Carried from 1.1.0.)* Reflog entries are unbounded today, so `fsck --prune` reclaims reflogged objects only via `--prune-now`; expiry closes that. `@{<date>}` complements the integer `@{N}` ordinal.
 
 ---
 
@@ -79,4 +94,4 @@ Dropping sandhi for a hand-rolled `net`-direct loopback HTTP/1.0 server (surface
 
 ---
 
-*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/) — latest [`2026-08-17-v1.3.7.md`](../benchmarks/2026-08-17-v1.3.7.md). Security audit reports are in [`../audit/`](../audit/).*
+*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/) — latest [`2026-08-18-v1.4.0.md`](../benchmarks/2026-08-18-v1.4.0.md). Security audit reports are in [`../audit/`](../audit/).*

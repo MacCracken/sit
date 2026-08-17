@@ -418,7 +418,12 @@ Simplifications vs git (documented in `src/index.cyr`): a non-segment `**` (e.g.
 - `sit reset <path>` — unstage: rewrite the index entry for the path to HEAD's tree hash (or drop it if HEAD doesn't have it). Working tree untouched.
 - `sit reset --hard <ref>` — move the current branch's ref to `<ref>` (branch / tag / commit hex) and restore the working tree to that commit.
 - `sit config [--global] <key> [<value>]` — read/write config entries (`user.name`, `user.email`, etc). Local at `.sit/config`, global at `~/.sitconfig`
-- `sit fsck [--prune] [--prune-now]` — integrity (each stored object re-hashes to its key) **and reachability** (objects no ref / index entry points at are reported as `dangling <type> <hex>`); reflog entries count as reachability roots, so a `reset --hard`-discarded tip is protected. `--prune` removes dangling objects subject to a 90-day grace window (datable commits older than the window; undatable trees/blobs are kept), `--prune-now` is the legacy immediate sweep (`git gc --prune=now`). Both refused mid-merge or when the store looks corrupt
+- `sit fsck [--prune] [--prune-now]` — three checks, and it **exits non-zero if any of them fails**:
+  - **integrity** — each stored object re-hashes to its key (`bad object <hex>`); one that can't be decompressed at all is `unreadable <hex>`
+  - **missing referents (1.4.0)** — a commit or tree naming an object the store does **not contain** is reported as `missing <hex>`. Before 1.4.0 an absent object was invisible: only stored objects were enumerated, so the canonical broken repo reported `0 bad, 0 dangling` and exited 0. Shallow clones are exempt — a `--depth N` boundary commit's parents are absent by design and `.sit/shallow` says so
+  - **reachability** — objects no ref / index entry points at are `dangling <type> <hex>`; reflog entries count as roots, so a `reset --hard`-discarded tip is protected
+
+  `--prune` removes dangling objects subject to a 90-day grace window (datable commits older than the window; undatable trees/blobs are kept); `--prune-now` is the legacy immediate sweep (`git gc --prune=now`). Both are refused mid-merge, when the store looks corrupt, when anything is `bad`/`missing`, and (1.3.9) when a reachable tree carries entries `parse_tree` can't parse — in each case pruning would delete objects that are still referenced
 - `sit reflog [-n <count>] [<ref>]` — show a ref's movement history newest-first (`<short-oid> <ref>@{N}: <message>`), defaulting to HEAD; every commit / reset / merge / checkout / branch-create / fetch records an entry under `.sit/logs/`. Resolve `<ref>@{N}` anywhere a revision is accepted — e.g. `sit reset --hard HEAD@{1}` undoes your last reset, `sit log HEAD@{2}` inspects where HEAD was two moves ago
 - `sit merge-base <a> <b>` — print the lowest common ancestor of two commits over the full parent DAG (correct across merges; git's `git merge-base`)
 - `.sitignore` — git-parity ignore matcher (`*` / `?` / `[...]` char classes / `**` / `!` negation / leading-or-middle-`/` anchoring) filtering untracked-file display and `sit add` (override with `-f`)
@@ -447,7 +452,7 @@ Simplifications vs git (documented in `src/index.cyr`): a non-segment `**` (e.g.
 - Reflog entry expiry (`reflog expire` / `delete`) — entries are currently unbounded, so reflog-protected objects stay until the log is cleared manually; the `@{<date>}` time-selector (only the integer `@{N}` ordinal ships in 1.1.0)
 - Octopus (3+ parent) merges — `merge-base` resolves them correctly, but `sit merge` is 2-way, so 3-parent commits can't be created yet
 - Pack bundles / delta compression for object transfer (objects copy one-at-a-time)
-- HTTPS over public CA certs / mTLS — HTTPS today is TOFU-pinned (CA-chain + hostname verification is a post-v1 opt-in; the 1.5.0 transport-trust minor)
+- HTTPS over public CA certs / mTLS — HTTPS today is TOFU-pinned (CA-chain + hostname verification is a post-v1 opt-in; the **1.7.0** transport-trust minor)
 - `.sitignore` directory-only (`build/`) enforcement
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).

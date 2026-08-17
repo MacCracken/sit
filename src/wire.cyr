@@ -90,6 +90,21 @@ fn remote_objects_open(repo_path) {
     var db = patra_open(p);
     if (db == 0) { return 0; }
     patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
+    # P-11a: index the REMOTE's objects table too — `clone` reads every object
+    # through this handle, so an unindexed remote leaves the whole transfer on
+    # patra's full-scan path even when the local side is indexed. Marker lives
+    # beside the remote's own store (`<repo>/.sit/objects.indexed`), not under
+    # the local repo root, so each remote migrates once on its own terms.
+    var mlen = rl + 22;
+    var marker = alloc(mlen + 1);
+    memcpy(marker, repo_path, rl);
+    memcpy(marker + rl, "/.sit/objects.indexed", 21);
+    store8(marker + rl + 21, 0);
+    if (file_exists(marker) != 1) {
+        if (patra_exec(db, "CREATE INDEX ON objects (hash)") == 0) {
+            file_write_all(marker, "1\n", 2);
+        }
+    }
     return db;
 }
 
@@ -160,13 +175,13 @@ fn _decompress_raw_into(raw, deco_out) {
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
     var decompressed = alloc(dec_cap);
     if (decompressed == 0) { return 0 - 2; }
-    var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+    var dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
     if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
         if (dec_cap < 16 * 1024 * 1024) {
             dec_cap = 16 * 1024 * 1024;
             decompressed = alloc(dec_cap);
             if (decompressed == 0) { return 0 - 2; }
-            dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+            dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
         }
     }
     if (dlen <= 0) { return 0 - 3; }
@@ -199,13 +214,13 @@ fn db_object_read_both(db, hex, raw_out, deco_out) {
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
     var decompressed = alloc(dec_cap);
     if (decompressed == 0) { return 0 - 2; }
-    var dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+    var dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
     if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
         if (dec_cap < 16 * 1024 * 1024) {
             dec_cap = 16 * 1024 * 1024;
             decompressed = alloc(dec_cap);
             if (decompressed == 0) { return 0 - 2; }
-            dlen = zlib_decompress(compressed, clen, decompressed, dec_cap);
+            dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
         }
     }
     if (dlen <= 0) { return 0 - 3; }
@@ -226,7 +241,20 @@ fn db_object_read_both(db, hex, raw_out, deco_out) {
 # (caller can use this to count "actually new" inserts vs. all attempts);
 # negative on error from patra_insert_row.
 fn db_object_insert_raw(db, hex, type_code, compressed, clen) {
-    if (db_object_has(db, hex) == 1) { return 1; }
+    # P-11: one B+ tree op per object instead of two.
+    #
+    # This used to run `db_object_has` first — a full SELECT round trip — and only
+    # then insert. `patra_insert_row_or_ignore` folds the conflict probe into the
+    # write: it checks the indexed key BEFORE allocating the BYTES content chain,
+    # so a duplicate costs just the key probe with no chain write or cleanup.
+    #
+    # ⚠ Correct ONLY because `_ensure_object_index` / the remote-side equivalent
+    # guarantee an index on `objects.hash`. Patra's or-ignore needs `SCH_IDX_ROOT`;
+    # with no index it silently falls through and ALWAYS inserts, which would turn
+    # this from a dedup into a duplicate-row generator. Do not separate the two.
+    #
+    # Contract preserved for callers (`copy_objects` counts only real inserts):
+    # returns 1 when the object already existed, 0 when it was actually written.
     var types[24];
     store64(&types +  0, 1);
     store64(&types +  8, 0);
@@ -241,8 +269,11 @@ fn db_object_insert_raw(db, hex, type_code, compressed, clen) {
     store64(&bptrs + 16, compressed);
     var blens[24];
     store64(&blens + 16, clen);
-    return patra_insert_row(db, "objects", 7, 3,
-    &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+    if (patra_insert_row_or_ignore(db, "objects", 7, 3,
+    &types, &ivals, &sptrs, &slens, &bptrs, &blens) != 0) { return 0 - 1; }
+    # rows_affected: 1 = inserted, 0 = key already present (skipped).
+    if (patra_rows_affected(db) == 0) { return 1; }
+    return 0;
 }
 
 # ── obj_src abstraction (v0.7.3) ───────────────────────────────────

@@ -392,7 +392,7 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
             if (body >= plen) { return 0 - 11; }
             var content = alloc(size + 16);
             if (content == 0) { return 0 - 11; }
-            var got = zlib_decompress(pdata + body, plen - body, content, size + 16);
+            var got = zlib_decompress_with_ratio_cap(pdata + body, plen - body, content, size + 16, SIT_MAX_INFLATE_RATIO);
             if (got <= 0) { return 0 - 12; }
             store64(out24, content);
             store64(out24 + 8, got);
@@ -420,7 +420,7 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
         if (dbody >= plen) { return 0 - 16; }
         var delta = alloc(size + 16);
         if (delta == 0) { return 0 - 16; }
-        var dgot = zlib_decompress(pdata + dbody, plen - dbody, delta, size + 16);
+        var dgot = zlib_decompress_with_ratio_cap(pdata + dbody, plen - dbody, delta, size + 16, SIT_MAX_INFLATE_RATIO);
         if (dgot <= 0) { return 0 - 17; }
         return _git_apply_delta(load64(&base24), load64(&base24 + 8), delta, dgot, out24);
     }
@@ -445,7 +445,7 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
         if (dbody >= plen) { return 0 - 19; }
         var delta = alloc(size + 16);
         if (delta == 0) { return 0 - 19; }
-        var dgot = zlib_decompress(pdata + dbody, plen - dbody, delta, size + 16);
+        var dgot = zlib_decompress_with_ratio_cap(pdata + dbody, plen - dbody, delta, size + 16, SIT_MAX_INFLATE_RATIO);
         if (dgot <= 0) { return 0 - 20; }
         return _git_apply_delta(bbuf, blen, delta, dgot, out24);
     }

@@ -207,7 +207,7 @@ Make the table a `vec`-shaped grow-on-demand structure. **Rejected for the 5.7.1
 
 ## Cross-reference
 
-- sit v0.7.x release plan: [`roadmap.md § v0.7.x`](../roadmap.md#v07x--network-transport-release-sequence).
+- sit v0.7.x release plan: [`roadmap.md § v0.7.x`](../../roadmap.md).
 - sandhi fold details: cyrius CHANGELOG `[5.7.0]` (2026-04-25, "THE SANDHI FOLD"); sandhi v1.1.0 re-fold: cyrius CHANGELOG `[5.8.39]` (2026-05-03); sandhi ADR 0002.
 - 2026-04-25 retry log (cyrius 5.7.1 fresh cap, 8× insufficient): captured in this issue's status header above.
 - 2026-05-03 retry log (cyrius 5.8.45 — same cap, error renamed): captured in the Reproduction section.

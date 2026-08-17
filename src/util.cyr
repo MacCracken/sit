@@ -166,6 +166,28 @@ fn sf_patra_open(p) {
     return patra_open(sit_abs(p));
 }
 
+# P-12: relative bound on inflate, layered under the absolute 16 MiB ceiling.
+#
+# Every `zlib_decompress` site in sit now goes through sankoch's
+# `zlib_decompress_with_ratio_cap`, which rejects a stream whose output exceeds
+# `ratio * src_len` — checked INCREMENTALLY during inflate, so a bomb is stopped
+# while expanding rather than after.
+#
+# ⚠ Be honest about how much this buys. zlib's theoretical maximum is ~1032:1, so
+# 1000 rejects almost nothing a real encoder can emit, and the 16 MiB absolute
+# ceiling remains the load-bearing bound. What it *does* close is the specific
+# decompression-bomb shape the absolute cap handles worst: a TINY input engineered
+# to expand to the full ceiling — 16 KiB → 16 MiB is ratio 1024, now refused after
+# ~16 MB of work instead of completing. It is a narrow backstop, not a headline
+# defence.
+#
+# Deliberately NOT tighter. sit stores whatever a user commits, and legitimately
+# repetitive content compresses hard: 1 MiB of identical bytes lands near 1000:1.
+# A cap of, say, 200 would reject real objects — trading a rare correctness
+# failure for a marginal security gain on a path the absolute ceiling already
+# bounds. Wrong trade for a VCS.
+var SIT_MAX_INFLATE_RATIO = 1000;
+
 # S-25: validate a Content-Length taken off the wire.
 #
 # Every caller of this is parsing a header written by the other end — a remote

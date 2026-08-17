@@ -4,6 +4,72 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-08-18 — every object lookup was a full table scan
+
+Wires the two dependency capabilities that had been sitting available-but-unused.
+Wiring the first one turned up something considerably worse than the missing
+call: **`objects.hash` had no index, so every object lookup was a full table
+scan** and `log` / `status` / `diff` / `clone` were quadratic in repository size.
+
+**`clone-100commits` 167.32 → 122.65 ms (−27%)**, ratio to git **12.13× → 8.64×**
+— it was the worst row in the head-to-head and is now not. `log-100commits`
+−13%. The 100-commit fixture *understates* both, because the effect it removes
+grows with repo size.
+
+### Fixed
+
+- **`objects.hash` was unindexed, so patra fell back to a full table scan on
+  every `read_object` / `db_object_has` / `resolve_hash`.** patra's
+  `_patra_query_exec` takes an indexed-WHERE path only when the column has a
+  B-tree; sit created the table with a bare `CREATE TABLE` and never an index.
+
+  Measured with an identical 50 commit reads, varying only the table size:
+
+  | objects in table | `log -n 50`, before | after |
+  |---|---|---|
+  | ~300 | 14, 15, 15 ms | 13, 13, 13 ms |
+  | ~1200 | 44, 43, 45 ms | 35, 35, 35 ms |
+
+  4× the table for 3× the time on the *same work* is the signature of a scan. A
+  single `cat-file` on the 1200-object repo went 3703 → 2329 µs (−37%).
+
+  ⚠ **The residual scaling is not gone.** 13 → 35 ms across a 4× table is still
+  not flat, so something on patra's indexed path continues to grow with table
+  size. That is an upstream question and is on the roadmap; this release removes
+  the sit-side cause (no index at all), not the whole curve. Said plainly rather
+  than claiming the quadratic behaviour is fixed.
+
+  Both the local store (`object_db.cyr`) and the **remote** store
+  (`wire.cyr`, the handle `clone` reads every object through) are indexed.
+  `CREATE INDEX` rebuilds over all existing rows, so it must run once, not per
+  open: `.sit/objects.indexed` is the marker, written only after a successful
+  build so an interrupted migration retries. Fresh repos build an empty tree for
+  free; pre-1.4.1 repos pay one rebuild on first open.
+
+### Changed
+
+- **`db_object_insert_raw` now uses `patra_insert_row_or_ignore` (P-11)** — one
+  B+ tree op per object instead of two. The old path ran a full `db_object_has`
+  SELECT and only then inserted; or-ignore folds the conflict probe into the
+  write and checks the indexed key *before* allocating the BYTES content chain,
+  so a duplicate costs only the probe. Caller contract is unchanged (1 = already
+  existed, 0 = written), so `copy_objects` still counts real inserts.
+
+  ⚠ **This is correct only because of the index above.** patra's or-ignore needs
+  `SCH_IDX_ROOT`; with no index it silently falls through and *always inserts*.
+  Wiring it alone — the roadmap item as originally written — would have turned a
+  dedup into a duplicate-row generator. The two changes must not be separated.
+- **All 15 `zlib_decompress` sites now use `zlib_decompress_with_ratio_cap`**
+  (P-12) at a 1000:1 bound, checked incrementally during inflate.
+
+  ⚠ **Narrow backstop, not a headline defence, and the source says so.** zlib's
+  theoretical maximum is ~1032:1, so this rejects almost nothing a real encoder
+  emits and the 16 MiB absolute ceiling remains load-bearing. What it closes is
+  the shape the absolute cap handles worst — a tiny input engineered to expand to
+  the full ceiling (16 KiB → 16 MiB is ratio 1024, now refused mid-inflate).
+  Deliberately not tighter: 1 MiB of identical bytes compresses near 1000:1, so a
+  tighter cap would reject legitimate objects. Wrong trade for a VCS.
+
 ## [1.4.0] — 2026-08-18 — `fsck` reports missing objects; commit identities can't forge headers
 
 Two integrity fixes that belong together: one manufactures a corrupt repository,
@@ -65,6 +131,19 @@ Nothing else changes; there is no new command, flag, or API symbol.
 - **`load_shallow_set()` extracted** to `object_db.cyr` (earlier in the include
   chain, so the single-pass dist bundle stays forward-only). `cmd_log` had an
   inline copy of the same loader; it now shares this one.
+- **`_wildmatch`'s step budget moved from function entry into the `*` branches.**
+  Only the star paths can blow up (they fan out into "match empty" / "consume one
+  byte"); every other path consumes a pattern byte *and* a string byte per call,
+  so that recursion is already bounded by `min(plen, slen)`. Same bound, less
+  work on the `is_ignored` hot path.
+
+  ⚠ **This is not a regression fix, and the benchmark note says so.** The
+  `is_ignored-*` numbers read ~10% slower than the v1.3.7 snapshot, which looked
+  like the budget's fault. It isn't: building v1.3.7's `index.cyr` — which has
+  **no budget at all** — against the current toolchain benches *slower*
+  (36.55 µs) than the shipped v1.4.0 (35.61 µs). The gap is 6.5.24 → 6.5.26
+  codegen; the budget costs nothing measurable either way. See
+  [`docs/benchmarks/2026-08-18-v1.4.0.md`](docs/benchmarks/2026-08-18-v1.4.0.md).
 - **Toolchain pin `6.5.24` → `6.5.26`** (latest published; clears the
   manifest-vs-wrapper drift warning). Source needed no change to build or pass,
   and the tree is already clean under the 6.5.26 formatter. Since 1.3.6 this pin
@@ -77,6 +156,29 @@ Nothing else changes; there is no new command, flag, or API symbol.
   select what the snapshot ships. Nothing in 2.7.8 affects sit — it is a
   toolchain catch-up with zero source change, ten byte-identical bundles — so
   there is nothing to wait for; sit picks it up on the next fold.
+
+### Benchmarks
+
+- **Head-to-head vs git refreshed** for the first time since v0.6.12 (April) —
+  [`docs/development/benchmarks-git-v-sit.md`](docs/development/benchmarks-git-v-sit.md).
+  **sit is faster on 9 of 10 operations in absolute terms than it was at v0.6.12**,
+  despite the ~1,150 lines of bounds checks the v1.3.6–v1.4.0 audit arc added:
+  `add-1KB` −20%, `commit` −17%, `init` −14%, `add-64KB` −13%, `add-1MB` −11%,
+  `diff` −10%, `status` −7%, `fetch` −5%, `clone` −4%; `log` flat. Against git it
+  wins `fetch` (0.25×), `commit` (0.58×), `init` (0.65×), ties `add-1KB`, and loses
+  the six read/compress-heavy rows.
+
+  ⚠ **The `log` and `clone` ratios widened, and that is git getting faster, not sit
+  getting slower** — git's `log` improved 9% and its `clone` 9% across 2.53.0 →
+  2.55.0. Verified rather than assumed, because those two ops do the most
+  per-object reads and v1.3.8 added a `hex_prefix_valid` gate to `read_object`:
+  building v1.3.7's sources against the *same* toolchain and timing `log` on the
+  same fixture gives 28–30 ms against v1.4.0's 28–29 ms. **Indistinguishable.**
+- **Two slow rows are now sit-side wiring rather than upstream work** — a change
+  since v0.6.12, when every gap waited on a dependency release.
+  `patra_insert_row_or_ignore` and `zlib_decompress_with_ratio_cap` both ship in the
+  current folded versions and sit does not call them yet; `clone` (12.13×, the worst
+  row) is the operation that would move.
 
 ### Added
 
@@ -1167,7 +1269,7 @@ Followups to the v0.8.8 HTTPS transport. `https://` is now a full read **+ write
 - **HTTPS keep-alive** — the http handle now holds ONE persistent socket + `tls_native` ctx (`_wire_https_acquire` / `_wire_https_teardown`) reused across every request of a clone / fetch / push, so a clone does **one TLS handshake instead of one-per-object** (verified: a 15-object clone made exactly 1 handshake). New `_wire_https_exchange` reads each response by exact Content-Length (via sandhi's `body_offset` / `content_length` / `find_header` parsers) so the reused connection stays framed; `_wire_http_request` / `_wire_http_post` / `_wire_http_post_xhdr` delegate to it when `is_tls`. Server: `_serve_run_tls` loops requests per connection until the client closes (recv 0) or the 30s timeout fires; TLS responses now advertise `Connection: keep-alive`. Plain http keeps its proven per-request path (the sandhi server closes per response). Handle grows 64 → 80 bytes.
 - **Socket read-timeout** — 30s `SO_RCVTIMEO` on the client TLS socket (`_wire_https_connect`) and the server's accepted connections (`_serve_run_tls`), so a stalled / hostile peer can't pin a clone or a serve worker indefinitely (slowloris bound; mirrors sandhi's plain-http path).
 - **CI smoke** `Smoke — https transport` — `sit serve --tls` (ECDSA P-256 cert) + `clone https://` + content + fsck, plus TOFU **pin-recorded** and **tampered-pin-refused** assertions.
-- **Filed** [`docs/development/issues/2026-06-10-tls-native-ed25519-server-cert-accept-fails.md`](docs/development/issues/2026-06-10-tls-native-ed25519-server-cert-accept-fails.md) — `tls_native_accept` fails with an Ed25519 server cert (ECDSA P-256 works); upstream cyrius gap, workaround documented.
+- **Filed** [`docs/development/issues/archived/2026-06-10-tls-native-ed25519-server-cert-accept-fails.md`](docs/development/issues/archived/2026-06-10-tls-native-ed25519-server-cert-accept-fails.md) — `tls_native_accept` fails with an Ed25519 server cert (ECDSA P-256 works); upstream cyrius gap, workaround documented.
 
 ### Changed
 
@@ -1310,14 +1412,14 @@ checked 6 objects, 0 bad, 2 dangling
 
 **Closes the v0.7.6 documented footgun.** Pushes to a remote whose `HEAD` is the same branch are now refused by default — mirrors git's `receive.denyCurrentBranch=refuse`. Previously, `sit push` silently advanced the remote's `refs/heads/<branch>` while leaving its working tree stale, surprising whoever was editing on the remote side. **All three transports** (file://, http://, ssh://) gate the same way.
 
-**Upstream block surfaced for HTTPS/mTLS.** Verified during v0.8.4 prep: sandhi's `tls_policy/` is libssl-via-fdlopen at the transport layer (composes `lib/tls.cyr`'s FFI bridge); consuming it from sit would punch [ADR 0007](docs/adr/0007-network-transport-security.md)'s no-libssl wall. Filed upstream at [`docs/development/issues/2026-05-13-sandhi-first-party-tls-surface-needed.md`](docs/development/issues/2026-05-13-sandhi-first-party-tls-surface-needed.md). v0.8.4 and v0.8.5 slots (originally HTTPS + mTLS) re-targeted to `denyCurrentBranch` + `sit fsck` reachability; HTTPS/mTLS slot in when the upstream gate clears.
+**Upstream block surfaced for HTTPS/mTLS.** Verified during v0.8.4 prep: sandhi's `tls_policy/` is libssl-via-fdlopen at the transport layer (composes `lib/tls.cyr`'s FFI bridge); consuming it from sit would punch [ADR 0007](docs/adr/0007-network-transport-security.md)'s no-libssl wall. Filed upstream at [`docs/development/issues/archived/2026-05-13-sandhi-first-party-tls-surface-needed.md`](docs/development/issues/archived/2026-05-13-sandhi-first-party-tls-surface-needed.md). v0.8.4 and v0.8.5 slots (originally HTTPS + mTLS) re-targeted to `denyCurrentBranch` + `sit fsck` reachability; HTTPS/mTLS slot in when the upstream gate clears.
 
 ### Added
 
 - **Server-side `denyCurrentBranch` check** in `src/serve.cyr`'s `serve_handle_put_ref` (right after the namespace check, before the FF gate). When the incoming refname matches the server's checked-out HEAD branch (read via `read_head_ref_path`) AND the ref already exists (so it's not an initial push to an empty remote), respond `423 Locked` with body `"refusing to update checked-out branch (denyCurrentBranch)"`. 423 distinguishes this from 409 Conflict (non-FF) on the wire so the client can surface the right error.
 - **`_remote_current_branch(repo_path)`** helper in `src/wire.cyr` — reads `<repo_path>/.sit/HEAD`, returns the branch name if it's a symbolic ref ("ref: refs/heads/<name>"), or 0 for detached HEAD / unreadable. Used by the file:// push path to enforce the same denyCurrentBranch gate as the http:// / ssh:// path.
 - **CI smoke step extension** in the SSH smoke block: build a SECOND origin with HEAD attached to main + an initial commit; clone, second commit, push — assert REJECTED with the `denyCurrentBranch` message and origin's ref unchanged. Then detach HEAD on origin and assert the same push now succeeds.
-- **Cross-repo issue** at `docs/development/issues/2026-05-13-sandhi-first-party-tls-surface-needed.md` documenting the HTTPS/mTLS upstream block — sandhi's `tls_policy` wraps libssl-via-fdlopen (verified against sandhi 1.3.4 + cyrius 5.11.34); sit can't consume it without violating ADR 0007. Three proposed fixes (cyrius `lib/tls.cyr` becomes first-party; sandhi grows a parallel native surface; ADR 0007 amendment). User carries upstream.
+- **Cross-repo issue** at `docs/development/issues/archived/2026-05-13-sandhi-first-party-tls-surface-needed.md` documenting the HTTPS/mTLS upstream block — sandhi's `tls_policy` wraps libssl-via-fdlopen (verified against sandhi 1.3.4 + cyrius 5.11.34); sit can't consume it without violating ADR 0007. Three proposed fixes (cyrius `lib/tls.cyr` becomes first-party; sandhi grows a parallel native surface; ADR 0007 amendment). User carries upstream.
 
 ### Changed
 
@@ -1351,7 +1453,7 @@ checked 6 objects, 0 bad, 2 dangling
 
 ### Cross-repo issue filed (carry upstream)
 
-- [`docs/development/issues/2026-05-13-sandhi-first-party-tls-surface-needed.md`](docs/development/issues/2026-05-13-sandhi-first-party-tls-surface-needed.md) — High severity. Blocks sit's HTTPS (was v0.8.4) and mTLS (was v0.8.5) roadmap slots. Sandhi's `tls_policy/` wraps stdlib `lib/tls.cyr` which is libssl-via-fdlopen; ADR 0007 forbids consumption. Three fix paths documented; preference: cyrius `lib/tls.cyr` becomes first-party Cyrius.
+- [`docs/development/issues/archived/2026-05-13-sandhi-first-party-tls-surface-needed.md`](docs/development/issues/archived/2026-05-13-sandhi-first-party-tls-surface-needed.md) — High severity. Blocks sit's HTTPS (was v0.8.4) and mTLS (was v0.8.5) roadmap slots. Sandhi's `tls_policy/` wraps stdlib `lib/tls.cyr` which is libssl-via-fdlopen; ADR 0007 forbids consumption. Three fix paths documented; preference: cyrius `lib/tls.cyr` becomes first-party Cyrius.
 
 ## [0.8.3] — 2026-05-13 — Push over SSH
 
