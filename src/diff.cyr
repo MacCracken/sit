@@ -83,7 +83,24 @@ fn list_working_walk(prefix, fs_path, out, patterns) {
             memcpy(child_fs + fs_path_len + 1, sdata, slen);
             store8(child_fs + fs_path_len + 1 + slen, 0);
 
+            # S-25: never DESCEND through a symlink.
+            #
+            # `is_dir` follows symlinks, so a symlinked directory pointing at
+            # `.` or any ancestor made this recurse until the kernel's 40-deep
+            # ELOOP cap, emitting nonsense paths
+            # (`d/loop/d/loop/d/loop/...`) and allocating a fresh path string at
+            # every level. Several such links multiply combinatorially before
+            # ELOOP stops any single chain.
+            #
+            # Treating a symlink as a leaf is also the CORRECT semantics, not
+            # merely the safe one: git records a symlink as a symlink blob and
+            # never traverses it. So this is emitted as an entry (below) rather
+            # than walked.
+            var child_is_dir = 0;
             if (is_dir(str_from(child_fs)) == 1) {
+                if (path_is_symlink(child_fs) != 1) { child_is_dir = 1; }
+            }
+            if (child_is_dir == 1) {
                 var new_prefix = alloc(prefix_len + slen + 2);
                 memcpy(new_prefix, prefix, prefix_len);
                 memcpy(new_prefix + prefix_len, sdata, slen);
@@ -1184,7 +1201,7 @@ fn cmd_show() {
 
     var tree_hex = load64(&info);
     var new_entries = vec_new();
-    if (tree_hex != 0) { flatten_tree(tree_hex, "", new_entries); }
+    if (tree_hex != 0) { flatten_tree_reset(); flatten_tree(tree_hex, "", new_entries); }
 
     var parent_hex = load64(&info + 8);
     var old_entries = vec_new();

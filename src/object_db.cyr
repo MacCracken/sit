@@ -89,6 +89,20 @@ fn read_object(hex, out) {
         return _git_read_any(hex, out);
     }
 
+    # S-25: gate the object id HERE, at the choke point.
+    #
+    # The 64 bytes below are memcpy'd verbatim into a patra SQL string literal,
+    # and `hex` reaches this function from a dozen places — commit `tree` /
+    # `parent` header fields, tree entry hashes, ref files, the reflog, wire
+    # responses — several of which had no gate of their own. A single check here
+    # covers every one of them and is the same defence `resolve_hash` and the
+    # serve endpoints already apply individually.
+    #
+    # It also bounds the read: the memcpy takes 64 bytes unconditionally, so a
+    # shorter string was an out-of-bounds read. hex_prefix_valid stops at the
+    # first non-hex byte, and a NUL terminator is not a hex digit.
+    if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
+
     var db = get_object_db();
     if (db == 0) { return 0 - 1; }
 

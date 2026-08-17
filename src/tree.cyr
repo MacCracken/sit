@@ -194,9 +194,36 @@ fn parse_tree(body, body_len) {
 var _TREE_MAX_DEPTH = 256;
 var _tree_walk_depth = 0;
 
+# S-25: depth is not the only unbounded dimension.
+#
+# S-14 capped how DEEP the walk goes, but not how MANY nodes it visits. A tree
+# object may reference the same subtree hash many times, and each reference is
+# expanded again — so a DAG of k levels where every level names the previous
+# subtree N times expands to N^k paths from a repository of only a few hundred
+# KB. Depth 256 is never reached; memory is exhausted first, on the read-only
+# path owl / thoth call against untrusted repos.
+#
+# The node budget bounds total expansions per top-level walk. 2M entries is far
+# above any real tree (the Linux kernel is ~80k files) and is reached in well
+# under a second, so a hostile repo fails fast instead of ballooning.
+var _TREE_MAX_NODES = 2000000;
+var _tree_walk_nodes = 0;
+
+# Reset the per-walk budgets. Every EXTERNAL entry into flatten_tree must call
+# this first; the recursion itself must not.
+fn flatten_tree_reset() {
+    _tree_walk_depth = 0;
+    _tree_walk_nodes = 0;
+    return 0;
+}
+
 fn flatten_tree(tree_hex, prefix, out) {
     if (_tree_walk_depth >= _TREE_MAX_DEPTH) {
         eprintln("sit: tree depth exceeds 256 — refusing to walk further");
+        return 0 - 2;
+    }
+    if (_tree_walk_nodes >= _TREE_MAX_NODES) {
+        eprintln("sit: tree entry count exceeds the walk limit (malformed or hostile repo?)");
         return 0 - 2;
     }
     _tree_walk_depth = _tree_walk_depth + 1;
@@ -217,6 +244,7 @@ fn flatten_tree(tree_hex, prefix, out) {
         var mode = tree_entry_mode(e);
         var name = tree_entry_name(e);
         var hash_hex = tree_entry_hash(e);
+        _tree_walk_nodes = _tree_walk_nodes + 1;   # S-25 node budget
 
         var prefix_len = strlen(prefix);
         var name_len = strlen(name);
@@ -269,6 +297,7 @@ fn read_head_tree_entries() {
     store8(tree_hex + hexlen, 0);
 
     var out = vec_new();
+    flatten_tree_reset();
     flatten_tree(tree_hex, "", out);
     return out;
 }

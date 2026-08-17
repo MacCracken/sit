@@ -166,6 +166,31 @@ fn sf_patra_open(p) {
     return patra_open(sit_abs(p));
 }
 
+# S-25: validate a Content-Length taken off the wire.
+#
+# Every caller of this is parsing a header written by the other end — a remote
+# server for the wire clients, a client for `sit serve` — so the value is fully
+# attacker-controlled. Returns the length when it is a sane body size, or
+# (0 - 1) otherwise; callers MUST treat (0 - 1) as a protocol error and abort
+# the exchange rather than continuing with a nonsense length.
+#
+# Two distinct failure modes this closes:
+#
+#  1. **Overflow.** The idiomatic completeness test is `used >= body_off + clen`.
+#     With clen near i64 max that sum wraps NEGATIVE, so the test passes on the
+#     first pass and the reader proceeds as though it had received a body it
+#     never read — then hands the bogus length to a decompressor or memcpy.
+#  2. **Huge-but-positive.** A length past the buffer cap makes callers size or
+#     read memory they do not own.
+#
+# `max` is the caller's ceiling (WIRE_HTTP_MAX_BODY / SIT_SERVE_MAX_BODY, both
+# 16 MiB) so the failure modes line up across transports.
+fn content_length_sane(v, max) {
+    if (v < 0) { return 0 - 1; }
+    if (v > max) { return 0 - 1; }
+    return v;
+}
+
 fn eprintln(s) {
     var len = strlen(s);
     syscall(SYS_WRITE, STDERR, s, len);

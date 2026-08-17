@@ -74,6 +74,18 @@ fn _ssh_handle_auth_token(h) { return 0; }
 #
 # Returns 1 on success with parsed pieces written into the out cells;
 # 0 on parse failure (caller emits the user-visible error).
+
+# S-25 helper: reject `%` in the ssh user/host. OpenSSH percent-expands those
+# fields into ProxyCommand / LocalCommand, which are executed through /bin/sh.
+fn _ssh_has_percent(s, len) {
+    var i = 0;
+    while (i < len) {
+        if ((load8(s + i) & 0xFF) == 37) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn _ssh_parse_url(url, out_user, out_host, out_port, out_path) {
     var ulen = strlen(url);
     if (ulen < 7) { return 0; }
@@ -106,6 +118,15 @@ fn _ssh_parse_url(url, out_user, out_host, out_port, out_path) {
         var user_len = at - authority_start;
         if (user_len == 0) { return 0; }                          # empty user
         if (load8(url + authority_start) == 45) { return 0; }     # CVE-2017-1000117: user starts with `-`
+        # S-25: actually apply the byte whitelist point 3 of the header comment
+        # has always promised. It was never called — the only checks were the
+        # three leading-`-` tests — so every shell metacharacter reached the ssh
+        # argv. `%` is additionally rejected in user/host because OpenSSH
+        # percent-expands those into ProxyCommand / LocalCommand, which run via
+        # /bin/sh (CVE-2023-51385 class); `%` stays legal in the repo path,
+        # where it is ordinary percent-encoding.
+        if (url_authority_path_valid(url + authority_start, user_len) == 0) { return 0; }
+        if (_ssh_has_percent(url + authority_start, user_len) == 1) { return 0; }
         user_buf = alloc(user_len + 1);
         memcpy(user_buf, url + authority_start, user_len);
         store8(user_buf + user_len, 0);
@@ -143,6 +164,8 @@ fn _ssh_parse_url(url, out_user, out_host, out_port, out_path) {
     var host_len = host_end - host_start;
     if (host_len == 0) { return 0; }
     if (load8(url + host_start) == 45) { return 0; }              # CVE-2017-1000117: host starts with `-`
+    if (url_authority_path_valid(url + host_start, host_len) == 0) { return 0; }   # S-25
+    if (_ssh_has_percent(url + host_start, host_len) == 1) { return 0; }           # S-25
     var host_buf = alloc(host_len + 1);
     memcpy(host_buf, url + host_start, host_len);
     store8(host_buf + host_len, 0);
@@ -156,6 +179,10 @@ fn _ssh_parse_url(url, out_user, out_host, out_port, out_path) {
     if (path_len < 2) { return 0; }                               # need at least "/x"
     var first_path_byte = load8(url + path_start + 1);
     if (first_path_byte == 45) { return 0; }                      # `/-foo` rejected
+    # S-25: the repo path is joined into the trailing argv OpenSSH hands to the
+    # remote LOGIN SHELL as one string, so an unfiltered `;` / `|` / `$(...)`
+    # there is remote command execution on an otherwise-legitimate server.
+    if (url_authority_path_valid(url + path_start, path_len) == 0) { return 0; }
     var path_buf = alloc(path_len + 1);
     memcpy(path_buf, url + path_start, path_len);
     store8(path_buf + path_len, 0);
@@ -619,10 +646,16 @@ fn _wire_ssh_recv_response(rfd, out_body) {
             }
             if (body_off >= 0) {
                 # Parse Content-Length from the header block.
-                clen = _wire_ssh_parse_content_length(buf, body_off);
+                # S-25: bound it. The parser accepted any digit run, so a remote
+                # `sit serve` (or anything wearing its clothes) could send a
+                # near-i64-max Content-Length; `body_off + clen` then wrapped
+                # negative and the completeness test below passed immediately,
+                # leaving `clen` as a body length for memory never read.
+                clen = content_length_sane(
+                _wire_ssh_parse_content_length(buf, body_off), WIRE_HTTP_MAX_BODY);
                 if (clen < 0) {
                     fl_free(buf);
-                    eprintln("sit: ssh response missing Content-Length");
+                    eprintln("sit: ssh response has a missing or bogus Content-Length");
                     return 0 - 1;
                 }
             }

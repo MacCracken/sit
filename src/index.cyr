@@ -542,8 +542,44 @@ fn index_find(entries, path) {
 # exact.
 var _GLOB_PAT_MAX = 256;
 
+# S-25: step budget for one top-level match.
+#
+# `_wildmatch_rec` is an unmemoized backtracking matcher: every `*` branches
+# into "match empty" and "consume one byte", so k star-groups against an n-byte
+# segment explore exponentially many states. `_GLOB_PAT_MAX` does NOT bound
+# that — 8 stars is already enough. A hostile `.sitignore` / `.gitignore` of
+# EIGHTEEN bytes (`*a*a*a*a*a*a*a*a*b`) plus a 64-char filename pinned a core
+# indefinitely in `sit status`, and the same matcher serves `.gitignore` on the
+# `sit_repo_status` read path that owl / thoth call against repos cloned from
+# untrusted remotes.
+#
+# The budget bounds the work per top-level match. Exhaustion returns "no match",
+# which for ignore matching is the SAFE direction: the file is reported rather
+# than silently hidden.
+#
+# ⚠ This bounds the resource, it does not make the matcher polynomial — the
+# algorithm is still worst-case exponential, it simply can no longer spend more
+# than `_GLOB_STEP_MAX` steps proving it. 200k is ~4 orders of magnitude above
+# what any realistic ignore pattern needs (real patterns carry 0-2 stars and
+# finish in tens of steps) and completes in well under a millisecond. A proper
+# fix is memoization over (pattern offset, string offset); it was not taken here
+# because the memo table would have to be allocated and zeroed per (pattern,
+# path) pair on the `is_ignored` hot path, which is a measured benchmark
+# (`is_ignored-200pat`). Tracked on the roadmap.
+var _GLOB_STEP_MAX = 200000;
+var _glob_steps = 0;
+
+# Public entry: resets the per-match budget, then runs the recursive core.
+# Every EXTERNAL caller must come through here; the core recurses into itself.
 fn _wildmatch(pat, plen, str, slen) {
+    _glob_steps = 0;
+    return _wildmatch_rec(pat, plen, str, slen);
+}
+
+fn _wildmatch_rec(pat, plen, str, slen) {
     if (plen > _GLOB_PAT_MAX) { return 0; }
+    _glob_steps = _glob_steps + 1;
+    if (_glob_steps > _GLOB_STEP_MAX) { return 0; }
     if (plen == 0) {
         if (slen == 0) { return 1; }
         if ((load8(str) & 0xFF) == 47) { return 1; }   # dir-exclusion
@@ -566,13 +602,13 @@ fn _wildmatch(pat, plen, str, slen) {
         if (nstar >= 2) {                       # '**' — may cross '/'
             if (restlen == 0) { return 1; }
             if ((load8(rest) & 0xFF) == 47) {   # '**/...' may match zero dirs
-                if (_wildmatch(rest + 1, restlen - 1, str, slen) == 1) { return 1; }
+                if (_wildmatch_rec(rest + 1, restlen - 1, str, slen) == 1) { return 1; }
             }
             var m = 0;
             var res = 0;
             var done = 0;
             while (done == 0) {
-                if (_wildmatch(rest, restlen, str + m, slen - m) == 1) { res = 1; done = 1; }
+                if (_wildmatch_rec(rest, restlen, str + m, slen - m) == 1) { res = 1; done = 1; }
                 else {
                     if (m >= slen) { done = 1; }
                     else { m = m + 1; }
@@ -581,16 +617,16 @@ fn _wildmatch(pat, plen, str, slen) {
             return res;
         }
         # single '*' — run of non-'/'
-        if (_wildmatch(rest, restlen, str, slen) == 1) { return 1; }
+        if (_wildmatch_rec(rest, restlen, str, slen) == 1) { return 1; }
         if (slen == 0) { return 0; }
         if ((load8(str) & 0xFF) == 47) { return 0; }
-        return _wildmatch(pat, plen, str + 1, slen - 1);
+        return _wildmatch_rec(pat, plen, str + 1, slen - 1);
     }
 
     if (pc == 47) {   # '/'
         if (slen == 0) { return 0; }
         if ((load8(str) & 0xFF) != 47) { return 0; }
-        return _wildmatch(pat + 1, plen - 1, str + 1, slen - 1);
+        return _wildmatch_rec(pat + 1, plen - 1, str + 1, slen - 1);
     }
 
     if (slen == 0) { return 0; }
@@ -598,7 +634,7 @@ fn _wildmatch(pat, plen, str, slen) {
 
     if (pc == 63) {   # '?'
         if (sc == 47) { return 0; }
-        return _wildmatch(pat + 1, plen - 1, str + 1, slen - 1);
+        return _wildmatch_rec(pat + 1, plen - 1, str + 1, slen - 1);
     }
 
     if (pc == 91) {   # '[' char class
@@ -652,11 +688,11 @@ fn _wildmatch(pat, plen, str, slen) {
             else { ok = 1; }
         }
         if (ok == 0) { return 0; }
-        return _wildmatch(pat + ci, plen - ci, str + 1, slen - 1);
+        return _wildmatch_rec(pat + ci, plen - ci, str + 1, slen - 1);
     }
 
     if (pc != sc) { return 0; }
-    return _wildmatch(pat + 1, plen - 1, str + 1, slen - 1);
+    return _wildmatch_rec(pat + 1, plen - 1, str + 1, slen - 1);
 }
 
 # True if `path` (repo-relative, e.g. "src/build/foo.o") is ignored. Patterns are

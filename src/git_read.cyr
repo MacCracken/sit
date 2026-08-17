@@ -46,22 +46,101 @@ fn _id_rawlen() {
 
 # --- .git/config hash-algo detection ----------------------------------------
 # SHA-256 git repos carry `[extensions]\n\tobjectFormat = sha256` (and
-# repositoryFormatVersion = 1). A whole-file substring scan for "sha256" is
-# sufficient — the token appears nowhere else in a normal config. Best-effort:
-# an unreadable config falls back to SHA-1 (git's default), which is correct
-# for the overwhelming majority of repos.
+# repositoryFormatVersion = 1). Best-effort: an unreadable config falls back to
+# SHA-1 (git's default), which is correct for the overwhelming majority.
+#
+# S-25: this used to be a whole-file substring scan for "sha256", justified by
+# the claim that "the token appears nowhere else in a normal config". That claim
+# is false, and the failure is silent and consumer-visible. ANY occurrence flips
+# a SHA-1 repo into 64-hex mode, after which every width gate below rejects and
+# `read_head_ref` returns 0 — but `sit_repo_open` still returns 1 and
+# `sit_repo_branch` still returns the right name, so `sit_repo_status` reports a
+# clean tree as ALL FILES UNTRACKED. owl / thoth get a confident wrong answer
+# rather than an error.
+#
+# The token reaches .git/config through paths an attacker controls, not just
+# user typos: a submodule NAME chosen by the attacker's .gitmodules is copied
+# verbatim into the superproject's .git/config by `git submodule update --init`,
+# and a repository whose own name contains "sha256" lands in the cloned-in
+# remote URL. Both are ordinary content in a repo cloned from an untrusted
+# remote — the exact threat model `.git/` read-mode exists for.
+#
+# Fixed by anchoring to the actual `objectFormat` KEY rather than scanning
+# values. Section headers (`[submodule "sha256-x"]`) and other keys' values
+# (`url = .../sha256-utils.git`) no longer match.
+
+# Skip spaces and tabs from `i`, returning the first other index (or n).
+fn _git_skip_ws(p, i, n) {
+    var j = i;
+    var go = 1;
+    while (go == 1) {
+        if (j >= n) { go = 0; }
+        else {
+            var c = load8(p + j) & 0xFF;
+            if (c == 32) { j = j + 1; }
+            else {
+                if (c == 9) { j = j + 1; }
+                else { go = 0; }
+            }
+        }
+    }
+    return j;
+}
+
+# ASCII case-insensitive compare of `litlen` bytes at p+i against a lowercase
+# literal. git config keys are case-insensitive.
+fn _git_ieq(p, i, n, lit, litlen) {
+    if (i + litlen > n) { return 0; }
+    var k = 0;
+    var ok = 1;
+    while (k < litlen) {
+        var c = load8(p + i + k) & 0xFF;
+        if (c >= 65) { if (c <= 90) { c = c + 32; } }
+        if (c != (load8(lit + k) & 0xFF)) { ok = 0; }
+        k = k + 1;
+    }
+    return ok;
+}
+
+# Is this config line exactly `objectFormat = sha256` (any spacing / case)?
+fn _git_line_is_objectformat_sha256(p, n) {
+    var i = _git_skip_ws(p, 0, n);
+    if (_git_ieq(p, i, n, "objectformat", 12) == 0) { return 0; }
+    i = _git_skip_ws(p, i + 12, n);
+    if (i >= n) { return 0; }
+    if ((load8(p + i) & 0xFF) != 61) { return 0; }        # '='
+    i = _git_skip_ws(p, i + 1, n);
+    if (_git_ieq(p, i, n, "sha256", 6) == 0) { return 0; }
+    # Nothing but trailing whitespace / CR may follow the value.
+    var j = _git_skip_ws(p, i + 6, n);
+    while (j < n) {
+        if ((load8(p + j) & 0xFF) != 13) { return 0; }
+        j = j + 1;
+    }
+    return 1;
+}
+
 fn _git_detect_hash_algo() {
     var pair[16];
     if (read_file_heap(".git/config", &pair) != 0) { return 0; }
     var buf = load64(&pair);
     var len = load64(&pair + 8);
-    var i = 0;
+    var pos = 0;
     var found = 0;
-    while (i + 6 <= len) {
-        if (found == 0) {
-            if (memeq(buf + i, "sha256", 6) == 1) { found = 1; }
+    while (pos < len) {
+        var le = pos;
+        var scanning = 1;
+        while (scanning == 1) {
+            if (le >= len) { scanning = 0; }
+            else {
+                if (load8(buf + le) == 10) { scanning = 0; }
+                else { le = le + 1; }
+            }
         }
-        i = i + 1;
+        if (found == 0) {
+            if (_git_line_is_objectformat_sha256(buf + pos, le - pos) == 1) { found = 1; }
+        }
+        pos = le + 1;
     }
     return found;
 }

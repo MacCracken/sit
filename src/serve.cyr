@@ -98,7 +98,7 @@ fn serve_build_capabilities() {
     # TODO: derive from VERSION at build time once cyrius exposes a
     # source-level VERSION constant — the manifest ${file:VERSION} is
     # build-metadata only. Until then it is bumped by hand at each tag.
-    str_builder_add_cstr(sb, "{\"sit\":\"1.3.7\",\"max_body\":");
+    str_builder_add_cstr(sb, "{\"sit\":\"1.3.8\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[");
     if (_serve_require_auth == 1) {
@@ -356,7 +356,13 @@ fn serve_handle_want(cfd, buf, n) {
         _serve_send_status(cfd, 400, "Bad Request");
         return 0;
     }
-    var clen = sandhi_server_content_length(buf, n);
+    # S-25: cap before the `body_off + clen` sum below, so a near-i64-max
+    # Content-Length cannot wrap it negative and slip past the framing check.
+    # (The exact `clen != expected_clen` test further down happened to catch
+    # that case anyway; this makes it structural rather than incidental, and
+    # matches the ordering already used by serve_handle_put_object.)
+    var clen = content_length_sane(
+    sandhi_server_content_length(buf, n), SIT_SERVE_MAX_BODY);
     if (clen <= 0) {
         _serve_send_status(cfd, 411, "Length Required");
         return 0;
@@ -1126,8 +1132,32 @@ fn _serve_run_stdio() {
             stdout_flush();
             return 1;
         }
-        var clen = sandhi_server_content_length(buf, n);
+        # S-25: bound the claimed Content-Length, then clamp the dispatch length
+        # to the bytes ACTUALLY read.
+        #
+        # `req_end` used to be `bo + clen` unclamped and was passed straight in
+        # as `n` below. `_stdio_recv_request` returns at most HSV_REQ_BUF_SIZE-1
+        # bytes and never loops to complete an oversized body, so a client that
+        # claimed a Content-Length larger than it sent turned every POST
+        # handler's completeness check — `if (body_off + clen > n)` — into the
+        # tautology `X > X`, which never fires. `serve_handle_put_object` then
+        # handed that claimed length (up to 16 MiB) to `zlib_decompress` over a
+        # 64 KiB buffer, reading out of bounds.
+        var clen = content_length_sane(
+        sandhi_server_content_length(buf, n), SIT_SERVE_MAX_BODY);
+        if (clen < 0) {
+            _serve_send_status(STDOUT_FILENO, 400, "Bad Request");
+            stdout_flush();
+            return 1;
+        }
         var req_end = bo + clen;
+        # A body we never received is a truncated request, not a short one —
+        # refuse rather than dispatching a handler over bytes that aren't there.
+        if (req_end > n) {
+            _serve_send_status(STDOUT_FILENO, 400, "Bad Request");
+            stdout_flush();
+            return 1;
+        }
         var leftover = n - req_end;
         if (leftover < 0) { leftover = 0; }
 

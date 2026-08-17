@@ -320,6 +320,22 @@ fn print_indented_message(body, msg_start, body_len) {
 # out+8 keeps the last-parent pointer for back-compat with single-parent-chain
 # readers (cmd_log, merge_base). out+48's vec is the multi-parent surface that
 # reachability + ancestor walks consume so merge commits don't drop edges.
+# S-25: ceiling on a linear commit-history walk. Well above any real repository
+# (the Linux kernel is ~1.3M commits), low enough that a cyclic or corrupt store
+# fails in seconds instead of never.
+var SIT_MAX_COMMIT_WALK = 10000000;
+
+# S-25: 9999-12-31T23:59:59Z — the largest instant `iso8601` can render in its
+# fixed 4-digit year field, and the bound that keeps `epoch_to_date`'s
+# year-at-a-time walk from spinning on a hostile commit timestamp.
+var SIT_TS_MAX = 253402300799;
+
+fn commit_ts_clamp(ts) {
+    if (ts < 0) { return 0; }
+    if (ts > SIT_TS_MAX) { return SIT_TS_MAX; }
+    return ts;
+}
+
 fn parse_commit_body(body, body_len, out) {
     store64(out, 0);
     store64(out + 8, 0);
@@ -377,7 +393,23 @@ fn parse_commit_body(body, body_len, out) {
                         var ao[24];
                         if (parse_author_line(body + pos, line_len, 7, &ao) == 0) {
                             store64(out + 16, load64(&ao));
-                            store64(out + 24, load64(&ao + 8));
+                            # S-25: clamp the author timestamp to a representable
+                            # range before anything formats it.
+                            #
+                            # The commit body is attacker-controlled (cloned or
+                            # `.git/`-read repo) and the timestamp went straight
+                            # into `iso8601`, whose stdlib `epoch_to_date` walks
+                            # forward from 1970 ONE YEAR PER ITERATION. A
+                            # timestamp of ~1e18 is tens of billions of
+                            # iterations — `sit log` / `sit show` spin for hours
+                            # on a single crafted commit.
+                            #
+                            # SIT_TS_MAX is 9999-12-31T23:59:59Z, which is also
+                            # the largest value `iso8601`'s FOUR-digit year field
+                            # can render without corrupting its own output, so
+                            # the clamp is the formatter's real domain, not an
+                            # arbitrary cutoff.
+                            store64(out + 24, commit_ts_clamp(load64(&ao + 8)));
                             store64(out + 32, load64(&ao + 16));
                         }
                     }
@@ -856,9 +888,23 @@ fn cmd_log() {
 
     var first = 1;
     var shown = 0;
+    # S-25: bound the parent walk.
+    #
+    # Objects are content-addressed, so a genuine hash cycle is infeasible to
+    # forge — but sit does not re-verify an object's hash on READ (that is
+    # fsck's job), so a hand-authored .sit/objects.patra can store a commit
+    # under hash X whose body names X (or any descendant) as its parent. The
+    # walk then never terminates. `limit` only bounds this when the user passed
+    # `-n`; the default walk was unbounded.
+    var walked = 0;
     while (current_hex != 0) {
         if (limit >= 0) {
             if (shown >= limit) { current_hex = 0; }
+        }
+        walked = walked + 1;
+        if (walked > SIT_MAX_COMMIT_WALK) {
+            eprintln("sit: commit history exceeds the walk limit (cycle or corrupt store?)");
+            return 1;
         }
         if (current_hex == 0) { return 0; }
 
@@ -916,6 +962,7 @@ fn commit_tree_entries(commit_hex) {
     if (tree_hex == 0) { return 0; }
 
     var out = vec_new();
+    flatten_tree_reset();
     flatten_tree(tree_hex, "", out);
     return out;
 }

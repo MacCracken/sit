@@ -517,7 +517,19 @@ fn _wire_https_exchange(h, is_post, sub_path, body, body_len, extra_hdr, out_qua
         used = used + n;
         if (body_off < 0) {
             body_off = sandhi_server_body_offset(buf, used);
-            if (body_off > 0) { content_len = sandhi_server_content_length(buf, used); }
+            if (body_off > 0) {
+                content_len = content_length_sane(
+                sandhi_server_content_length(buf, used), WIRE_HTTP_MAX_BODY);
+                # S-25: a malicious server sending a near-i64-max Content-Length
+                # made `body_off + content_len` wrap negative, so the test below
+                # passed on the first iteration and this returned a "complete"
+                # response whose body was never read.
+                if (content_len < 0) {
+                    fl_free(buf); _wire_https_teardown(h);
+                    eprintln("sit: https response has a bogus Content-Length");
+                    return 0 - 1;
+                }
+            }
         }
         if (body_off > 0) {
             if (used >= body_off + content_len) { rgo = 0; }

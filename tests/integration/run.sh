@@ -344,6 +344,71 @@ else
   printf '  SKIP: python3 not installed — hostile packfile corpus skipped\n'
 fi
 
+# ── 11. S-25 regressions (2026-08-18 deep audit) ───────────────────
+# Each of these reproduced a live defect at v1.3.7. They are ordinary
+# operations, not exotic inputs — the merge case in particular needs no
+# hostile data at all.
+hr "S-25 regressions (deep-audit fixes)"
+
+# 11a. CRITICAL: three_way_line_merge looped forever on an insert-only hunk
+# (base_start == base_end), running `out` past its allocation. One side
+# appends a line, the other prepends one — an everyday merge. Was SIGSEGV.
+R="$WORK/s25merge"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'a\nb\n' > f.txt; "$SIT" add f.txt >/dev/null; "$SIT" commit -m base >/dev/null
+"$SIT" branch other >/dev/null 2>&1
+printf 'a\nb\nAPPEND\n' > f.txt; "$SIT" add f.txt >/dev/null; "$SIT" commit -m ours >/dev/null
+"$SIT" checkout other >/dev/null 2>&1
+printf 'PREPEND\na\nb\n' > f.txt; "$SIT" add f.txt >/dev/null; "$SIT" commit -m theirs >/dev/null
+"$SIT" checkout main >/dev/null 2>&1
+timeout 30 "$SIT" merge other >/dev/null 2>&1; MRC=$?
+assert_eq "$MRC" "0" "insert-only-hunk merge completes (no SIGSEGV/hang)"
+assert_eq "$(cat f.txt)" "$(printf 'PREPEND\na\nb\nAPPEND')" "insert-only-hunk merge keeps BOTH sides' edits"
+
+# 11b. HIGH: _wildmatch catastrophic backtracking — an 18-byte ignore file
+# pinned a core forever. Same matcher serves .gitignore on the owl/thoth
+# read path.
+R="$WORK/s25glob"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf '*a*a*a*a*a*a*a*a*b\n' > .sitignore
+: > aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+timeout 20 "$SIT" status >/dev/null 2>&1
+assert_eq "$?" "0" "adversarial glob pattern does not hang sit status"
+
+# 11c. HIGH: a HEAD symref target was never validated, so `.sit/HEAD`
+# containing `ref: ../../X` made commit write 64 hex bytes OUTSIDE the repo.
+R="$WORK/s25head"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'x\n' > f.txt; "$SIT" add f.txt >/dev/null; "$SIT" commit -m one >/dev/null 2>&1
+rm -f "$WORK/ESCAPED"
+printf 'ref: ../../ESCAPED\n' > .sit/HEAD
+printf 'y\n' > g.txt; "$SIT" add g.txt >/dev/null 2>&1
+"$SIT" commit -m two >/dev/null 2>&1
+if [ -f "$WORK/ESCAPED" ]; then bad "HEAD symref traversal wrote outside the repo"; else ok; fi
+
+# 11d. HIGH: `is_dir` follows symlinks, so a self-referential symlinked dir
+# recursed to the kernel's 40-deep ELOOP cap emitting nonsense paths. git
+# treats a symlink as a leaf; so do we now.
+R="$WORK/s25link"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+mkdir sub && ln -s .. sub/loop
+LOOPOUT=$(timeout 20 "$SIT" status 2>&1); assert_eq "$?" "0" "symlink loop does not hang the worktree walk"
+case "$LOOPOUT" in
+  *loop/sub/loop*) bad "worktree walk descended through a symlink" ;;
+  *) ok ;;
+esac
+
+# 11e. HIGH: config_file_set sized its output for ONE occurrence of the key
+# but rewrote EVERY matching line — 2000 duplicates + a 1000-byte value wrote
+# ~2 MB into a ~9 KB allocation.
+R="$WORK/s25cfg"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+{ echo '[user]'; i=0; while [ $i -lt 500 ]; do echo 'dup.key=1'; i=$((i+1)); done; } > .sit/config
+BIGVAL=$(printf 'v%.0s' $(seq 1 900))
+timeout 20 "$SIT" config dup.key "$BIGVAL" >/dev/null 2>&1
+assert_eq "$?" "0" "config set with many duplicate keys succeeds"
+assert_eq "$("$SIT" config dup.key)" "$BIGVAL" "config value round-trips after duplicate-key rewrite"
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

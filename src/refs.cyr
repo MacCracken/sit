@@ -173,6 +173,23 @@ fn read_head_ref_path() {
     var ref = alloc(ref_len + 1);
     memcpy(ref, buf + 5, ref_len);
     store8(ref + ref_len, 0);
+    # S-25: validate the symref TARGET before anyone builds a path out of it.
+    #
+    # This is the single choke point feeding read_head_ref (read path),
+    # write_head_ref (".sit/" + target) and reflog_head_move (".sit/logs/" +
+    # target). It used to return the raw bytes after "ref: " unchecked, so a
+    # HEAD file reading `ref: ../../PWNED` made `sit commit` write 64 hex chars
+    # + LF to a file OUTSIDE the repository — verified end to end — and
+    # `refs/heads/../../../../home/u/.bashrc` additionally passed the
+    # memeq("refs/heads/", 11) test in reflog_head_move, appending reflog lines
+    # (which carry the user's commit message) onto that path.
+    #
+    # Reachable from any repo whose .sit/ arrived from outside: tarball, shared
+    # checkout, restored backup, CI workspace. git blocks the same shape via
+    # check_refname_format() on the referent in parse_loose_ref_contents.
+    # refname_valid rejects `..` components, leading/trailing '/', and the
+    # control/space/special bytes git forbids.
+    if (refname_valid(ref) == 0) { return 0; }
     return ref;
 }
 
@@ -325,6 +342,13 @@ fn cmd_tag() {
             return 1;
         }
         var dname = argv_heap(3);
+        # S-25: the CREATE path below validates the name (S-02) but the DELETE
+        # path did not, so `sit tag -d ../../..<path>` built an unlink target
+        # outside .sit/refs/tags/. Same grammar, same gate, both directions.
+        if (refname_valid(dname) == 0) {
+            eprintln("sit: invalid tag name (see git check-ref-format rules)");
+            return 1;
+        }
         var dnlen = strlen(dname);
         var dpath = alloc(15 + dnlen + 1);
         memcpy(dpath, ".sit/refs/tags/", 15);
@@ -451,6 +475,13 @@ fn cmd_branch() {
             return 1;
         }
         var dname = argv_heap(3);
+        # S-25: same gap as `sit tag -d` — the create path validates, the delete
+        # path did not, so the unlink target could escape .sit/refs/heads/.
+        # Note this also gates the reflog unlink below (reflog_log_path(dlref)).
+        if (refname_valid(dname) == 0) {
+            eprintln("sit: invalid branch name (see git check-ref-format rules)");
+            return 1;
+        }
         var dnlen = strlen(dname);
         var dpath = alloc(16 + dnlen + 1);
         memcpy(dpath, ".sit/refs/heads/", 16);
@@ -644,6 +675,15 @@ fn cmd_checkout() {
     var n = file_read(target_fd, target_hex, 80);
     file_close(target_fd);
     if (n < 64) {
+        eprintln("sit: target ref is invalid");
+        return 1;
+    }
+    # S-25: apply the S-11 hex gate here too. `cmd_checkout` read the ref file
+    # and NUL-terminated at 64 without validating the bytes, so a corrupt or
+    # hand-written ref sent raw content into commit_tree_entries -> read_object,
+    # where it is interpolated into a patra SQL string literal and recorded in
+    # the reflog. Every other ref consumer already gates on hex_prefix_valid.
+    if (hex_prefix_valid(target_hex, 64) == 0) {
         eprintln("sit: target ref is invalid");
         return 1;
     }

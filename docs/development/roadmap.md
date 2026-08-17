@@ -24,6 +24,30 @@ Nothing below blocks anything else; the ordering is a recommendation, not a cont
 Consumption, hardening, and deferred no-surface work. The deps **already ship every symbol below**; what remains is the *wiring*. As of 1.3.6 there are no dep pins to bump — sakshi / sankoch / sigil / patra are `[deps].stdlib` leaves and the `cyrius` pin in `[package]` selects all four (see [`state.md`](state.md#dependencies-current-versions) for why the git blocks were removed and must not return).
 
 - **Wire patra `patra_insert_row_or_ignore` (P-11).** Available (patra 1.12.6+ ships it; 1.13.0 current). Route `db_object_insert_raw` through the or-ignore insert so `sit add` upserts the index without a full rewrite and drops the inner `db_object_has` probe — one B+ tree op per object on clone / push / add instead of two.
+- **The ten deferred findings from the 2026-08-18 deep audit** *(carried; see
+  [`docs/audit/2026-08-18-audit.md`](../audit/2026-08-18-audit.md) § Deferred).*
+  Every CRITICAL and HIGH from that audit shipped in 1.3.8; these are the
+  confirmed MEDIUM/LOW remainder, none memory-safety. Highest value first:
+  `lcs_diff`'s per-dimension guard fires before the cell-count check, so sit
+  **refuses to diff any add/delete of a >8192-line file** (functional, users hit
+  this); `fsck --prune-now` can delete reachable objects when `parse_tree`
+  silently drops a malformed entry; `sit_repo_branch` hands raw unsanitized
+  `.git/HEAD` bytes (control/ANSI) to owl and thoth; the wire commit-chain walk
+  has no allocation cap; object ids from commit bodies reach the *remote-handle*
+  SQL path, which does not pass through the `read_object` gate added in 1.3.8;
+  `sit_repo_open` detects the backend before setting the repo root; `git_pack`
+  has two raw `is_dir()` calls bypassing the `sit_abs` seam (AGNOS-relevant);
+  plus four LOWs (`group_hunks` `2 * ctx` overflow, `-U0` spurious context line,
+  config values echoed without control-char sanitization, `ssh_remote_read_raw`
+  missing its HTTP sibling's validation).
+- **Memoize `_wildmatch`** *(carried from the 2026-08-18 audit).* 1.3.8 bounded
+  the catastrophic backtracking with a per-match step budget, which fixes the
+  DoS but leaves the matcher worst-case exponential. The real fix is memoization
+  over (pattern offset, string offset). The obstacle is cost: the memo table
+  would be allocated and zeroed per (pattern, path) pair on `is_ignored`, which
+  is a measured benchmark (`is_ignored-200pat`). Likely shape — only memoize
+  when the pattern carries ≥3 star groups, so the common 0–2 star patterns keep
+  today's allocation-free fast path.
 - **ASAN (or an equivalent poisoned-allocator mode) for the fuzz harnesses** *(carried from the 2026-08-17 audit).* The 127-byte heap overread in `_git_apply_delta` was invisible to fuzzing because the read landed in mapped memory — it was found by reading, and is pinned only by a deterministic corpus that asserts on the leak. Every OOB *read* in the tree has the same blind spot. Wanted: a build mode that poisons redzones so `cyrius fuzz` fails on overreads rather than only on faults. Likely a cyrius-side ask — draft onto its `docs/development/roadmap.md`.
 - **Fuzz targets for the remaining unfuzzed parsers** *(carried from the 2026-08-17 audit).* The audit's central lesson was that the one module with no fuzz target held every serious finding. `parse_tree`, `parse_commit_body`, `_git_packed_ref_lookup` and `_wildmatch` all parse untrusted bytes and have unit tests but no harness. None showed a defect under review, which is exactly what was true of the pack reader before someone looked properly.
 - **Upstream ask (cyrius) — per-profile `distlib` dep sidecars.** `cyrius distlib read` writes its sidecar to `dist/sit.deps`, the same path the full profile uses, and emits the full `[deps].stdlib` list rather than the leaves the `read` profile actually needs. Both profiles therefore produce a byte-identical sidecar, so a `dist/sit-read.cyr` consumer following it pulls in the whole network stdlib (`net` / `tls` / `tls_native` / `ws` / `http` / `sandhi`) that the read bundle deliberately drops — which is the entire point of the profile. Harmless today (a superset always resolves, and the last writer wins with the same bytes), so it is a packaging nit, not a bug. Wanted: `dist/<name>-<profile>.deps` scoped to the profile's own module set. Draft this onto cyrius's `docs/development/roadmap.md` — these repos don't use the issue tracker.

@@ -111,7 +111,47 @@ fn config_file_set(path, key, value) {
         }
     }
 
-    var out = alloc(len + key_len + val_len + 8);
+    # S-25: size `out` for EVERY matching line, not one.
+    #
+    # This used to be `alloc(len + key_len + val_len + 8)`, which assumes the key
+    # occurs at most once. The rewrite loop below replaces *every* matching line
+    # with "<key> = <value>\n", so N occurrences each contribute
+    # key_len + 3 + val_len + 1 bytes while the allowance covered a single one.
+    # A config holding 2000 short duplicate lines plus a 1000-byte value wrote
+    # 2,010,007 bytes into a 9,016-byte allocation — a silent 2 MB heap overflow
+    # that exited 0, faulting only if the bump allocator happened to be short of
+    # mapped slack. Reachable from `sit config` / `sit remote add` against any
+    # repo whose .sit/config arrived from outside (clone, tarball, shared
+    # checkout).
+    #
+    # Count the matches first, then allocate for all of them plus the append
+    # case. The counting pass mirrors the rewrite loop's line scan exactly.
+    var nmatch = 0;
+    var cpos = 0;
+    while (cpos < len) {
+        var cle = cpos;
+        var cfind = 1;
+        while (cfind == 1) {
+            if (cle >= len) { cfind = 0; }
+            else {
+                if (load8(data + cle) == 10) { cfind = 0; }
+                else { cle = cle + 1; }
+            }
+        }
+        var cstop = cle;
+        if (cstop > cpos) {
+            if (load8(data + cstop - 1) == 13) { cstop = cstop - 1; }
+        }
+        if (config_parse_value(data, cpos, cstop, key, key_len) != 0) { nmatch = nmatch + 1; }
+        cpos = cle + 1;
+    }
+
+    # Each rewritten line costs at most key_len + 3 (" = ") + val_len + 1 ("\n").
+    # The trailing +... covers the not-found append path (same shape, plus a
+    # possible inserted newline) and keeps the old slack.
+    var per_line = key_len + val_len + 4;
+    var out_cap = len + nmatch * per_line + per_line + 8;
+    var out = alloc_or_die(out_cap);
     var out_pos = 0;
     var replaced = 0;
 

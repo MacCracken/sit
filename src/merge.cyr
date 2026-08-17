@@ -87,11 +87,22 @@ fn any_hunk_overlap(hunks_a, hunks_b) {
     return 0;
 }
 
-# Append a line-tuple's bytes + "\n" into `buf` starting at `pos`. Returns
-# the new position.
-fn append_line_to_buf(buf, pos, line_tup) {
+# Append a line-tuple's bytes + "\n" into `buf` starting at `pos`, refusing to
+# write past `cap`. Returns the new position, or (0 - 1) if the line would not
+# fit.
+#
+# S-25: this used to take no capacity and memcpy unconditionally. The caller
+# sizes `out` from a worst-case estimate, so an estimate that is ever wrong —
+# or a caller-side loop that fails to terminate, which is exactly what happened
+# — writes attacker-influenced file bytes over adjacent heap objects until it
+# reaches an unmapped page. The bound makes any such miscount fail closed (the
+# merge degrades to a conflict) instead of corrupting the heap.
+fn append_line_to_buf(buf, pos, line_tup, cap) {
     var lp = load64(line_tup);
     var ll = load64(line_tup + 8);
+    if (ll < 0) { return 0 - 1; }
+    if (pos < 0) { return 0 - 1; }
+    if (pos + ll + 1 > cap) { return 0 - 1; }
     memcpy(buf + pos, lp, ll);
     store8(buf + pos + ll, 10);
     return pos + ll + 1;
@@ -133,41 +144,70 @@ fn three_way_line_merge(base_buf, base_len, ours_buf, ours_len, theirs_buf, thei
     var out = alloc_or_die(cap);
     var pos = 0;
 
+    # S-25: walk base, applying each side's hunk that starts here.
+    #
+    # A hunk is {base_start, base_end, inserts} — "replace base[start,end) with
+    # inserts". An INSERT-ONLY hunk has start == end, and the previous shape of
+    # this loop set `b = load64(oh + 8)` unconditionally, i.e. back to the same
+    # `b`. `hunk_starting_at` then re-found the identical hunk and re-appended
+    # its lines forever, running `out` past its allocation — a SIGSEGV on an
+    # entirely ordinary merge (one side appends a line, the other prepends one;
+    # no hostile input required).
+    #
+    # The fix is to only take a hunk's base_end when it actually consumes base
+    # lines. A pure insert emits its lines and leaves `b` alone, so the base
+    # line at `b` is still emitted below and `b` advances by one — which is the
+    # correct semantics for "insert before base line b" anyway.
+    #
+    # `err` makes an out-of-capacity append abort the whole merge (returns 0 =
+    # conflict) rather than silently truncating the merged file.
     var b = 0;
+    var err = 0;
     while (b <= bn) {
-        var oh = hunk_starting_at(ours_hunks, b);
-        var th = hunk_starting_at(theirs_hunks, b);
-
-        if (oh != 0) {
-            var inserts = load64(oh + 16);
-            var ilen = vec_len(inserts);
-            var k = 0;
-            while (k < ilen) {
-                pos = append_line_to_buf(out, pos, vec_get(inserts, k));
-                k = k + 1;
-            }
-            b = load64(oh + 8);
-        }
+        if (err != 0) { b = bn + 1; }
         else {
-            if (th != 0) {
-                var inserts = load64(th + 16);
-                var ilen = vec_len(inserts);
-                var k = 0;
-                while (k < ilen) {
-                    pos = append_line_to_buf(out, pos, vec_get(inserts, k));
-                    k = k + 1;
+            var advanced = 0;
+
+            var oh = hunk_starting_at(ours_hunks, b);
+            if (oh != 0) {
+                var oins = load64(oh + 16);
+                var oilen = vec_len(oins);
+                var ok2 = 0;
+                while (ok2 < oilen) {
+                    if (pos >= 0) { pos = append_line_to_buf(out, pos, vec_get(oins, ok2), cap); }
+                    ok2 = ok2 + 1;
                 }
-                b = load64(th + 8);
+                var oend = load64(oh + 8);
+                if (oend > b) { b = oend; advanced = 1; }
             }
-            else {
+
+            if (advanced == 0) {
+                var th = hunk_starting_at(theirs_hunks, b);
+                if (th != 0) {
+                    var tins = load64(th + 16);
+                    var tilen = vec_len(tins);
+                    var tk = 0;
+                    while (tk < tilen) {
+                        if (pos >= 0) { pos = append_line_to_buf(out, pos, vec_get(tins, tk), cap); }
+                        tk = tk + 1;
+                    }
+                    var tend = load64(th + 8);
+                    if (tend > b) { b = tend; advanced = 1; }
+                }
+            }
+
+            if (advanced == 0) {
                 if (b < bn) {
-                    pos = append_line_to_buf(out, pos, vec_get(base_lines, b));
+                    if (pos >= 0) { pos = append_line_to_buf(out, pos, vec_get(base_lines, b), cap); }
                 }
                 b = b + 1;
             }
+
+            if (pos < 0) { err = 1; }
         }
     }
 
+    if (err != 0) { return 0; }
     store64(out_len_ptr, pos);
     return out;
 }

