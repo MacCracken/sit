@@ -24,14 +24,12 @@ Nothing below blocks anything else; ordering within a section is a recommendatio
 
 Ordered. Nothing here adds observable surface, so each can ship as it lands.
 
-- **`1.4.2` — the residual object-lookup curve.** 1.4.1 indexed `objects.hash`
-  and `log -n 50` went 44 → 35 ms across a 4× table — better, but **still not
-  flat**, so patra's indexed-WHERE path keeps some per-lookup growth. Profile it,
-  and if the cost is upstream, file it on patra with the reproducer already
-  written (`docs/development/benchmarks-git-v-sit.md` has the method). This is the
-  single largest remaining perf lever: it gates `clone` (8.64× git), `log`
-  (6.33×), `status` and `diff` simultaneously, and it grows with repo size, so the
-  100-commit fixture understates it.
+- **`1.4.2` — ~~profile the residual lookup curve~~ → ANSWERED, see the 1.4.2
+  CHANGELOG entry.** It is patra's fixed 1024-slot (~4 MB) page cache: indexed
+  lookups degrade **15× once a DB is 8× the cache**, and row count is not the
+  driver. Filed upstream as a patra consumer request. **sit has no lever left on
+  the lookup itself** — the index exists, the query is a single indexed equality.
+  What sit *can* do is stop reaching the cliff so early; see the packing item below.
 - **`1.4.3` — index `entries.path` in `index.patra`.** The staging index has the
   same bare-`CREATE TABLE` shape `objects` had. `parse_index` scans deliberately
   (it wants every row, ordered), but any `WHERE path = …` lookup is on the scan
@@ -54,6 +52,27 @@ Ordered. Nothing here adds observable surface, so each can ship as it lands.
 
 ---
 
+## Structural — object storage size
+
+**Now the top structural item in the tree**, promoted out of "heavier /
+unscheduled" by the 1.4.2 profiling. It was filed as a disk-space and
+transfer-efficiency feature; it is actually upstream of sit's read performance.
+
+- **Pack bundles + `gc` / repack.** For an identical 1,600-commit history sit's
+  store is **62.8 MB** where git packs to **1.1 MB** (git loose: 6.4 MB) — sit has
+  no delta compression or packing, and every object occupies at least one patra
+  page. Against patra's ~4 MB page cache that is a ~16× overshoot, which is why
+  indexed lookups run in the degraded regime on a repository of only 1,600
+  commits. Shrinking the store is the one lever sit owns over that curve.
+
+  The git-delta *read* interpreter already exists (1.2.0, `src/git_pack.cyr`);
+  what remains is delta *generation*, on-disk repack, and the negotiated wire
+  capability (which makes it a minor, not a patch). Was gated on "patra
+  storage-shape work that isn't ready" — that gate should be re-examined, because
+  the cost of waiting is now measured rather than theoretical.
+
+---
+
 ## Minor line — themed `1.x.0`
 
 Each is a self-contained minor; the heavier ones earn their own slot. **Next: `1.5.0`** — and it is the first *feature* work since 1.3.0, after five consecutive hardening releases.
@@ -73,7 +92,6 @@ Each is a self-contained minor; the heavier ones earn their own slot. **Next: `1
 Each earns its own minor when its time comes.
 
 - **`sit rebase`** — the heaviest rewrite tool; depends on the reflog (1.1.0) for safety and shares cherry-pick's apply machinery (1.6.0).
-- **Pack bundles + `gc` / repack** — batched, delta-compressed object transfer (a new negotiated wire capability → minor) plus on-disk repacking. The git-delta *read* interpreter exists (1.2.0, `src/git_pack.cyr`); what remains is delta *generation* + on-disk repack + the wire capability, tied to patra storage-shape work that isn't ready.
 - **Hooks** (`pre-commit`, `pre-push`, …) — if a consumer asks.
 
 ---

@@ -4,6 +4,66 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.2] — 2026-08-18 — the residual lookup curve is patra's fixed page cache
+
+**No sit code change.** This release is the 1.4.2 investigation itself: profiling
+the object-lookup curve 1.4.1 left behind, and filing it where it can be fixed.
+The version exists so the finding has a citable home; the binary is 1.4.1's.
+
+### Found
+
+- **The residual per-lookup growth is patra's fixed 1024-slot page cache, not
+  sit.** `PcConst { PC_CAP = 1024 }` caps resident pages at roughly **4 MB
+  regardless of database size**. Past that, every B-tree descent re-reads interior
+  pages from disk.
+
+  Measured in pure patra — same key, same index, only file size varying:
+
+  | DB file size | ns / indexed query | |
+  |---|---:|---:|
+  | ~1.2 MB (fits cache) | 131,993 | 1.0× |
+  | ~4.8 MB (just past) | 346,313 | 2.6× |
+  | ~32.8 MB (8× cache) | 1,989,206 | **15.1×** |
+
+  **Row count is not the driver.** A separate probe grew rows 500 → 5,000 at small
+  file size and lookups stayed flat (40.8 → 42.5 → 42.8 µs). The index works
+  correctly; the pages simply are not resident.
+
+  Confirmed from sit's side by phase-resolving `read_object` over 50 reads:
+
+  ```
+                     300-object repo      4800-object repo
+  patra_query          10,219 us            123,419 us   <-- all of the growth
+  result_read_bytes        96 us                 96 us
+  zlib inflate          2,150 us              2,126 us
+  ```
+
+  Filed as [`patra/docs/development/requests/2026-08-18-sit-page-cache-fixed-1024-slots.md`](https://github.com/MacCracken/patra)
+  — sit has no further lever here: the index exists (added 1.4.1), the query is a
+  single equality on the indexed column, and the per-call work is already minimal.
+
+- **sit reaches that cliff far sooner than it should, and that part *is* sit's.**
+  For an identical 1,600-commit history:
+
+  | store | size |
+  |---|---:|
+  | sit `objects.patra` | **62.8 MB** |
+  | git loose (unpacked) | 6.4 MB |
+  | git packed | **1.1 MB** |
+
+  sit's store is **57× git's packed size** and 10× git's *loose* size, because sit
+  has no delta compression or packing and every object occupies at least one page.
+  A 60 MB store against a 4 MB cache is a ~16× overshoot, which is why a
+  1,600-commit repository already sits deep in the degraded regime.
+
+### Changed — planning
+
+- **"Pack bundles + `gc` / repack" moves from *heavier / unscheduled* to the top
+  structural item on the roadmap.** It was filed as a disk-space and
+  transfer-efficiency feature. It is actually the lever that keeps sit's working
+  set inside patra's cache — i.e. it is upstream of the read-performance curve,
+  not adjacent to it. That reframing is the main planning output of this release.
+
 ## [1.4.1] — 2026-08-18 — every object lookup was a full table scan
 
 Wires the two dependency capabilities that had been sitting available-but-unused.
