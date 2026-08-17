@@ -127,7 +127,7 @@ hr "merge-base full-DAG LCA (diamond)"
 R="$WORK/diamond"; mkdir -p "$R"; cd "$R"
 "$SIT" init >/dev/null
 printf 'r\n' > r.txt; "$SIT" add r.txt >/dev/null; "$SIT" commit -m "R" >/dev/null
-ROOT=$(tr -d '\n' < .sit/refs/heads/main)
+ROOT_COMMIT=$(tr -d '\n' < .sit/refs/heads/main)
 "$SIT" checkout -b feature >/dev/null
 printf 'b\n' > b.txt; "$SIT" add b.txt >/dev/null; "$SIT" commit -m "B" >/dev/null
 BASE=$(tr -d '\n' < .sit/refs/heads/feature)
@@ -139,7 +139,7 @@ printf 'c\n' > c.txt; "$SIT" add c.txt >/dev/null; "$SIT" commit -m "C" >/dev/nu
 printf 'd\n' > d.txt; "$SIT" add d.txt >/dev/null; "$SIT" commit -m "D" >/dev/null
 MB=$("$SIT" merge-base main feature)
 assert_eq "$MB" "$BASE" "merge-base(main,feature) = B (true full-DAG LCA)"
-if [ "$MB" = "$ROOT" ]; then bad "merge-base returned root (pre-v0.8.13 first-parent behavior)"; else ok; fi
+if [ "$MB" = "$ROOT_COMMIT" ]; then bad "merge-base returned root (pre-v0.8.13 first-parent behavior)"; else ok; fi
 # self and ancestor identities
 assert_eq "$("$SIT" merge-base main main)" "$(tr -d '\n' < .sit/refs/heads/main)" "merge-base(X,X) = X"
 
@@ -322,6 +322,26 @@ if command -v git >/dev/null 2>&1; then
   fi
 else
   printf '  SKIP: git not installed — .git/ read-mode test skipped\n'
+fi
+
+# ── 10. hostile packfile corpus (S-24, 2026-08-17 audit) ───────────
+# `.git/` read-mode parses attacker-controlled .idx / .pack bytes whenever a
+# consumer points sit at a repo cloned from a hostile remote. Four of these
+# cases were live defects at v1.3.6: three SIGSEGVs in the .idx table math and
+# a 127-byte heap disclosure via the delta literal opcode. Guarded on python3
+# (needed to build binary fixtures) so a python-less runner skips.
+hr "hostile packfile corpus (.idx / delta bounds)"
+if command -v python3 >/dev/null 2>&1; then
+  if python3 "$ROOT/tests/integration/hostile_pack.py" "$SIT" "$WORK/hostile" >"$WORK/hostile.log" 2>&1; then
+    # 11 hostile cases + 1 positive control, all asserted inside the script.
+    N=$(grep -c '^  PASS' "$WORK/hostile.log")
+    i=0; while [ "$i" -lt "$N" ]; do ok; i=$((i+1)); done
+  else
+    bad "hostile packfile corpus (see below)"
+    sed 's/^/    /' "$WORK/hostile.log"
+  fi
+else
+  printf '  SKIP: python3 not installed — hostile packfile corpus skipped\n'
 fi
 
 # ── summary ────────────────────────────────────────────────────────

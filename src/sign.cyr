@@ -149,9 +149,9 @@ fn extract_sitsig(body, body_len, out_sig, out_pub, out_stripped_ptr, out_stripp
                             var sig_bytes = 0;
                             var pub_bytes = 0;
                             if (sig_ok == 1) { if (pub_ok == 1) {
-                                sig_bytes = hex_decode(body + pos + 7, 128);
-                                pub_bytes = hex_decode(body + pos + 136, 64);
-                            } }
+                                    sig_bytes = hex_decode(body + pos + 7, 128);
+                                    pub_bytes = hex_decode(body + pos + 136, 64);
+                                } }
                             if (sig_bytes != 0) {
                                 if (pub_bytes != 0) {
                                     memcpy(out_sig, sig_bytes, 64);

@@ -211,7 +211,7 @@ fn write_typed_object(type_str, type_len, content, content_len) {
         var blens[24];
         store64(&blens + 16, clen);
         patra_insert_row(db, "objects", 7, 3,
-            &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+        &types, &ivals, &sptrs, &slens, &bptrs, &blens);
     }
     return hex;
 }
@@ -511,7 +511,7 @@ fn object_db_migrate_from_loose(db) {
                         var blens[24];
                         store64(&blens + 16, clen);
                         patra_insert_row(db, "objects", 7, 3,
-                            &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+                        &types, &ivals, &sptrs, &slens, &bptrs, &blens);
 
                         sf_unlink(loose_path);
                     }

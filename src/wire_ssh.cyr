@@ -200,11 +200,11 @@ fn _ssh_find_binary() {
                 # executability probe so this file has no eager undefined-var
                 # reference on --agnos; the whole spawn path stays unreachable
                 # there via wire_ssh_open. See ADR 0008.
-#ifndef CYRIUS_TARGET_AGNOS
+                #ifndef CYRIUS_TARGET_AGNOS
                 if (syscall(SYS_ACCESS, cand, 1) == 0) {
                     return cand;
                 }
-#endif
+                #endif
             }
             start = i + 1;
         }
@@ -271,7 +271,7 @@ fn _ssh_port_str(port) {
 #
 # Returns a wire_ssh handle (40 bytes) on success, 0 on failure.
 fn wire_ssh_open(url) {
-#ifdef CYRIUS_TARGET_AGNOS
+    #ifdef CYRIUS_TARGET_AGNOS
     # The SSH transport shells out to the `ssh` binary via fork/exec (see
     # the child branch below) — a Linux-host capability. agnos has no
     # fork/exec, so sys_fork / sys_dup2 / sys_execve are undefined on the
@@ -281,7 +281,7 @@ fn wire_ssh_open(url) {
     # fail cleanly for ssh:// URLs. See ADR 0008.
     eprintln("sit: ssh:// transport is unsupported on agnos (no fork/exec)");
     return 0;
-#else
+    #else
     var u_cell = alloc(8); store64(u_cell, 0);
     var h_cell = alloc(8); store64(h_cell, 0);
     var p_cell = alloc(8); store64(p_cell, 0);
@@ -428,7 +428,7 @@ fn wire_ssh_open(url) {
         return 0;
     }
     return h;
-#endif
+    #endif
 }
 
 fn wire_ssh_close(h) {
@@ -439,7 +439,7 @@ fn wire_ssh_close(h) {
     if (rfd > 0) { sys_close(rfd); }
     var pid = _ssh_handle_pid(h);
     if (pid > 0) {
-#ifndef CYRIUS_TARGET_AGNOS
+        #ifndef CYRIUS_TARGET_AGNOS
         # Reap the ssh child. Gated out on agnos for the same reason the
         # spawn body in wire_ssh_open is: agnos has no fork/exec, so
         # wire_ssh_open early-returns 0 there and no handle ever carries a
@@ -449,7 +449,7 @@ fn wire_ssh_close(h) {
         # check is static, not reachability-based. See ADR 0008.
         var status_buf[1];
         sys_waitpid(pid, &status_buf, 0);
-#endif
+        #endif
     }
     return 0;
 }
@@ -639,8 +639,8 @@ fn _wire_ssh_recv_response(rfd, out_body) {
     if (used >= 12) {
         if (memeq(buf, "HTTP/1.", 7) == 1) {
             status = (load8(buf + 9) - 48) * 100
-                   + (load8(buf + 10) - 48) * 10
-                   + (load8(buf + 11) - 48);
+            + (load8(buf + 10) - 48) * 10
+            + (load8(buf + 11) - 48);
         }
     }
 

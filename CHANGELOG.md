@@ -4,6 +4,138 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.7] — 2026-08-17 — hardening pass: two memory-safety defects in the git packfile reader
+
+A full P(-1) audit / refactor / hardening pass over the whole tree. **The
+`.git/` packfile reader was the one module with no fuzz target, and it is where
+every serious finding landed** — three reproducible SIGSEGVs and a heap-memory
+disclosure, all reachable from a *read-only* command against a repository the
+user merely opened. Full report:
+[`docs/audit/2026-08-17-audit.md`](docs/audit/2026-08-17-audit.md).
+
+No public-API change; both dist bundles are byte-identical to 1.3.6 apart from
+the version stamp, so owl / thoth are unaffected.
+
+### Security
+
+sit's `.git/` read-mode exists so consumers (owl, thoth) can report on
+**arbitrary real-world git repositories** on disk — routinely cloned from
+remotes the user does not control. The bytes in `.git/objects/pack/*.{idx,pack}`
+are therefore attacker-controlled input on a no-privilege path, which is what
+makes both of these matter.
+
+- **HIGH — `_git_idx_lookup` trusted the `.idx` table geometry (out-of-bounds
+  read → SIGSEGV).** `src/git_pack.cyr` validated the magic, the version word and
+  `len >= 1032`, then computed **every subsequent table address from numbers
+  inside the file**: the object count `N`, the fanout-derived binary-search
+  bounds `lo`/`hi`, and both offset tables. A `.idx` whose fanout claims ~10⁹
+  entries drives the first `_memcmp_n` gigabytes past the mapping. Reproduced as
+  a crash three distinct ways (`huge_fanout`, `huge_N`, `large_offset_oob`) on
+  nothing more than `sit cat-file <hash>`.
+
+  **Fixed**: `N` is bounded by the real file length
+  (`N > (len - 1032) / (rawlen + 8)` → reject), the fanout must be monotonic
+  within `[0, N]`, and the large-offset entry — which sits *after* the size gate
+  and so needs its own check — is bounded against `len` before `_be64` reads it.
+
+- **HIGH — `_git_apply_delta` read past the delta buffer (127-byte heap
+  disclosure).** The delta interpreter's literal opcode bounds-checked its
+  **destination** but never its **source**: nothing verified
+  `cur + lit <= delta_len`. A delta ending in a bare `0x7F` opcode copied 127
+  bytes of adjacent heap into the reconstructed object — and because the attacker
+  also chooses `result_size`, the function **returns success** and sit prints
+  them. Observed output contained a live heap pointer (`0x7f8bb7000640`), i.e. an
+  ASLR-defeating disclosure plus allocator metadata, through `sit cat-file`.
+
+  **Fixed**: the literal is bounded against `delta_len` before the `memcpy`, and
+  a COPY opcode's whole operand run is bounded before any of it is consumed.
+
+- **Hardening on the same parser** (real missing guards; no demonstrated
+  exploit — the corpus cases for these pass pre-fix too, because an earlier error
+  path caught them first, and the audit records that distinction rather than
+  overclaiming): the three pack varint decoders took **no length argument at
+  all** and walked off the buffer on a trailing continuation bit (now
+  length-bounded, run-capped at 10 bytes, and reject a wrapped accumulator that
+  could otherwise overflow `size` negative past the `_PACK_MAX_OBJ` gate); the
+  pack `offset` from the `.idx` is now required to satisfy `12 <= offset < plen`
+  before becoming a load address; three `zlib_decompress` sites could be handed a
+  negative length; an OFS_DELTA of distance 0 made an object its own delta base;
+  and a REF_DELTA base oid could be read past the end of the pack.
+
+- **LOW — `serve_handle_put_ref` guard off by one.** `rname_len >= 12` preceded
+  `memeq(rname, "refs/remotes/", 13)`. The read stayed in bounds (the buffer is
+  `rname_len + 1`; byte 12 is the NUL) and behaviour was correct, but the guard
+  read as an overread. Tightened to `>= 13`. Found by a mechanical guard-vs-compare
+  scan across the tree — the only instance.
+
+### Added
+
+- **`tests/integration/hostile_pack.py` + `packlib.py` — an 11-case hostile
+  packfile corpus**, wired into `run.sh` (guarded on `python3`). It opens with a
+  **positive control** that builds a valid pack + OFS_DELTA and asserts sit
+  reconstructs it byte-for-byte; this is load-bearing, because the first draft of
+  the corpus scored **7 false passes** from fixtures that bounced off an earlier
+  error path without ever reaching the parser. Proven non-vacuous by A/B: the
+  four defect cases fail against a pre-fix binary (three `exit=-11`, one
+  `LEAK 127B`) and pass after.
+- **Two fuzz harnesses** in `tests/sit.fcyr` closing the gap that hid the above:
+  `fuzz_pack_varints` (500k rounds; cursor started at random in-range offsets
+  *including the last byte*, plus a past-the-end cursor) and `fuzz_apply_delta`
+  (200k rounds against a fixed base). ⚠ Without ASAN, fuzzing catches crashes but
+  **not** a 127-byte overread into mapped heap — the disclosure is pinned by the
+  deterministic corpus, which asserts on it directly.
+
+### Changed
+
+- **`_serve_rehash_and_insert` scanned the object framing header twice** for the
+  type/length separator — once to prove a space existed, again to recover its
+  index, because the first pass clobbered the cursor to force loop exit.
+  Consolidated to a single flag-guarded pass.
+- **Removed `src/lib/`** — 3.4 MB of stale, gitignored, unreferenced build
+  artifacts from a pre-6.x toolchain (it still carried `base64.cyr` / `bigint.cyr`,
+  folded into `bayan` back in cyrius 6.x), plus an empty `src/build/`. `src/` is
+  now exactly the 22 source files.
+- **`tests/integration/run.sh` no longer shadows its own `$ROOT`** — line 130
+  assigned a commit hash over the repo-root path set at line 13. Latent while
+  nothing read `$ROOT` afterwards; it broke the moment the new corpus step did.
+  Renamed to `ROOT_COMMIT`.
+- **Reformatted 15 files to the 6.5.x formatter** (13 of them untouched by this
+  release — pre-existing drift, confirmed present at the 1.3.6 tag, that was
+  failing `cyrius audit`). The only change is `#ifdef` / `#else` / `#endif`
+  directives indented to their surrounding block.
+
+  ⚠ **This hunk was verified, not assumed.** sit uses `#ifdef CYRIUS_TARGET_AGNOS`
+  to select between AGNOS and Linux **syscall shapes** (`sit_mkdir` / `sit_rmdir`
+  in `util.cyr`, the lstat degradation in `validate.cyr` / `serve.cyr`, the ssh
+  spawn path in `wire_ssh.cyr`). If cyrius's preprocessor were column-sensitive,
+  indenting them would silently select the wrong branch — and **no Linux test run
+  could catch it**, because Linux would still take the Linux branch; it would
+  surface only on AGNOS, as a repeat of the exact ABI class 1.3.3–1.3.5 spent
+  three releases fixing. Checked by building **both targets before and after** the
+  reformat and comparing binaries: `sha256` **identical on Linux and on
+  `--agnos`**, DCE included. Cosmetic, confirmed safe.
+- **`.gitignore`**: added `__pycache__/` / `*.pyc` (the new integration fixtures
+  are Python).
+
+### Verified
+
+- 282 unit / **70 integration** (was 58; +12 from the hostile corpus) / **9 fuzz
+  harnesses** (was 7) / lint 0 warnings / `cyrius audit` / benchmarks — all green.
+  `--agnos` clean with and without DCE.
+- **No benchmark regression**: max |delta| 7.0%, on a sub-microsecond measurement
+  (`sha256-64B`, 676ns → 723ns) on an unpinned box; no benchmarked path was
+  touched.
+- **Dead-code audit**: five uncalled functions, all five kept. `sit_repo_branch` /
+  `sit_repo_status` are public API (ADR 0009); `build_merge_commit` is a
+  documented intentional wrapper; `sf_mkdir` / `sf_stat` were **considered for
+  deletion and deliberately kept** — an asymmetric `sf_*` family is a trap that
+  sends the next caller to raw `xstat` / `sit_mkdir`, which is the exact
+  unprefixed-path bug class 1.3.4 spent a release fixing. DCE strips both.
+- **Reviewed and clean**: no `sys_system` anywhere; `exec_vec` argv fully
+  controlled; `tree_entry_name_valid` / `tree_flat_path_valid` traversal defenses;
+  `parse_tree`, `_git_read_loose` and `_git_packed_ref_lookup` bounds; the push
+  rehash trust boundary; the ref-write allowlist; all `var buf[N]` sizings.
+
 ## [1.3.6] — 2026-08-17 — cyrius `6.5.24` + deps to latest, and the four first-party layers stop being git deps
 
 A toolchain and dependency refresh whose substance is a **packaging correction**:

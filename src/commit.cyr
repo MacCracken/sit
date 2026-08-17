@@ -786,25 +786,25 @@ fn cmd_log() {
         var a = argv(ai);
         if (streq(a, "--oneline") == 1) { oneline = 1; ai = ai + 1; }
         else {
-          if (streq(a, "--graph") == 1) { graph = 1; ai = ai + 1; }
-          else {
-            if (streq(a, "-n") == 1) {
-                if (ai + 1 >= argc()) {
-                    eprintln("sit: -n requires a number");
-                    return 1;
-                }
-                limit = atoi(argv(ai + 1));
-                ai = ai + 2;
-            }
+            if (streq(a, "--graph") == 1) { graph = 1; ai = ai + 1; }
             else {
-                if (start_ref != 0) {
-                    eprintln("usage: sit log [--oneline] [--graph] [-n <count>] [<ref>]");
-                    return 1;
+                if (streq(a, "-n") == 1) {
+                    if (ai + 1 >= argc()) {
+                        eprintln("sit: -n requires a number");
+                        return 1;
+                    }
+                    limit = atoi(argv(ai + 1));
+                    ai = ai + 2;
                 }
-                start_ref = argv_heap(ai);
-                ai = ai + 1;
+                else {
+                    if (start_ref != 0) {
+                        eprintln("usage: sit log [--oneline] [--graph] [-n <count>] [<ref>]");
+                        return 1;
+                    }
+                    start_ref = argv_heap(ai);
+                    ai = ai + 1;
+                }
             }
-          }
         }
     }
 

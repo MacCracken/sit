@@ -236,7 +236,7 @@ fn db_object_insert_raw(db, hex, type_code, compressed, clen) {
     var blens[24];
     store64(&blens + 16, clen);
     return patra_insert_row(db, "objects", 7, 3,
-        &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+    &types, &ivals, &sptrs, &slens, &bptrs, &blens);
 }
 
 # ── obj_src abstraction (v0.7.3) ───────────────────────────────────

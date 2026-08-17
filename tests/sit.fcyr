@@ -192,6 +192,78 @@ fn fuzz_reflog_index(rounds) {
     return 0;
 }
 
+# S-24: the git packfile decoders had NO fuzz target through v1.3.6, and that is
+# exactly where the 2026-08-17 audit found an unbounded `.idx` table read
+# (SIGSEGV) and an out-of-bounds delta literal read that leaked heap bytes —
+# including a live pointer — into `cat-file` output. Every one of these parses
+# attacker-controlled bytes from a cloned repo, so they get a harness.
+#
+# The varint decoders and `_git_apply_delta` are pure (buffer + length), so they
+# fuzz in-process. `_git_idx_lookup` takes a path, so its hostile-input coverage
+# lives in the integration corpus (tests/integration/hostile_pack.py) instead.
+fn fuzz_pack_varints(rounds) {
+    var buf_cap = 512;
+    var input = alloc(buf_cap);
+    var cur[8];
+    var type_slot[8];
+    var seed = 0x9E3779B1;
+    var i = 0;
+    while (i < rounds) {
+        var size = (seed & 0xFF) + 1;   # 1..256
+        if (size > buf_cap) { size = buf_cap; }
+        fill_pseudo_random(input, size, seed);
+        # Start the cursor at a random in-range offset, including the last byte,
+        # so a continuation bit on the final byte is exercised every round.
+        var start = seed & 0x7F;
+        if (start >= size) { start = size - 1; }
+
+        store64(&cur, start);
+        _pack_obj_header(input, &cur, &type_slot, size);
+        store64(&cur, start);
+        _ofs_varint(input, &cur, size);
+        store64(&cur, start);
+        _delta_varint(input, &cur, size);
+
+        # Cursor already past the end must fail closed, not read.
+        store64(&cur, size);
+        _pack_obj_header(input, &cur, &type_slot, size);
+        store64(&cur, size);
+        _ofs_varint(input, &cur, size);
+        store64(&cur, size);
+        _delta_varint(input, &cur, size);
+
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Random delta instruction streams against a fixed base. Every accepted result
+# must have consumed exactly `result_size` bytes; the harness only asserts no
+# crash, which is what the OOB literal read would have produced under ASAN.
+fn fuzz_apply_delta(rounds) {
+    var base_cap = 4096;
+    var delta_cap = 1024;
+    var base = alloc(base_cap);
+    var delta = alloc(delta_cap);
+    var out24[24];
+    fill_pseudo_random(base, base_cap, 0x5EED);
+    var seed = 0xC0FFEE;
+    var i = 0;
+    while (i < rounds) {
+        var dlen = (seed & 0x3FF) + 1;  # 1..1024
+        if (dlen > delta_cap) { dlen = delta_cap; }
+        fill_pseudo_random(delta, dlen, seed);
+        _git_apply_delta(base, base_cap, delta, dlen, &out24);
+        # Zero-length and negative-length deltas must fail closed.
+        _git_apply_delta(base, base_cap, delta, 0, &out24);
+        _git_apply_delta(base, 0, delta, dlen, &out24);
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn main() {
     alloc_init();
     println("fuzz: zlib_decompress (10000 rounds)");
@@ -208,6 +280,10 @@ fn main() {
     if (fuzz_want_frame_decoder(10000000) != 0) { return 1; }
     println("fuzz: reflog_index (200000 rounds)");
     if (fuzz_reflog_index(200000) != 0) { return 1; }
+    println("fuzz: pack_varints (500000 rounds)");
+    if (fuzz_pack_varints(500000) != 0) { return 1; }
+    println("fuzz: apply_delta (200000 rounds)");
+    if (fuzz_apply_delta(200000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

@@ -588,7 +588,7 @@ fn cmd_merge() {
         }
         materialize_target(&target_hex);
         reflog_head_move(head_hex, &target_hex,
-            reflog_msg_join("merge ", target_name, ": Fast-forward"));
+        reflog_msg_join("merge ", target_name, ": Fast-forward"));
 
         stdout_write("fast-forward to ", 16);
         stdout_write(&target_hex, 12);
@@ -685,10 +685,10 @@ fn cmd_merge() {
                                 if (read_blob_content(theirs_h, &tp) == 0) {
                                     var merged_len[8];
                                     var merged_buf = three_way_line_merge(
-                                        load64(&bp), load64(&bp + 8),
-                                        load64(&op), load64(&op + 8),
-                                        load64(&tp), load64(&tp + 8),
-                                        &merged_len);
+                                    load64(&bp), load64(&bp + 8),
+                                    load64(&op), load64(&op + 8),
+                                    load64(&tp), load64(&tp + 8),
+                                    &merged_len);
                                     if (merged_buf != 0) {
                                         # Line-level merge succeeded — write as a new blob
                                         var new_hex = write_blob_object(merged_buf, load64(&merged_len));
@@ -816,7 +816,7 @@ fn cmd_merge() {
     }
     materialize_target(merge_hex);
     reflog_head_move(head_copy, merge_hex,
-        reflog_msg_join("merge ", target_name, ": Merge made by the '3-way' strategy"));
+    reflog_msg_join("merge ", target_name, ": Merge made by the '3-way' strategy"));
 
     stdout_write("merge ", 6);
     stdout_write(merge_hex, 12);

@@ -98,7 +98,7 @@ fn serve_build_capabilities() {
     # TODO: derive from VERSION at build time once cyrius exposes a
     # source-level VERSION constant — the manifest ${file:VERSION} is
     # build-metadata only. Until then it is bumped by hand at each tag.
-    str_builder_add_cstr(sb, "{\"sit\":\"1.3.6\",\"max_body\":");
+    str_builder_add_cstr(sb, "{\"sit\":\"1.3.7\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[");
     if (_serve_require_auth == 1) {
@@ -323,7 +323,7 @@ fn serve_handle_object(cfd, path) {
     store8(hdr + 12 + ty_digits + 1, 10);
     store8(hdr + 12 + ty_digits + 2, 0);
     _serve_send_response(cfd, 200, "OK", "application/octet-stream",
-                                 compressed, clen, hdr);
+    compressed, clen, hdr);
     return 0;
 }
 
@@ -464,7 +464,7 @@ fn serve_handle_want(cfd, buf, n) {
     }
 
     _serve_send_response(cfd, 200, "OK", "application/octet-stream",
-                                 resp, resp_used, 0);
+    resp, resp_used, 0);
     fl_free(resp);
     return 0;
 }
@@ -487,7 +487,7 @@ fn _serve_load_token(path) {
         eprintln("sit: refusing to follow symlink for serve token");
         return 0;
     }
-#ifdef CYRIUS_TARGET_AGNOS
+    #ifdef CYRIUS_TARGET_AGNOS
     # agnos: length-carrying sys_stat; mode at STAT_MODE (per-target offset).
     # agnos's file_open ignores the create mode (the frozen floor chooses it),
     # so a token file may not read back as exactly 0600 — the strict check then
@@ -500,7 +500,7 @@ fn _serve_load_token(path) {
         return 0;
     }
     var mode = load32(&stbuf + STAT_MODE);
-#else
+    #else
     var stbuf[144];
     var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, 0);
     if (rc < 0) {
@@ -508,7 +508,7 @@ fn _serve_load_token(path) {
         return 0;
     }
     var mode = load32(&stbuf + 24);
-#endif
+    #endif
     var perm = mode & 0xFFF;
     if (perm != 384) {        # 0600 octal = 384 decimal
         eprintln("sit: serve token file must be mode 0600");
@@ -643,19 +643,20 @@ fn _serve_rehash_and_insert(cfd, hex, claimed_ty, compressed, clen) {
     # `coff - 1` is the index of the NUL; the type-string runs from
     # 0 to the first space (which must be at coff - 1 - <digits>).
     if (coff < 5) { _serve_send_status(cfd, 400, "Bad Request"); return 0; }
+    # Single flag-guarded scan for the type/length separator. This used to run
+    # two passes — one to prove a space existed, a second to recover its index,
+    # because the first clobbered `sp` to force loop exit. Keeping the index in
+    # its own slot does both in one pass over the framing header.
     var sp = 0;
     var found_sp = 0;
-    while (sp < coff) {
-        if (load8(dbuf + sp) == 32) { found_sp = 1; sp = coff; }
-        else { sp = sp + 1; }
+    var scan = 0;
+    while (scan < coff) {
+        if (found_sp == 0) {
+            if (load8(dbuf + scan) == 32) { found_sp = 1; sp = scan; }
+        }
+        scan = scan + 1;
     }
     if (found_sp == 0) { _serve_send_status(cfd, 400, "Bad Request"); return 0; }
-    # Recompute sp as the actual space index.
-    sp = 0;
-    while (sp < coff) {
-        if (load8(dbuf + sp) == 32) { break; }
-        sp = sp + 1;
-    }
     var declared_ty = type_code_of(dbuf, sp);
     if (declared_ty < 0) { _serve_send_status(cfd, 400, "Bad Request"); return 0; }
     if (declared_ty != claimed_ty) { _serve_send_status(cfd, 400, "Bad Request"); return 0; }
@@ -759,7 +760,11 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
     # Refuse refs/remotes/* — those are local state for tracking other
     # remotes; they have no meaning on the server side and would let a
     # malicious client smuggle a fake remote-tracking entry.
-    if (rname_len >= 12) {
+    # `refs/remotes/` is 13 bytes, so the guard is >= 13. At rname_len == 12 the
+    # old `>= 12` guard let memeq read the 13th byte — in bounds (the buffer is
+    # rname_len + 1 and byte 12 is the NUL) and the comparison still failed
+    # correctly, but the guard read as an overread. Tightened for clarity.
+    if (rname_len >= 13) {
         if (memeq(rname, "refs/remotes/", 13) == 1) {
             _serve_send_status(cfd, 400, "Bad Request");
             return 0;
@@ -809,7 +814,7 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
                 if (sf_exists(probe_path) == 1) {
                     var msg = "refusing to update checked-out branch (denyCurrentBranch)\n";
                     _serve_send_response(cfd, 423, "Locked", "text/plain",
-                                                 msg, strlen(msg), 0);
+                    msg, strlen(msg), 0);
                     return 0;
                 }
             }
@@ -921,13 +926,13 @@ fn serve_handle_request(ctx, cfd, buf, n) {
         if (streq(path, "/sit/v1/capabilities") == 1) {
             var b1 = serve_build_capabilities();
             _serve_send_response(cfd, 200, "OK", "application/json",
-                                         b1, strlen(b1), 0);
+            b1, strlen(b1), 0);
             return 0;
         }
         if (streq(path, "/sit/v1/refs") == 1) {
             var b2 = serve_build_refs();
             _serve_send_response(cfd, 200, "OK", "application/json",
-                                         b2, strlen(b2), 0);
+            b2, strlen(b2), 0);
             return 0;
         }
         # /sit/v1/objects/<64-hex>: prefix-match (path is the path-only
@@ -935,7 +940,7 @@ fn serve_handle_request(ctx, cfd, buf, n) {
         var plen = strlen(path);
         if (plen >= SIT_OBJECT_PATH_PREFIX_LEN) {
             if (memeq(path, SIT_OBJECT_PATH_PREFIX,
-                      SIT_OBJECT_PATH_PREFIX_LEN) == 1) {
+            SIT_OBJECT_PATH_PREFIX_LEN) == 1) {
                 return serve_handle_object(cfd, path);
             }
         }
@@ -952,11 +957,11 @@ fn serve_handle_request(ctx, cfd, buf, n) {
         var is_put_ref = 0;
         if (plen3 >= SIT_OBJECT_PATH_PREFIX_LEN) {
             if (memeq(path, SIT_OBJECT_PATH_PREFIX,
-                      SIT_OBJECT_PATH_PREFIX_LEN) == 1) { is_put_object = 1; }
+            SIT_OBJECT_PATH_PREFIX_LEN) == 1) { is_put_object = 1; }
         }
         if (plen3 >= SIT_REF_PUT_PREFIX_LEN) {
             if (memeq(path, SIT_REF_PUT_PREFIX,
-                      SIT_REF_PUT_PREFIX_LEN) == 1) { is_put_ref = 1; }
+            SIT_REF_PUT_PREFIX_LEN) == 1) { is_put_ref = 1; }
         }
         if (is_put_object == 1) {
             if (_serve_auth_ok(buf, n) == 0) {
@@ -1442,7 +1447,7 @@ fn cmd_serve() {
         }
         stdout_flush();
         return _serve_run_tls(port, load64(&cert_pair), load64(&cert_pair + 8),
-                              load64(&key_pair), load64(&key_pair + 8));
+        load64(&key_pair), load64(&key_pair + 8));
     }
 
     if (_serve_require_auth == 1) {

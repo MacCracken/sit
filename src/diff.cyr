@@ -942,8 +942,8 @@ fn cmd_diff() {
                     if (read_blob_content(ahex, &ap) == 0) {
                         if (read_blob_content(tree_entry_hash(be), &bp) == 0) {
                             print_file_diff(apath,
-                                load64(&ap), load64(&ap + 8),
-                                load64(&bp), load64(&bp + 8), ctx);
+                            load64(&ap), load64(&ap + 8),
+                            load64(&bp), load64(&bp + 8), ctx);
                         }
                     }
                 }
@@ -988,8 +988,8 @@ fn cmd_diff() {
                             if (read_blob_content(head_hex, &hp) == 0) {
                                 if (read_file_heap(path, &wp) == 0) {
                                     print_file_diff(path,
-                                        load64(&hp), load64(&hp + 8),
-                                        load64(&wp), load64(&wp + 8), ctx);
+                                    load64(&hp), load64(&hp + 8),
+                                    load64(&wp), load64(&wp + 8), ctx);
                                 }
                             }
                         }
@@ -1072,8 +1072,8 @@ fn cmd_diff() {
                     if (read_blob_content(tree_entry_hash(head_ent), &hp) == 0) {
                         if (read_blob_content(idx_hash_hex, &ip) == 0) {
                             print_file_diff(path,
-                                load64(&hp), load64(&hp + 8),
-                                load64(&ip), load64(&ip + 8), ctx);
+                            load64(&hp), load64(&hp + 8),
+                            load64(&ip), load64(&ip + 8), ctx);
                         }
                     }
                 }
@@ -1089,8 +1089,8 @@ fn cmd_diff() {
                         if (read_blob_content(idx_hash_hex, &ip) == 0) {
                             if (read_file_heap(path, &wp) == 0) {
                                 print_file_diff(path,
-                                    load64(&ip), load64(&ip + 8),
-                                    load64(&wp), load64(&wp + 8), ctx);
+                                load64(&ip), load64(&ip + 8),
+                                load64(&wp), load64(&wp + 8), ctx);
                             }
                         }
                     }
@@ -1227,17 +1227,17 @@ fn cmd_show() {
                     if (read_blob_content(new_hash, &np) == 0) {
                         if (stat_mode == 1) {
                             print_file_stat(path,
-                                load64(&op), load64(&op + 8),
-                                load64(&np), load64(&np + 8),
-                                &stat_pair);
+                            load64(&op), load64(&op + 8),
+                            load64(&np), load64(&np + 8),
+                            &stat_pair);
                             tot_files = tot_files + 1;
                             tot_ins = tot_ins + load64(&stat_pair);
                             tot_del = tot_del + load64(&stat_pair + 8);
                         }
                         else {
                             print_file_diff(path,
-                                load64(&op), load64(&op + 8),
-                                load64(&np), load64(&np + 8), ctx);
+                            load64(&op), load64(&op + 8),
+                            load64(&np), load64(&np + 8), ctx);
                         }
                     }
                 }

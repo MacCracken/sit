@@ -145,29 +145,29 @@ fn index_migrate_from_plaintext(db) {
                 if (plen > 4096) { pos = len; }
                 else {
 
-                var hash_copy = alloc(65);
-                memcpy(hash_copy, data + pos, 64);
-                store8(hash_copy + 64, 0);
-                var path_copy = alloc(plen + 1);
-                memcpy(path_copy, data + pos + 65, plen);
-                store8(path_copy + plen, 0);
+                    var hash_copy = alloc(65);
+                    memcpy(hash_copy, data + pos, 64);
+                    store8(hash_copy + 64, 0);
+                    var path_copy = alloc(plen + 1);
+                    memcpy(path_copy, data + pos + 65, plen);
+                    store8(path_copy + plen, 0);
 
-                var types[16];
-                store64(&types + 0, 1);
-                store64(&types + 8, 1);
-                var ivals[16];
-                var sptrs[16];
-                store64(&sptrs + 0, path_copy);
-                store64(&sptrs + 8, hash_copy);
-                var slens[16];
-                store64(&slens + 0, plen);
-                store64(&slens + 8, 64);
-                var bptrs[16];
-                var blens[16];
-                patra_insert_row(db, "entries", 7, 2,
+                    var types[16];
+                    store64(&types + 0, 1);
+                    store64(&types + 8, 1);
+                    var ivals[16];
+                    var sptrs[16];
+                    store64(&sptrs + 0, path_copy);
+                    store64(&sptrs + 8, hash_copy);
+                    var slens[16];
+                    store64(&slens + 0, plen);
+                    store64(&slens + 8, 64);
+                    var bptrs[16];
+                    var blens[16];
+                    patra_insert_row(db, "entries", 7, 2,
                     &types, &ivals, &sptrs, &slens, &bptrs, &blens);
 
-                pos = nl + 1;
+                    pos = nl + 1;
                 }
             }
         }
@@ -202,7 +202,7 @@ fn rewrite_index(entries) {
         var bptrs[16];
         var blens[16];
         patra_insert_row(db, "entries", 7, 2,
-            &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+        &types, &ivals, &sptrs, &slens, &bptrs, &blens);
         i = i + 1;
     }
     return 0;

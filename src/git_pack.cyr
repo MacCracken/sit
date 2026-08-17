@@ -67,12 +67,34 @@ fn _memcmp_n(a, b, n) {
     return result;
 }
 
-# Read one byte at the cursor and advance it.
+# Read one byte at the cursor and advance it. Callers MUST have already checked
+# that the byte is in bounds — every call site below pre-validates the whole
+# run of bytes an opcode needs (see `_delta_op_bytes`), so this stays branchless.
 fn _next_byte(data, curptr) {
     var b = load8(data + load64(curptr)) & 0xFF;
     store64(curptr, load64(curptr) + 1);
     return b;
 }
+
+# Number of trailing operand bytes a delta COPY opcode encodes: one per set bit
+# in the low 7 bits (4 offset bytes, 3 size bytes). Used to bounds-check the
+# whole operand run before `_next_byte` consumes any of it.
+fn _delta_op_bytes(op) {
+    var n = 0;
+    if ((op & 0x01) != 0) { n = n + 1; }
+    if ((op & 0x02) != 0) { n = n + 1; }
+    if ((op & 0x04) != 0) { n = n + 1; }
+    if ((op & 0x08) != 0) { n = n + 1; }
+    if ((op & 0x10) != 0) { n = n + 1; }
+    if ((op & 0x20) != 0) { n = n + 1; }
+    if ((op & 0x40) != 0) { n = n + 1; }
+    return n;
+}
+
+# Max continuation bytes any pack varint may carry. git's size/offset varints
+# are 7 bits per byte, so 10 bytes covers the full i64 range; anything longer is
+# a hostile encoding padded to overflow the accumulator.
+var _PACK_VARINT_MAX = 10;
 
 # --- .idx v2 lookup ----------------------------------------------------------
 # Binary-search idx_path (v2) for oid_raw (rawlen bytes) -> pack byte offset.
@@ -93,10 +115,25 @@ fn _git_idx_lookup(idx_path, oid_raw, rawlen) {
 
     var fanout = d + 8;
     var N = _be32(fanout + 255 * 4);
+    # S-24: N and the fanout bounds are all attacker-supplied. Every table
+    # address below is derived from them, so validate against the actual file
+    # length before any of them becomes a load address. Without this a crafted
+    # .idx whose fanout claims ~1e9 entries drove `oid_table + mid * rawlen`
+    # gigabytes past the mapping — a reproducible SIGSEGV on `sit cat-file`
+    # against a hostile repo, and an out-of-bounds read at milder offsets.
+    if (N < 0) { return 0 - 1; }
+    if (rawlen <= 0) { return 0 - 1; }
+    # oids + CRCs + short offsets must all fit: 1032 + N*(rawlen + 4 + 4).
+    if (N > (len - 1032) / (rawlen + 8)) { return 0 - 1; }
+
     var b0 = load8(oid_raw) & 0xFF;
     var lo = 0;
     if (b0 != 0) { lo = _be32(fanout + (b0 - 1) * 4); }
     var hi = _be32(fanout + b0 * 4);
+    # The fanout is cumulative and must be monotonic within [0, N].
+    if (lo < 0) { return 0 - 1; }
+    if (hi > N) { return 0 - 1; }
+    if (lo > hi) { return 0 - 1; }
     var oid_table = d + 1032;
 
     var mid = 0;
@@ -118,8 +155,13 @@ fn _git_idx_lookup(idx_path, oid_raw, rawlen) {
     var off_table = oid_table + N * rawlen + N * 4;   # skip oids + CRCs
     var off32 = _be32(off_table + found * 4);
     if ((off32 & 2147483648) == 0) { return off32; }
+    # Large-offset (>2 GiB) entry: the 8-byte table sits after the 4-byte one,
+    # and is NOT covered by the size gate above — bound it against `len` here.
     var large_table = off_table + N * 4;
     var idx2 = off32 & 2147483647;
+    var large_off = 1032 + N * (rawlen + 8) + idx2 * 8;
+    if (large_off < 0) { return 0 - 1; }
+    if (large_off + 8 > len) { return 0 - 1; }
     return _be64(large_table + idx2 * 8);
 }
 
@@ -149,51 +191,94 @@ fn _git_load_pack(path, out_pair) {
 # --- varint decoders (cursor is an i64 slot, advanced in place) --------------
 # Pack object header: byte0 = [cont|3-bit type|4-bit size-low]; continuation
 # bytes add 7 bits each (little-endian). Writes type to out_type, returns size.
-fn _pack_obj_header(data, curptr, out_type) {
+# S-24: `limit` is the length of `data`. A hostile pack can set the continuation
+# bit on its final byte, so every one of these fails closed (returns a negative
+# sentinel) on overrun rather than walking off the buffer. They also cap the
+# continuation run at `_PACK_VARINT_MAX` and reject a wrapped accumulator, so a
+# padded varint can't overflow `size` negative and slip past the `> _PACK_MAX_OBJ`
+# gate. Callers MUST check the sentinel before using the result.
+fn _pack_obj_header(data, curptr, out_type, limit) {
+    if (load64(curptr) < 0) { return 0 - 1; }
+    if (load64(curptr) >= limit) { return 0 - 1; }
     var c = load8(data + load64(curptr)) & 0xFF;
     store64(curptr, load64(curptr) + 1);
     var type = (c / 16) & 7;
     var size = c & 0x0F;
     var mult = 16;
     var cont = c & 0x80;
+    var used = 0;
+    var bad = 0;
     while (cont != 0) {
-        var b = load8(data + load64(curptr)) & 0xFF;
-        store64(curptr, load64(curptr) + 1);
-        size = size + (b & 0x7F) * mult;
-        mult = mult * 128;
-        cont = b & 0x80;
+        if (load64(curptr) >= limit) { cont = 0; bad = 1; }
+        else {
+            if (used >= _PACK_VARINT_MAX) { cont = 0; bad = 1; }
+            else {
+                var b = load8(data + load64(curptr)) & 0xFF;
+                store64(curptr, load64(curptr) + 1);
+                used = used + 1;
+                size = size + (b & 0x7F) * mult;
+                mult = mult * 128;
+                cont = b & 0x80;
+            }
+        }
     }
+    if (bad != 0) { return 0 - 1; }
+    if (size < 0) { return 0 - 1; }
     store64(out_type, type);
     return size;
 }
 
 # OFS_DELTA base-offset varint (the ((ofs+1)<<7)|next biased big-endian scheme).
-fn _ofs_varint(data, curptr) {
+fn _ofs_varint(data, curptr, limit) {
+    if (load64(curptr) < 0) { return 0 - 1; }
+    if (load64(curptr) >= limit) { return 0 - 1; }
     var b = load8(data + load64(curptr)) & 0xFF;
     store64(curptr, load64(curptr) + 1);
     var ofs = b & 0x7F;
     var cont = b & 0x80;
+    var used = 0;
+    var bad = 0;
     while (cont != 0) {
-        b = load8(data + load64(curptr)) & 0xFF;
-        store64(curptr, load64(curptr) + 1);
-        ofs = (ofs + 1) * 128 + (b & 0x7F);
-        cont = b & 0x80;
+        if (load64(curptr) >= limit) { cont = 0; bad = 1; }
+        else {
+            if (used >= _PACK_VARINT_MAX) { cont = 0; bad = 1; }
+            else {
+                b = load8(data + load64(curptr)) & 0xFF;
+                store64(curptr, load64(curptr) + 1);
+                used = used + 1;
+                ofs = (ofs + 1) * 128 + (b & 0x7F);
+                cont = b & 0x80;
+            }
+        }
     }
+    if (bad != 0) { return 0 - 1; }
+    if (ofs < 0) { return 0 - 1; }
     return ofs;
 }
 
 # Delta size varint: pure 7-bit little-endian chunks from byte 0.
-fn _delta_varint(data, curptr) {
+fn _delta_varint(data, curptr, limit) {
     var val = 0;
     var mult = 1;
     var cont = 1;
+    var used = 0;
+    var bad = 0;
     while (cont != 0) {
-        var b = load8(data + load64(curptr)) & 0xFF;
-        store64(curptr, load64(curptr) + 1);
-        val = val + (b & 0x7F) * mult;
-        mult = mult * 128;
-        cont = b & 0x80;
+        if (load64(curptr) >= limit) { cont = 0; bad = 1; }
+        else {
+            if (used >= _PACK_VARINT_MAX) { cont = 0; bad = 1; }
+            else {
+                var b = load8(data + load64(curptr)) & 0xFF;
+                store64(curptr, load64(curptr) + 1);
+                used = used + 1;
+                val = val + (b & 0x7F) * mult;
+                mult = mult * 128;
+                cont = b & 0x80;
+            }
+        }
     }
+    if (bad != 0) { return 0 - 1; }
+    if (val < 0) { return 0 - 1; }
     return val;
 }
 
@@ -201,10 +286,15 @@ fn _delta_varint(data, curptr) {
 # Reconstruct a target object from base + delta instruction stream. Writes the
 # read_object contract into out24 (content_off 0). Returns 0 or negative.
 fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
+    # S-24: `base` / `delta` are both attacker-controlled in a hostile repo, so
+    # validate the pair before touching either.
+    if (base == 0) { return 0 - 1; }
+    if (base_len < 0) { return 0 - 1; }
+    if (delta_len <= 0) { return 0 - 1; }
     var cur[8];
     store64(&cur, 0);
-    _delta_varint(delta, &cur);              # base-size (unused sanity field)
-    var result_size = _delta_varint(delta, &cur);
+    if (_delta_varint(delta, &cur, delta_len) < 0) { return 0 - 1; }   # base-size (sanity field)
+    var result_size = _delta_varint(delta, &cur, delta_len);
     if (result_size <= 0) { return 0 - 1; }
     if (result_size > _PACK_MAX_OBJ) { return 0 - 1; }
     var out = alloc(result_size);
@@ -216,33 +306,48 @@ fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
             var op = load8(delta + load64(&cur)) & 0xFF;
             store64(&cur, load64(&cur) + 1);
             if ((op & 0x80) != 0) {
-                var coff = 0;
-                var csize = 0;
-                if ((op & 0x01) != 0) { coff = coff + _next_byte(delta, &cur); }
-                if ((op & 0x02) != 0) { coff = coff + _next_byte(delta, &cur) * 256; }
-                if ((op & 0x04) != 0) { coff = coff + _next_byte(delta, &cur) * 65536; }
-                if ((op & 0x08) != 0) { coff = coff + _next_byte(delta, &cur) * 16777216; }
-                if ((op & 0x10) != 0) { csize = csize + _next_byte(delta, &cur); }
-                if ((op & 0x20) != 0) { csize = csize + _next_byte(delta, &cur) * 256; }
-                if ((op & 0x40) != 0) { csize = csize + _next_byte(delta, &cur) * 65536; }
-                if (csize == 0) { csize = 65536; }
-                if (coff + csize > base_len) { err = 0 - 3; }
+                # S-24: the operand run must be fully in bounds before
+                # `_next_byte` consumes any of it — a COPY opcode in the final
+                # bytes of the delta would otherwise read past `delta_len`.
+                if (load64(&cur) + _delta_op_bytes(op) > delta_len) { err = 0 - 8; }
                 else {
-                    if (op_out + csize > result_size) { err = 0 - 4; }
+                    var coff = 0;
+                    var csize = 0;
+                    if ((op & 0x01) != 0) { coff = coff + _next_byte(delta, &cur); }
+                    if ((op & 0x02) != 0) { coff = coff + _next_byte(delta, &cur) * 256; }
+                    if ((op & 0x04) != 0) { coff = coff + _next_byte(delta, &cur) * 65536; }
+                    if ((op & 0x08) != 0) { coff = coff + _next_byte(delta, &cur) * 16777216; }
+                    if ((op & 0x10) != 0) { csize = csize + _next_byte(delta, &cur); }
+                    if ((op & 0x20) != 0) { csize = csize + _next_byte(delta, &cur) * 256; }
+                    if ((op & 0x40) != 0) { csize = csize + _next_byte(delta, &cur) * 65536; }
+                    if (csize == 0) { csize = 65536; }
+                    if (coff + csize > base_len) { err = 0 - 3; }
                     else {
-                        memcpy(out + op_out, base + coff, csize);
-                        op_out = op_out + csize;
+                        if (op_out + csize > result_size) { err = 0 - 4; }
+                        else {
+                            memcpy(out + op_out, base + coff, csize);
+                            op_out = op_out + csize;
+                        }
                     }
                 }
             }
             else {
                 if (op != 0) {
                     var lit = op & 0x7F;
-                    if (op_out + lit > result_size) { err = 0 - 5; }
+                    # S-24: bound the literal against the DELTA (source) as well
+                    # as the result buffer (destination). Only the destination
+                    # was checked before, so a literal opcode declaring more
+                    # bytes than the delta has left copied up to 127 bytes of
+                    # adjacent heap into the reconstructed object — readable by
+                    # the user via `sit cat-file`.
+                    if (load64(&cur) + lit > delta_len) { err = 0 - 9; }
                     else {
-                        memcpy(out + op_out, delta + load64(&cur), lit);
-                        store64(&cur, load64(&cur) + lit);
-                        op_out = op_out + lit;
+                        if (op_out + lit > result_size) { err = 0 - 5; }
+                        else {
+                            memcpy(out + op_out, delta + load64(&cur), lit);
+                            store64(&cur, load64(&cur) + lit);
+                            op_out = op_out + lit;
+                        }
                     }
                 }
                 else { err = 0 - 6; }
@@ -262,16 +367,29 @@ fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
 # Reconstruct the object at `offset` in the in-memory pack {pdata,plen}. Writes
 # read_object contract into out24 (content_off 0). Recurses through delta bases.
 fn _git_pack_obj(pdata, plen, offset, out24) {
+    # S-24: `offset` comes from the .idx offset table, which is attacker-supplied
+    # in a hostile repo (and can reach 2^63 via the large-offset table). Reject
+    # it before it becomes a load address. The pack v2 header is 12 bytes, so any
+    # real object starts at >= 12.
+    if (pdata == 0) { return 0 - 10; }
+    if (offset < 12) { return 0 - 10; }
+    if (offset >= plen) { return 0 - 10; }
     var cur[8];
     store64(&cur, offset);
     var type_slot[8];
-    var size = _pack_obj_header(pdata, &cur, &type_slot);
+    store64(&type_slot, 0);
+    var size = _pack_obj_header(pdata, &cur, &type_slot, plen);
+    if (size < 0) { return 0 - 10; }
     var type = load64(&type_slot);
     if (size > _PACK_MAX_OBJ) { return 0 - 10; }
 
     if (type >= 1) {
         if (type <= 4) {
             var body = load64(&cur);
+            # S-24: a header that consumed the whole buffer leaves body == plen,
+            # making `plen - body` zero or negative — never hand that to the
+            # decompressor as a length.
+            if (body >= plen) { return 0 - 11; }
             var content = alloc(size + 16);
             if (content == 0) { return 0 - 11; }
             var got = zlib_decompress(pdata + body, plen - body, content, size + 16);
@@ -286,15 +404,20 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
     if (_pack_delta_depth >= 64) { return 0 - 13; }
 
     if (type == 6) {
-        var ofs = _ofs_varint(pdata, &cur);
+        var ofs = _ofs_varint(pdata, &cur, plen);
+        if (ofs < 0) { return 0 - 14; }
         var base_off = offset - ofs;
         if (base_off < 0) { return 0 - 14; }
+        # S-24: a zero-distance back-reference makes the object its own delta
+        # base — infinite recursion the depth cap only bounds at 64 frames.
+        if (ofs == 0) { return 0 - 14; }
         var base24[24];
         _pack_delta_depth = _pack_delta_depth + 1;
         var br = _git_pack_obj(pdata, plen, base_off, &base24);
         _pack_delta_depth = _pack_delta_depth - 1;
         if (br != 0) { return 0 - 15; }
         var dbody = load64(&cur);
+        if (dbody >= plen) { return 0 - 16; }
         var delta = alloc(size + 16);
         if (delta == 0) { return 0 - 16; }
         var dgot = zlib_decompress(pdata + dbody, plen - dbody, delta, size + 16);
@@ -304,6 +427,9 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
 
     if (type == 7) {
         var rawlen = _id_rawlen();
+        # S-24: the base oid is `rawlen` raw bytes at the cursor — bound the
+        # whole run before hex_encode reads it.
+        if (load64(&cur) + rawlen > plen) { return 0 - 18; }
         var base_hex = hex_encode(pdata + load64(&cur), rawlen);
         store64(&cur, load64(&cur) + rawlen);
         var base24[24];
@@ -314,7 +440,9 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
         # normalize base to raw content (loose base carries framing at +16)
         var bbuf = load64(&base24) + load64(&base24 + 16);
         var blen = load64(&base24 + 8) - load64(&base24 + 16);
+        if (blen < 0) { return 0 - 18; }
         var dbody = load64(&cur);
+        if (dbody >= plen) { return 0 - 19; }
         var delta = alloc(size + 16);
         if (delta == 0) { return 0 - 19; }
         var dgot = zlib_decompress(pdata + dbody, plen - dbody, delta, size + 16);

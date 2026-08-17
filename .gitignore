@@ -1,6 +1,10 @@
 /build/
 *.core
 
+# Python bytecode from the integration suite's hostile-packfile fixtures
+__pycache__/
+*.pyc
+
 # `lib/` is populated by `cyrius deps` / `cyrius update` from cyrius.cyml [deps]
 # — a build artifact, not source. Never commit; cyrius.lock pins what was
 # resolved. Mirrors the sandhi/cyim convention.

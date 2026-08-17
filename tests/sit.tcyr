@@ -19,14 +19,14 @@ fn test_sigil_hash_known_answer() {
     # sha256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     var empty_hex = hash_data("", 0);
     assert_streq(empty_hex,
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "sha256 of empty string");
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sha256 of empty string");
 
     # sha256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
     var abc_hex = hash_data("abc", 3);
     assert_streq(abc_hex,
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        "sha256 of 'abc'");
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    "sha256 of 'abc'");
     return 0;
 }
 
@@ -42,8 +42,8 @@ fn test_blob_framing_git_compatible() {
     memcpy(framed + 8, "hello, sit!\n", 12);
     var hex = hash_data(framed, 20);
     assert_streq(hex,
-        "37f70a18b0d27d5dd912f6080063bf6fe10820814bccc4bcd13c67ce97c2a96c",
-        "blob('hello, sit!\\n') matches git SHA-256");
+    "37f70a18b0d27d5dd912f6080063bf6fe10820814bccc4bcd13c67ce97c2a96c",
+    "blob('hello, sit!\\n') matches git SHA-256");
     return 0;
 }
 

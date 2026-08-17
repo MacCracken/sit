@@ -309,8 +309,8 @@ fn _wire_http_request(h, sub_path, out_quad) {
     if (used >= 12) {
         if (memeq(buf, "HTTP/1.", 7) == 1) {
             status = (load8(buf + 9) - 48) * 100
-                   + (load8(buf + 10) - 48) * 10
-                   + (load8(buf + 11) - 48);
+            + (load8(buf + 10) - 48) * 10
+            + (load8(buf + 11) - 48);
         }
     }
 
@@ -668,8 +668,8 @@ fn _wire_http_post(h, sub_path, body, body_len, out_quad) {
     if (used >= 12) {
         if (memeq(buf, "HTTP/1.", 7) == 1) {
             status = (load8(buf + 9) - 48) * 100
-                   + (load8(buf + 10) - 48) * 10
-                   + (load8(buf + 11) - 48);
+            + (load8(buf + 10) - 48) * 10
+            + (load8(buf + 11) - 48);
         }
     }
     var i = 0;
@@ -1327,8 +1327,8 @@ fn _wire_http_post_xhdr(h, sub_path, body, body_len, extra_hdr, out_quad) {
     if (used >= 12) {
         if (memeq(buf, "HTTP/1.", 7) == 1) {
             status = (load8(buf + 9) - 48) * 100
-                   + (load8(buf + 10) - 48) * 10
-                   + (load8(buf + 11) - 48);
+            + (load8(buf + 10) - 48) * 10
+            + (load8(buf + 11) - 48);
         }
     }
     var i = 0;
