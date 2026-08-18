@@ -178,22 +178,9 @@ stdlib = [
     "ws",
     "http",
     "sandhi",
-    # ── the four first-party layers, folded (see the note above) ──
-    # sakshi  — structured logging (pulled transitively by patra: sakshi_error,
-    #           sakshi_set_level; sit calls neither directly)
     "sakshi",
-    # sankoch — LZ4/DEFLATE/zlib/gzip; sit uses zlib_compress / zlib_decompress
     "sankoch",
-    # sigil   — hashing + signing. sit's consumed surface is 10 symbols:
-    #           hash_data, hex_encode, hex_decode, hex_decode_into, hex_is_valid,
-    #           ed25519_keypair, ed25519_sign, ed25519_verify,
-    #           ed25519_generate_keypair, pem_decode_certs (serve.cyr's --tls
-    #           PEM chain loader). The PE/authenticode, argon2, blake2b, RSA and
-    #           trust-store surface is unreferenced by sit — including the
-    #           3.12.3–3.12.6 RSA verify forged-signature bypass, which is off
-    #           sit's path entirely (sit signs with ed25519, never RSA).
     "sigil",
-    # patra   — B+ tree / WAL object store (.sit/objects.patra, .sit/index.patra)
     "patra",
 ]
 
