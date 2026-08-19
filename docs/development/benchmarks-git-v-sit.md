@@ -50,29 +50,53 @@ FIXTURE_COMMITS=1000 ./scripts/benchmark.sh
 FIXTURE_COMMITS=5000 ./scripts/benchmark.sh
 ```
 
-At 10× the repository, two rows change character completely:
+At 10× the repository, the picture changes — `clone` still changes character
+completely, and `status` did until v1.4.6:
 
 | operation | ratio @100 | ratio @1000 | sit growth | git growth |
 |---|---:|---:|---:|---:|
 | `log` | 2.54× | 6.59× | 8.0× | 3.1× |
 | `status` (v1.4.4) | **1.78×** | **26.64×** | **24×** | 1.6× |
 | `status` (v1.4.5) | 1.59× | **21.35×** | 21× | 1.6× |
+| `status` (**v1.4.6**) | **1.37×** | **4.98×** | **5.2×** | 1.43× |
 | `clone` | **5.17×** | **60.80×** | **34×** | 2.9× |
 
-v1.4.5 hashmap-backed `index_find` (an O(N) scan called from O(N) loops), worth
-**−20%** at N=1000. ⚠ `status` is **still superlinear** — 10× the files costs ~19×
-the time — so that was not the dominant term at this size. Second cause
-unidentified; tracked as 1.4.6, to be profiled rather than guessed.
+**`status` is no longer superlinear.** v1.4.6 grows 5.2× for 10× the files —
+*sub*-linear, and −80% against v1.4.5 in absolute terms (110.15 → 22.46 ms).
 
-⚠ **Read the default tier accordingly.** `status` at 1.78× and `clone` at 5.17×
-are *not* the whole story — both are superlinear and the small fixture cannot see
-it. This is the same blind spot that let `objects.hash` ship unindexed from 1.0
-through 1.4.0 with every benchmark green.
+It took three releases because the fix that looked obvious was not the dominant
+term. v1.4.5's hashmap-backed `index_find` removed a genuine O(N²) and bought
+**20%**; profiling `cmd_status`'s phases at both sizes — which is what the 1.4.6
+roadmap entry insisted on, rather than a third guess — found two more quadratics
+stacked underneath:
 
-`status`'s cause is identified: `index_find` (`src/index.cyr:515`) is a linear
-scan called once per working file and once per HEAD tree entry — O(N²). The same
-defect was fixed for `tree_find` in v0.6.6; this one was missed. `clone`'s growth
-is tracked but **not yet diagnosed** — profile before assuming.
+| phase, N=1000 | v1.4.5 | v1.4.6 | growth per 10× files |
+|---|---:|---:|---:|
+| `read_head_tree_entries` | 3,968 µs | 4,070 µs | 5.6× |
+| **`parse_index`** | **87,323 µs** | **5,366 µs** | **9.0×** |
+| `list_working_files` | 2,944 µs | 3,132 µs | 9.8× |
+| staged/unstaged loop (of which `hash_file_as_blob`) | 7,442 µs | 10,994 (6,005) µs | 7.8× |
+
+1. **`sit add` rewrote the whole staging index per file** — `index_upsert` did a
+   DELETE-all + re-INSERT of every row, once per staged file, so staging N files
+   wrote O(N²) rows. patra never reclaims deleted pages, so that volume was
+   permanent: the 1,000-file fixture's `.sit/index.patra` was **277 MB for 1,000
+   live entries**, and `status` full-scans it. Now a targeted delete + one insert:
+   **672 KB, 422× smaller.**
+2. **`ORDER BY path` was patra's insertion sort.** With the bloat gone this was
+   exposed underneath: 42,150 µs vs 3,753 µs for the same scan unordered, growing
+   38× per 10× rows against the plain scan's 9×. It had been deliberate since
+   v0.6.11 (P-20 added it so sit's *own* insertion sort would get pre-sorted
+   input) — which moved the quadratic rather than removing it. sit now sorts
+   in-process with an O(N log N) merge sort. Filed upstream.
+
+⚠ **Read the default tier accordingly.** `clone` at 5.17× @100 is *not* the whole
+story — it is superlinear and the small fixture cannot see it. This is the same
+blind spot that let `objects.hash` ship unindexed from 1.0 through 1.4.0 with
+every benchmark green, and that rated `status` benign for four releases.
+
+`clone`'s growth remains **undiagnosed** — profile before assuming. Note it may
+have moved on its own now that the index no longer bloats; re-measure first.
 
 ---
 

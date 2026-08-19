@@ -4,7 +4,17 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.4.5`. The `1.3.x` line went almost entirely to audit work (two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two integrity gaps; `1.4.1` found `objects.hash` had no index at all; `1.4.2` profiled the residual curve to patra's result-buffer sizing; `1.4.3` picked up the upstream fix (patra 1.13.8 via cyrius 6.5.28) and **the object-lookup curve is now flat**; `1.4.4` made the benchmark fixture a knob and it immediately exposed **two more superlinear paths** the 100-commit default rated as benign; `1.4.5` fixed one cause (`index_find`'s linear scan) but `status` is still superlinear from something else. Audit backlogs are empty. The themed minor line shifted **+1** when `1.4.0` went to integrity rather than tags.
+**Where we are**: `1.4.6`. The `1.3.x` line went almost entirely to audit work
+(two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two
+integrity gaps; `1.4.1`–`1.4.3` flattened the object-lookup curve (`objects.hash`
+had no index; the residual traced to patra sizing a result buffer by the whole
+table, fixed upstream); `1.4.4` made the benchmark fixture a knob and immediately
+exposed two superlinear paths the 100-commit default rated as benign; `1.4.5`
+fixed one cause and `1.4.6` found the other two — `sit add` rewriting the whole
+index per staged file, and an `ORDER BY` that was patra's insertion sort. **`status`
+is no longer superlinear** (4.98× git at 1,000 files, was 26.64× at 1.4.4). Audit
+backlogs are empty. The themed minor line shifted **+1** when `1.4.0` went to
+integrity rather than tags.
 
 ---
 
@@ -24,15 +34,6 @@ Nothing below blocks anything else; ordering within a section is a recommendatio
 
 Ordered. Nothing here adds observable surface, so each can ship as it lands.
 
-- **`1.4.6` — profile what is still superlinear in `status`.** 1.4.5 gave
-  `index_find` the hashmap `tree_find` got in v0.6.6, which removed a genuine
-  O(N²) — but only bought **20%** at N=1000 (`status-1000files` 26.64× → 21.35×
-  git), so it was not the dominant term at that size. **10× the files still costs
-  ~19× the time.** Cause unidentified. Do it the way 1.4.2 did the lookup curve:
-  instrument `cmd_status`'s phases (`read_head_tree_entries`, `parse_index`,
-  `list_working_files`, the per-entry `hash_file_as_blob`, the three loops) and
-  measure at two sizes — **do not guess**. Two guesses were wrong in the 1.4.2
-  investigation before profiling settled it in one run.
 - **`1.4.7` — fuzz targets for the remaining unfuzzed parsers.** *(From the
   2026-08-17 audit, whose central lesson was that the one module with no fuzz
   target held every serious finding.)* `parse_tree`, `parse_commit_body`,
@@ -40,8 +41,13 @@ Ordered. Nothing here adds observable surface, so each can ship as it lands.
   unit tests but no harness. Test-only, so a patch — not a minor.
 - **Diagnose `clone`'s superlinear growth.** The 1.4.4 large tier put it at
   **5.17× git at 100 commits and 60.80× at 1000** — 34× growth for 10× the work.
-  Plausibly the same `index_find` scan via materialize plus per-object round
-  trips, but **unmeasured**; profile before assuming, the way 1.4.2 did.
+  Still **unmeasured**; profile before assuming, the way 1.4.2 and 1.4.6 did.
+  ⚠ Note 1.4.6 removed the index write amplification and the `ORDER BY`, so
+  `clone` may have moved on its own — **re-measure before profiling**, and do not
+  assume the remaining growth has the same cause `status` did. `clone`'s
+  materialize step writes the index through `rewrite_index`, which is still a
+  whole-table DELETE + re-insert (correct there: it runs once per operation, not
+  once per file) — that is the first thing to check.
 - **Nested `.gitignore` / `info/exclude`** for `.git/` read-mode. Only the
   top-level `.gitignore` is honoured today (`_ignore_filename`, `git_read.cyr`).
 - **Reflog `expire` / `delete` + `@{<date>}` selector** *(carried from 1.1.0)*.
@@ -106,15 +112,16 @@ Each earns its own minor when its time comes.
 These are blocked on another repo. Per [CLAUDE.md](../../CLAUDE.md), cross-project requests go on the **target repo's** roadmap, not an issue tracker — so each needs drafting there.
 
 - **cyrius — ASAN / poisoned-allocator mode for `cyrius fuzz`.** The 127-byte heap overread in `_git_apply_delta` (2026-08-17 audit) was invisible to fuzzing because the read landed in mapped memory: it was found by reading and is pinned only by a deterministic corpus that asserts on the leak. **Every OOB *read* in the tree has that blind spot.** Wanted: redzone poisoning so `cyrius fuzz` fails on overreads, not only on faults.
-- **cyrius — per-profile `distlib` dep sidecars.** `cyrius distlib read` writes its sidecar to `dist/sit.deps`, the same path the full profile uses, and emits the whole `[deps].stdlib` list rather than the leaves the `read` profile needs. Both profiles therefore emit a byte-identical sidecar, so a `dist/sit-read.cyr` consumer following it pulls in the network stdlib (`net` / `tls` / `tls_native` / `ws` / `http` / `sandhi`) the lean bundle exists to drop. Harmless today (a superset resolves, and last-writer-wins with identical bytes) — a packaging nit, not a bug. Wanted: `dist/<name>-<profile>.deps` scoped to the profile's own module set.
-
-  ⚠ **Re-verified on cyrius 6.5.28 (2026-08-18): still reproduces** via all three
-  paths — `distlib read` alone, `distlib` then `distlib read`, and `distlib --all`
-  each leave only `dist/sit.deps` with all 38 leaves. **But one run did emit a
-  correctly profile-scoped `dist/sit-read.deps`** (231 bytes, a strictly smaller
-  leaf set) and it has not been reproducible since — so the capability may already
-  be partly implemented behind some condition, rather than absent. Worth checking
-  that path before writing it from scratch.
+- **patra — `ORDER BY` is an insertion sort; `DELETE` never reclaims pages.**
+  Filed 2026-08-19 as
+  [`2026-08-19-sit-order-by-insertion-sort.md`](https://github.com/MacCracken/patra/blob/main/docs/development/requests/2026-08-19-sit-order-by-insertion-sort.md).
+  `ORDER BY` costs **3.9× per doubling** against the unordered scan's 1.96×
+  (831 ms vs 7.4 ms at 2,000 rows) because `_sort_result_multi` shifts whole
+  result rows; and a table's file grows with total rows ever inserted (~0.57 KB
+  per insert, reclaiming nothing across three delete patterns). **sit is not
+  blocked** — 1.4.6 sorts in-process and no longer churns the index — but sit
+  would hand the sort back to patra once it is O(N log N), since patra can sort
+  before materializing.
 - **sankoch — match-finder / SIMD.** Targets the `add-1MB` `zlib_compress` floor (~140 ms, the largest single cost in `sit add`). Already on sankoch's roadmap, gated on a wire-identical speedup.
 
 ---

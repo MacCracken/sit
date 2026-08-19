@@ -4,6 +4,104 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.6] — 2026-08-19 — `status` stops being superlinear: two quadratics, both in the index path
+
+1.4.4 caught `status` growing **24× for 10× the files** where git grows 1.6×.
+1.4.5 fixed `index_find`'s linear scan and bought 20% — real, but it was not the
+dominant term, and the roadmap entry for this release said to **profile rather
+than guess**. Profiling found two more quadratics stacked on each other, neither
+of them where the previous two guesses pointed.
+
+| | 1.4.4 | 1.4.5 | **1.4.6** |
+|---|---:|---:|---:|
+| `status-100files` | 1.78× git | 1.59× | **1.37×** |
+| `status-1000files` | 26.64× git (137.74 ms) | 21.35× (110.15 ms) | **4.98× (22.46 ms)** |
+| sit growth, 100 → 1000 files | 24× | 21× | **5.2×** |
+
+**−80% at N=1000 against 1.4.5.** sit now grows *sub*-linearly across that step
+(5.2× the time for 10× the files); git grows 1.43×. Every phase of `cmd_status`
+measured at both sizes is linear or better.
+
+### Fixed
+
+- **`sit add` no longer rewrites the entire staging index per file.**
+  `index_upsert` read the whole index, filtered one path out in memory, and
+  handed the survivors to `rewrite_index` — `DELETE FROM entries` plus a re-INSERT
+  of **every** row, once **per staged file**. Staging N files wrote O(N²) rows.
+
+  patra never returns emptied pages to a freelist (filed upstream, see below), so
+  that write volume was permanent on disk rather than transient: a 1,000-file
+  fixture reached a **277 MB `.sit/index.patra` holding 1,000 live entries**, and
+  `sit status` full-scans that file on every invocation. The measured size curve
+  matched `0.27 KB × (total inserts ever)` at both sizes — 2.67 MB at N=100,
+  277 MB at N=1000 — which is what identified the mechanism.
+
+  Now a targeted `DELETE FROM entries WHERE path = '<escaped>'` plus one INSERT:
+  **O(1) rows written per staged file**. The same 1,000-file index is now
+  **672 KB — 422× smaller** — and grows with live entries rather than with total
+  stagings ever performed. The path is escaped via `patra_quote_str` (it is a
+  working-tree filename, i.e. external data); a new `entries(path)` index keeps
+  the delete a keyed lookup, built once behind a `.sit/index.indexed` marker
+  exactly like `objects.hash` in 1.4.1.
+
+- **`parse_index` no longer asks patra to sort, and `sort_entries` is no longer
+  an insertion sort.** With the disk bloat gone, a second quadratic was exposed
+  underneath it: `ORDER BY path`.
+
+  | | plain scan | `ORDER BY path` |
+  |---|---:|---:|
+  | 1,000-row index, in situ | 3,753 µs | **42,150 µs** |
+  | growth per 10× rows | 9.0× | **38×** |
+
+  This was load-bearing by design and had been since **v0.6.11**: P-20 added the
+  `ORDER BY` *specifically* so sit's O(N²) insertion sort would receive a
+  pre-sorted vec and fall through in O(N). That did not remove the quadratic, it
+  moved it into patra — whose `_sort_result_multi` is itself an insertion sort
+  that `memcpy`s a full result row per shift, i.e. O(N² × rowsize) bytes moved.
+
+  `sort_entries` is now a stable bottom-up **merge sort, O(N log N)** regardless
+  of arrival order, and `parse_index` drops the `ORDER BY` and sorts the vec
+  itself before returning — so the sorted-by-path contract every caller has
+  relied on since v0.6.11 is unchanged. `parse_index` at N=1000 went
+  **87,323 µs (1.4.5) → 5,366 µs**, growing 9.0× per 10× rows.
+
+  ⚠ The insertion sort is now genuinely on the hot path (rows arrive unsorted),
+  where before it was structurally guaranteed its best case. Its replacement is
+  covered by a differential test against the old algorithm — empty, single,
+  sorted, reverse, duplicates, odd length, prefix relationships
+  (`a` / `a.txt` / `a/b`), and 200 scrambled entries to exercise all 8 merge
+  passes.
+
+### Changed
+
+- **Toolchain pin `6.5.28` → `6.5.29`.** Resolves the profile-scoped `distlib`
+  sidecar gap tracked on the roadmap: `cyrius distlib read` now writes
+  `dist/sit-read.deps` (37 leaves) alongside `dist/sit.deps` (59), correctly
+  dropping the network stack — `net`, `tls`, `tls_native`, `ws`, `http`,
+  `sandhi` — that the lean read-only bundle exists to avoid. A `dist/sit-read.cyr`
+  consumer following the sidecar no longer pulls in transports it cannot reach.
+
+### Tests
+
+- `tests/sit.tcyr` — `sort_entries` differential vs the pre-1.4.6 insertion sort
+  (8 cases). **306 assertions**, up from 282.
+- `tests/integration/run.sh` — S-28 regressions: index file stays compact after
+  60 stagings, re-staging a path three times leaves one entry, a single quote in
+  a filename round-trips through the targeted DELETE, and entries come back
+  path-sorted without patra's `ORDER BY`. **94 checks**, up from 88.
+
+### Upstream
+
+- **patra — `ORDER BY` is an insertion sort, and `DELETE` never reclaims pages.**
+  Filed as `docs/development/requests/2026-08-19-sit-order-by-insertion-sort.md`
+  with both curves. `ORDER BY` costs **3.9× per doubling** where the unordered
+  scan costs 1.96× (831 ms vs 7.4 ms at 2,000 rows); suggested fix is to sort an
+  index permutation with a merge sort rather than shifting whole rows. Separately,
+  a table's file grows with total rows ever inserted — measured at ~0.57 KB per
+  insert across three delete patterns, reclaiming nothing — for which the ask is a
+  page freelist. sit is not blocked on either: it now sorts in-process and no
+  longer churns the index.
+
 ## [1.4.5] — 2026-08-18 — `index_find` gets the hashmap `tree_find` got in v0.6.6
 
 The 1.4.4 large-tier fixture found `status` at **1.78× git on 100 files and

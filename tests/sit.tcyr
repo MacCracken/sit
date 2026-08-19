@@ -775,6 +775,143 @@ fn test_fsck_commit_author_ts() {
     return 0;
 }
 
+# ── sort_entries: merge sort vs reference insertion sort (v1.4.6) ──────────
+# v1.4.6 replaced sort_entries' insertion sort with a bottom-up merge sort,
+# because the insertion sort was only ever O(N) thanks to parse_index asking
+# patra for `ORDER BY path` — and that ORDER BY was itself the quadratic.
+# Dropping the ORDER BY means rows now arrive unsorted, so this sort is on the
+# hot path for real and its correctness is load-bearing in a way it was not
+# before. Differential against the previous algorithm, same shape as
+# test_myers_diff_differential (P-14).
+fn _se_entry(path) {
+    var e = alloc(40);
+    memset(e, 0, 32);
+    store64(e + 32, path);
+    return e;
+}
+
+# The pre-1.4.6 insertion sort, kept here as the reference implementation.
+fn _se_ref_sort(entries) {
+    var n = vec_len(entries);
+    var i = 1;
+    while (i < n) {
+        var cur = vec_get(entries, i);
+        var cur_path = entry_path(cur);
+        var j = i - 1;
+        var placed = 0;
+        while (placed == 0) {
+            if (j < 0) { placed = 1; }
+            else {
+                var prev = vec_get(entries, j);
+                if (strcmp_cstr(cur_path, entry_path(prev)) >= 0) { placed = 1; }
+                else {
+                    vec_set(entries, j + 1, prev);
+                    j = j - 1;
+                }
+            }
+        }
+        vec_set(entries, j + 1, cur);
+        i = i + 1;
+    }
+    return entries;
+}
+
+fn _se_case(paths, label) {
+    var n = vec_len(paths);
+    var mine = vec_new();
+    var ref = vec_new();
+    var i = 0;
+    while (i < n) {
+        vec_push(mine, _se_entry(vec_get(paths, i)));
+        vec_push(ref, _se_entry(vec_get(paths, i)));
+        i = i + 1;
+    }
+    sort_entries(mine);
+    _se_ref_sort(ref);
+
+    assert_eq(vec_len(mine), n, label);
+
+    var same = 1;
+    var sorted = 1;
+    var j = 0;
+    while (j < n) {
+        var pm = entry_path(vec_get(mine, j));
+        var pr = entry_path(vec_get(ref, j));
+        if (strcmp_cstr(pm, pr) != 0) { same = 0; }
+        if (j > 0) {
+            var prev = entry_path(vec_get(mine, j - 1));
+            if (strcmp_cstr(prev, pm) > 0) { sorted = 0; }
+        }
+        j = j + 1;
+    }
+    assert_eq(same, 1, label);
+    assert_eq(sorted, 1, label);
+    return 0;
+}
+
+fn _se_push(v, s) { vec_push(v, s); return 0; }
+
+fn test_sort_entries_differential() {
+    test_group("index.cyr — sort_entries merge sort (differential, v1.4.6)");
+
+    var a = vec_new();
+    _se_case(a, "empty");
+
+    var b = vec_new(); _se_push(b, "only.txt");
+    _se_case(b, "single element");
+
+    var c = vec_new();
+    _se_push(c, "a.txt"); _se_push(c, "b.txt"); _se_push(c, "c.txt");
+    _se_case(c, "already sorted");
+
+    var d = vec_new();
+    _se_push(d, "c.txt"); _se_push(d, "b.txt"); _se_push(d, "a.txt");
+    _se_case(d, "reverse sorted");
+
+    var e = vec_new();
+    _se_push(e, "b.txt"); _se_push(e, "a.txt"); _se_push(e, "b.txt");
+    _se_push(e, "a.txt"); _se_push(e, "c.txt");
+    _se_case(e, "duplicates");
+
+    # Odd length exercises the ragged tail of every merge width.
+    var f = vec_new();
+    _se_push(f, "src/z.cyr"); _se_push(f, "README.md"); _se_push(f, "src/a.cyr");
+    _se_push(f, "Makefile"); _se_push(f, "docs/b.md"); _se_push(f, "src/m.cyr");
+    _se_push(f, "docs/a.md");
+    _se_case(f, "odd length, path-like keys");
+
+    # Prefix relationships — "a" vs "a.txt" vs "a/b" is where a sloppy
+    # comparator diverges from the reference.
+    var g = vec_new();
+    _se_push(g, "a/b"); _se_push(g, "a"); _se_push(g, "a.txt");
+    _se_push(g, "a/b/c"); _se_push(g, "ab");
+    _se_case(g, "prefix relationships");
+
+    # 200 entries in a deterministic scrambled order: forces log2(200) = 8
+    # merge passes, well past the single-pass cases above.
+    var h = vec_new();
+    var k = 0;
+    var x = 12345;
+    while (k < 200) {
+        x = (x * 1103515245 + 12345) % 100000;
+        if (x < 0) { x = 0 - x; }
+        var nm = alloc(24);
+        var w = 0;
+        store8(nm + w, 102); w = w + 1;
+        var v = x;
+        if (v == 0) { store8(nm + w, 48); w = w + 1; }
+        var dg[24];
+        var dn = 0;
+        while (v > 0) { store8(&dg + dn, 48 + (v % 10)); dn = dn + 1; v = v / 10; }
+        while (dn > 0) { dn = dn - 1; store8(nm + w, load8(&dg + dn)); w = w + 1; }
+        store8(nm + w, 0);
+        vec_push(h, nm);
+        k = k + 1;
+    }
+    _se_case(h, "200 scrambled entries (8 merge passes)");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -800,6 +937,7 @@ fn main() {
     test_reflog_format_and_index();
     test_reflog_spec_parse();
     test_fsck_commit_author_ts();
+    test_sort_entries_differential();
     return assert_summary();
 }
 

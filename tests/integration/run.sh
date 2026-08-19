@@ -489,6 +489,66 @@ cd "$WORK/s27sc" 2>/dev/null && {
   assert_contains "$("$SIT" fsck)" "0 bad" "shallow boundary parents are not reported missing"
 }
 
+# ── 14. S-28 regressions (1.4.6 index write amplification) ─────────
+hr "S-28 regressions (single-row index upsert)"
+
+# 14a. `sit add` used to rewrite the ENTIRE entries table per staged file
+# (DELETE-all + re-INSERT every row), so staging N files wrote O(N^2) rows.
+# patra never returns emptied pages to a freelist, so that volume was
+# permanent on disk: a 1,000-file repo reached a 277 MB .sit/index.patra
+# holding 1,000 live entries, and `sit status` full-scans that file. The
+# upsert is now a targeted DELETE + one INSERT. Assert the file stays small.
+R="$WORK/s28bloat"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+i=0
+while [ $i -lt 60 ]; do
+  printf 'file %s\n' "$i" > "f$i.txt"
+  "$SIT" add "f$i.txt" >/dev/null
+  i=$((i+1))
+done
+IDXKB=$(du -k .sit/index.patra | cut -f1)
+# Pre-fix this was ~1 MB at N=60 and grew quadratically; 256 KB is a
+# generous ceiling that still fails loudly if the rewrite-all comes back.
+assert_eq "$([ "$IDXKB" -lt 256 ] && echo ok || echo "too big: ${IDXKB}KB")" "ok" \
+  "staging 60 files leaves a compact .sit/index.patra"
+
+# 14b. Re-staging the same path must REPLACE its row, not append a second one.
+# The targeted DELETE is what enforces this now; previously the in-memory
+# filter did.
+R="$WORK/s28replace"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'one\n' > a.txt; "$SIT" add a.txt >/dev/null
+printf 'two\n' > a.txt; "$SIT" add a.txt >/dev/null
+printf 'three\n' > a.txt; "$SIT" add a.txt >/dev/null
+assert_eq "$("$SIT" status | grep -c 'a.txt')" "1" \
+  "re-staging a path three times leaves exactly one index entry"
+"$SIT" commit -m c1 >/dev/null
+assert_contains "$("$SIT" status)" "nothing to commit" \
+  "index matches the tree after re-staged commit"
+
+# 14c. The targeted DELETE embeds the path in SQL, so a quote in a filename
+# must be escaped rather than terminating the string literal.
+R="$WORK/s28quote"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'q\n' > "it's.txt"
+"$SIT" add "it's.txt" >/dev/null
+"$SIT" commit -m c1 >/dev/null
+assert_contains "$("$SIT" status)" "nothing to commit" \
+  "a single quote in a filename round-trips through the index"
+assert_contains "$("$SIT" fsck)" "0 bad" "repo with a quoted filename is structurally clean"
+
+# 14d. parse_index no longer asks patra for ORDER BY, so sit's own merge sort
+# is what produces path order. Staging in reverse must still yield sorted
+# status output.
+R="$WORK/s28order"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+for f in zeta.txt mid.txt alpha.txt beta.txt; do
+  printf 'x\n' > "$f"; "$SIT" add "$f" >/dev/null
+done
+ORDERED=$("$SIT" status | grep -o '[a-z]*\.txt' | head -4)
+assert_eq "$(printf '%s' "$ORDERED" | tr '\n' ' ')" "alpha.txt beta.txt mid.txt zeta.txt" \
+  "index entries are path-sorted without patra ORDER BY"
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
