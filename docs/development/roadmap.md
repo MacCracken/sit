@@ -4,7 +4,7 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.4.3`. The `1.3.x` line went almost entirely to audit work (two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two integrity gaps; `1.4.1` found `objects.hash` had no index at all; `1.4.2` profiled the residual curve to patra's result-buffer sizing; `1.4.3` picked up the upstream fix (patra 1.13.8 via cyrius 6.5.28) and **the object-lookup curve is now flat** — `log -n 50` holds at 5 ms across a 10× store growth. Audit backlogs are empty. The themed minor line shifted **+1** when `1.4.0` went to integrity rather than tags.
+**Where we are**: `1.4.4`. The `1.3.x` line went almost entirely to audit work (two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two integrity gaps; `1.4.1` found `objects.hash` had no index at all; `1.4.2` profiled the residual curve to patra's result-buffer sizing; `1.4.3` picked up the upstream fix (patra 1.13.8 via cyrius 6.5.28) and **the object-lookup curve is now flat**; `1.4.4` made the benchmark fixture a knob and it immediately exposed **two more superlinear paths** the 100-commit default rated as benign. Audit backlogs are empty. The themed minor line shifted **+1** when `1.4.0` went to integrity rather than tags.
 
 ---
 
@@ -24,10 +24,23 @@ Nothing below blocks anything else; ordering within a section is a recommendatio
 
 Ordered. Nothing here adds observable surface, so each can ship as it lands.
 
-- **`1.4.4` — larger benchmark fixture.** Every number in the head-to-head comes
-  from a 100-commit / 100-file repo, which is small enough to hide exactly the
-  quadratic behaviour 1.4.1 found. A 5k-commit fixture would have surfaced the
-  missing index years earlier. Add one as an opt-in bench tier.
+- **`1.4.5` — hashmap-back `index_find`.** `index_find` (`src/index.cyr:515`) is a
+  linear scan, and `cmd_status` calls it once per working file *and* once per HEAD
+  tree entry — **O(N²)**. The same defect was fixed for `tree_find` in v0.6.6
+  (P-10/P-18) with a memoized hashmap; `index_find` was missed. Measured by the
+  1.4.4 large tier: `status` is **1.78× git at 100 files and 26.64× at 1000** —
+  sit grows 24× for 10× the work where git grows 1.6×. Mirror `_tree_find_map`.
+  **Highest-value item in the tree**: one function, and it is on `status`, `add`,
+  and `diff`.
+- **`1.4.6` — fuzz targets for the remaining unfuzzed parsers.** *(From the
+  2026-08-17 audit, whose central lesson was that the one module with no fuzz
+  target held every serious finding.)* `parse_tree`, `parse_commit_body`,
+  `_git_packed_ref_lookup` and `_wildmatch` all parse untrusted bytes and have
+  unit tests but no harness. Test-only, so a patch — not a minor.
+- **Diagnose `clone`'s superlinear growth.** The 1.4.4 large tier put it at
+  **5.17× git at 100 commits and 60.80× at 1000** — 34× growth for 10× the work.
+  Plausibly the same `index_find` scan via materialize plus per-object round
+  trips, but **unmeasured**; profile before assuming, the way 1.4.2 did.
 - **Nested `.gitignore` / `info/exclude`** for `.git/` read-mode. Only the
   top-level `.gitignore` is honoured today (`_ignore_filename`, `git_read.cyr`).
 - **Reflog `expire` / `delete` + `@{<date>}` selector** *(carried from 1.1.0)*.
@@ -36,7 +49,6 @@ Ordered. Nothing here adds observable surface, so each can ship as it lands.
 
 ### Test & tooling debt
 
-- **Fuzz targets for the remaining unfuzzed parsers.** *(From the 2026-08-17 audit, whose central lesson was that the one module with no fuzz target held every serious finding.)* `parse_tree`, `parse_commit_body`, `_git_packed_ref_lookup` and `_wildmatch` all parse untrusted bytes and have unit tests but no harness. None showed a defect under review — which is exactly what was true of the pack reader before anyone looked properly.
 - **Memoize `_wildmatch`.** 1.3.8 bounded the catastrophic backtracking with a per-match step budget. That fixes the DoS but leaves the matcher worst-case exponential — it simply cannot spend more than the budget proving it. The real fix is memoization over (pattern offset, string offset). The obstacle is cost: the memo table would be allocated and zeroed per (pattern, path) pair on `is_ignored`, which is a measured benchmark (`is_ignored-200pat`). Likely shape — memoize only when the pattern carries ≥3 star groups, so the common 0–2 star patterns keep today's allocation-free fast path.
 
 ---
@@ -94,6 +106,14 @@ These are blocked on another repo. Per [CLAUDE.md](../../CLAUDE.md), cross-proje
 
 - **cyrius — ASAN / poisoned-allocator mode for `cyrius fuzz`.** The 127-byte heap overread in `_git_apply_delta` (2026-08-17 audit) was invisible to fuzzing because the read landed in mapped memory: it was found by reading and is pinned only by a deterministic corpus that asserts on the leak. **Every OOB *read* in the tree has that blind spot.** Wanted: redzone poisoning so `cyrius fuzz` fails on overreads, not only on faults.
 - **cyrius — per-profile `distlib` dep sidecars.** `cyrius distlib read` writes its sidecar to `dist/sit.deps`, the same path the full profile uses, and emits the whole `[deps].stdlib` list rather than the leaves the `read` profile needs. Both profiles therefore emit a byte-identical sidecar, so a `dist/sit-read.cyr` consumer following it pulls in the network stdlib (`net` / `tls` / `tls_native` / `ws` / `http` / `sandhi`) the lean bundle exists to drop. Harmless today (a superset resolves, and last-writer-wins with identical bytes) — a packaging nit, not a bug. Wanted: `dist/<name>-<profile>.deps` scoped to the profile's own module set.
+
+  ⚠ **Re-verified on cyrius 6.5.28 (2026-08-18): still reproduces** via all three
+  paths — `distlib read` alone, `distlib` then `distlib read`, and `distlib --all`
+  each leave only `dist/sit.deps` with all 38 leaves. **But one run did emit a
+  correctly profile-scoped `dist/sit-read.deps`** (231 bytes, a strictly smaller
+  leaf set) and it has not been reproducible since — so the capability may already
+  be partly implemented behind some condition, rather than absent. Worth checking
+  that path before writing it from scratch.
 - **sankoch — match-finder / SIMD.** Targets the `add-1MB` `zlib_compress` floor (~140 ms, the largest single cost in `sit add`). Already on sankoch's roadmap, gated on a wire-identical speedup.
 
 ---

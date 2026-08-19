@@ -4,6 +4,56 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.4] — 2026-08-18 — the benchmark fixture is a knob, and it immediately found two O(N²) paths
+
+Every number in the head-to-head came from a **100-commit / 100-file** repo. That
+fixture is small enough to hide quadratic behaviour — sit shipped 1.0 through
+1.4.0 with `objects.hash` carrying no index at all, every object lookup a full
+table scan, and **no benchmark ever showed it**. It surfaced only when someone
+hand-built a 1,600-commit repo while chasing something else.
+
+**No sit source change.** This is the harness plus what it found on its first run.
+
+### Added
+
+- **`FIXTURE_COMMITS` in `scripts/benchmark.sh`** (default `100`, so the standard
+  run stays fast and comparable to every historical table):
+
+  ```sh
+  FIXTURE_COMMITS=1000 ./scripts/benchmark.sh   # ~10x, minutes
+  FIXTURE_COMMITS=5000 ./scripts/benchmark.sh   # the "would have caught it" tier
+  ```
+
+  Row labels carry the size (`log-1000commits`, `status-1000files`, …) so a
+  large-tier table can never be mistaken for a default-tier one when pasted into
+  the docs. Default-tier values are unchanged.
+
+### Found — two superlinear paths the default tier rates as benign
+
+At 10× the repository (100 → 1000 commits/files):
+
+| operation | ratio @100 | ratio @1000 | sit growth | git growth |
+|---|---:|---:|---:|---:|
+| `log` | 2.54× | 6.59× | 8.0× | 3.1× |
+| `status` | **1.78×** | **26.64×** | **24×** | 1.6× |
+| `clone` | **5.17×** | **60.80×** | **34×** | 2.9× |
+
+`status` and `clone` grow ~24× and ~34× for 10× the work while git grows 1.6× and
+2.9×. The default fixture rates them 1.78× and 5.17× — entirely benign-looking.
+
+- **`status` is O(N²), and the cause is identified.** `index_find`
+  (`src/index.cyr:515`) is a **linear scan** over the index, and `cmd_status`
+  calls it once per working file *and* once per HEAD tree entry. The identical
+  problem was fixed for `tree_find` in **v0.6.6** (P-10/P-18) by backing it with a
+  hashmap — `index_find` was missed and has been linear ever since. Tracked as the
+  next patch item; it is a one-function change but earns its own before/after
+  measurement rather than riding along here.
+- **`clone` growth is not yet diagnosed** — plausibly the same index path via
+  materialize, plus per-object round trips. Tracked.
+
+Both are recorded rather than fixed, because the fixture is this release's
+deliverable and each fix deserves its own measured change.
+
 ## [1.4.3] — 2026-08-18 — the patra fix lands: `log` −64%, `clone` −43%, and the lookup curve is flat
 
 Toolchain `6.5.26` → `6.5.28`, which folds **patra 1.13.8** — including the

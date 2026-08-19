@@ -40,6 +40,36 @@ and three shared libraries.
 
 (Caveat: git ships rebase, gc, merge-base, hundreds of plumbing commands sit doesn't have. The footprint comparison is "sit covers the core VCS loop in 10× less disk", not "sit does the same work in 10× the bytes". Sit has 24 commands so far.)
 
+## Large-tier fixture (v1.4.4) — what the default hides
+
+Every table on this page below this section uses a **100-commit / 100-file**
+repository. `scripts/benchmark.sh` now takes `FIXTURE_COMMITS` (default 100):
+
+```sh
+FIXTURE_COMMITS=1000 ./scripts/benchmark.sh
+FIXTURE_COMMITS=5000 ./scripts/benchmark.sh
+```
+
+At 10× the repository, two rows change character completely:
+
+| operation | ratio @100 | ratio @1000 | sit growth | git growth |
+|---|---:|---:|---:|---:|
+| `log` | 2.54× | 6.59× | 8.0× | 3.1× |
+| `status` | **1.78×** | **26.64×** | **24×** | 1.6× |
+| `clone` | **5.17×** | **60.80×** | **34×** | 2.9× |
+
+⚠ **Read the default tier accordingly.** `status` at 1.78× and `clone` at 5.17×
+are *not* the whole story — both are superlinear and the small fixture cannot see
+it. This is the same blind spot that let `objects.hash` ship unindexed from 1.0
+through 1.4.0 with every benchmark green.
+
+`status`'s cause is identified: `index_find` (`src/index.cyr:515`) is a linear
+scan called once per working file and once per HEAD tree entry — O(N²). The same
+defect was fixed for `tree_find` in v0.6.6; this one was missed. `clone`'s growth
+is tracked but **not yet diagnosed** — profile before assuming.
+
+---
+
 ## Operation latency (v1.4.3, 2026-08-18)
 
 Measured on cyrius **6.5.28** (patra 1.13.8). **5 of 10 ops are slower than git,

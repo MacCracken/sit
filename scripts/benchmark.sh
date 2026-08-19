@@ -16,6 +16,25 @@ GIT="${GIT:-git}"
 RUNS_LIGHT="${RUNS_LIGHT:-20}"
 RUNS_HEAVY="${RUNS_HEAVY:-10}"
 
+# v1.4.4: fixture size is a knob, not a constant.
+#
+# WHY: every number in docs/development/benchmarks-git-v-sit.md came from a
+# 100-commit / 100-file repo, and that fixture is small enough to HIDE quadratic
+# behaviour. sit shipped 1.0 through 1.4.0 with `objects.hash` carrying no index
+# at all — every object lookup a full table scan — and no benchmark ever showed
+# it. It surfaced only when someone hand-built a 1,600-commit repo while chasing
+# something else. A large tier is the cheap insurance against repeating that.
+#
+# The default stays 100 so the standard run is fast and comparable to every
+# historical table. Opt into a bigger one:
+#
+#   FIXTURE_COMMITS=1000 ./scripts/benchmark.sh     # ~10x, minutes
+#   FIXTURE_COMMITS=5000 ./scripts/benchmark.sh     # the "would have caught it" tier
+#
+# Row labels carry the size (log-1000commits, …) so a large-tier table can never
+# be mistaken for a default-tier one when pasted into the docs.
+FIXTURE_COMMITS="${FIXTURE_COMMITS:-100}"
+
 [ -x "$SIT" ] || { echo "error: sit binary not found at $SIT"; exit 1; }
 
 # ── timing helpers ────────────────────────────────────────────────
@@ -57,7 +76,7 @@ fixture_history_git() {
     (
         cd "$dir" && $GIT init -q
         i=0
-        while [ $i -lt 100 ]; do
+        while [ $i -lt $FIXTURE_COMMITS ]; do
             echo "file $i content" > "f$i.txt"
             $GIT add "f$i.txt"
             $GIT commit -q -m "c$i"
@@ -71,7 +90,7 @@ fixture_history_sit() {
     (
         cd "$dir" && $SIT init > /dev/null
         i=0
-        while [ $i -lt 100 ]; do
+        while [ $i -lt $FIXTURE_COMMITS ]; do
             echo "file $i content" > "f$i.txt"
             $SIT add "f$i.txt" > /dev/null
             $SIT commit -m "c$i" > /dev/null
@@ -159,7 +178,7 @@ $((t1-t0))"
 }
 
 bench_log() {
-    name="log-100commits"
+    name="log-${FIXTURE_COMMITS}commits"
     runs=$RUNS_LIGHT
     gd=$(fixture_history_git)
     sd=$(fixture_history_sit)
@@ -181,7 +200,7 @@ $((t1-t0))"
 }
 
 bench_status() {
-    name="status-100files"
+    name="status-${FIXTURE_COMMITS}files"
     runs=$RUNS_LIGHT
     gd=$(fixture_history_git)
     sd=$(fixture_history_sit)
@@ -228,7 +247,7 @@ $((t1-t0))"
 }
 
 bench_clone() {
-    name="clone-100commits"
+    name="clone-${FIXTURE_COMMITS}commits"
     runs=$RUNS_HEAVY
     gsrc=$(fixture_history_git)
     ssrc=$(fixture_history_sit)
