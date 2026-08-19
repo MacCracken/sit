@@ -4,7 +4,7 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.4.4`. The `1.3.x` line went almost entirely to audit work (two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two integrity gaps; `1.4.1` found `objects.hash` had no index at all; `1.4.2` profiled the residual curve to patra's result-buffer sizing; `1.4.3` picked up the upstream fix (patra 1.13.8 via cyrius 6.5.28) and **the object-lookup curve is now flat**; `1.4.4` made the benchmark fixture a knob and it immediately exposed **two more superlinear paths** the 100-commit default rated as benign. Audit backlogs are empty. The themed minor line shifted **+1** when `1.4.0` went to integrity rather than tags.
+**Where we are**: `1.4.5`. The `1.3.x` line went almost entirely to audit work (two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two integrity gaps; `1.4.1` found `objects.hash` had no index at all; `1.4.2` profiled the residual curve to patra's result-buffer sizing; `1.4.3` picked up the upstream fix (patra 1.13.8 via cyrius 6.5.28) and **the object-lookup curve is now flat**; `1.4.4` made the benchmark fixture a knob and it immediately exposed **two more superlinear paths** the 100-commit default rated as benign; `1.4.5` fixed one cause (`index_find`'s linear scan) but `status` is still superlinear from something else. Audit backlogs are empty. The themed minor line shifted **+1** when `1.4.0` went to integrity rather than tags.
 
 ---
 
@@ -24,15 +24,16 @@ Nothing below blocks anything else; ordering within a section is a recommendatio
 
 Ordered. Nothing here adds observable surface, so each can ship as it lands.
 
-- **`1.4.5` — hashmap-back `index_find`.** `index_find` (`src/index.cyr:515`) is a
-  linear scan, and `cmd_status` calls it once per working file *and* once per HEAD
-  tree entry — **O(N²)**. The same defect was fixed for `tree_find` in v0.6.6
-  (P-10/P-18) with a memoized hashmap; `index_find` was missed. Measured by the
-  1.4.4 large tier: `status` is **1.78× git at 100 files and 26.64× at 1000** —
-  sit grows 24× for 10× the work where git grows 1.6×. Mirror `_tree_find_map`.
-  **Highest-value item in the tree**: one function, and it is on `status`, `add`,
-  and `diff`.
-- **`1.4.6` — fuzz targets for the remaining unfuzzed parsers.** *(From the
+- **`1.4.6` — profile what is still superlinear in `status`.** 1.4.5 gave
+  `index_find` the hashmap `tree_find` got in v0.6.6, which removed a genuine
+  O(N²) — but only bought **20%** at N=1000 (`status-1000files` 26.64× → 21.35×
+  git), so it was not the dominant term at that size. **10× the files still costs
+  ~19× the time.** Cause unidentified. Do it the way 1.4.2 did the lookup curve:
+  instrument `cmd_status`'s phases (`read_head_tree_entries`, `parse_index`,
+  `list_working_files`, the per-entry `hash_file_as_blob`, the three loops) and
+  measure at two sizes — **do not guess**. Two guesses were wrong in the 1.4.2
+  investigation before profiling settled it in one run.
+- **`1.4.7` — fuzz targets for the remaining unfuzzed parsers.** *(From the
   2026-08-17 audit, whose central lesson was that the one module with no fuzz
   target held every serious finding.)* `parse_tree`, `parse_commit_body`,
   `_git_packed_ref_lookup` and `_wildmatch` all parse untrusted bytes and have

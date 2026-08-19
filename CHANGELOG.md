@@ -4,6 +4,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.5] — 2026-08-18 — `index_find` gets the hashmap `tree_find` got in v0.6.6
+
+The 1.4.4 large-tier fixture found `status` at **1.78× git on 100 files and
+26.64× on 1000** — sit growing 24× for 10× the work where git grows 1.6×. Cause:
+`index_find` was an **O(N) linear scan** called from O(N) loops, i.e. O(N²).
+
+The identical defect was fixed for `tree_find` in **v0.6.6** (P-10/P-18) by
+backing it with a memoized hashmap. `index_find` was missed and had been linear
+ever since.
+
+### Fixed
+
+- **`index_find` (`src/index.cyr`) is now hashmap-backed** (P-10b), mirroring
+  `_tree_find_map` exactly: a path → entry map built on first lookup per entries
+  vec, cached by vec pointer for the process lifetime. `cmd_status` calls it once
+  per working file *and* once per HEAD tree entry; `cmd_diff` and `cmd_rm` do the
+  same.
+
+  | | 1.4.4 | 1.4.5 |
+  |---|---:|---:|
+  | `status-100files` | 1.78× git | **1.59×** |
+  | `status-1000files` | 26.64× git (137.74 ms) | **21.35× (110.15 ms, −20%)** |
+
+  Worst case (a single lookup on a vec) is one map build + one lookup = O(N) +
+  O(1) — the same complexity as the scan it replaces, so no caller regresses. No
+  other benchmark row moved.
+
+  **Safety of the pointer-keyed cache** is argued at the call site rather than
+  assumed: an index entries vec is built entirely inside `parse_index` (its only
+  `vec_push`) and never mutated afterwards; `sort_entries` reorders in place,
+  which does not change the path → entry mapping; `dedupe_entries` returns a
+  *new* vec, so it gets its own map; and entry payloads come from `alloc()`
+  (bump, never freed), so an address is never recycled into a different vec
+  within one process.
+
+### Still open — `status` remains superlinear
+
+⚠ **This did not make `status` linear, and the release notes should not imply it
+did.** 10× the files still costs ~19× the time. Removing the O(N²) bought 20% at
+N=1000, which means `index_find` was *not* the dominant term at this size — though
+it would become dominant as N grows, so the fix matters more than the 20% suggests.
+
+Something else in `cmd_status` is superlinear and **the cause is not yet
+identified**. Tracked on the roadmap; it gets the same treatment `1.4.2` gave the
+lookup curve — profile the phases, do not guess.
+
 ## [1.4.4] — 2026-08-18 — the benchmark fixture is a knob, and it immediately found two O(N²) paths
 
 Every number in the head-to-head came from a **100-commit / 100-file** repo. That

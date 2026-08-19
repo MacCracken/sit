@@ -55,8 +55,14 @@ At 10× the repository, two rows change character completely:
 | operation | ratio @100 | ratio @1000 | sit growth | git growth |
 |---|---:|---:|---:|---:|
 | `log` | 2.54× | 6.59× | 8.0× | 3.1× |
-| `status` | **1.78×** | **26.64×** | **24×** | 1.6× |
+| `status` (v1.4.4) | **1.78×** | **26.64×** | **24×** | 1.6× |
+| `status` (v1.4.5) | 1.59× | **21.35×** | 21× | 1.6× |
 | `clone` | **5.17×** | **60.80×** | **34×** | 2.9× |
+
+v1.4.5 hashmap-backed `index_find` (an O(N) scan called from O(N) loops), worth
+**−20%** at N=1000. ⚠ `status` is **still superlinear** — 10× the files costs ~19×
+the time — so that was not the dominant term at this size. Second cause
+unidentified; tracked as 1.4.6, to be profiled rather than guessed.
 
 ⚠ **Read the default tier accordingly.** `status` at 1.78× and `clone` at 5.17×
 are *not* the whole story — both are superlinear and the small fixture cannot see
