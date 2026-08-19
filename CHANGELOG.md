@@ -4,6 +4,109 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.7] — 2026-08-19 — the last four unfuzzed parsers, and a sweep of every deferral comment
+
+Two pieces of debt, both from the **2026-08-17 audit**, whose central lesson was
+that the one module with no fuzz target held every serious finding.
+
+### Added
+
+- **Fuzz targets for `parse_tree`, `parse_commit_body`, `_git_packed_ref_scan`
+  and `_wildmatch`** — the four remaining parsers that read untrusted bytes and
+  had unit tests but no harness. **13 harnesses, up from 9.**
+
+  All four cycle `_repo_backend` / `_git_hash_algo` across rounds, because each
+  branches on the active object-id width (`_id_rawlen()` / `_id_hexlen()` return
+  32/64 for sit's SHA-256 but **20/40 for a git SHA-1 repo**) — different
+  arithmetic over the same buffers, and the path taken when reading a
+  real-world `.git/`.
+
+  ⚠ **The first cut of two of these targets was vacuous, and measuring is the
+  only reason that was caught.** Feeding pure random bytes, `parse_tree` parsed
+  **0** valid entries in 200,000 rounds and `_git_packed_ref_scan` scored **0**
+  hits — random input essentially never synthesises a valid `<mode> <name>\0<hash>`
+  record or a hex OID, so both targets only ever exercised the *reject* path
+  while reporting a clean pass. The accept path is where the hash read, the
+  entry allocation and the `memcpy` into the caller's buffer live, which is the
+  half that matters. Both were rebuilt to **seed a well-formed record and then
+  corrupt one byte**, which covers the accept path and the near-misses together:
+
+  | target | random bytes | seed-and-mutate |
+  |---|---:|---:|
+  | `parse_tree` parsed ≥1 entry | 0 | **199,898** |
+  | `parse_tree` dropped an entry | 160,916 | 28,425 |
+  | `_git_packed_ref_scan` hit a ref | 0 | **67,650** |
+  | `parse_commit_body` returned ok | 72,427 | 72,427 |
+  | `_wildmatch` matched | 6,250 | 6,250 |
+
+  This is the same failure mode the v1.3.7 hostile packfile corpus hit — its
+  first draft scored 7 false passes from fixtures that bounced off an earlier
+  error path — and the same fix: prove the target reaches the code before
+  trusting a green run.
+
+### Changed
+
+- **`_git_packed_ref_scan` split out of `_git_packed_ref_lookup`**
+  (`src/git_read.cyr`). The lookup reads `.git/packed-refs` itself, so its
+  parsing was unreachable from a fuzz harness without writing that file — and
+  the harness runs from the repo root, where doing so would clobber a real
+  `.git/`. The scanner now takes `(buf, len, refname, out_buf)`; the disk
+  wrapper only supplies the first two. Behaviour is unchanged.
+
+- **`sit --help` had three stale command descriptions**, all user-facing:
+  `merge` advertised "(3-way deferred)" when `cmd_merge` has done full 3-way with
+  diff3 conflict markers since v0.5.x; `serve` was described as a "read-only HTTP
+  daemon" after v0.7.6 added POST `/objects` + `/refs` (its own capabilities
+  banner reports `"push":true`) and v0.8.8 added `--tls`; and `remote` claimed
+  "local-path transport" when it has handled `file://` / `http://` / `https://` /
+  `ssh://` since v0.8.x. `docs/guides/getting-started.md` was correct on all
+  three — the CLI help was the only place that had drifted.
+
+### Fixed
+
+- **Deferral-comment sweep: 11 untracked deferrals in `src/` → 0.** `cyrius lint`
+  flags a deferral comment that does not cross-reference a CHANGELOG / roadmap
+  entry. Each was read and dispositioned rather than blanket-suppressed — two
+  were **stale claims about shipped work**, two were **dead version tags**, two
+  were not deferrals at all, and the rest are real and now tracked:
+
+  | site | finding |
+  |---|---|
+  | `wire_http.cyr` | claimed https push was "a later bite" and `check_writable` gated https off — **v0.8.9 shipped https push and lit up that exact gate** |
+  | `serve.cyr` | "mTLS is deferred to the **1.5.0** transport-trust minor" — that minor is **1.7.0** since the themed line shifted +1 at 1.4.0 |
+  | `validate.cyr` | HFS-ignorable Unicode codepoints flagged as a "**v0.7** follow-up", unmoved from v0.7 to v1.4.6 — re-filed on the roadmap |
+  | `object_db.cyr` | the patra BATCH-mode investigation is a *recorded decision*, not a deferral — `#skip-lint` |
+  | `wire_http.cyr` | "batch_probed (0 = **not yet**, 1 = …)" describes a field's value, not a deferral — `#skip-lint` |
+  | `refs.cyr`, `object_db.cyr` | `@{N}` on git repos, git short-prefix disambiguation — both cross-referenced to `.git/` CLI parity |
+  | `wire.cyr`, `wire_http.cyr` | batched `WHERE hash IN (…)` pre-filter, HTTP base-path routing — newly tracked on the roadmap |
+  | `serve.cyr` | the hand-bumped capabilities banner — **filed as a cyrius upstream ask** |
+
+- **A dangling roadmap cross-reference in `wire_https.cyr`.** It pointed at a
+  roadmap section named `"Longer horizon"` that no longer exists; the content is
+  now the 1.7.0 TLS-trust entry. It passed `cyrius lint` the whole time —
+  **the deferral check is presence-based, not resolution-based**, so a
+  cross-reference can satisfy it while resolving to nothing. Every roadmap
+  reference in `src/` was checked to resolve; this was the only broken one.
+
+### Known limitation
+
+- **The three buffer-parser targets pin faults and hangs, not memory errors.**
+  Proven, not assumed: with the new targets in place, `parse_tree`'s
+  `alloc_or_die(name_len + 1)` was changed to `alloc_or_die(8)` — a straight
+  heap overflow on every entry with a name over 8 bytes, hit ~200,000 times per
+  run — and the suite **still reported `no crashes` and exited 0**. The
+  allocator has enough slack that the overflow never leaves mapped memory.
+
+  `_wildmatch`'s target *does* have teeth, because its failure mode is
+  non-termination rather than corruption: raising `_GLOB_STEP_MAX` from 200,000
+  to effectively unbounded makes the suite **hang** (killed at 200 s) where it
+  otherwise completes in ~57 s. The probe is a 10-star pattern
+  (`a*a*…a*b`) against 96 `a` — measured at 200,010 steps, i.e. budget-exhausted,
+  where 4 stars over 32 chars finishes naturally in 41,448.
+
+  This is the strongest case yet for the **cyrius ASAN / poisoned-allocator ask**
+  already on the roadmap, and it is recorded there with the repro.
+
 ## [1.4.6] — 2026-08-19 — `status` stops being superlinear: two quadratics, both in the index path
 
 1.4.4 caught `status` growing **24× for 10× the files** where git grows 1.6×.

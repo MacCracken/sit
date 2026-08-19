@@ -269,15 +269,16 @@ fn _git_read_loose_ref(refpath) {
     return buf;
 }
 
-# Look up a full refname (e.g. "refs/heads/main") in .git/packed-refs. Writes
-# _id_hexlen() hex chars + NUL into out_buf and returns 1 on hit, else 0. Lines:
-# "<oid> <refname>\n"; '#' header/comment lines and '^' peeled-tag lines are
-# skipped (a ref name resolves to its own object, not a tag's peeled target).
-fn _git_packed_ref_lookup(refname, out_buf) {
-    var pair[16];
-    if (read_file_heap(".git/packed-refs", &pair) != 0) { return 0; }
-    var buf = load64(&pair);
-    var len = load64(&pair + 8);
+# Pure scanner over a packed-refs buffer, split out of
+# `_git_packed_ref_lookup` in v1.4.7 so the parse can be fuzzed in-process.
+# The lookup reads `.git/packed-refs` itself, which made its parsing
+# unreachable from a fuzz harness without writing that file — and the
+# harness runs from the repo root, where doing so would clobber a real
+# `.git/`. Splitting the buffer walk out is the same move the pack varint
+# decoders already had by construction, and it is why they had a target
+# while this did not. Contract is unchanged: writes `_id_hexlen()` hex
+# chars + NUL into `out_buf` and returns 1 on hit, else 0.
+fn _git_packed_ref_scan(buf, len, refname, out_buf) {
     var hexlen = _id_hexlen();
     var rn_len = strlen(refname);
 
@@ -315,6 +316,16 @@ fn _git_packed_ref_lookup(refname, out_buf) {
         }
     }
     return result;
+}
+
+# Look up a full refname (e.g. "refs/heads/main") in .git/packed-refs. Writes
+# _id_hexlen() hex chars + NUL into out_buf and returns 1 on hit, else 0. Lines:
+# "<oid> <refname>\n"; '#' header/comment lines and '^' peeled-tag lines are
+# skipped (a ref name resolves to its own object, not a tag's peeled target).
+fn _git_packed_ref_lookup(refname, out_buf) {
+    var pair[16];
+    if (read_file_heap(".git/packed-refs", &pair) != 0) { return 0; }
+    return _git_packed_ref_scan(load64(&pair), load64(&pair + 8), refname, out_buf);
 }
 
 # git-mode read_head_ref: resolve .git/HEAD. Symref → loose ref then packed-refs;

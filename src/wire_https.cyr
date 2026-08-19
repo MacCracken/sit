@@ -9,7 +9,11 @@
 #
 # First connection to a host records its pin (trust-on-first-use). Later
 # connections must match; a mismatch aborts (possible MITM). CA-chain + hostname
-# verification is a post-v1 opt-in (roadmap "Longer horizon").
+# verification is an opt-in in the 1.7.0 transport-trust minor (roadmap: TLS
+# trust hardening). This previously pointed at a roadmap section called
+# "Longer horizon", which no longer exists — the 1.4.7 deferral sweep found the
+# reference had gone dangling, satisfying cyrlint (a "roadmap" mention is
+# present) while resolving to nothing.
 #
 # Two parts, both live since v0.8.8: this pin store, and the TLS I/O wiring in
 # wire_http.cyr's open/request/post (tls_native handshake over the socket, reads/

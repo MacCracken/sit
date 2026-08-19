@@ -672,9 +672,9 @@ fn copy_objects(src, dst_db, hashes, raw_cache) {
     # 100-commit/100-file clone fixture, this collapses ~300 fsyncs into 1.
     # Removed the outer db_object_has check that duplicates the one already
     # inside db_object_insert_raw — every object was paying for two SELECTs
-    # plus an insert. Batched WHERE hash IN (...) pre-filter is deferred to
-    # a later release (would need 60-hash chunking per patra's SQL parser
-    # limits).
+    # plus an insert. Batched WHERE hash IN (...) pre-filter is deferred (roadmap)
+    # to a later release — it would need 60-hash chunking per patra's SQL
+    # parser limits.
     #
     # P-04 (v0.6.7): raw_cache is the (hex → 24-byte raw struct) map populated
     # during walk_reachable_*. For commits + trees (everything walk visited),

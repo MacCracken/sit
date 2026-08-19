@@ -49,7 +49,7 @@ fn resolve_reflog_spec(name, out_buf) {
 
 fn resolve_ref_name(name, out_buf) {
     # Storage seam (roadmap 1.2.0): a .git/ repo resolves refs from .git/HEAD,
-    # .git/refs/, and .git/packed-refs. @{N} reflog specs are .sit-only for now.
+    # .git/refs/, and .git/packed-refs. @{N} reflog specs are .sit-only for now (roadmap: `.git/` CLI parity).
     if (_repo_backend == 1) { return _git_resolve_ref_name(name, out_buf); }
 
     # Reflog selector <ref>@{N} takes precedence over plain-name lookup.

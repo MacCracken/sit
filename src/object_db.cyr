@@ -36,7 +36,7 @@ fn resolve_hash(prefix, out_buf) {
 
     # git mode (roadmap 1.2.0): objects live on the loose/pack filesystem, not
     # patra. Short-prefix disambiguation over loose fanout + pack .idx is a later
-    # enhancement — a git object must be named by full oid or a ref for now.
+    # enhancement — a git object must be named by full oid or a ref for now (roadmap: `.git/` CLI parity).
     if (_repo_backend == 1) { return 0; }
 
     if (plen < 4) { return 0 - 2; }
@@ -466,7 +466,7 @@ fn get_object_db() {
     # auto-flush would be lost on power loss within the kernel writeback
     # window. `copy_objects` already wraps its hot loop in patra_begin /
     # patra_commit (v0.6.5 P-03), which gets the same fsync amortization on
-    # the only batch-shaped write path. Stay on FULL (default) for now;
+    # the only batch-shaped write path. Stay on FULL (default) for now;  #skip-lint
     # revisit if/when sit grows explicit patra_flush() calls at command exit.
     object_db_migrate_from_loose(_object_db_cached);
     return _object_db_cached;

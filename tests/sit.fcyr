@@ -264,6 +264,307 @@ fn fuzz_apply_delta(rounds) {
     return 0;
 }
 
+# ── v1.4.7: the four remaining unfuzzed parsers ───────────────────────────
+# From the 2026-08-17 audit, whose central lesson was that the one module with
+# NO fuzz target held every serious finding. These four all parse untrusted
+# bytes and had unit tests but no harness.
+#
+# All four branch on the active backend's object-id width — `_id_rawlen()` /
+# `_id_hexlen()` return 32/64 for sit's SHA-256, 20/40 for a git SHA-1 repo and
+# 32/64 for git SHA-256 — so each target cycles `_repo_backend` /
+# `_git_hash_algo` across rounds. The SHA-1 path is different arithmetic on the
+# same buffers, and it is the one reached when reading a real-world `.git/`.
+
+fn _fz_set_backend(sel) {
+    if (sel == 0) { _repo_backend = 0; _git_hash_algo = 1; return 0; }
+    if (sel == 1) { _repo_backend = 1; _git_hash_algo = 0; return 0; }
+    _repo_backend = 1;
+    _git_hash_algo = 1;
+    return 0;
+}
+
+# Tree bodies: "<mode> <name>\0<rawhash>" repeated. Random bytes hit the
+# framing checks; the seeded well-formed prefix walks the accept path far
+# enough to reach the mode/name validators and the entry-drop counter.
+fn fuzz_parse_tree(rounds) {
+    var cap = 4096;
+    var body = alloc(cap);
+    var seed = 0x7EE00001;
+    var i = 0;
+    while (i < rounds) {
+        _fz_set_backend(seed % 3);
+        var rawlen = _id_rawlen();
+
+        # Build a WELL-FORMED body of 3 entries, then corrupt one random byte.
+        # Pure random bytes never synthesise a valid "<mode> <name>\0<rawhash>"
+        # record — a first cut of this target parsed 0 entries in 200k rounds
+        # while dropping 160k, i.e. it only ever exercised the reject path. The
+        # accept path is where the hash read and the entry allocation live, so
+        # it is the half that matters for memory safety. Seeding valid records
+        # and mutating reaches both: most rounds parse, mutated rounds land on
+        # the mode digits, the name, the NUL, or the hash and near-miss.
+        var w = 0;
+        var e = 0;
+        while (e < 3) {
+            store8(body + w, 49); w = w + 1;      # '1'
+            store8(body + w, 48); w = w + 1;      # '0'
+            store8(body + w, 48); w = w + 1;      # '0'
+            store8(body + w, 54); w = w + 1;      # '6'
+            store8(body + w, 52); w = w + 1;      # '4'
+            store8(body + w, 52); w = w + 1;      # '4'
+            store8(body + w, 32); w = w + 1;      # ' '
+            var nlen = ((seed >> (e * 3)) & 0x07) + 1;   # 1..8 byte name
+            var k = 0;
+            while (k < nlen) {
+                store8(body + w, 97 + ((seed + k + e) & 0x0F));
+                w = w + 1;
+                k = k + 1;
+            }
+            store8(body + w, 0); w = w + 1;       # NUL terminator
+            var h = 0;
+            while (h < rawlen) {
+                store8(body + w, (seed + h * 31 + e) & 0xFF);
+                w = w + 1;
+                h = h + 1;
+            }
+            e = e + 1;
+        }
+
+        # Corrupt one byte on 3 of every 4 rounds; leave a clean parse on the 4th.
+        if ((seed & 3) != 0) {
+            var off = (seed >> 5) % w;
+            store8(body + off, (seed >> 11) & 0xFF);
+        }
+
+        tree_dropped_reset();
+        parse_tree(body, w);
+
+        # Truncation at every prefix length is the classic tree-parser bug:
+        # a record header that promises more bytes than the body holds.
+        parse_tree(body, (seed >> 7) % (w + 1));
+        parse_tree(body, 0);
+
+        # A fully random body still gets a turn — it covers the "no space, no
+        # NUL anywhere" shapes the seeded builder cannot produce.
+        var rsize = (seed & 0x1FF) + 1;
+        fill_pseudo_random(body, rsize, seed);
+        tree_dropped_reset();
+        parse_tree(body, rsize);
+
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+    _fz_set_backend(0);
+    return 0;
+}
+
+# Commit bodies: header block ("tree "/"parent "/"author "/"committer ") then a
+# blank line then the message. Hostile timestamps are in scope — S-25 clamps
+# them, and `epoch_to_date`'s year-at-a-time walk is what that guards.
+fn fuzz_parse_commit_body(rounds) {
+    var cap = 4096;
+    var body = alloc(cap);
+    var info[56];
+    var seed = 0xC0FFEE11;
+    var i = 0;
+    while (i < rounds) {
+        _fz_set_backend(seed % 3);
+        var size = (seed & 0x3FF) + 1;   # 1..1024
+        if (size > cap) { size = cap; }
+        fill_pseudo_random(body, size, seed);
+
+        if ((seed & 3) == 0) {
+            # "tree " — drives the hex-width read at the object-id boundary.
+            store8(body + 0, 116); store8(body + 1, 114); store8(body + 2, 101);
+            store8(body + 3, 101); store8(body + 4, 32);
+        }
+        if ((seed & 3) == 1) {
+            # "parent " — the multi-parent vec path (v0.8.7, out+48).
+            store8(body + 0, 112); store8(body + 1, 97); store8(body + 2, 114);
+            store8(body + 3, 101); store8(body + 4, 110); store8(body + 5, 116);
+            store8(body + 6, 32);
+        }
+        if ((seed & 3) == 2) {
+            # "author " — reaches parse_author_line and the timestamp clamp.
+            store8(body + 0, 97); store8(body + 1, 117); store8(body + 2, 116);
+            store8(body + 3, 104); store8(body + 4, 111); store8(body + 5, 114);
+            store8(body + 6, 32);
+        }
+        parse_commit_body(body, size, &info);
+        parse_commit_body(body, 0, &info);
+        seed = seed * 2862933555 + 3037000493;
+        i = i + 1;
+    }
+    _fz_set_backend(0);
+    return 0;
+}
+
+# packed-refs buffers. Fuzzes the pure scanner split out in v1.4.7; the disk
+# wrapper only supplies (buf, len). Refname length is varied because the line
+# test is `line_len == hexlen + 1 + rn_len`, so rn_len steers which random
+# lines reach the hex validator and the memeq.
+fn fuzz_packed_ref_scan(rounds) {
+    var cap = 2048;
+    var buf = alloc(cap);
+    var out[128];
+    var rn = alloc(64);
+    var seed = 0x9ACD0011;
+    var i = 0;
+    while (i < rounds) {
+        _fz_set_backend(seed % 3);
+        var hexlen = _id_hexlen();
+
+        # Refname first — the line test is `line_len == hexlen + 1 + rn_len`,
+        # so the buffer has to be built to match a specific refname length.
+        var rlen = ((seed >> 3) & 0x0F) + 1;   # 1..16
+        var k = 0;
+        while (k < rlen) {
+            store8(rn + k, 97 + ((seed + k) & 0x0F));
+            k = k + 1;
+        }
+        store8(rn + rlen, 0);
+
+        # Build WELL-FORMED "<hex> <refname>\n" lines, preceded by a '#' comment
+        # and a '^' peeled line so both skip branches are walked. Random bytes
+        # alone scored 0 hits in 200k rounds — the memcpy into out_buf, which is
+        # the whole memory-safety question here, was never reached.
+        var w = 0;
+        store8(buf + w, 35); w = w + 1;        # '#' comment line
+        store8(buf + w, 120); w = w + 1;
+        store8(buf + w, 10); w = w + 1;
+        store8(buf + w, 94); w = w + 1;        # '^' peeled line
+        store8(buf + w, 97); w = w + 1;
+        store8(buf + w, 10); w = w + 1;
+
+        var h = 0;
+        while (h < hexlen) {
+            var nib = (seed + h * 7) & 0x0F;
+            if (nib < 10) { store8(buf + w, 48 + nib); }
+            else { store8(buf + w, 97 + nib - 10); }
+            w = w + 1;
+            h = h + 1;
+        }
+        store8(buf + w, 32); w = w + 1;        # the OID/name boundary space
+        var m = 0;
+        while (m < rlen) {
+            store8(buf + w, load8(rn + m));
+            w = w + 1;
+            m = m + 1;
+        }
+        store8(buf + w, 10); w = w + 1;
+
+        # Corrupt one byte on 3 of every 4 rounds so near-misses (bad hex, a
+        # non-space at the boundary, a refname off by one byte) get covered
+        # alongside the clean hit.
+        if ((seed & 3) != 0) {
+            var off = (seed >> 9) % w;
+            store8(buf + off, (seed >> 17) & 0xFF);
+        }
+
+        _git_packed_ref_scan(buf, w, rn, &out);
+
+        # Truncation mid-OID and mid-name: a line that runs off the buffer end
+        # without its newline is the shape that would over-read.
+        _git_packed_ref_scan(buf, (seed >> 6) % (w + 1), rn, &out);
+        _git_packed_ref_scan(buf, 0, rn, &out);
+
+        # Empty refname is a degenerate accept-path edge (rn_len == 0).
+        store8(rn + 0, 0);
+        _git_packed_ref_scan(buf, w, rn, &out);
+
+        # Fully random buffer still gets a turn for the no-newline shapes.
+        var rsize = (seed & 0x1FF) + 1;
+        if (rsize > cap) { rsize = cap; }
+        fill_pseudo_random(buf, rsize, seed);
+        _git_packed_ref_scan(buf, rsize, rn, &out);
+
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+    _fz_set_backend(0);
+    return 0;
+}
+
+# _wildmatch: random patterns against random subjects, plus the adversarial
+# star-heavy shapes that motivated 1.3.8's per-match step budget. The budget is
+# the only thing standing between a hostile `.sitignore` and exponential
+# backtracking, so the point of this target is that these RETURN — the harness
+# would hang, not crash, if the budget regressed.
+fn fuzz_wildmatch(rounds) {
+    var pcap = 128;
+    var scap = 256;
+    var pat = alloc(pcap);
+    var str = alloc(scap);
+    var seed = 0x51DE0001;
+    var i = 0;
+    while (i < rounds) {
+        var plen = (seed & 0x1F) + 1;    # 1..32
+        var slen = ((seed >> 5) & 0x3F) + 1;  # 1..64
+
+        # Draw from a small alphabet heavy in glob metacharacters, so random
+        # draws actually produce globs rather than literals that never branch.
+        var k = 0;
+        while (k < plen) {
+            var c = (seed + k * 7) & 0x07;
+            if (c == 0) { store8(pat + k, 42); }        # *
+            if (c == 1) { store8(pat + k, 63); }        # ?
+            if (c == 2) { store8(pat + k, 91); }        # [
+            if (c == 3) { store8(pat + k, 93); }        # ]
+            if (c == 4) { store8(pat + k, 47); }        # /
+            if (c == 5) { store8(pat + k, 97); }        # a
+            if (c == 6) { store8(pat + k, 98); }        # b
+            if (c == 7) { store8(pat + k, 92); }        # backslash
+            k = k + 1;
+        }
+        store8(pat + plen, 0);
+
+        var j = 0;
+        while (j < slen) {
+            var d = (seed + j * 3) & 0x03;
+            if (d == 0) { store8(str + j, 97); }        # a
+            if (d == 1) { store8(str + j, 98); }        # b
+            if (d == 2) { store8(str + j, 47); }        # /
+            if (d == 3) { store8(str + j, 46); }        # .
+            j = j + 1;
+        }
+        store8(str + slen, 0);
+
+        _wildmatch(pat, plen, str, slen);
+        # Zero lengths on either side must fail closed.
+        _wildmatch(pat, 0, str, slen);
+        _wildmatch(pat, plen, str, 0);
+
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+
+    # Explicit catastrophic-backtracking shape: "a*a*...a*b" (10 star groups)
+    # against a run of 96 'a'. The trailing 'b' never matches, so a naive
+    # backtracking matcher must try every way of splitting the run across the
+    # stars before concluding "no" — exponential in the star count. 1.3.8's
+    # per-match step budget is the only thing that bounds it, and this shape is
+    # the A/B probe for that: with the budget raised to 2e9 the harness hangs,
+    # with the shipped 200k it returns immediately.
+    var stars = 10;
+    var bp = 0;
+    while (bp < stars) {
+        store8(pat + bp * 2, 97);          # 'a'
+        store8(pat + bp * 2 + 1, 42);      # '*'
+        bp = bp + 1;
+    }
+    var cat_plen = stars * 2 + 1;
+    store8(pat + stars * 2, 98);           # trailing 'b', unmatchable
+    store8(pat + cat_plen, 0);
+    var sp = 0;
+    while (sp < 96) {
+        store8(str + sp, 97);
+        sp = sp + 1;
+    }
+    store8(str + 96, 0);
+    _wildmatch(pat, cat_plen, str, 96);
+    return 0;
+}
+
 fn main() {
     alloc_init();
     println("fuzz: zlib_decompress (10000 rounds)");
@@ -284,6 +585,14 @@ fn main() {
     if (fuzz_pack_varints(500000) != 0) { return 1; }
     println("fuzz: apply_delta (200000 rounds)");
     if (fuzz_apply_delta(200000) != 0) { return 1; }
+    println("fuzz: parse_tree (200000 rounds)");
+    if (fuzz_parse_tree(200000) != 0) { return 1; }
+    println("fuzz: parse_commit_body (200000 rounds)");
+    if (fuzz_parse_commit_body(200000) != 0) { return 1; }
+    println("fuzz: packed_ref_scan (200000 rounds)");
+    if (fuzz_packed_ref_scan(200000) != 0) { return 1; }
+    println("fuzz: wildmatch (100000 rounds)");
+    if (fuzz_wildmatch(100000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

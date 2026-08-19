@@ -4,17 +4,15 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.4.6`. The `1.3.x` line went almost entirely to audit work
+**Where we are**: `1.4.7`. The `1.3.x` line went almost entirely to audit work
 (two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two
-integrity gaps; `1.4.1`–`1.4.3` flattened the object-lookup curve (`objects.hash`
-had no index; the residual traced to patra sizing a result buffer by the whole
-table, fixed upstream); `1.4.4` made the benchmark fixture a knob and immediately
-exposed two superlinear paths the 100-commit default rated as benign; `1.4.5`
-fixed one cause and `1.4.6` found the other two — `sit add` rewriting the whole
-index per staged file, and an `ORDER BY` that was patra's insertion sort. **`status`
-is no longer superlinear** (4.98× git at 1,000 files, was 26.64× at 1.4.4). Audit
-backlogs are empty. The themed minor line shifted **+1** when `1.4.0` went to
-integrity rather than tags.
+integrity gaps; `1.4.1`–`1.4.3` flattened the object-lookup curve; `1.4.4` made
+the benchmark fixture a knob and exposed two superlinear paths; `1.4.5`–`1.4.6`
+fixed all three causes and **`status` is no longer superlinear** (4.98× git at
+1,000 files, was 26.64× at 1.4.4). `1.4.7` closed the last four unfuzzed parsers
+and swept every deferral comment in `src/` for staleness. Audit backlogs are
+empty. The themed minor line shifted **+1** when `1.4.0` went to integrity
+rather than tags.
 
 ---
 
@@ -34,11 +32,6 @@ Nothing below blocks anything else; ordering within a section is a recommendatio
 
 Ordered. Nothing here adds observable surface, so each can ship as it lands.
 
-- **`1.4.7` — fuzz targets for the remaining unfuzzed parsers.** *(From the
-  2026-08-17 audit, whose central lesson was that the one module with no fuzz
-  target held every serious finding.)* `parse_tree`, `parse_commit_body`,
-  `_git_packed_ref_lookup` and `_wildmatch` all parse untrusted bytes and have
-  unit tests but no harness. Test-only, so a patch — not a minor.
 - **Diagnose `clone`'s superlinear growth.** The 1.4.4 large tier put it at
   **5.17× git at 100 commits and 60.80× at 1000** — 34× growth for 10× the work.
   Still **unmeasured**; profile before assuming, the way 1.4.2 and 1.4.6 did.
@@ -50,6 +43,20 @@ Ordered. Nothing here adds observable surface, so each can ship as it lands.
   once per file) — that is the first thing to check.
 - **Nested `.gitignore` / `info/exclude`** for `.git/` read-mode. Only the
   top-level `.gitignore` is honoured today (`_ignore_filename`, `git_read.cyr`).
+- **Tree-name validation: HFS-ignorable Unicode codepoints.** `validate.cyr`'s
+  `tree_flat_path_valid` rejects `.sit` / `.git` / `.ssh` case-folded, NTFS
+  reserved names, and over-long names — but HFS-ignorable codepoints need a
+  check over *decoded* Unicode, not bytes, so they are unhandled. Carried in the
+  source as a "v0.7 follow-up" from v0.7 to v1.4.6 without moving; re-filed here
+  in the 1.4.7 deferral sweep so it has a real home instead of a dead version tag.
+- **Batched `WHERE hash IN (...)` pre-filter in `copy_objects`** (`wire.cyr`).
+  v0.6.5 P-03 already collapses the insert loop into one patra transaction; the
+  remaining win is replacing per-object existence SELECTs with chunked batch
+  probes. Needs 60-hash chunking to stay inside patra's SQL parser limits.
+- **HTTP base-path routing** (`wire_http.cyr`). Only `""` and `"/"` are accepted
+  as the URL path today, so `http://host/repos/foo` is refused rather than
+  silently mis-routed. Serving multiple repos behind one origin needs real
+  server-side routing in `serve.cyr`.
 - **Reflog `expire` / `delete` + `@{<date>}` selector** *(carried from 1.1.0)*.
   Entries are unbounded, so `fsck --prune` reclaims reflog-protected objects only
   via `--prune-now`; expiry closes that.
@@ -96,6 +103,8 @@ Each is a self-contained minor; the heavier ones earn their own slot. **Next: `1
 - **`1.8.0` — Wider merge + inspection.** **Octopus / N-way merge** (`cmd_merge` → N branches; `find_merge_base` already walks N parents correctly); **`sit blame`** (per-line last-touch — also a natural `dist/sit.cyr` library export for owl, alongside `sit_diff_path`); **`.sitignore` directory-only (`build/`) enforcement** (closes the last documented git-parity gap).
 - **`.git/` CLI parity** *(unscheduled).* `sit status` / `log` / `diff` and `@{N}` on git repos — the 1.2.0 *library* API already works on git; the CLI commands stay `.sit`-gated. Needs a shared `_compute_status_records()` in `diff.cyr` so it doesn't back-reference `api.cyr` in single-pass dist order. A `1.x.0` when a consumer wants CLI parity.
 
+  Two source sites defer to this entry (cross-referenced there since the 1.4.7 sweep): `resolve_ref_name` (`refs.cyr`) — `@{N}` reflog specs are `.sit`-only, because a git repo has no `.sit/logs/`; and `resolve_prefix` (`object_db.cyr`) — short-prefix disambiguation over a git store would have to walk the loose fanout plus every pack `.idx`, so a git object must be named by full oid or a ref.
+
 ---
 
 ## Heavier / unscheduled
@@ -112,6 +121,26 @@ Each earns its own minor when its time comes.
 These are blocked on another repo. Per [CLAUDE.md](../../CLAUDE.md), cross-project requests go on the **target repo's** roadmap, not an issue tracker — so each needs drafting there.
 
 - **cyrius — ASAN / poisoned-allocator mode for `cyrius fuzz`.** The 127-byte heap overread in `_git_apply_delta` (2026-08-17 audit) was invisible to fuzzing because the read landed in mapped memory: it was found by reading and is pinned only by a deterministic corpus that asserts on the leak. **Every OOB *read* in the tree has that blind spot.** Wanted: redzone poisoning so `cyrius fuzz` fails on overreads, not only on faults.
+
+  ⚠ **1.4.7 demonstrated this concretely rather than arguing it.** With the four
+  new parser targets in place, `parse_tree`'s `alloc_or_die(name_len + 1)` was
+  changed to `alloc_or_die(8)` — a straight heap overflow on every entry whose
+  name exceeds 8 bytes, hit ~200,000 times per run — and the fuzz suite **still
+  reported `no crashes` and exited 0**. The allocator has enough slack that the
+  overflow never leaves mapped memory. So the three buffer-parser targets pin
+  *faults and hangs*, not memory errors, and no amount of additional rounds
+  changes that. The `_wildmatch` target does have teeth by construction (see the
+  A/B in the 1.4.7 CHANGELOG entry) because its failure mode is non-termination,
+  which is observable without ASAN. **This is the single highest-leverage thing
+  cyrius could give sit's test suite.**
+- **cyrius — a source-level `VERSION` constant.** `serve_build_capabilities()`
+  (`serve.cyr`) hardcodes the version string the `/sit/v1/capabilities` banner
+  reports, because `cyrius.cyml`'s `${file:VERSION}` is build metadata with no
+  source-visible equivalent. It is therefore bumped by hand at every tag, it
+  silently drifted to `0.8.10` from v0.8.x through v1.0.3, and it was **missed
+  again at 1.4.6** — caught only by the CI version-consistency gate that exists
+  solely to catch it. Wanted: a compile-time constant (or `${file:...}`
+  interpolation reaching source) so the banner can be derived instead of copied.
 - **patra — `ORDER BY` is an insertion sort; `DELETE` never reclaims pages.**
   Filed 2026-08-19 as
   [`2026-08-19-sit-order-by-insertion-sort.md`](https://github.com/MacCracken/patra/blob/main/docs/development/requests/2026-08-19-sit-order-by-insertion-sort.md).

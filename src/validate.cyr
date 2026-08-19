@@ -155,8 +155,9 @@ fn refname_valid(name) {
 #   - length > VAL_TREE_NAME_MAX
 #
 # HFS-ignorable Unicode codepoints are not handled byte-level here — they
-# belong in a higher-level check that operates on decoded Unicode. Flagged
-# as a v0.7 follow-up.
+# belong in a higher-level check that operates on decoded Unicode. This was
+# flagged as a "v0.7 follow-up" (roadmap: tree-name validation) and sat unmoved
+# through v1.4.6; re-filed there rather than carrying a dead version tag.
 
 fn _ascii_tolower(c) {
     if (c >= 65) { if (c <= 90) { return c + 32; } }
