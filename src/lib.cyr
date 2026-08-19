@@ -5,6 +5,7 @@
 # order doesn't affect function resolution — order here is just logical
 # grouping (primitives first, then storage, refs, objects, commands).
 
+include "src/version.cyr"
 include "src/util.cyr"
 include "src/validate.cyr"
 include "src/config.cyr"

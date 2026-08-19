@@ -565,6 +565,76 @@ fn fuzz_wildmatch(rounds) {
     return 0;
 }
 
+# tree_entry_name_valid + the v1.4.8 UTF-8 decoder underneath it. The decoder
+# reads attacker-controlled bytes (tree entry names arrive from any remote, via
+# parse_tree or a push that `_serve_rehash_and_insert` accepts without parsing
+# the body), so it is fuzzed directly rather than only through parse_tree —
+# whose generated names are ASCII and would never reach the multi-byte paths.
+fn fuzz_tree_entry_name(rounds) {
+    var cap = 256;
+    var name = alloc(cap + 1);
+    var seed = 0x7F000111;
+    var i = 0;
+    while (i < rounds) {
+        var nlen = (seed & 0x3F) + 1;   # 1..64
+        fill_pseudo_random(name, nlen, seed);
+        store8(name + nlen, 0);
+        tree_entry_name_valid(name);
+
+        # Seed a guarded prefix so the dot-directory comparison is reached with
+        # hostile continuation bytes after it, not just on random noise.
+        if ((seed & 3) == 0) {
+            store8(name + 0, 46);   # '.'
+            store8(name + 1, 103);  # 'g'
+            store8(name + 2, 105);  # 'i'
+            store8(name + 3, 116);  # 't'
+            store8(name + nlen, 0);
+            tree_entry_name_valid(name);
+            # ".git" + one ignorable + NUL: the exact spoof shape, 7 bytes.
+            store8(name + 4, 0xE2);
+            store8(name + 5, 0x80);
+            store8(name + 6, 0x8C);
+            store8(name + 7, 0);
+            tree_entry_name_valid(name);
+        }
+
+        # Splice a real HFS-ignorable sequence in. Random bytes hit E2 80 8C by
+        # chance about once in 16M positions, so without this the skip branch
+        # the whole check exists for would never execute under fuzz. Combined
+        # with the ".git" prefix above this reaches the spoof comparison with
+        # attacker-shaped input, which the unit tests only cover by hand.
+        if ((seed & 7) == 1) {
+            var at = 4;
+            if (at + 3 <= nlen) {
+                store8(name + at, 0xE2);
+                store8(name + at + 1, 0x80);
+                var pick = (seed >> 9) & 3;
+                if (pick == 0) { store8(name + at + 2, 0x8C); }   # ZWNJ
+                if (pick == 1) { store8(name + at + 2, 0x8D); }   # ZWJ
+                if (pick == 2) { store8(name + at + 2, 0xAE); }   # RLO
+                if (pick == 3) { store8(name + at + 2, 0x8E); }   # LRM
+                store8(name + nlen, 0);
+                tree_entry_name_valid(name);
+            }
+        }
+
+        # Truncated multi-byte sequences at the very end of the buffer are the
+        # shape that would over-read past the NUL.
+        if (nlen >= 2) {
+            store8(name + nlen - 2, 0xE2);
+            store8(name + nlen - 1, 0x80);
+            store8(name + nlen, 0);
+            tree_entry_name_valid(name);
+            store8(name + nlen - 1, 0xF0);
+            store8(name + nlen, 0);
+            tree_entry_name_valid(name);
+        }
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn main() {
     alloc_init();
     println("fuzz: zlib_decompress (10000 rounds)");
@@ -593,6 +663,8 @@ fn main() {
     if (fuzz_packed_ref_scan(200000) != 0) { return 1; }
     println("fuzz: wildmatch (100000 rounds)");
     if (fuzz_wildmatch(100000) != 0) { return 1; }
+    println("fuzz: tree_entry_name (200000 rounds)");
+    if (fuzz_tree_entry_name(200000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

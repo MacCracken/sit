@@ -4,6 +4,111 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.8] — 2026-08-19 — HFS dot-directory spoofing, generated version banner, and `clone` diagnosed
+
+### Security
+
+- **Tree entry names could spell `.git` / `.sit` / `.ssh` using HFS-ignorable
+  Unicode.** macOS HFS+ ignores a set of formatting codepoints when comparing
+  filenames, so `.g<U+200C>it` and `.git` name the **same directory** there while
+  differing byte-for-byte. sit compared bytes, so a tree entry carrying such a
+  name passed validation and materialised over the guarded directory on
+  checkout — the **CVE-2014-9390** class, which git closed with `is_hfs_dotgit()`.
+
+  Reachable from any remote through two doors: `parse_tree` reads these names out
+  of objects fetched from anywhere, and `_serve_rehash_and_insert` validates a
+  pushed object's framing, type and SHA-256 but **never parses a tree body**, so
+  a hostile tree lands in the store either way. `.sit` matters as much as `.git`
+  here — it holds sit's own refs, index and config.
+
+  `tree_entry_name_valid` now compares with `_name_iequal_hfs`, which decodes
+  UTF-8 and skips the ignorable set (matching git's `next_hfs_char()`: U+200C–F,
+  U+202A–E, U+206A–F, U+FEFF). **Verified against the pre-fix build: all 9 spoof
+  shapes returned *valid* before this change**, including `.g<ZWNJ>it`,
+  `.<LRM>git`, `.git<BOM>`, `.gi<RLO>t` and `.s<ZWNJ>it`.
+
+  A malformed or truncated UTF-8 sequence yields its raw lead byte and advances
+  one, deliberately: a decode failure can only make a name compare *more*
+  distinct from `.git`, never less, so a hostile encoding cannot use it to slip
+  a guarded name through.
+
+  ⚠ **This fix regressed a measured benchmark and the fix for that is part of
+  it.** Replacing the O(1) length-mismatch reject with a full decode cost
+  **`tree_entry_name_valid-good` 79 → 129 ns (+63%)** — a path `parse_tree` runs
+  per entry and `materialize_target` runs per write. A pre-filter on the first
+  *significant* codepoint being `.` restores it to **89 ns** (parity: the
+  untouched `refname_valid-good` drifted 260 → 296 ns on the same host). The
+  pre-filter tests the first significant codepoint rather than the first byte,
+  because `<ZWNJ>.git` is itself a valid spoof — pinned by two tests that fail
+  against a `load8(name) == 46` shortcut.
+
+### Changed
+
+- **The `/sit/v1/capabilities` version banner is generated, not hand-copied.**
+  `scripts/gen-version.sh` writes `src/version.cyr` from `VERSION`, and
+  `serve_build_capabilities()` calls `sit_version_string()`. CI regenerates and
+  diffs it — the same shape as the `dist/` sync gate — plus two guards that fail
+  the build if the literal is ever re-hardcoded.
+
+  This closes a footgun recorded in the **v0.8.2 CHANGELOG** (2026-05-13) and
+  carried for three months: the banner drifted to `0.8.10` from v0.8.x through
+  v1.0.3, and **was missed again at 1.4.6**, each time caught only by the CI gate
+  that exists solely to catch it. A gate that fires every few releases is a
+  reminder, not a fix.
+
+### Fixed
+
+- **`clone` diagnosed — and the framing it had been carried under was wrong.**
+  Phase profile of `cmd_clone` at two fixture sizes:
+
+  | phase | N=100 | N=1000 | growth |
+  |---|---:|---:|---:|
+  | `walk_reachable_phased` | 35,512 µs | **1,823,692 µs** | **51.4×** |
+  | `copy_objects` | 21,952 µs | 484,133 µs | 22.1× |
+  | `materialize_target` | 9,225 µs | 91,260 µs | 9.9× (linear) |
+
+  ⚠ **The 1000-commit fixture is not 10× the 100-commit one — it is 22×.**
+  `fixture_history_sit` adds *one new file per commit*, so commit `i`'s tree
+  carries `i+1` entries and total tree bytes are **quadratic** in commit count:
+  300 → 3,000 objects (10×) but **1,332 KB → 29,272 KB of store (22×)**. Every
+  previous write-up of this row, including the roadmap's, measured sit against
+  the commit count and called it "34× growth for 10× the work". Against bytes
+  actually moved, `clone` is **1.5× worse than linear** and the walk **2.3×**.
+
+  So two separate things, only one of which is a sit defect: git moves the same
+  content in 2.4× the time because it **delta-compresses trees** (the packing
+  item, a minor), and there is a **~2.3× residual in `walk_reachable_phased`**
+  that byte growth does not explain (not yet localised — `seen` is already
+  hashmap-backed and both object stores are verified indexed, so it is neither
+  of the two causes that produced sit's previous O(N²)s).
+
+  Also rejected by measurement: the `entries(path)` index added in 1.4.6 costs
+  clone **nothing** (A/B'd at ~71.9 ms with, ~71.5 ms without).
+
+- **`clone`'s ratio is not a usable metric, and prior entries were misreading
+  it.** Across four back-to-back runs sit held **71.4–71.9 ms (0.7% spread)**
+  while git swung **9.96–14.47 ms (45%)**, moving the ratio 4.95× → 7.39× with
+  sit unchanged. The apparent "60.80× → 102.78× regression" versus 1.4.4 is that
+  illusion: sit's 2,461 ms matches what 1.4.4's own growth figure implies.
+  Absolutes are now recorded alongside ratios wherever clone appears.
+
+### Added
+
+- **`docs/benchmarks/2026-08-19-v1.4.8.md`** — backfill covering **v1.4.4 →
+  v1.4.8**. Snapshots had stopped at v1.4.3, so 1.4.6 — the largest perf change
+  in the line — shipped with no snapshot and lived only as CHANGELOG prose.
+- **`fuzz_tree_entry_name`** (200k rounds) — **14 harnesses, up from 13**. The
+  new UTF-8 decoder reads attacker-controlled bytes, and `parse_tree`'s existing
+  target generates ASCII names that never reach the multi-byte paths. Measured
+  non-vacuous: 78,900 generated names survive the control-character sweep and
+  reach the decoder. Ignorable sequences are spliced in deliberately, because
+  random bytes hit `E2 80 8C` about once in 16M positions — without that the
+  skip branch the whole check exists for would never execute under fuzz.
+- **23 unit assertions** for HFS spoofing — **331 total, up from 306** — split
+  between 13 spoof shapes that must be rejected and 10 that must *not* be
+  over-rejected (`.gitignore`, `read<ZWNJ>me.txt`, 2/3/4-byte UTF-8 names,
+  truncated and invalid sequences).
+
 ## [1.4.7] — 2026-08-19 — the last four unfuzzed parsers, and a sweep of every deferral comment
 
 Two pieces of debt, both from the **2026-08-17 audit**, whose central lesson was

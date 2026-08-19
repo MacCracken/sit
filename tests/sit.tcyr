@@ -912,6 +912,68 @@ fn test_sort_entries_differential() {
     return 0;
 }
 
+# ── HFS-ignorable dot-directory spoofing (v1.4.8) ─────────────────────────
+# macOS HFS+ ignores certain Unicode formatting codepoints when comparing
+# filenames, so these names resolve to .git / .sit there while differing
+# byte-for-byte — the CVE-2014-9390 class. Before v1.4.8 every "spoof" case
+# below returned VALID from tree_entry_name_valid.
+fn _hfs_case(bytes, expect_valid, label) {
+    assert_eq(tree_entry_name_valid(bytes), expect_valid, label);
+    return 0;
+}
+
+fn test_hfs_dotdir_spoofing() {
+    test_group("validate.cyr — HFS-ignorable dot-directory spoofing");
+
+    # Plain forms still rejected (regression guard on the pre-1.4.8 behaviour).
+    _hfs_case(".git", 0, ".git rejected");
+    _hfs_case(".GIT", 0, ".GIT rejected (ASCII case-fold)");
+    _hfs_case(".sit", 0, ".sit rejected");
+    _hfs_case(".ssh", 0, ".ssh rejected");
+
+    # U+200C ZERO WIDTH NON-JOINER = E2 80 8C
+    _hfs_case(".g\xe2\x80\x8cit", 0, ".g<ZWNJ>it rejected");
+    # U+200D ZERO WIDTH JOINER = E2 80 8D
+    _hfs_case(".g\xe2\x80\x8dit", 0, ".g<ZWJ>it rejected");
+    # U+200E LEFT-TO-RIGHT MARK = E2 80 8E
+    _hfs_case(".\xe2\x80\x8egit", 0, ".<LRM>git rejected (leading)");
+    # U+FEFF ZERO WIDTH NO-BREAK SPACE = EF BB BF
+    _hfs_case(".git\xef\xbb\xbf", 0, ".git<BOM> rejected (trailing)");
+    # U+202E RIGHT-TO-LEFT OVERRIDE = E2 80 AE
+    _hfs_case(".gi\xe2\x80\xaet", 0, ".gi<RLO>t rejected");
+    # U+206F NOMINAL DIGIT SHAPES = E2 81 AF (top of the shaping range)
+    _hfs_case(".g\xe2\x81\xafit", 0, ".g<U+206F>it rejected");
+    # Ignorable BEFORE the dot. This is the case that breaks if the
+    # _starts_with_dot_hfs pre-filter is ever "optimised" to load8(name) == 46:
+    # the name does not begin with '.' bytewise, but its first *significant*
+    # codepoint is '.', and HFS+ resolves it to .git.
+    _hfs_case("\xe2\x80\x8c.git", 0, "<ZWNJ>.git rejected (ignorable before the dot)");
+    _hfs_case("\xef\xbb\xbf.sit", 0, "<BOM>.sit rejected (ignorable before the dot)");
+    # Combined with ASCII case folding.
+    _hfs_case(".G\xe2\x80\x8cIT", 0, ".G<ZWNJ>IT rejected (ignorable + case)");
+    # .sit and .ssh get the same treatment, not just .git.
+    _hfs_case(".s\xe2\x80\x8cit", 0, ".s<ZWNJ>it rejected");
+    _hfs_case(".s\xe2\x80\x8csh", 0, ".s<ZWNJ>sh rejected");
+
+    # ── Must NOT over-reject ──────────────────────────────────────────
+    # An ignorable codepoint in a name that is not a guarded dot-directory is
+    # legitimate and must survive.
+    _hfs_case("read\xe2\x80\x8cme.txt", 1, "ZWNJ in an ordinary name allowed");
+    _hfs_case(".gitignore", 1, ".gitignore allowed (longer than .git)");
+    _hfs_case(".gitattributes", 1, ".gitattributes allowed");
+    _hfs_case("git", 1, "git without the dot allowed");
+    _hfs_case(".gi", 1, ".gi allowed (shorter)");
+    # Non-ignorable multi-byte codepoints must decode without being skipped:
+    # U+00E9 e-acute = C3 A9, U+4E2D CJK = E4 B8 AD, U+1F600 emoji = F0 9F 98 80
+    _hfs_case("caf\xc3\xa9.txt", 1, "2-byte UTF-8 name allowed");
+    _hfs_case("\xe4\xb8\xad.txt", 1, "3-byte UTF-8 name allowed");
+    _hfs_case("\xf0\x9f\x98\x80.txt", 1, "4-byte UTF-8 name allowed");
+    # A truncated sequence must not crash and must not compare equal to .git.
+    _hfs_case(".g\xe2\x80it", 1, "truncated UTF-8 does not spoof .git");
+    _hfs_case("\xff\xfe", 1, "invalid lead bytes decode without crashing");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -938,6 +1000,7 @@ fn main() {
     test_reflog_spec_parse();
     test_fsck_commit_author_ts();
     test_sort_entries_differential();
+    test_hfs_dotdir_spoofing();
     return assert_summary();
 }
 

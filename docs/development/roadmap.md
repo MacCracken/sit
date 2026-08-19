@@ -4,13 +4,17 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.4.7`. The `1.3.x` line went almost entirely to audit work
+**Where we are**: `1.4.8`. The `1.3.x` line went almost entirely to audit work
 (two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two
 integrity gaps; `1.4.1`–`1.4.3` flattened the object-lookup curve; `1.4.4` made
 the benchmark fixture a knob and exposed two superlinear paths; `1.4.5`–`1.4.6`
 fixed all three causes and **`status` is no longer superlinear** (4.98× git at
 1,000 files, was 26.64× at 1.4.4). `1.4.7` closed the last four unfuzzed parsers
-and swept every deferral comment in `src/` for staleness. Audit backlogs are
+and swept every deferral comment in `src/` for staleness; `1.4.8` closed an
+HFS dot-directory spoofing hole (CVE-2014-9390 class), made the capabilities
+version banner generated rather than hand-copied, and **diagnosed `clone`** —
+finding that the fixture it was measured against grows 22×, not 10×, so the
+long-quoted "34× for 10× the work" was never the right comparison. Audit backlogs are
 empty. The themed minor line shifted **+1** when `1.4.0` went to integrity
 rather than tags.
 
@@ -32,46 +36,57 @@ Nothing below blocks anything else; ordering within a section is a recommendatio
 
 Ordered. Nothing here adds observable surface, so each can ship as it lands.
 
-- **Diagnose `clone`'s superlinear growth.** The 1.4.4 large tier put it at
-  **5.17× git at 100 commits and 60.80× at 1000** — 34× growth for 10× the work.
-  Still **unmeasured**; profile before assuming, the way 1.4.2 and 1.4.6 did.
-  ⚠ Note 1.4.6 removed the index write amplification and the `ORDER BY`, so
-  `clone` may have moved on its own — **re-measure before profiling**, and do not
-  assume the remaining growth has the same cause `status` did. `clone`'s
-  materialize step writes the index through `rewrite_index`, which is still a
-  whole-table DELETE + re-insert (correct there: it runs once per operation, not
-  once per file) — that is the first thing to check.
+- **`clone`: close the residual walk cost + pack the store.** *(Diagnosed in
+  1.4.8 — the entry below replaces the old "34× growth for 10× the work"
+  framing, which was wrong.)*
+
+  Phase profile of `cmd_clone`, measured at two fixture sizes:
+
+  | phase | N=100 | N=1000 | growth |
+  |---|---:|---:|---:|
+  | `walk_reachable_phased` | 35,512 µs | **1,823,692 µs** | **51.4×** |
+  | `copy_objects` | 21,952 µs | 484,133 µs | 22.1× |
+  | `materialize_target` | 9,225 µs | 91,260 µs | 9.9× (linear) |
+
+  ⚠ **The fixture is not 10× bigger — it is 22× bigger.** `fixture_history_sit`
+  adds *one new file per commit*, so commit `i`'s tree carries `i+1` entries and
+  **total tree bytes are quadratic in commit count**: 300 → 3,000 objects (10×)
+  but **1,332 KB → 29,272 KB of store (22×)**. Every prior write-up of this row,
+  including this file's, compared sit's time against the commit count and called
+  the result 34× superlinear. Against the *bytes actually transferred* it is:
+
+  - whole `clone` 34× / 22× = **1.5× worse than linear**
+  - the walk 51× / 22× = **2.3× worse than linear** ← the only real defect here
+
+  So there are two separate things, and only the second is a sit bug:
+
+  1. **git wins this row on delta compression, not on algorithms.** It moves the
+     same 22× content in 2.4× the time because each tree is a small delta of the
+     previous one; sit stores and reads every tree whole. That is the
+     **Pack bundles + `gc` / repack** item under *Structural* below — this
+     profile is the strongest argument for it, and it is a minor, not a patch.
+  2. **A ~2.3× residual in `walk_reachable_phased`**, above what the byte growth
+     explains. Not yet localised. Ruled out already: `seen` is hashmap-backed
+     (`map_has`/`map_set`, not a linear scan), and both object stores *are*
+     indexed — P-11a indexes the remote's `objects` table too and the
+     `.sit/objects.indexed` marker was verified present on both fixtures. Next
+     place to look is per-object read cost inside the walk (it rose 118 µs →
+     600 µs per object) and patra's `COL_BYTES` chain read on the larger tree
+     values.
+
+  ⚠ **Track absolutes, not the ratio.** Across four back-to-back runs sit held
+  71.4–71.9 ms @100 (0.7% spread) while git swung 9.96–14.47 ms (45%), moving
+  the *ratio* 4.95× → 7.39× with sit unchanged. The 60.80× @1000 recorded at
+  1.4.4 versus 102.78× measured now is that same illusion — sit's 2,461 ms
+  matches what 1.4.4's own growth figure implies. Also already tested and
+  rejected: the `entries(path)` index added in 1.4.6 costs clone nothing
+  (A/B'd, ~71.9 ms with it, ~71.5 ms without).
 - **Nested `.gitignore` / `info/exclude`** for `.git/` read-mode. Only the
   top-level `.gitignore` is honoured today (`_ignore_filename`, `git_read.cyr`).
-- **Tree-name validation: HFS-ignorable Unicode codepoints.** `validate.cyr`'s
-  `tree_flat_path_valid` rejects `.sit` / `.git` / `.ssh` case-folded, NTFS
-  reserved names, and over-long names — but HFS-ignorable codepoints need a
-  check over *decoded* Unicode, not bytes, so they are unhandled. Carried in the
-  source as a "v0.7 follow-up" from v0.7 to v1.4.6 without moving; re-filed here
-  in the 1.4.7 deferral sweep so it has a real home instead of a dead version tag.
 - **Batched `WHERE hash IN (...)` pre-filter in `copy_objects`** (`wire.cyr`).
   v0.6.5 P-03 already collapses the insert loop into one patra transaction; the
   remaining win is replacing per-object existence SELECTs with chunked batch
   probes. Needs 60-hash chunking to stay inside patra's SQL parser limits.
-- **Generate the `/sit/v1/capabilities` version banner from `VERSION`.**
-  `serve_build_capabilities()` (`serve.cyr`) hardcodes the version string, so it
-  is bumped by hand at every tag. It silently drifted to `0.8.10` from v0.8.x
-  through v1.0.3, and was **missed again at 1.4.6** — caught only by the CI
-  version-consistency gate that exists solely to catch it.
-
-  ⚠ Already recorded as a known footgun in the **v0.8.2 CHANGELOG** (2026-05-13,
-  "a future cleanup release … wires this to the version constant") and never
-  carried onto this file, so it sat for three months somewhere that does not
-  drive work. That is the argument for it living here: CHANGELOG is the shipped
-  record, this file is the backlog.
-
-  **Not blocked on cyrius.** `cyrius build` has no value-injection flag
-  (`--features` is conditional compilation, not a define) and the manifest's
-  `${file:VERSION}` is build metadata that does not reach source — but sit does
-  not need either. Generate `src/version.cyr` from `VERSION` as a build step and
-  gate it in CI the same way `dist/` sync is gated. The 1.4.7 sweep first filed
-  this as a cyrius upstream ask, which was wrong: it would have parked a
-  solvable sit task behind another repo.
 - **HTTP base-path routing** (`wire_http.cyr`). Only `""` and `"/"` are accepted
   as the URL path today, so `http://host/repos/foo` is refused rather than
   silently mis-routed. Serving multiple repos behind one origin needs real
@@ -108,13 +123,19 @@ structural item — but for a **narrower reason than first written**.
   what remains is delta *generation*, on-disk repack, and the negotiated wire
   capability (which makes it a minor, not a patch).
 
+  ⚠ **The 1.4.8 `clone` profile is the strongest evidence for this item.** On a
+  fixture whose tree bytes grow quadratically, git moves the same content in
+  **2.4× the time** purely because each tree is a small delta of the previous
+  one, while sit stores and reads every tree whole. That is the entire gap on
+  the `clone` row — not an algorithmic defect in sit's walk.
+
 ---
 
 ## Minor line — themed `1.x.0`
 
-Each is a self-contained minor; the heavier ones earn their own slot. **Next: `1.5.0`** — and it is the first *feature* work since 1.3.0, after five consecutive hardening releases.
+Each is a self-contained minor; the heavier ones earn their own slot. **Next: `1.5.0`** — and it is the first *feature* work since 1.3.0: every release from 1.3.1 through 1.4.7 was hardening, perf, or toolchain.
 
-- **`1.5.0` — Annotated & signed tags + ref ergonomics** *(light; high git-parity value).* Annotated tags (a real tag object with tagger + message, not just a lightweight ref); **ed25519-signed tags** (reuse the sitsig machinery from signed commits); `sit mv` (rename in working tree + index); `sit describe` (nearest tag + offset). Completes the tag + signing story; low risk — a good cadence-setter after five consecutive hardening releases.
+- **`1.5.0` — Annotated & signed tags + ref ergonomics** *(light; high git-parity value).* Annotated tags (a real tag object with tagger + message, not just a lightweight ref); **ed25519-signed tags** (reuse the sitsig machinery from signed commits); `sit mv` (rename in working tree + index); `sit describe` (nearest tag + offset). Completes the tag + signing story; low risk — a good cadence-setter after the entire 1.3.1–1.4.8 run of hardening, perf and toolchain work.
 - **`1.6.0` — History tools** *(medium; reflog-backed).* `sit revert` (inverse commit); `sit cherry-pick` (apply a commit onto HEAD via the existing 3-way merge + `merge-base`); `sit stash` (save / restore the working tree). Safe now that the reflog (1.1.0) makes them recoverable.
 
   ⚠ All three route through `three_way_line_merge`, which 1.3.8 found could not terminate on an insert-only hunk. That is fixed, but this minor is the one that will exercise the merge core hardest — budget for merge-correctness testing, not just command plumbing.
@@ -172,4 +193,4 @@ Dropping sandhi for a hand-rolled `net`-direct loopback HTTP/1.0 server (surface
 
 ---
 
-*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/) — latest [`2026-08-18-v1.4.3.md`](../benchmarks/2026-08-18-v1.4.3.md). Security audit reports are in [`../audit/`](../audit/).*
+*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/) — latest [`2026-08-19-v1.4.8.md`](../benchmarks/2026-08-19-v1.4.8.md). Security audit reports are in [`../audit/`](../audit/).*

@@ -23,6 +23,7 @@ output = "sit"
 # for the public-API contract.
 [lib]
 modules = [
+    "src/version.cyr",
     "src/util.cyr",
     "src/validate.cyr",
     "src/config.cyr",

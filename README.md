@@ -83,9 +83,10 @@ Full walkthrough: [docs/guides/getting-started.md](docs/guides/getting-started.m
 
 ```sh
 cyrius bench tests/sit.bcyr   # SHA-256 / zlib / patra / LCS-diff / .sitignore / blob-hash
-cyrius fuzz tests/sit.fcyr    # 13 harnesses: hash / zlib / hex-decode / URL / ssh-url /
+cyrius fuzz tests/sit.fcyr    # 14 harnesses: hash / zlib / hex-decode / URL / ssh-url /
                               # want-frame / reflog / pack-varints / apply-delta /
-                              # parse-tree / parse-commit / packed-refs / wildmatch
+                              # parse-tree / parse-commit / packed-refs / wildmatch /
+                              # tree-entry-name
 ```
 
 ## Docs

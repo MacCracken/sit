@@ -786,11 +786,28 @@ jobs:
           echo "VERSION file: $VERSION"
           grep -q "$VERSION" CHANGELOG.md || { echo "FAIL: version not in CHANGELOG.md"; exit 1; }
           echo "Version consistent (cyrius.cyml pulls VERSION via \${file:VERSION})"
-          # serve capabilities banner ("sit":"X.Y.Z") must track VERSION — it
-          # silently drifted to 0.8.10 through v1.0.3 before this guard. The
-          # capabilities line is the only lowercase 'sit'+'max_body' line.
-          SERVE_VER=$(grep 'sit.*max_body' src/serve.cyr | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-          echo "serve capabilities banner: $SERVE_VER"
-          test -n "$SERVE_VER" || { echo "FAIL: could not locate the capabilities banner in src/serve.cyr (literal moved/reformatted?)"; exit 1; }
-          test "$SERVE_VER" = "$VERSION" || { echo "FAIL: serve capabilities banner ($SERVE_VER) != VERSION ($VERSION) — bump the literal in src/serve.cyr serve_build_capabilities()"; exit 1; }
-          echo "serve banner matches VERSION"
+          # The /sit/v1/capabilities banner reports sit's version from source.
+          # Through v1.4.7 that was a hand-copied literal in src/serve.cyr, and
+          # it drifted twice despite this gate existing to catch it (stuck at
+          # 0.8.10 through v1.0.3; missed again at 1.4.6). v1.4.8 generates it
+          # into src/version.cyr instead, so the check is now a regenerate-and-
+          # diff, the same shape as the dist/ sync gate — a stale file fails the
+          # build rather than shipping a wrong banner.
+          ./scripts/gen-version.sh
+          if ! git diff --quiet src/version.cyr; then
+            echo "FAIL: src/version.cyr is stale — run scripts/gen-version.sh and commit it"
+            git diff src/version.cyr
+            exit 1
+          fi
+          GEN_VER=$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' src/version.cyr | tr -d '"' | head -1)
+          test "$GEN_VER" = "$VERSION" || { echo "FAIL: src/version.cyr ($GEN_VER) != VERSION ($VERSION)"; exit 1; }
+          echo "src/version.cyr matches VERSION ($VERSION)"
+
+          # Regression guard: the banner must not be hand-hardcoded again.
+          if grep -qE '\{\\"sit\\":\\"[0-9]+\.[0-9]+\.[0-9]+' src/serve.cyr; then
+            echo "FAIL: src/serve.cyr has a hardcoded version literal again — it must call sit_version_string()"
+            exit 1
+          fi
+          # Match the call site, not a comment that merely names the function.
+          grep -q 'str_builder_add_cstr(sb, sit_version_string())' src/serve.cyr || { echo "FAIL: serve_build_capabilities() no longer emits sit_version_string()"; exit 1; }
+          echo "capabilities banner is generated, not hand-copied"

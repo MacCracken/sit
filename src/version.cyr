@@ -1,0 +1,11 @@
+# version.cyr — GENERATED FILE, DO NOT EDIT.
+#
+# Regenerate with `scripts/gen-version.sh` after changing VERSION; CI fails if
+# this file disagrees with VERSION. See that script for why the version is
+# generated rather than hand-copied.
+#
+# Kept as a function rather than a top-level `var` on purpose: a top-level
+# `var NAME = <non-literal>` consumes one of the 4,096 initialized-globals
+# slots, and a bare string literal in a function body does not.
+
+fn sit_version_string() { return "1.4.8"; }

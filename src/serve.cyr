@@ -91,18 +91,16 @@ fn serve_read_ref_file(path) {
 
 fn serve_build_capabilities() {
     var sb = str_builder_new();
-    # The "sit" string identifies the wire-protocol release line the
-    # server promises; it tracks VERSION. The CI "Verify version
-    # consistency" step asserts this literal == VERSION so it cannot
-    # silently drift (it had drifted to 0.8.10 through v1.0.3 before
-    # the guard landed).
-    # TODO (roadmap: generate this banner from VERSION): the manifest's
-    # ${file:VERSION} is build metadata and does not reach source, so this is
-    # bumped by hand at each tag — which is exactly what was missed at 1.4.6
-    # and caught by the CI version-consistency gate. The fix is sit-side
-    # codegen of a version constant, not a cyrius feature; it was recorded as a
-    # known footgun in the v0.8.2 CHANGELOG and is now on the roadmap.
-    str_builder_add_cstr(sb, "{\"sit\":\"1.4.7\",\"max_body\":");
+    # The "sit" string identifies the wire-protocol release line the server
+    # promises. v1.4.8: it now comes from `sit_version_string()` in the
+    # GENERATED src/version.cyr, so it tracks VERSION by construction rather
+    # than by hand. It was hand-copied from v0.8.2 through v1.4.7 and drifted
+    # twice in that span — stuck at 0.8.10 through v1.0.3, and missed again at
+    # 1.4.6 — each time caught only by the CI gate that exists to catch it.
+    # Regenerate with scripts/gen-version.sh; CI diffs it like dist/ sync.
+    str_builder_add_cstr(sb, "{\"sit\":\"");
+    str_builder_add_cstr(sb, sit_version_string());
+    str_builder_add_cstr(sb, "\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[");
     if (_serve_require_auth == 1) {
