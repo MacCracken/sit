@@ -53,6 +53,25 @@ Ordered. Nothing here adds observable surface, so each can ship as it lands.
   v0.6.5 P-03 already collapses the insert loop into one patra transaction; the
   remaining win is replacing per-object existence SELECTs with chunked batch
   probes. Needs 60-hash chunking to stay inside patra's SQL parser limits.
+- **Generate the `/sit/v1/capabilities` version banner from `VERSION`.**
+  `serve_build_capabilities()` (`serve.cyr`) hardcodes the version string, so it
+  is bumped by hand at every tag. It silently drifted to `0.8.10` from v0.8.x
+  through v1.0.3, and was **missed again at 1.4.6** — caught only by the CI
+  version-consistency gate that exists solely to catch it.
+
+  ⚠ Already recorded as a known footgun in the **v0.8.2 CHANGELOG** (2026-05-13,
+  "a future cleanup release … wires this to the version constant") and never
+  carried onto this file, so it sat for three months somewhere that does not
+  drive work. That is the argument for it living here: CHANGELOG is the shipped
+  record, this file is the backlog.
+
+  **Not blocked on cyrius.** `cyrius build` has no value-injection flag
+  (`--features` is conditional compilation, not a define) and the manifest's
+  `${file:VERSION}` is build metadata that does not reach source — but sit does
+  not need either. Generate `src/version.cyr` from `VERSION` as a build step and
+  gate it in CI the same way `dist/` sync is gated. The 1.4.7 sweep first filed
+  this as a cyrius upstream ask, which was wrong: it would have parked a
+  solvable sit task behind another repo.
 - **HTTP base-path routing** (`wire_http.cyr`). Only `""` and `"/"` are accepted
   as the URL path today, so `http://host/repos/foo` is refused rather than
   silently mis-routed. Serving multiple repos behind one origin needs real
@@ -133,14 +152,6 @@ These are blocked on another repo. Per [CLAUDE.md](../../CLAUDE.md), cross-proje
   A/B in the 1.4.7 CHANGELOG entry) because its failure mode is non-termination,
   which is observable without ASAN. **This is the single highest-leverage thing
   cyrius could give sit's test suite.**
-- **cyrius — a source-level `VERSION` constant.** `serve_build_capabilities()`
-  (`serve.cyr`) hardcodes the version string the `/sit/v1/capabilities` banner
-  reports, because `cyrius.cyml`'s `${file:VERSION}` is build metadata with no
-  source-visible equivalent. It is therefore bumped by hand at every tag, it
-  silently drifted to `0.8.10` from v0.8.x through v1.0.3, and it was **missed
-  again at 1.4.6** — caught only by the CI version-consistency gate that exists
-  solely to catch it. Wanted: a compile-time constant (or `${file:...}`
-  interpolation reaching source) so the banner can be derived instead of copied.
 - **patra — `ORDER BY` is an insertion sort; `DELETE` never reclaims pages.**
   Filed 2026-08-19 as
   [`2026-08-19-sit-order-by-insertion-sort.md`](https://github.com/MacCracken/patra/blob/main/docs/development/requests/2026-08-19-sit-order-by-insertion-sort.md).

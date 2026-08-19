@@ -13254,11 +13254,12 @@ fn serve_build_capabilities() {
     # consistency" step asserts this literal == VERSION so it cannot
     # silently drift (it had drifted to 0.8.10 through v1.0.3 before
     # the guard landed).
-    # TODO (roadmap, cyrius upstream ask): derive from VERSION at build time
-    # once cyrius exposes a source-level VERSION constant.
-    # The manifest ${file:VERSION} is build-metadata only, so
-    # until then this is bumped by hand at each tag — which is exactly what
-    # was missed at 1.4.6 and caught by the CI version-consistency gate.
+    # TODO (roadmap: generate this banner from VERSION): the manifest's
+    # ${file:VERSION} is build metadata and does not reach source, so this is
+    # bumped by hand at each tag — which is exactly what was missed at 1.4.6
+    # and caught by the CI version-consistency gate. The fix is sit-side
+    # codegen of a version constant, not a cyrius feature; it was recorded as a
+    # known footgun in the v0.8.2 CHANGELOG and is now on the roadmap.
     str_builder_add_cstr(sb, "{\"sit\":\"1.4.7\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[");

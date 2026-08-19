@@ -79,8 +79,20 @@ that the one module with no fuzz target held every serious finding.
   | `wire_http.cyr` | "batch_probed (0 = **not yet**, 1 = …)" describes a field's value, not a deferral — `#skip-lint` |
   | `refs.cyr`, `object_db.cyr` | `@{N}` on git repos, git short-prefix disambiguation — both cross-referenced to `.git/` CLI parity |
   | `wire.cyr`, `wire_http.cyr` | batched `WHERE hash IN (…)` pre-filter, HTTP base-path routing — newly tracked on the roadmap |
-  | `serve.cyr` | the hand-bumped capabilities banner — **filed as a cyrius upstream ask** |
+  | `serve.cyr` | the hand-bumped capabilities banner — tracked on the roadmap (see correction below) |
 
+- ⚠ **Correction, same release.** The capabilities-banner deferral was first
+  written up here as a *cyrius upstream ask* ("expose a source-level VERSION
+  constant"). That was wrong twice over, and is recorded rather than quietly
+  rewritten. It was **already tracked** — as a known footgun in the **v0.8.2**
+  CHANGELOG (2026-05-13), which correctly called it a future sit cleanup — and
+  it is **not blocked on cyrius**: `cyrius build` has no value-injection flag,
+  but sit can generate `src/version.cyr` from `VERSION` and gate it in CI the
+  way `dist/` sync already is. Filing it upstream would have parked a solvable
+  sit task behind another repo. It now sits on sit's own patch line. The real
+  lesson is the one the v0.8.2 entry illustrates: a "known footgun" recorded
+  only in a CHANGELOG is not tracked, because CHANGELOG is the shipped record
+  and the roadmap is the backlog.
 - **A dangling roadmap cross-reference in `wire_https.cyr`.** It pointed at a
   roadmap section named `"Longer horizon"` that no longer exists; the content is
   now the 1.7.0 TLS-trust entry. It passed `cyrius lint` the whole time —
