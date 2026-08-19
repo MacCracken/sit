@@ -4,7 +4,7 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.4.8`. The `1.3.x` line went almost entirely to audit work
+**Where we are**: `1.4.9`. The `1.3.x` line went almost entirely to audit work
 (two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two
 integrity gaps; `1.4.1`–`1.4.3` flattened the object-lookup curve; `1.4.4` made
 the benchmark fixture a knob and exposed two superlinear paths; `1.4.5`–`1.4.6`
@@ -36,68 +36,58 @@ Nothing below blocks anything else; ordering within a section is a recommendatio
 
 Ordered. Nothing here adds observable surface, so each can ship as it lands.
 
-- **`clone`: close the residual walk cost + pack the store.** *(Diagnosed in
-  1.4.8 — the entry below replaces the old "34× growth for 10× the work"
-  framing, which was wrong.)*
+- **`clone` — nothing left on the patch line; the remaining work is packing.**
+  *(1.4.8 diagnosed the phases; 1.4.9 finished the job and found no defect.)*
 
-  Phase profile of `cmd_clone`, measured at two fixture sizes:
+  Phase profile inside `walk_reachable_phased`, the phase that dominates clone:
 
   | phase | N=100 | N=1000 | growth |
   |---|---:|---:|---:|
-  | `walk_reachable_phased` | 35,512 µs | **1,823,692 µs** | **51.4×** |
-  | `copy_objects` | 21,952 µs | 484,133 µs | 22.1× |
-  | `materialize_target` | 9,225 µs | 91,260 µs | 9.9× (linear) |
+  | p1 — commit chain | 7,796 µs | 78,113 µs | **10.0× (exactly linear)** |
+  | p2 — batch prefetch | 1 µs | 1 µs | no-op for a local source |
+  | p3 — tree walk | 29,471 µs | 1,873,566 µs | 63.6× |
 
-  ⚠ **The fixture is not 10× bigger — it is 22× bigger.** `fixture_history_sit`
-  adds *one new file per commit*, so commit `i`'s tree carries `i+1` entries and
-  **total tree bytes are quadratic in commit count**: 300 → 3,000 objects (10×)
-  but **1,332 KB → 29,272 KB of store (22×)**. Every prior write-up of this row,
-  including this file's, compared sit's time against the commit count and called
-  the result 34× superlinear. Against the *bytes actually transferred* it is:
+  ⚠ **63.6× is sub-linear here, and 1.4.8's "2.3× residual" was an artefact of
+  the wrong denominator.** p3's work is tree entries visited, not store bytes:
+  the fixture adds one file per commit, so tree `i` carries `i+1` entries and
+  the history holds `N(N+1)/2` of them — **5,050 → 500,500, a 99.1× increase**
+  (verified against the fixtures, not just derived). Against that, p3 grew 63.6×
+  and **per-entry cost improved, 5.83 → 3.74 µs**. 1.4.8 compared against store
+  bytes (22×), which mixes in blobs that grow only linearly, and reported a
+  residual that does not exist.
 
-  - whole `clone` 34× / 22× = **1.5× worse than linear**
-  - the walk 51× / 22× = **2.3× worse than linear** ← the only real defect here
-
-  So there are two separate things, and only the second is a sit bug:
-
-  1. **git wins this row on delta compression, not on algorithms.** It moves the
-     same 22× content in 2.4× the time because each tree is a small delta of the
-     previous one; sit stores and reads every tree whole. That is the
-     **Pack bundles + `gc` / repack** item under *Structural* below — this
-     profile is the strongest argument for it, and it is a minor, not a patch.
-  2. **A ~2.3× residual in `walk_reachable_phased`**, above what the byte growth
-     explains. Not yet localised. Ruled out already: `seen` is hashmap-backed
-     (`map_has`/`map_set`, not a linear scan), and both object stores *are*
-     indexed — P-11a indexes the remote's `objects` table too and the
-     `.sit/objects.indexed` marker was verified present on both fixtures. Next
-     place to look is per-object read cost inside the walk (it rose 118 µs →
-     600 µs per object) and patra's `COL_BYTES` chain read on the larger tree
-     values.
-
-  ⚠ **Track absolutes, not the ratio.** Across four back-to-back runs sit held
-  71.4–71.9 ms @100 (0.7% spread) while git swung 9.96–14.47 ms (45%), moving
-  the *ratio* 4.95× → 7.39× with sit unchanged. The 60.80× @1000 recorded at
-  1.4.4 versus 102.78× measured now is that same illusion — sit's 2,461 ms
-  matches what 1.4.4's own growth figure implies. Also already tested and
-  rejected: the `entries(path)` index added in 1.4.6 costs clone nothing
-  (A/B'd, ~71.9 ms with it, ~71.5 ms without).
-- **Nested `.gitignore` / `info/exclude`** for `.git/` read-mode. Only the
-  top-level `.gitignore` is honoured today (`_ignore_filename`, `git_read.cyr`).
-- **Batched `WHERE hash IN (...)` pre-filter in `copy_objects`** (`wire.cyr`).
-  v0.6.5 P-03 already collapses the insert loop into one patra transaction; the
-  remaining win is replacing per-object existence SELECTs with chunked batch
-  probes. Needs 60-hash chunking to stay inside patra's SQL parser limits.
-- **HTTP base-path routing** (`wire_http.cyr`). Only `""` and `"/"` are accepted
-  as the URL path today, so `http://host/repos/foo` is refused rather than
-  silently mis-routed. Serving multiple repos behind one origin needs real
-  server-side routing in `serve.cyr`.
-- **Reflog `expire` / `delete` + `@{<date>}` selector** *(carried from 1.1.0)*.
-  Entries are unbounded, so `fsck --prune` reclaims reflog-protected objects only
-  via `--prune-now`; expiry closes that.
+  So the entire `clone` row is (a) a fixture whose content is quadratic in commit
+  count and (b) git's delta compression — see **Pack bundles + `gc` / repack**
+  under *Structural*. There is no algorithmic defect left to chase, and this item
+  is closed rather than carried.
 
 ### Test & tooling debt
 
-- **Memoize `_wildmatch`.** 1.3.8 bounded the catastrophic backtracking with a per-match step budget. That fixes the DoS but leaves the matcher worst-case exponential — it simply cannot spend more than the budget proving it. The real fix is memoization over (pattern offset, string offset). The obstacle is cost: the memo table would be allocated and zeroed per (pattern, path) pair on `is_ignored`, which is a measured benchmark (`is_ignored-200pat`). Likely shape — memoize only when the pattern carries ≥3 star groups, so the common 0–2 star patterns keep today's allocation-free fast path.
+- **~~Memoize `_wildmatch`~~ — built, measured, and declined in 1.4.9.**
+  Kept here as a decision, not a task, so it is not re-attempted blindly.
+
+  Two shapes were implemented and benchmarked against `is_ignored-10/50/200pat`:
+
+  | shape | cost |
+  |---|---|
+  | arm the memo when the pattern has ≥3 star groups | **+14% / +15.6% / +18.4%** |
+  | escalate on demand (plain first, memoized retry only on budget exhaustion) | **+7% / +7.3% / +8.8%** |
+
+  Untouched controls moved −2% to −7% in the same runs, so the gap is real, not
+  machine drift. Even the escalating shape pays, because the memo check lands in
+  the `*` branch — which *is* the inner loop.
+
+  What it buys does not justify that. Budget exhaustion returns "no match", so
+  the only wrong answer possible is a file **appearing** in `sit status` that
+  should have been ignored — the safe direction, and benign. The threshold is
+  real but pathological (4 star groups over 32 chars completes in 41,448 steps;
+  6 over 48 exhausts), and `is_ignored` runs per file per pattern on every
+  `status` and `add`.
+
+  If revisited: the only shape that can win is splitting the recursive core into
+  plain and memoized copies so the hot path carries zero memo code — at the cost
+  of ~80 duplicated lines of matcher, which is its own correctness hazard. The
+  reasoning and numbers are also recorded at the call site in `src/index.cyr`.
 
 ---
 
@@ -141,6 +131,16 @@ Each is a self-contained minor; the heavier ones earn their own slot. **Next: `1
   ⚠ All three route through `three_way_line_merge`, which 1.3.8 found could not terminate on an insert-only hunk. That is fixed, but this minor is the one that will exercise the merge core hardest — budget for merge-correctness testing, not just command plumbing.
 - **`1.7.0` — TLS trust hardening** *(medium).* HTTPS **CA-chain + hostname verification** (opt-in: `http.sslVerify` / `http.caBundle`, system store via `tls_native_set_ca_system`; TOFU stays the default); **mTLS** (client certs — the `tls_native` verify primitives already exist); **non-loopback `sit serve`** (lift the `127.0.0.1` lock, gated on `--tls`, refuse non-loopback plain HTTP); **bearer auth over SSH** (`_ssh_handle_auth_token` stub → real). A cohesive transport-trust minor.
 - **`1.8.0` — Wider merge + inspection.** **Octopus / N-way merge** (`cmd_merge` → N branches; `find_merge_base` already walks N parents correctly); **`sit blame`** (per-line last-touch — also a natural `dist/sit.cyr` library export for owl, alongside `sit_diff_path`); **`.sitignore` directory-only (`build/`) enforcement** (closes the last documented git-parity gap).
+- **Reflog `expire` / `delete` + `@{<date>}` selector, and HTTP base-path
+  routing** *(unscheduled; moved off the patch line in 1.4.9).* Both were filed
+  under "Patch line — no new surface", and both plainly add surface: `expire` /
+  `delete` are new subcommands and `@{<date>}` is new selector syntax, while
+  accepting `http://host/repos/foo` changes what the wire endpoint accepts and
+  needs real routing in `serve.cyr`. Per this file's own SemVer tiers those are
+  **minors**. Substance unchanged: reflog entries are unbounded, so
+  `fsck --prune` reclaims reflog-protected objects only via `--prune-now`, and
+  expiry closes that; base-path routing is what serving multiple repos behind
+  one origin requires.
 - **`.git/` CLI parity** *(unscheduled).* `sit status` / `log` / `diff` and `@{N}` on git repos — the 1.2.0 *library* API already works on git; the CLI commands stay `.sit`-gated. Needs a shared `_compute_status_records()` in `diff.cyr` so it doesn't back-reference `api.cyr` in single-pass dist order. A `1.x.0` when a consumer wants CLI parity.
 
   Two source sites defer to this entry (cross-referenced there since the 1.4.7 sweep): `resolve_ref_name` (`refs.cyr`) — `@{N}` reflog specs are `.sit`-only, because a git repo has no `.sit/logs/`; and `resolve_prefix` (`object_db.cyr`) — short-prefix disambiguation over a git store would have to walk the loose fanout plus every pack `.idx`, so a git object must be named by full oid or a ref.

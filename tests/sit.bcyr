@@ -396,7 +396,8 @@ fn bench_lcs_diff(n, iters) {
 }
 
 # Build a vec of `n` non-anchored `*.tmp` pattern structs (matching
-# load_sitignore's 32-byte [text, len, negated, anchored] layout).
+# _parse_ignore_file's 40-byte [text, len, negated, anchored, scope]
+# layout; scope 0 = a root-level rule).
 fn bench_make_patterns(n) {
     var patterns = vec_new();
     var i = 0;
@@ -404,11 +405,12 @@ fn bench_make_patterns(n) {
         var text = alloc(8);
         memcpy(text, "*.tmp", 5);
         store8(text + 5, 0);
-        var p = alloc(32);
+        var p = alloc(40);
         store64(p, text);
         store64(p + 8, 5);
         store64(p + 16, 0);
         store64(p + 24, 0);
+        store64(p + 32, 0);
         vec_push(patterns, p);
         i = i + 1;
     }

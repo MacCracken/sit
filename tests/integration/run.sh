@@ -549,6 +549,46 @@ ORDERED=$("$SIT" status | grep -o '[a-z]*\.txt' | head -4)
 assert_eq "$(printf '%s' "$ORDERED" | tr '\n' ' ')" "alpha.txt beta.txt mid.txt zeta.txt" \
   "index entries are path-sorted without patra ORDER BY"
 
+# ── 15. S-29 (1.4.9 ignore-file completeness) ──────────────────────
+hr "S-29 regressions (info/exclude + nested ignore files)"
+
+# 15a. <repo-dir>/info/exclude is consulted, and the top-level ignore file
+# overrides it (git's precedence: last match wins, info/exclude is parsed
+# first).
+R="$WORK/s29exclude"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+mkdir -p .sit/info
+printf 'secret.txt\n' > .sit/info/exclude
+printf 'x\n' > secret.txt
+printf 'x\n' > normal.txt
+assert_eq "$("$SIT" status | grep -c 'secret.txt')" "0" \
+  "info/exclude hides secret.txt"
+assert_contains "$("$SIT" status)" "normal.txt" "info/exclude does not hide everything"
+printf '!secret.txt\n' > .sitignore
+assert_contains "$("$SIT" status)" "secret.txt" \
+  "a top-level '!' rule overrides info/exclude"
+
+# 15b. A nested ignore file applies only under its own directory.
+R="$WORK/s29nested"; mkdir -p "$R/sub/deep"; cd "$R"
+"$SIT" init >/dev/null
+printf 'x\n' > root.tmp
+printf 'x\n' > sub/a.tmp
+printf 'x\n' > sub/deep/d.tmp
+printf 'x\n' > sub/b.txt
+printf '*.tmp\n' > sub/.sitignore
+OUT=$("$SIT" status)
+assert_contains "$OUT" "root.tmp" "nested rule does NOT reach the repo root"
+assert_eq "$(printf '%s' "$OUT" | grep -c 'sub/a.tmp')" "0" \
+  "nested rule ignores a sibling under its directory"
+assert_eq "$(printf '%s' "$OUT" | grep -c 'sub/deep/d.tmp')" "0" \
+  "nested rule reaches deeper paths"
+assert_contains "$OUT" "sub/b.txt" "nested rule does not over-match"
+
+# 15c. A deeper ignore file overrides a shallower one.
+printf '!d.tmp\n' > sub/deep/.sitignore
+assert_contains "$("$SIT" status)" "sub/deep/d.tmp" \
+  "deeper '!' rule re-includes what the shallower rule ignored"
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

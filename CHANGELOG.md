@@ -4,6 +4,105 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.9] — 2026-08-19 — ignore-file completeness, and three roadmap items resolved by measurement
+
+The `1.4.x` patch line is now empty. Of the five items it carried into this
+release, **one shipped, two were closed by measuring them, and two were
+misfiled** and have moved to the minor line.
+
+### Added
+
+- **`<repo-dir>/info/exclude` is consulted** (`.git/info/exclude` in read-mode,
+  `.sit/info/exclude` natively), matching git. Parsed *before* the top-level
+  ignore file, because `is_ignored` is last-match-wins — so a `.gitignore` rule,
+  including a `!` re-include, overrides it. That is git's precedence.
+
+- **Nested `.gitignore` / `.sitignore`.** A rule from `sub/.gitignore` now
+  applies to paths under `sub/`, matched against the path *relative to* `sub/`,
+  and a deeper file overrides a shallower one. Pattern structs carry a **scope**
+  (the directory prefix, with its trailing `/`); `list_working_walk` appends a
+  directory's rules to the inherited set on descent, and only copies the
+  inherited vec when such a file actually exists — so the common directory costs
+  one `sf_exists`.
+
+  Previously only the top-level file was honoured, which is the last documented
+  gap in `.git/` read-mode ignore handling.
+
+  ⚠ The pattern struct grew 32 → 40 bytes. Both hand-rolled builders in the test
+  suite (`tests/sit.bcyr`'s `bench_make_patterns`, `tests/sit.tcyr`'s `_mkpat`)
+  encoded the old layout literally and were updated with it; a stale one would
+  have read uninitialised memory as the scope pointer.
+
+### Fixed
+
+- **`clone` — closed, no defect.** 1.4.8 profiled the phases and reported a
+  "~2.3× residual" in `walk_reachable_phased`. **That residual does not exist**;
+  it was an artefact of dividing by the wrong thing. Phase profile:
+
+  | phase | N=100 | N=1000 | growth |
+  |---|---:|---:|---:|
+  | p1 — commit chain | 7,796 µs | 78,113 µs | **10.0× (exactly linear)** |
+  | p2 — batch prefetch | 1 µs | 1 µs | no-op for a local source |
+  | p3 — tree walk | 29,471 µs | 1,873,566 µs | 63.6× |
+
+  p3's work is **tree entries visited**, not store bytes. The fixture adds one
+  file per commit, so tree `i` holds `i+1` entries and the history holds
+  `N(N+1)/2` — **5,050 → 500,500, a 99.1× increase** (verified against the
+  fixtures). Against that, p3 grew 63.6× and **per-entry cost improved,
+  5.83 → 3.74 µs**. 1.4.8 divided by store bytes (22×), which mixes in blobs
+  that grow only linearly.
+
+  So the whole `clone` row is the fixture's quadratic content plus git's delta
+  compression. There is no algorithmic defect; the remaining work is the packing
+  minor.
+
+### Changed
+
+- **`Batched WHERE hash IN (...)` pre-filter — dropped as obsolete.** The item
+  was written when `copy_objects` paid two SELECTs per object. **P-11 already
+  superseded it**: `db_object_insert_raw` uses `patra_insert_row_or_ignore`,
+  which folds the conflict probe into the write and checks the indexed key
+  before allocating the BYTES chain. A batched pre-filter would now be *extra*
+  work on top of a probe that still has to happen.
+
+- **`Memoize _wildmatch` — built, measured, and declined.** Implemented twice
+  and benchmarked against `is_ignored-10/50/200pat`:
+
+  | shape | cost |
+  |---|---|
+  | arm the memo when the pattern has ≥3 star groups | **+14% / +15.6% / +18.4%** |
+  | escalate on demand (plain first, memoized retry only on budget exhaustion) | **+7% / +7.3% / +8.8%** |
+
+  Untouched controls moved −2% to −7% in the same runs, so the gap is real. Even
+  the escalating shape pays, because the memo check lands in the `*` branch —
+  which *is* the inner loop.
+
+  It does not buy enough. Budget exhaustion returns "no match", so the only
+  wrong answer possible is a file **appearing** in `sit status` that should have
+  been ignored — the safe direction, and benign. The threshold is real but
+  pathological (4 star groups over 32 chars completes in 41,448 steps; 6 over 48
+  exhausts), while `is_ignored` runs per file per pattern on every `status` and
+  `add`. Reverted; `is_ignored` measures 7.444 / 37.078 / 147.598 µs against the
+  v1.4.3 baseline of 7.249 / 36.287 / 145.949. Reasoning and numbers are recorded
+  at the call site so this is not re-attempted blindly.
+
+- **Two items moved off the patch line**, which is headed "no new surface".
+  `reflog expire` / `delete` add subcommands and `@{<date>}` adds selector
+  syntax; HTTP base-path routing changes what the wire endpoint accepts. Per the
+  roadmap's own SemVer tiers those are **minors**, and they were filed as
+  patches.
+
+### Tests
+
+- **345 unit assertions** (was 331): nested-ignore scoping — including that a
+  scoped rule does not escape its directory, that `subterfuge/` does not match
+  scope `sub/`, and that an anchored scoped rule anchors to the *scope* rather
+  than the repo root.
+- **102 integration checks** (was 94): `info/exclude` and its override by a
+  top-level `!` rule; a nested rule that does not reach the root, does not
+  over-match, and does reach deeper paths; and a deeper file overriding a
+  shallower one.
+
 ## [1.4.8] — 2026-08-19 — HFS dot-directory spoofing, generated version banner, and `clone` diagnosed
 
 ### Security

@@ -553,11 +553,17 @@ fn test_sitignore_wildmatch() {
 }
 
 fn _mkpat(text, negated, anchored) {
-    var p = alloc(32);
+    return _mkpat_scoped(text, negated, anchored, 0);
+}
+
+# v1.4.9: patterns carry a scope (the nested-ignore directory prefix, or 0).
+fn _mkpat_scoped(text, negated, anchored, scope) {
+    var p = alloc(40);
     store64(p, text);
     store64(p + 8, strlen(text));
     store64(p + 16, negated);
     store64(p + 24, anchored);
+    store64(p + 32, scope);
     return p;
 }
 
@@ -974,6 +980,47 @@ fn test_hfs_dotdir_spoofing() {
     return 0;
 }
 
+# ── Nested ignore-file scoping (v1.4.9) ───────────────────────────────────
+# A rule from `sub/.gitignore` applies only under `sub/`, matched against the
+# path relative to it. Scope is the directory prefix WITH its trailing '/'.
+fn test_nested_ignore_scope() {
+    test_group("index.cyr — nested ignore scoping (v1.4.9)");
+
+    # A scoped "*.tmp" from sub/ must ignore under sub/ and nowhere else.
+    var a = vec_new();
+    vec_push(a, _mkpat_scoped("*.tmp", 0, 0, "sub/"));
+    assert_eq(is_ignored("sub/x.tmp", a), 1, "scoped *.tmp ignores sub/x.tmp");
+    assert_eq(is_ignored("sub/deep/y.tmp", a), 1, "scoped *.tmp reaches deeper paths");
+    assert_eq(is_ignored("root.tmp", a), 0, "scoped *.tmp does NOT ignore root.tmp");
+    assert_eq(is_ignored("other/z.tmp", a), 0, "scoped *.tmp does NOT escape its directory");
+    # The scope directory itself is not below itself.
+    assert_eq(is_ignored("sub", a), 0, "scope dir itself is not matched");
+    # A path that merely shares the prefix as a substring must not match.
+    assert_eq(is_ignored("subterfuge/x.tmp", a), 0, "prefix must be a directory boundary");
+
+    # Deeper file overrides shallower: order in the vec IS precedence.
+    var b = vec_new();
+    vec_push(b, _mkpat_scoped("*.tmp", 0, 0, "sub/"));
+    vec_push(b, _mkpat_scoped("d.tmp", 1, 0, "sub/deep/"));
+    assert_eq(is_ignored("sub/deep/d.tmp", b), 0, "deeper !d.tmp re-includes");
+    assert_eq(is_ignored("sub/deep/o.tmp", b), 1, "sibling still ignored");
+    assert_eq(is_ignored("sub/d.tmp", b), 1, "shallower d.tmp unaffected by deeper scope");
+
+    # Anchored rules anchor to the SCOPE, not the repo root.
+    var c = vec_new();
+    vec_push(c, _mkpat_scoped("build", 0, 1, "sub/"));   # parser strips the leading "/" and sets anchored
+    assert_eq(is_ignored("sub/build", c), 1, "anchored scoped rule matches at scope root");
+    assert_eq(is_ignored("build", c), 0, "anchored scoped rule does not match repo root");
+    assert_eq(is_ignored("sub/deep/build", c), 0, "anchored scoped rule does not match deeper");
+
+    # A scope-0 (root) rule keeps the pre-1.4.9 behaviour exactly.
+    var d = vec_new();
+    vec_push(d, _mkpat("*.tmp", 0, 0));
+    assert_eq(is_ignored("root.tmp", d), 1, "unscoped rule still matches at root");
+    assert_eq(is_ignored("sub/deep/x.tmp", d), 1, "unscoped rule still matches at depth");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -1001,6 +1048,7 @@ fn main() {
     test_fsck_commit_author_ts();
     test_sort_entries_differential();
     test_hfs_dotdir_spoofing();
+    test_nested_ignore_scope();
     return assert_summary();
 }
 

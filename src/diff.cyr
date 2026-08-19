@@ -106,7 +106,35 @@ fn list_working_walk(prefix, fs_path, out, patterns) {
                 memcpy(new_prefix + prefix_len, sdata, slen);
                 store8(new_prefix + prefix_len + slen, 47);
                 store8(new_prefix + prefix_len + slen + 1, 0);
-                list_working_walk(new_prefix, child_fs, out, patterns);
+
+                # v1.4.9: a nested .gitignore / .sitignore applies to paths
+                # under its own directory. Its rules are appended AFTER the
+                # inherited ones, and is_ignored is last-match-wins, so a
+                # deeper file overrides a shallower one — git's precedence.
+                # The inherited vec is only copied when such a file actually
+                # exists, so the common case costs one sf_exists per directory.
+                var child_patterns = patterns;
+                var ig_name = _ignore_filename();
+                var ig_nlen = strlen(ig_name);
+                var cfs_len = strlen(child_fs);
+                var ig_path = alloc(cfs_len + 1 + ig_nlen + 1);
+                memcpy(ig_path, child_fs, cfs_len);
+                store8(ig_path + cfs_len, 47);
+                memcpy(ig_path + cfs_len + 1, ig_name, ig_nlen);
+                store8(ig_path + cfs_len + 1 + ig_nlen, 0);
+                if (sf_exists(ig_path) == 1) {
+                    child_patterns = vec_new();
+                    if (patterns != 0) {
+                        var ci = 0;
+                        var cn = vec_len(patterns);
+                        while (ci < cn) {
+                            vec_push(child_patterns, vec_get(patterns, ci));
+                            ci = ci + 1;
+                        }
+                    }
+                    _parse_ignore_file(ig_path, child_patterns, new_prefix);
+                }
+                list_working_walk(new_prefix, child_fs, out, child_patterns);
             }
             else {
                 var full_len = prefix_len + slen;
