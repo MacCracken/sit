@@ -98,7 +98,7 @@ fn serve_build_capabilities() {
     # TODO: derive from VERSION at build time once cyrius exposes a
     # source-level VERSION constant — the manifest ${file:VERSION} is
     # build-metadata only. Until then it is bumped by hand at each tag.
-    str_builder_add_cstr(sb, "{\"sit\":\"1.4.2\",\"max_body\":");
+    str_builder_add_cstr(sb, "{\"sit\":\"1.4.3\",\"max_body\":");
     str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
     str_builder_add_cstr(sb, ",\"auth\":[");
     if (_serve_require_auth == 1) {
@@ -323,7 +323,7 @@ fn serve_handle_object(cfd, path) {
     store8(hdr + 12 + ty_digits + 1, 10);
     store8(hdr + 12 + ty_digits + 2, 0);
     _serve_send_response(cfd, 200, "OK", "application/octet-stream",
-    compressed, clen, hdr);
+      compressed, clen, hdr);
     return 0;
 }
 
@@ -362,7 +362,7 @@ fn serve_handle_want(cfd, buf, n) {
     # that case anyway; this makes it structural rather than incidental, and
     # matches the ordering already used by serve_handle_put_object.)
     var clen = content_length_sane(
-    sandhi_server_content_length(buf, n), SIT_SERVE_MAX_BODY);
+      sandhi_server_content_length(buf, n), SIT_SERVE_MAX_BODY);
     if (clen <= 0) {
         _serve_send_status(cfd, 411, "Length Required");
         return 0;
@@ -470,7 +470,7 @@ fn serve_handle_want(cfd, buf, n) {
     }
 
     _serve_send_response(cfd, 200, "OK", "application/octet-stream",
-    resp, resp_used, 0);
+      resp, resp_used, 0);
     fl_free(resp);
     return 0;
 }
@@ -820,7 +820,7 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
                 if (sf_exists(probe_path) == 1) {
                     var msg = "refusing to update checked-out branch (denyCurrentBranch)\n";
                     _serve_send_response(cfd, 423, "Locked", "text/plain",
-                    msg, strlen(msg), 0);
+                      msg, strlen(msg), 0);
                     return 0;
                 }
             }
@@ -932,13 +932,13 @@ fn serve_handle_request(ctx, cfd, buf, n) {
         if (streq(path, "/sit/v1/capabilities") == 1) {
             var b1 = serve_build_capabilities();
             _serve_send_response(cfd, 200, "OK", "application/json",
-            b1, strlen(b1), 0);
+              b1, strlen(b1), 0);
             return 0;
         }
         if (streq(path, "/sit/v1/refs") == 1) {
             var b2 = serve_build_refs();
             _serve_send_response(cfd, 200, "OK", "application/json",
-            b2, strlen(b2), 0);
+              b2, strlen(b2), 0);
             return 0;
         }
         # /sit/v1/objects/<64-hex>: prefix-match (path is the path-only
@@ -946,7 +946,7 @@ fn serve_handle_request(ctx, cfd, buf, n) {
         var plen = strlen(path);
         if (plen >= SIT_OBJECT_PATH_PREFIX_LEN) {
             if (memeq(path, SIT_OBJECT_PATH_PREFIX,
-            SIT_OBJECT_PATH_PREFIX_LEN) == 1) {
+                SIT_OBJECT_PATH_PREFIX_LEN) == 1) {
                 return serve_handle_object(cfd, path);
             }
         }
@@ -963,11 +963,11 @@ fn serve_handle_request(ctx, cfd, buf, n) {
         var is_put_ref = 0;
         if (plen3 >= SIT_OBJECT_PATH_PREFIX_LEN) {
             if (memeq(path, SIT_OBJECT_PATH_PREFIX,
-            SIT_OBJECT_PATH_PREFIX_LEN) == 1) { is_put_object = 1; }
+                SIT_OBJECT_PATH_PREFIX_LEN) == 1) { is_put_object = 1; }
         }
         if (plen3 >= SIT_REF_PUT_PREFIX_LEN) {
             if (memeq(path, SIT_REF_PUT_PREFIX,
-            SIT_REF_PUT_PREFIX_LEN) == 1) { is_put_ref = 1; }
+                SIT_REF_PUT_PREFIX_LEN) == 1) { is_put_ref = 1; }
         }
         if (is_put_object == 1) {
             if (_serve_auth_ok(buf, n) == 0) {
@@ -1144,7 +1144,7 @@ fn _serve_run_stdio() {
         # handed that claimed length (up to 16 MiB) to `zlib_decompress` over a
         # 64 KiB buffer, reading out of bounds.
         var clen = content_length_sane(
-        sandhi_server_content_length(buf, n), SIT_SERVE_MAX_BODY);
+          sandhi_server_content_length(buf, n), SIT_SERVE_MAX_BODY);
         if (clen < 0) {
             _serve_send_status(STDOUT_FILENO, 400, "Bad Request");
             stdout_flush();
@@ -1477,7 +1477,7 @@ fn cmd_serve() {
         }
         stdout_flush();
         return _serve_run_tls(port, load64(&cert_pair), load64(&cert_pair + 8),
-        load64(&key_pair), load64(&key_pair + 8));
+          load64(&key_pair), load64(&key_pair + 8));
     }
 
     if (_serve_require_auth == 1) {

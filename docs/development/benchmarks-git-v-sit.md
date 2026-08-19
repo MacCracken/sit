@@ -4,7 +4,7 @@ Head-to-head comparison on a real workstation. sit is a first-party Cyrius imple
 
 The point of this document is to be **honest about where sit currently wins, loses, and breaks even against git**, and to track that over time as sigil/sankoch/patra mature. The slow numbers are kept in plain sight; that's how we know which dep needs the next push.
 
-> **Snapshot note**: refreshed at **v1.4.0 (2026-08-18)**; the v0.6.12 tables are kept below as the historical arc. This head-to-head is not re-run every release. For current version, command inventory, dep versions, and binary metrics see [`state.md`](state.md); per-release micro-benchmark snapshots are under [`../benchmarks/`](../benchmarks/).
+> **Snapshot note**: refreshed at **v1.4.3 (2026-08-18)**; the v0.6.12 tables are kept below as the historical arc. This head-to-head is not re-run every release. For current version, command inventory, dep versions, and binary metrics see [`state.md`](state.md); per-release micro-benchmark snapshots are under [`../benchmarks/`](../benchmarks/).
 >
 > ⚠ **Read the ratios, not the absolute deltas, when comparing across snapshots.** The v0.6.12 run and this one are ~4 months apart on a different kernel (6.18 → 7.1) and a different git (2.53.0 → 2.55.0), so absolute millisecond changes are *not* a controlled measurement. The **ratio** column is — git and sit are timed back-to-back on the same box in the same run.
 
@@ -12,7 +12,7 @@ The point of this document is to be **honest about where sit currently wins, los
 
 - **Host**: Linux 7.1.8-arch1-3 x86_64, 16 cores *(v0.6.12 run: Linux 6.18.22-1-lts)*
 - **git**: 2.55.0 (system install, libpcre2 + libz-ng + libc dynamic deps) *(v0.6.12 run: 2.53.0)*
-- **sit**: 1.4.0 built from source at `src/main.cyr` via `cyrius build` — cyrius 6.5.26, and since v1.3.6 the toolchain pin is the single lever for every dependency: sankoch 2.7.7, sigil 3.12.9, patra 1.13.0, sakshi 2.4.10 (all stdlib-folded, no git deps)
+- **sit**: 1.4.3 built from source at `src/main.cyr` via `cyrius build` — cyrius 6.5.28, and since v1.3.6 the toolchain pin is the single lever for every dependency: sankoch 2.7.8, sigil 3.12.9, patra 1.13.8, sakshi 2.4.10 (all stdlib-folded, no git deps)
 - **Timing**: `date +%s%N` around the command (~nanosecond resolution). Each operation runs with a fresh scratch repo and is measured 10–20 times; we report **min** (closest to true operation cost, minus noise) and **median** (typical case) in milliseconds.
 - **Bench config for the table below**: `RUNS_LIGHT=20 RUNS_HEAVY=10`.
 
@@ -40,7 +40,64 @@ and three shared libraries.
 
 (Caveat: git ships rebase, gc, merge-base, hundreds of plumbing commands sit doesn't have. The footprint comparison is "sit covers the core VCS loop in 10× less disk", not "sit does the same work in 10× the bytes". Sit has 24 commands so far.)
 
-## Operation latency (v1.4.0, 2026-08-18)
+## Operation latency (v1.4.3, 2026-08-18)
+
+Measured on cyrius **6.5.28** (patra 1.13.8). **5 of 10 ops are slower than git,
+4 faster, 1 even.**
+
+| operation | git (min / med) | sit (min / med) | ratio | vs v1.4.0 |
+|---|---:|---:|---:|---:|
+| `fetch-1commit` | 11.04 / 11.40 | **2.75 / 2.94** | **0.25×** | 0.25× |
+| `commit` | 4.15 / 4.46 | **2.41 / 2.72** | **0.58×** | 0.58× |
+| `init` | 2.75 / 2.99 | **1.70 / 1.89** | **0.62×** | 0.65× ✅ |
+| `add-1KB` | 2.26 / 2.51 | 2.44 / 2.66 | 1.08× | 1.02× |
+| `status-100files` | 3.19 / 3.34 | 5.62 / 5.88 | 1.76× | 1.88× ✅ |
+| `log-100commits` | 4.12 / 4.36 | **8.98 / 9.33** | **2.18×** | 6.48× ✅✅ |
+| `add-64KB` | 3.18 / 3.43 | 8.58 / 8.85 | 2.70× | 2.59× |
+| `diff-edit` | 2.65 / 2.81 | 12.14 / 12.64 | 4.57× | 4.47× |
+| `clone-100commits` | 13.93 / 14.36 | **69.39 / 70.03** | **4.98×** | 12.13× ✅✅ |
+| `add-1MB` | 16.12 / 16.66 | 100.70 / 101.89 | **6.25×** | 6.17× |
+
+### The read path stopped being quadratic
+
+`log` **−64%** and `clone` **−43%** in absolute terms, both from a single upstream
+fix: patra was allocating *and zeroing* a result buffer sized for the **whole
+table** on every query, including a one-row indexed hit. sit filed and profiled
+it; the fix landed in patra 1.13.1 and folded into cyrius 6.5.28.
+
+Same fixture, same command, only the store growing:
+
+| objects in store | v1.4.1 | v1.4.3 |
+|---|---:|---:|
+| ~300 | 13 ms | **5 ms** |
+| ~1200 | 35 ms | **5 ms** |
+| ~3100 (30 MB store) | ~125 ms | **5 ms** |
+
+**Flat across a 10× store growth.** Object reads no longer care how big the
+repository is — which is what the index was supposed to buy all along, and what
+the missing index (fixed in 1.4.1) plus the oversized buffer (fixed upstream) had
+been hiding between them.
+
+### What bounds sit now
+
+**`add-1MB` (6.25×) is the worst row** — `clone` held that spot from v0.6.12
+through v1.4.2 and no longer does.
+
+| slow op | dominant cost | where the fix lives |
+|---|---|---|
+| `add-1MB` 6.25× / `add-64KB` 2.70× | sankoch `zlib_compress` (~140 ms at 1 MB) | sankoch match-finder / SIMD (on sankoch's roadmap) |
+| `clone` 4.98× | per-object round trip + compress on ingest | pack bundles + delta transfer (sit roadmap, § Structural) |
+| `diff-edit` 4.57× | sankoch decompress + LCS | Myers fallback shipped v1.0.1; the DP path still dominates at this size |
+| `log` 2.18× | sankoch decompress per commit | sankoch small-input decompress throughput |
+| `status` 1.76× | 100× file open+read | not really a bottleneck; needs a larger fixture to say anything |
+
+**Every remaining gap is now a dependency's throughput or a sit feature that does
+not exist yet.** The two "sit hasn't wired the available call" items that topped
+this table at v1.4.0 both shipped in 1.4.1.
+
+---
+
+## Operation latency (v1.4.0, 2026-08-18) — historical
 
 All times in milliseconds, lower is better. **6 of 10 ops are slower than git, 4 are faster.**
 `RUNS_LIGHT=20 RUNS_HEAVY=10`, fresh scratch repo per run.

@@ -652,7 +652,7 @@ fn _wire_ssh_recv_response(rfd, out_body) {
                 # negative and the completeness test below passed immediately,
                 # leaving `clen` as a body length for memory never read.
                 clen = content_length_sane(
-                _wire_ssh_parse_content_length(buf, body_off), WIRE_HTTP_MAX_BODY);
+                  _wire_ssh_parse_content_length(buf, body_off), WIRE_HTTP_MAX_BODY);
                 if (clen < 0) {
                     fl_free(buf);
                     eprintln("sit: ssh response has a missing or bogus Content-Length");

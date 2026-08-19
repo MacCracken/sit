@@ -4,7 +4,7 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.4.1`. The `1.3.x` line went almost entirely to audit work (two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two integrity gaps; `1.4.1` wired the two dependency capabilities that had been sitting unused — and in doing so found that `objects.hash` had **no index**, so every object lookup was a full table scan. Both audit backlogs are empty. The themed minor line shifted **+1** when `1.4.0` went to integrity rather than tags.
+**Where we are**: `1.4.3`. The `1.3.x` line went almost entirely to audit work (two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two integrity gaps; `1.4.1` found `objects.hash` had no index at all; `1.4.2` profiled the residual curve to patra's result-buffer sizing; `1.4.3` picked up the upstream fix (patra 1.13.8 via cyrius 6.5.28) and **the object-lookup curve is now flat** — `log -n 50` holds at 5 ms across a 10× store growth. Audit backlogs are empty. The themed minor line shifted **+1** when `1.4.0` went to integrity rather than tags.
 
 ---
 
@@ -24,17 +24,6 @@ Nothing below blocks anything else; ordering within a section is a recommendatio
 
 Ordered. Nothing here adds observable surface, so each can ship as it lands.
 
-- **`1.4.2` — ~~profile the residual lookup curve~~ → ANSWERED, see the 1.4.2
-  CHANGELOG entry.** It is patra's fixed 1024-slot (~4 MB) page cache: indexed
-  lookups degrade **15× once a DB is 8× the cache**, and row count is not the
-  driver. Filed upstream as a patra consumer request. **sit has no lever left on
-  the lookup itself** — the index exists, the query is a single indexed equality.
-  What sit *can* do is stop reaching the cliff so early; see the packing item below.
-- **`1.4.3` — index `entries.path` in `index.patra`.** The staging index has the
-  same bare-`CREATE TABLE` shape `objects` had. `parse_index` scans deliberately
-  (it wants every row, ordered), but any `WHERE path = …` lookup is on the scan
-  path. Verify whether `cmd_add` / `cmd_rm` / `cmd_reset` do point lookups before
-  adding an index — the win is unproven, unlike `objects` where it was measured.
 - **`1.4.4` — larger benchmark fixture.** Every number in the head-to-head comes
   from a 100-commit / 100-file repo, which is small enough to hide exactly the
   quadratic behaviour 1.4.1 found. A 5k-commit fixture would have surfaced the
@@ -54,22 +43,25 @@ Ordered. Nothing here adds observable surface, so each can ship as it lands.
 
 ## Structural — object storage size
 
-**Now the top structural item in the tree**, promoted out of "heavier /
-unscheduled" by the 1.4.2 profiling. It was filed as a disk-space and
-transfer-efficiency feature; it is actually upstream of sit's read performance.
+Promoted out of "heavier / unscheduled" by the 1.4.2 profiling, and still the top
+structural item — but for a **narrower reason than first written**.
+
+> ⚠ **Correction.** The original entry argued store size mattered because it
+> overshot "patra's ~4 MB page cache". That reasoning was wrong — the page cache
+> is opt-in and was never enabled; the real cost was patra sizing a result buffer
+> by the whole table, fixed upstream and folded in 1.4.3. **The read-performance
+> argument for packing is therefore gone: lookups are now flat regardless of store
+> size.** What remains is the plain disk-and-transfer case, which is still strong.
 
 - **Pack bundles + `gc` / repack.** For an identical 1,600-commit history sit's
-  store is **62.8 MB** where git packs to **1.1 MB** (git loose: 6.4 MB) — sit has
-  no delta compression or packing, and every object occupies at least one patra
-  page. Against patra's ~4 MB page cache that is a ~16× overshoot, which is why
-  indexed lookups run in the degraded regime on a repository of only 1,600
-  commits. Shrinking the store is the one lever sit owns over that curve.
+  store is **62.8 MB** where git packs to **1.1 MB** (git loose, unpacked: 6.4 MB)
+  — sit has no delta compression or packing, and every object occupies at least
+  one patra page. That is a ~57× disk penalty and it rides on every clone/fetch as
+  bytes on the wire.
 
   The git-delta *read* interpreter already exists (1.2.0, `src/git_pack.cyr`);
   what remains is delta *generation*, on-disk repack, and the negotiated wire
-  capability (which makes it a minor, not a patch). Was gated on "patra
-  storage-shape work that isn't ready" — that gate should be re-examined, because
-  the cost of waiting is now measured rather than theoretical.
+  capability (which makes it a minor, not a patch).
 
 ---
 
@@ -112,4 +104,4 @@ Dropping sandhi for a hand-rolled `net`-direct loopback HTTP/1.0 server (surface
 
 ---
 
-*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/) — latest [`2026-08-18-v1.4.0.md`](../benchmarks/2026-08-18-v1.4.0.md). Security audit reports are in [`../audit/`](../audit/).*
+*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/) — latest [`2026-08-18-v1.4.3.md`](../benchmarks/2026-08-18-v1.4.3.md). Security audit reports are in [`../audit/`](../audit/).*

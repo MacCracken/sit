@@ -333,7 +333,7 @@ fn _reflog_append_full(refpath, old_hex, new_hex, msg, name, email, ts) {
 # wrapper around _reflog_append_full (branch-create, fetch remote-tracking).
 fn reflog_append(refpath, old_hex, new_hex, msg) {
     return _reflog_append_full(refpath, old_hex, new_hex, msg,
-    _reflog_user_name(), _reflog_user_email(), clock_epoch_secs());
+      _reflog_user_name(), _reflog_user_email(), clock_epoch_secs());
 }
 
 # Resolve <ref>@{n}: read .sit/logs/<refpath>, write the new-oid of entry n

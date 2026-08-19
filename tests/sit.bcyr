@@ -158,7 +158,7 @@ fn bench_populate_db(db, count, content_size) {
         var blens[24];
         store64(&blens + 16, content_size);
         patra_insert_row(db, "objects", 7, 3,
-        &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+          &types, &ivals, &sptrs, &slens, &bptrs, &blens);
         i = i + 1;
     }
     return 0;

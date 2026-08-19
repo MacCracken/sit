@@ -519,7 +519,7 @@ fn _wire_https_exchange(h, is_post, sub_path, body, body_len, extra_hdr, out_qua
             body_off = sandhi_server_body_offset(buf, used);
             if (body_off > 0) {
                 content_len = content_length_sane(
-                sandhi_server_content_length(buf, used), WIRE_HTTP_MAX_BODY);
+                  sandhi_server_content_length(buf, used), WIRE_HTTP_MAX_BODY);
                 # S-25: a malicious server sending a near-i64-max Content-Length
                 # made `body_off + content_len` wrap negative, so the test below
                 # passed on the first iteration and this returned a "complete"

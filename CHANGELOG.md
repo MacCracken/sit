@@ -4,6 +4,61 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.3] — 2026-08-18 — the patra fix lands: `log` −64%, `clone` −43%, and the lookup curve is flat
+
+Toolchain `6.5.26` → `6.5.28`, which folds **patra 1.13.8** — including the
+result-buffer sizing fix sit filed and profiled. This is the payoff release for
+that whole investigation: **sit does no work here, it just picks up the win.**
+
+### Changed
+
+- **Toolchain pin `6.5.26` → `6.5.28`.** Folded dependency versions:
+  sakshi `2.4.10`, sankoch `2.7.8`, sigil `3.12.9`, **patra `1.13.8`**.
+  No sit source change was required.
+
+### Performance
+
+- **The object-lookup curve is now FLAT.** 1.4.1 added the missing index on
+  `objects.hash`, which helped but left a residual O(table) cost; profiling
+  traced that to patra allocating and zeroing a result buffer sized for the whole
+  table on every query. Fixed upstream in patra 1.13.1 and folded here.
+
+  Same fixture, same command, only the store growing:
+
+  | objects in store | 1.4.1 | 1.4.3 |
+  |---|---:|---:|
+  | ~300 | 13 ms | **5 ms** |
+  | ~1200 | 35 ms | **5 ms** |
+  | ~3100 (30 MB store) | ~125 ms | **5 ms** |
+
+  Flat across a 10× store growth, where it was previously quadratic.
+
+- **Head-to-head vs git**, same harness as 1.4.2:
+
+  | operation | 1.4.2 | 1.4.3 | ratio to git |
+  |---|---:|---:|---:|
+  | `log-100commits` | 24.71 ms | **8.98 ms** (−64%) | 6.33× → **2.18×** |
+  | `clone-100commits` | 122.65 ms | **69.39 ms** (−43%) | 8.64× → **4.98×** |
+  | `status-100files` | 5.91 ms | 5.62 ms | 1.83× → 1.76× |
+
+  Everything else is within noise. **`clone` is no longer the worst row** —
+  `add-1MB` (6.25×, sankoch `zlib_compress`) now is.
+
+### Rejected — `entries.path` index
+
+The roadmap slotted "index `entries.path` in `index.patra`" as 1.4.3, with the
+caveat that the win was unproven and to verify point lookups existed first.
+**Verified: they do not.** The staging index has exactly three operations —
+`CREATE TABLE`, `DELETE FROM entries` (no WHERE), and
+`SELECT path, hash_hex FROM entries ORDER BY path` (a deliberate full scan that
+wants every row, ordered). There is no `WHERE path = …` anywhere.
+
+`rewrite_index` is delete-all + insert-all, so an index would add a B-tree write
+per row on **every** `sit add` / `rm` / `reset` and accelerate nothing. That is a
+pure regression, so it is **not implemented** and is struck from the roadmap.
+Recorded here because "we considered it and measured why not" is the useful
+artifact, not a silently dropped item.
+
 ## [1.4.2] — 2026-08-18 — the residual lookup curve is patra's fixed page cache
 
 **No sit code change.** This release is the 1.4.2 investigation itself: profiling
