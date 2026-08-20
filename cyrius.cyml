@@ -30,6 +30,7 @@ modules = [
     "src/reflog.cyr",
     "src/git_read.cyr",
     "src/git_pack.cyr",
+    "src/delta.cyr",
     "src/object_db.cyr",
     "src/index.cyr",
     "src/refs.cyr",

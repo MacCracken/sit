@@ -1,0 +1,191 @@
+# delta.cyr — git-format delta GENERATION (v1.6.1).
+#
+# The read side has existed since 1.2.0 (`_git_apply_delta`, git_pack.cyr) so
+# sit could interpret packs in `.git/` read-mode. This is the other direction:
+# producing a delta that that interpreter reconstructs byte-for-byte.
+#
+# Format (identical to git's, which is what makes the pair testable):
+#   <base-size varint> <result-size varint> <instruction>*
+#
+#   COPY   op & 0x80 set. Bits 0..3 say which of 4 offset bytes follow
+#          (little-endian), bits 4..6 which of 3 size bytes. A size of 0 means
+#          0x10000. Copies `size` bytes from `base + offset`.
+#   INSERT op & 0x80 clear, op != 0. `op` is a literal length 1..127, followed
+#          by that many bytes taken verbatim from the target.
+#
+# The matcher is deliberately simple: a hash of every DELTA_BLK-byte block in
+# the base, then a greedy left-to-right scan of the target extending each hit
+# as far as it matches. That is not an optimal parse and is not trying to be —
+# for sit's real input (successive versions of a tree, or a file edited in
+# place) the wins are large contiguous runs, which greedy finds. Anything
+# cleverer is a ratio/CPU trade to make against measurements, not up front.
+
+var DELTA_BLK = 16;            # match granularity
+var DELTA_HASH_BITS = 14;      # 16384 buckets
+var DELTA_MAX_LIT = 127;       # INSERT opcode's literal ceiling
+
+# Write a git varint (7 bits per byte, high bit = continue). Returns bytes written.
+fn _delta_put_varint(out, pos, v) {
+    var w = 0;
+    var n = v;
+    var more = 1;
+    while (more == 1) {
+        var b = n & 0x7F;
+        n = n >> 7;
+        if (n != 0) { b = b | 0x80; }
+        else { more = 0; }
+        store8(out + pos + w, b);
+        w = w + 1;
+    }
+    return w;
+}
+
+fn _delta_hash(buf, off) {
+    # FNV-ish over DELTA_BLK bytes, folded to DELTA_HASH_BITS.
+    var h = 2166136261;
+    var i = 0;
+    while (i < DELTA_BLK) {
+        h = h ^ (load8(buf + off + i) & 0xFF);
+        h = (h * 16777619) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return (h ^ (h >> DELTA_HASH_BITS)) & ((1 << DELTA_HASH_BITS) - 1);
+}
+
+# Produce a delta that reconstructs `tgt` from `base`.
+# Writes the heap buffer's length to *out_len and returns the buffer, or 0.
+#
+# Returns 0 when a delta would not be a win — the caller stores the object
+# whole in that case. Refusing here rather than emitting a bad-ratio delta
+# keeps the "is this worth deltifying" decision in one place.
+fn delta_generate(base, base_len, tgt, tgt_len, out_len) {
+    if (base == 0) { return 0; }
+    if (tgt == 0) { return 0; }
+    if (base_len < DELTA_BLK) { return 0; }
+    if (tgt_len <= 0) { return 0; }
+
+    # Bucket heads + chain, over base block starts. One entry per byte offset
+    # is wasteful; step by DELTA_BLK so the table is base_len/16 entries.
+    var nblk = base_len / DELTA_BLK;
+    if (nblk <= 0) { return 0; }
+    var nbuckets = 1 << DELTA_HASH_BITS;
+    var heads = fl_alloc(nbuckets * 8);
+    var chain = fl_alloc(nblk * 8);
+    var i = 0;
+    while (i < nbuckets) { store64(heads + i * 8, 0 - 1); i = i + 1; }
+    var b = 0;
+    while (b < nblk) {
+        var off = b * DELTA_BLK;
+        var hh = _delta_hash(base, off);
+        store64(chain + b * 8, load64(heads + hh * 8));
+        store64(heads + hh * 8, b);
+        b = b + 1;
+    }
+
+    # Worst case a delta is the target plus one INSERT opcode per 127 bytes,
+    # plus the two size varints. Allocate that so the writer never bounds-check
+    # mid-emit, and refuse below if the result is not actually smaller.
+    var cap = tgt_len + (tgt_len / DELTA_MAX_LIT) + 32;
+    var out = alloc(cap);
+    var pos = 0;
+    pos = pos + _delta_put_varint(out, pos, base_len);
+    pos = pos + _delta_put_varint(out, pos, tgt_len);
+
+    var lit_start = 0;      # first byte of the pending literal run
+    var t = 0;
+    while (t < tgt_len) {
+        var best_off = 0 - 1;
+        var best_len = 0;
+
+        if (t + DELTA_BLK <= tgt_len) {
+            var th = _delta_hash(tgt, t);
+            var cand = load64(heads + th * 8);
+            var probes = 0;
+            while (cand >= 0) {
+                if (probes >= 8) { cand = 0 - 1; }
+                else {
+                    probes = probes + 1;
+                    var coff = cand * DELTA_BLK;
+                    # Verify the block really matches (hash collisions are
+                    # expected), then extend forward as far as both run.
+                    if (memeq(base + coff, tgt + t, DELTA_BLK) == 1) {
+                        var mlen = DELTA_BLK;
+                        var extending = 1;
+                        while (extending == 1) {
+                            if (coff + mlen >= base_len) { extending = 0; }
+                            else {
+                                if (t + mlen >= tgt_len) { extending = 0; }
+                                else {
+                                    if (load8(base + coff + mlen) != load8(tgt + t + mlen)) { extending = 0; }
+                                    else { mlen = mlen + 1; }
+                                }
+                            }
+                        }
+                        if (mlen > best_len) { best_len = mlen; best_off = coff; }
+                    }
+                    cand = load64(chain + cand * 8);
+                }
+            }
+        }
+
+        if (best_len >= DELTA_BLK) {
+            # Flush any pending literal run before the COPY.
+            pos = _delta_flush_literal(out, pos, tgt, lit_start, t);
+            pos = _delta_emit_copy(out, pos, best_off, best_len);
+            t = t + best_len;
+            lit_start = t;
+        }
+        else { t = t + 1; }
+    }
+    pos = _delta_flush_literal(out, pos, tgt, lit_start, tgt_len);
+
+    fl_free(chain);
+    fl_free(heads);
+
+    # Only worth it if the delta is actually smaller than the object.
+    if (pos >= tgt_len) { return 0; }
+    store64(out_len, pos);
+    return out;
+}
+
+# Emit INSERT opcodes covering tgt[from, to). Returns the new position.
+fn _delta_flush_literal(out, pos, tgt, from, to) {
+    var p = pos;
+    var i = from;
+    while (i < to) {
+        var run = to - i;
+        if (run > DELTA_MAX_LIT) { run = DELTA_MAX_LIT; }
+        store8(out + p, run);
+        p = p + 1;
+        memcpy(out + p, tgt + i, run);
+        p = p + run;
+        i = i + run;
+    }
+    return p;
+}
+
+# Emit COPY opcodes for `len` bytes at `off`. A single COPY caps at 0xFFFF
+# bytes here (size fits 3 bytes, but 0 means 0x10000 and encoding that special
+# case buys nothing), so long runs become several COPYs.
+fn _delta_emit_copy(out, pos, off, len) {
+    var p = pos;
+    var remaining = len;
+    var o = off;
+    while (remaining > 0) {
+        var chunk = remaining;
+        if (chunk > 65535) { chunk = 65535; }
+        var opos = p;
+        p = p + 1;
+        var op = 0x80;
+        if ((o & 0xFF) != 0)         { store8(out + p, o & 0xFF); p = p + 1; op = op | 0x01; }
+        if (((o >> 8) & 0xFF) != 0)  { store8(out + p, (o >> 8) & 0xFF); p = p + 1; op = op | 0x02; }
+        if (((o >> 16) & 0xFF) != 0) { store8(out + p, (o >> 16) & 0xFF); p = p + 1; op = op | 0x04; }
+        if (((o >> 24) & 0xFF) != 0) { store8(out + p, (o >> 24) & 0xFF); p = p + 1; op = op | 0x08; }
+        if ((chunk & 0xFF) != 0)        { store8(out + p, chunk & 0xFF); p = p + 1; op = op | 0x10; }
+        if (((chunk >> 8) & 0xFF) != 0) { store8(out + p, (chunk >> 8) & 0xFF); p = p + 1; op = op | 0x20; }
+        store8(out + opos, op);
+        o = o + chunk;
+        remaining = remaining - chunk;
+    }
+    return p;
+}

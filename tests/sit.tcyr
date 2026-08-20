@@ -1114,6 +1114,85 @@ fn test_ignore_dir_only() {
     return 0;
 }
 
+# ── delta generation round-trip (v1.6.1) ──────────────────────────────────
+# delta_generate must produce something _git_apply_delta reconstructs
+# byte-for-byte. The two are written against the same spec but independently,
+# so this is a real differential, not a tautology — and it is the property the
+# whole packing feature rests on: a delta that does not reconstruct is silent
+# data loss.
+fn _delta_roundtrip(base, base_len, tgt, tgt_len, label) {
+    var dlen[8];
+    var d = delta_generate(base, base_len, tgt, tgt_len, &dlen);
+    if (d == 0) {
+        # Refusing is legal (no win available); nothing to check.
+        return 0;
+    }
+    var out24[24];
+    if (_git_apply_delta(base, base_len, d, load64(&dlen), &out24) != 0) {
+        assert_eq(0, 1, label);
+        return 0;
+    }
+    var got = load64(&out24);
+    var got_len = load64(&out24 + 8);
+    assert_eq(got_len, tgt_len, label);
+    if (got_len == tgt_len) {
+        assert_eq(memeq(got, tgt, tgt_len), 1, label);
+    }
+    return 0;
+}
+
+fn test_delta_roundtrip() {
+    test_group("delta.cyr — generate/apply round-trip (v1.6.1)");
+
+    # Identical buffers: the whole target is one COPY.
+    var a = alloc(4096);
+    var i = 0;
+    while (i < 4096) { store8(a + i, 97 + (i % 26)); i = i + 1; }
+    _delta_roundtrip(a, 4096, a, 4096, "identical 4 KiB");
+
+    # Target = base with one byte changed in the middle.
+    var b = alloc(4096);
+    memcpy(b, a, 4096);
+    store8(b + 2048, 33);
+    _delta_roundtrip(a, 4096, b, 4096, "one byte changed mid-buffer");
+
+    # Target = base with a run appended (the tree-growth shape).
+    var c = alloc(5000);
+    memcpy(c, a, 4096);
+    var j = 0;
+    while (j < 904) { store8(c + 4096 + j, 65 + (j % 26)); j = j + 1; }
+    _delta_roundtrip(a, 4096, c, 5000, "appended run (tree-growth shape)");
+
+    # Target = base with a prefix removed.
+    _delta_roundtrip(a, 4096, a + 1000, 3096, "prefix removed");
+
+    # Target shorter than a match block.
+    _delta_roundtrip(a, 4096, a, 8, "target shorter than the block size");
+
+    # Completely unrelated content — generate should refuse or still round-trip.
+    var d2 = alloc(2048);
+    var k = 0;
+    while (k < 2048) { store8(d2 + k, (k * 7) & 0xFF); k = k + 1; }
+    _delta_roundtrip(a, 4096, d2, 2048, "unrelated content");
+
+    # Repetitive content: many candidate matches, exercises the probe cap.
+    var r = alloc(4096);
+    var m = 0;
+    while (m < 4096) { store8(r + m, 65 + (m % 4)); m = m + 1; }
+    var r2 = alloc(4096);
+    memcpy(r2, r, 4096);
+    store8(r2 + 4000, 90);
+    _delta_roundtrip(r, 4096, r2, 4096, "highly repetitive content");
+
+    # Degenerate inputs must not crash and must not claim a delta.
+    var zl[8];
+    assert_eq(delta_generate(0, 0, a, 4096, &zl), 0, "null base refused");
+    assert_eq(delta_generate(a, 4096, 0, 10, &zl), 0, "null target refused");
+    assert_eq(delta_generate(a, 8, a, 8, &zl), 0, "base below block size refused");
+    assert_eq(delta_generate(a, 4096, a, 0, &zl), 0, "zero-length target refused");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -1144,6 +1223,7 @@ fn main() {
     test_nested_ignore_scope();
     test_parse_tag_body();
     test_ignore_dir_only();
+    test_delta_roundtrip();
     return assert_summary();
 }
 

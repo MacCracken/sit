@@ -4,6 +4,84 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.1] — 2026-08-20 — the index churn was sit's bug; delta generation lands
+
+### Fixed
+
+- ⚠ **`.sit/index.patra` grew without bound, and it was `rewrite_index`, not
+  patra.** 1.6.0 reported this residual and attributed it to B-tree index-page
+  churn upstream. That attribution was **wrong**, and the A/B that settles it is
+  one line: run the same 80 checkout round-trips against a table with **no**
+  `entries(path)` index and the file is **flat at 44 KB**, while with the index
+  it goes 56 → 540 KB. patra's page reclamation (1.13.9) works exactly as
+  intended; the growth was sit's own write volume feeding the B-tree.
+
+  `rewrite_index` did `DELETE FROM entries` + re-insert **every** row, so a
+  checkout that changes one file rewrote all N — 2N row operations to express a
+  one-row change. It now applies the **difference**: only paths that were added,
+  removed, or whose hash changed are touched.
+
+  | 80 checkout round-trips, 61 entries | before | after |
+  |---|---:|---:|
+  | `.sit/index.patra` | 56 → **540 KB** | 48 → **60 KB** |
+
+  This is the same defect 1.4.6 fixed for `index_upsert` (the per-file path) and
+  left in `rewrite_index` (the per-operation path). Both are now O(changes)
+  rather than O(table).
+
+  The `entries(path)` index was also re-examined and **kept**: it buys 2–7% on
+  `sit add` and the unindexed `DELETE … WHERE` stays linear to N=2000, so it is
+  marginal — but with the churn gone it no longer costs anything either.
+
+### Added
+
+- **git-format delta generation** (`src/delta.cyr`) — the other half of the
+  interpreter shipped in 1.2.0. Produces `<base-size><result-size>` followed by
+  COPY/INSERT opcodes that `_git_apply_delta` reconstructs byte-for-byte.
+
+  Verified as a **differential against the existing interpreter**, which is the
+  property the whole packing feature rests on — a delta that does not
+  reconstruct is silent data loss:
+
+  | case | target | delta |
+  |---|---:|---:|
+  | one byte changed in 8 KiB | 8,192 B | **35 B** |
+  | 808 bytes appended (the tree-growth shape) | 9,000 B | **842 B** |
+
+  The matcher is a hash of every 16-byte base block plus a greedy forward
+  extend, with an 8-deep probe cap. Deliberately not an optimal parse: sit's
+  real input is successive versions of a tree, where the wins are long
+  contiguous runs. Generation **refuses** when the delta would not be smaller,
+  so the "is this worth deltifying" decision lives in one place.
+
+### Changed
+
+- **The store-size figure driving the packing work was stale, and is corrected.**
+  Remeasured at 1,600 commits with both sides verified at 1,600 commits:
+
+  | | roadmap claimed | measured |
+  |---|---:|---:|
+  | sit `objects.patra` | 62.8 MB | **64.3 MB** |
+  | git packed | 1.1 MB | **1.6 MB** |
+  | git loose | 6.4 MB | **4.3 MB** |
+  | ratio | ~57× | **39×** |
+
+  Still a large gap, and worth closing — but 39×, not 57×. Note sit is also
+  **15× larger than git's *unpacked* store**, so page overhead is not the story:
+  the fixture's tree content is quadratic in commit count and successive trees
+  are near-identical, which is precisely what deltas collapse.
+
+### Not in this release
+
+`sit gc` — delta **storage** and repack — is the next bite and is deliberately
+not rushed in here. It is a storage-format change with four coupled parts: an
+`objects` schema column for the delta base (declared in two places), `read_object`
+reconstructing transparently, `fsck`'s integrity pass (which re-hashes stored
+bytes that would no longer *be* the content), and `copy_objects`' raw DB-to-DB
+transfer needing a delta's base to travel with it — plus migration for existing
+repositories. Generation is the half that can be built and proven in isolation,
+and it has been.
+
 ## [1.6.0] — 2026-08-20 — TLS trust hardening
 
 A real minor this time: new config keys and a lifted deployment restriction.

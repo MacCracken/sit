@@ -198,30 +198,91 @@ fn index_migrate_from_plaintext(db) {
 fn rewrite_index(entries) {
     var db = get_index_db();
     if (db == 0) { return 0 - 1; }
-    patra_exec(db, "DELETE FROM entries");
 
+    # v1.6.1 — apply the DIFFERENCE, not a nuke-and-rebuild.
+    #
+    # This used to run `DELETE FROM entries` and re-insert every row, so a
+    # checkout that changes ONE file rewrote all N. patra reclaims emptied data
+    # pages since 1.13.9, but the `entries(path)` B-tree churns per row touched
+    # and its pages are not reclaimed — so the whole-table rewrite made
+    # `.sit/index.patra` grow without bound anyway. Measured: 80 checkout
+    # round-trips over 61 entries took the file 56 KB -> 540 KB, while the same
+    # workload against a table with no index stayed **flat at 44 KB**. The
+    # growth was this function's write volume, not patra's reclamation.
+    #
+    # Applying the difference touches only paths that actually changed, so the
+    # common checkout writes one or two rows instead of 2N.
+    var current = parse_index();
+    var target_map = map_new();
     var n = vec_len(entries);
     var i = 0;
     while (i < n) {
         var e = vec_get(entries, i);
-        var path = entry_path(e);
-        var hash_hex = hex_encode(entry_hash(e), 32);
-
-        var types[16];
-        store64(&types + 0, 1);
-        store64(&types + 8, 1);
-        var ivals[16];
-        var sptrs[16];
-        store64(&sptrs + 0, path);
-        store64(&sptrs + 8, hash_hex);
-        var slens[16];
-        store64(&slens + 0, strlen(path));
-        store64(&slens + 8, 64);
-        var bptrs[16];
-        var blens[16];
-        patra_insert_row(db, "entries", 7, 2,
-          &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+        map_set(target_map, entry_path(e), hex_encode(entry_hash(e), 32));
         i = i + 1;
+    }
+
+    # Paths present now but absent from the target, or whose hash changed, are
+    # removed. A changed path is removed here and re-inserted below, which is
+    # what index_upsert does for a single path.
+    if (current != 0) {
+        var cn = vec_len(current);
+        var ci = 0;
+        while (ci < cn) {
+            var ce = vec_get(current, ci);
+            var cpath = entry_path(ce);
+            var want = map_get(target_map, cpath);
+            var drop = 0;
+            if (want == 0) { drop = 1; }
+            else {
+                if (streq(want, hex_encode(entry_hash(ce), 32)) == 0) { drop = 1; }
+            }
+            if (drop == 1) {
+                if (index_remove_path(cpath) != 0) { return 0 - 1; }
+            }
+            ci = ci + 1;
+        }
+    }
+
+    # Insert paths that are new, or whose hash changed (removed just above).
+    var current_map = map_new();
+    if (current != 0) {
+        var kn = vec_len(current);
+        var ki = 0;
+        while (ki < kn) {
+            var ke = vec_get(current, ki);
+            map_set(current_map, entry_path(ke), hex_encode(entry_hash(ke), 32));
+            ki = ki + 1;
+        }
+    }
+    var j = 0;
+    while (j < n) {
+        var te = vec_get(entries, j);
+        var tpath = entry_path(te);
+        var thex = hex_encode(entry_hash(te), 32);
+        var had = map_get(current_map, tpath);
+        var need = 0;
+        if (had == 0) { need = 1; }
+        else {
+            if (streq(had, thex) == 0) { need = 1; }
+        }
+        if (need == 1) {
+            var types[16];
+            store64(&types + 0, 1);
+            store64(&types + 8, 1);
+            var ivals[16];
+            var sptrs[16];
+            store64(&sptrs + 0, tpath);
+            store64(&sptrs + 8, thex);
+            var slens[16];
+            store64(&slens + 0, strlen(tpath));
+            store64(&slens + 8, 64);
+            var bptrs[16];
+            var blens[16];
+            if (patra_insert_row(db, "entries", 7, 2,
+                &types, &ivals, &sptrs, &slens, &bptrs, &blens) != 0) { return 0 - 1; }
+        }
+        j = j + 1;
     }
     return 0;
 }

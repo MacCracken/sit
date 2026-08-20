@@ -4,7 +4,7 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.6.0`. The `1.3.x` line went almost entirely to audit work
+**Where we are**: `1.6.1`. The `1.3.x` line went almost entirely to audit work
 (two security audits, see [`../audit/`](../audit/)) and `1.4.x` to correctness
 and growth curves — `status` is no longer superlinear (4.98× git at 1,000 files,
 was 26.64×), the last four unfuzzed parsers have harnesses, every deferral
@@ -110,21 +110,39 @@ structural item — but for a **narrower reason than first written**.
 > argument for packing is therefore gone: lookups are now flat regardless of store
 > size.** What remains is the plain disk-and-transfer case, which is still strong.
 
-- **Pack bundles + `gc` / repack.** For an identical 1,600-commit history sit's
-  store is **62.8 MB** where git packs to **1.1 MB** (git loose, unpacked: 6.4 MB)
-  — sit has no delta compression or packing, and every object occupies at least
-  one patra page. That is a ~57× disk penalty and it rides on every clone/fetch as
-  bytes on the wire.
+- **Pack bundles + `gc` / repack.** Remeasured 2026-08-20 at 1,600 commits,
+  both sides verified at 1,600 commits — **the previous figures were stale**:
 
-  The git-delta *read* interpreter already exists (1.2.0, `src/git_pack.cyr`);
-  what remains is delta *generation*, on-disk repack, and the negotiated wire
-  capability (which makes it a minor, not a patch).
+  | | previously claimed | measured |
+  |---|---:|---:|
+  | sit `objects.patra` | 62.8 MB | **64.3 MB** |
+  | git packed | 1.1 MB | **1.6 MB** |
+  | git loose | 6.4 MB | **4.3 MB** |
+  | ratio | ~57× | **39×** |
 
-  ⚠ **The 1.4.8 `clone` profile is the strongest evidence for this item.** On a
-  fixture whose tree bytes grow quadratically, git moves the same content in
-  **2.4× the time** purely because each tree is a small delta of the previous
-  one, while sit stores and reads every tree whole. That is the entire gap on
-  the `clone` row — not an algorithmic defect in sit's walk.
+  Still the largest measured gap sit has. Note sit is **15× larger than git's
+  *unpacked* store** as well, so patra page overhead is not the explanation:
+  the fixture's tree content is quadratic in commit count and successive trees
+  are near-identical — exactly what delta compression collapses.
+
+  **Delta *generation* shipped in 1.6.1** (`src/delta.cyr`), differential-tested
+  against the 1.2.0 interpreter: one byte changed in 8 KiB → a 35-byte delta;
+  808 bytes appended to 8 KiB → 842 bytes. What remains is **storage and
+  repack**, which is a storage-format change with four coupled parts:
+
+  1. **Schema** — an `objects` column naming the delta base (declared in *two*
+     places: `object_db.cyr` and `wire.cyr`), plus migration for existing repos.
+  2. **`read_object`** — reconstruct transparently. It is already the documented
+     single choke point, so this part is contained.
+  3. **`fsck` integrity** — it re-hashes stored bytes against the object id.
+     For a delta those bytes are not the content, so the pass must reconstruct
+     first or it will report every deltified object as `bad`.
+  4. **`copy_objects`** — wire transfer copies raw compressed bytes DB-to-DB by
+     design (CLAUDE.md forbids re-hashing on the hot path). A delta's base has
+     to travel with it, and "the base is reachable anyway" needs proving, not
+     assuming.
+
+  A negotiated wire capability is a further step beyond those four. Large.
 
 ---
 
