@@ -4,51 +4,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.6.2] — 2026-08-20 — `sit merge <branch> -m <msg>` works again; `src/` is lint-clean
-
-### Fixed
-
-- ⚠ **1.5.2's octopus dispatch broke `sit merge <branch> -m <msg>`.** It routed
-  to the octopus path on `argc() > 3` and then took **every** argument after
-  `merge` as a branch name, so the flag itself was resolved as one:
-
-  ```
-  sit: cannot resolve '-m'
-  ```
-
-  `cmd_merge` has never implemented `-m` — it ignored trailing arguments — and
-  the CI smoke has passed `-m "merge feature"` since v0.5.x, relying on exactly
-  that tolerance. My dispatch turned a silently-ignored flag into a fatal error.
-
-  Octopus now requires that **every** argument from index 2 on is a real branch
-  name (none beginning with `-`); a flag anywhere falls through to the
-  single-branch path, which is the pre-1.5.2 behaviour. `-S` and `--abort` keep
-  their own dispatch.
-
-  Pinned by regression tests that were A/B'd against the broken dispatch — 3
-  failures there, 0 with the fix — covering `merge <branch> -m <msg>` producing
-  a normal **two**-parent merge, two real branch names still octopus-merging to
-  **three** parents, and `-S` / `--abort` still routing correctly.
-
-  ⚠ Note `-m` remains **accepted and ignored**, which is what it has always
-  been. Honouring it is a separate change with its own tests, and is on the
-  roadmap rather than smuggled into a regression fix.
-
-### Changed (lint)
-
-- **`src/` is lint-clean: 39 warnings → 0.** CI began failing on warnings that
-  `cyrius audit` had been reporting as advisory, and 32 of the 39 were section
-  dividers — `# ── Title ─────…` — where each `─` is **3 bytes** in UTF-8, so a
-  rule that looks ~60 columns wide trips a 120-**byte** limit. Those were
-  trimmed mechanically.
-
-  The other 7 were real: three `zlib_decompress_with_ratio_cap` calls wrapped
-  at argument boundaries (no behaviour change at all), four over-long error
-  strings split into two lines each in the same style the 1.6.0 TLS errors use,
-  and one stray double blank line. No test asserts on any of those strings —
-  checked before rewording, since the integration suite does assert on error
-  text elsewhere.
-
 ## [1.6.1] — 2026-08-20 — the index churn was sit's bug; delta generation lands
 
 ### Fixed
@@ -126,6 +81,49 @@ bytes that would no longer *be* the content), and `copy_objects`' raw DB-to-DB
 transfer needing a delta's base to travel with it — plus migration for existing
 repositories. Generation is the half that can be built and proven in isolation,
 and it has been.
+
+### Fixed
+
+- ⚠ **1.5.2's octopus dispatch broke `sit merge <branch> -m <msg>`.** It routed
+  to the octopus path on `argc() > 3` and then took **every** argument after
+  `merge` as a branch name, so the flag itself was resolved as one:
+
+  ```
+  sit: cannot resolve '-m'
+  ```
+
+  `cmd_merge` has never implemented `-m` — it ignored trailing arguments — and
+  the CI smoke has passed `-m "merge feature"` since v0.5.x, relying on exactly
+  that tolerance. My dispatch turned a silently-ignored flag into a fatal error.
+
+  Octopus now requires that **every** argument from index 2 on is a real branch
+  name (none beginning with `-`); a flag anywhere falls through to the
+  single-branch path, which is the pre-1.5.2 behaviour. `-S` and `--abort` keep
+  their own dispatch.
+
+  Pinned by regression tests that were A/B'd against the broken dispatch — 3
+  failures there, 0 with the fix — covering `merge <branch> -m <msg>` producing
+  a normal **two**-parent merge, two real branch names still octopus-merging to
+  **three** parents, and `-S` / `--abort` still routing correctly.
+
+  ⚠ Note `-m` remains **accepted and ignored**, which is what it has always
+  been. Honouring it is a separate change with its own tests, and is on the
+  roadmap rather than smuggled into a regression fix.
+
+### Changed (lint)
+
+- **`src/` is lint-clean: 39 warnings → 0.** CI began failing on warnings that
+  `cyrius audit` had been reporting as advisory, and 32 of the 39 were section
+  dividers — `# ── Title ─────…` — where each `─` is **3 bytes** in UTF-8, so a
+  rule that looks ~60 columns wide trips a 120-**byte** limit. Those were
+  trimmed mechanically.
+
+  The other 7 were real: three `zlib_decompress_with_ratio_cap` calls wrapped
+  at argument boundaries (no behaviour change at all), four over-long error
+  strings split into two lines each in the same style the 1.6.0 TLS errors use,
+  and one stray double blank line. No test asserts on any of those strings —
+  checked before rewording, since the integration suite does assert on error
+  text elsewhere.
 
 ## [1.6.0] — 2026-08-20 — TLS trust hardening
 
