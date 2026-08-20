@@ -1021,6 +1021,55 @@ fn test_nested_ignore_scope() {
     return 0;
 }
 
+# ── Annotated tag objects (v1.5.0) ────────────────────────────────────────
+# parse_tag_body reads bytes that arrive from any remote — `parse_tree`'s
+# sibling in that respect — so malformed shapes must be rejected, not trusted.
+fn _tag_body(txt) { return txt; }
+
+fn test_parse_tag_body() {
+    test_group("tag.cyr — parse_tag_body (v1.5.0)");
+    var out[40];
+
+    var good = "object 1111111111111111111111111111111111111111111111111111111111111111\ntype commit\ntag v1.0\ntagger sit user <u@l> 1700000000 +0000\n\nrelease notes\n";
+    assert_eq(parse_tag_body(good, strlen(good), &out), 0, "well-formed tag parses");
+    assert_streq(load64(&out),
+      "1111111111111111111111111111111111111111111111111111111111111111",
+      "target oid extracted");
+    assert_streq(load64(&out + 8), "v1.0", "tag name extracted");
+    assert_eq(load64(&out + 32), 1700000000, "tagger timestamp extracted");
+
+    # A tag with no `tag` header is not a tag.
+    var noname = "object 2222222222222222222222222222222222222222222222222222222222222222\ntype commit\ntagger sit user <u@l> 1700000000 +0000\n\nmsg\n";
+    assert_eq(parse_tag_body(noname, strlen(noname), &out) != 0, 1, "missing 'tag' header rejected");
+
+    # Wrong lead header.
+    var wrong = "commit 3333333333333333333333333333333333333333333333333333333333333333\ntag v\n\nm\n";
+    assert_eq(parse_tag_body(wrong, strlen(wrong), &out) != 0, 1, "non-'object' lead header rejected");
+
+    # Non-hex oid must not be accepted as a target.
+    var badhex = "object zzzz111111111111111111111111111111111111111111111111111111111111\ntype commit\ntag v\n\nm\n";
+    assert_eq(parse_tag_body(badhex, strlen(badhex), &out) != 0, 1, "non-hex target oid rejected");
+
+    # Truncated before the oid completes.
+    var trunc = "object 4444\n";
+    assert_eq(parse_tag_body(trunc, strlen(trunc), &out) != 0, 1, "truncated oid rejected");
+
+    # Missing the newline after the oid (would run the name into the hash).
+    var nonl = "object 5555555555555555555555555555555555555555555555555555555555555555 tag v\n";
+    assert_eq(parse_tag_body(nonl, strlen(nonl), &out) != 0, 1, "missing newline after oid rejected");
+
+    # Empty and 1-byte bodies must fail closed, not read past the end.
+    assert_eq(parse_tag_body("", 0, &out) != 0, 1, "empty body rejected");
+    assert_eq(parse_tag_body("o", 1, &out) != 0, 1, "1-byte body rejected");
+
+    # A body with headers but no blank line still yields the name; the message
+    # offset stays unset rather than pointing past the end.
+    var nomsg = "object 6666666666666666666666666666666666666666666666666666666666666666\ntype commit\ntag only\n";
+    assert_eq(parse_tag_body(nomsg, strlen(nomsg), &out), 0, "headers-only tag parses");
+    assert_streq(load64(&out + 8), "only", "name from headers-only tag");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -1049,6 +1098,7 @@ fn main() {
     test_sort_entries_differential();
     test_hfs_dotdir_spoofing();
     test_nested_ignore_scope();
+    test_parse_tag_body();
     return assert_summary();
 }
 

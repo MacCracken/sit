@@ -635,6 +635,69 @@ fn fuzz_tree_entry_name(rounds) {
     return 0;
 }
 
+# parse_tag_body (v1.5.0). Tag objects arrive from any remote and
+# `_serve_rehash_and_insert` accepts a pushed object on framing + SHA-256
+# without parsing its body, so this reads attacker-controlled bytes.
+#
+# Seed-and-mutate, for the reason 1.4.7 established the hard way: pure random
+# bytes never synthesise "object <64 hex>\n" and would exercise only the reject
+# path while reporting a clean pass.
+fn fuzz_parse_tag_body(rounds) {
+    var cap = 1024;
+    var body = alloc(cap);
+    var out[40];
+    var seed = 0x7A600011;
+    var i = 0;
+    while (i < rounds) {
+        # Build a well-formed tag body, then corrupt one byte on most rounds.
+        var w = 0;
+        memcpy(body + w, "object ", 7); w = w + 7;
+        var h = 0;
+        while (h < 64) {
+            var nib = (seed + h * 7) & 0x0F;
+            if (nib < 10) { store8(body + w, 48 + nib); }
+            else { store8(body + w, 97 + nib - 10); }
+            w = w + 1;
+            h = h + 1;
+        }
+        store8(body + w, 10); w = w + 1;
+        memcpy(body + w, "type commit\n", 12); w = w + 12;
+        memcpy(body + w, "tag ", 4); w = w + 4;
+        var nlen = ((seed >> 5) & 0x0F) + 1;
+        var k = 0;
+        while (k < nlen) {
+            store8(body + w, 97 + ((seed + k) & 0x0F));
+            w = w + 1;
+            k = k + 1;
+        }
+        store8(body + w, 10); w = w + 1;
+        memcpy(body + w, "tagger n <e> 1700000000 +0000\n", 30); w = w + 30;
+        store8(body + w, 10); w = w + 1;
+        memcpy(body + w, "msg", 3); w = w + 3;
+        store8(body + w, 10); w = w + 1;
+
+        if ((seed & 3) != 0) {
+            var off = (seed >> 11) % w;
+            store8(body + off, (seed >> 19) & 0xFF);
+        }
+        parse_tag_body(body, w, &out);
+
+        # Truncation at every prefix length: a header that promises more bytes
+        # than the body holds is the shape that would over-read.
+        parse_tag_body(body, (seed >> 7) % (w + 1), &out);
+        parse_tag_body(body, 0, &out);
+
+        # Fully random body covers the shapes the builder cannot produce.
+        var rsize = (seed & 0x1FF) + 1;
+        fill_pseudo_random(body, rsize, seed);
+        parse_tag_body(body, rsize, &out);
+
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn main() {
     alloc_init();
     println("fuzz: zlib_decompress (10000 rounds)");
@@ -665,6 +728,8 @@ fn main() {
     if (fuzz_wildmatch(100000) != 0) { return 1; }
     println("fuzz: tree_entry_name (200000 rounds)");
     if (fuzz_tree_entry_name(200000) != 0) { return 1; }
+    println("fuzz: parse_tag_body (200000 rounds)");
+    if (fuzz_parse_tag_body(200000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

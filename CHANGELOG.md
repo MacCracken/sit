@@ -4,6 +4,108 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-08-20 — Annotated & signed tags, `sit mv`, `sit describe`
+
+**The first feature work since 1.3.0** — every release from 1.3.1 through 1.4.9
+went to hardening, perf or toolchain. Three new commands and a new object type.
+
+### Added
+
+- **Annotated tag objects.** `sit tag -a <name> [-m <msg>] [<commit>]` writes a
+  real **tag object** — a fourth object type alongside blob/tree/commit — and
+  points the ref at *it* rather than at the commit. Body framing is
+  byte-compatible with git's:
+
+  ```
+  object <64-hex>
+  type commit
+  tag <name>
+  tagger <name> <email> <ts> +0000
+
+  <message>
+  ```
+
+  Tags without `-a`/`-s` stay **lightweight** (a ref file holding a commit oid),
+  which is what every tag before 1.5.0 was and what git does too.
+
+- **Signed tags.** `sit tag -s` produces an annotated tag carrying a `sitsig`
+  line, and **`sit verify-tag <tag>`** checks it. This reuses the commit signing
+  path verbatim — `sign_commit_body` only needs a body with a `\n\n`
+  header/message split, which a tag object has, and it signs the payload without
+  the sitsig line so `verify_commit_body` re-parses it identically. There is no
+  tag-specific crypto path, deliberately: a second signing path is a second
+  thing to get wrong.
+
+  `verify-tag` does **not** peel — the signature covers the tag object's body,
+  so peeling would verify the wrong object and report "no signature" on a
+  perfectly good signed tag whose commit happens to be unsigned.
+
+- **`sit mv <src> <dst>`** — renames in the working tree *and* restages in one
+  step. The index half is the point: a bare `mv` leaves the old path staged and
+  the new one untracked, so the next commit records a delete plus an unrelated
+  add. The blob is **reused, not rehashed** — content did not change, and
+  rehashing would be wasted work plus a chance for the two paths to disagree.
+  Guarded on both paths with the same `tree_flat_path_valid` gate `add` uses, so
+  no traversal, no absolute path, no clobbering an existing destination, and no
+  moving an untracked file.
+
+- **`sit describe [<commit>]`** — names a commit by the nearest tag: `v1.0` when
+  the commit *is* the tag, else `v1.0-2-g<short>`. Both tag kinds are honoured;
+  annotated tags are peeled first, so it does not matter which was used.
+
+### Fixed
+
+- ⚠ **`fsck` treated a tag object as a leaf, and `--prune-now` deleted the
+  commit it pointed at.** Found while building this release, before it shipped.
+  `fsck_walk_reachable` classifies objects by framing prefix and handled only
+  `commit ` and `tree `, so a tag object's `object` header was never followed —
+  a commit reachable *only* through an annotated tag read as **dangling**.
+
+  Verified against a pre-fix build on a repo whose reflog had been removed, so
+  the walk was the only thing keeping the commit alive:
+
+  ```
+  dangling tree   6cb793ef…
+  dangling commit 43ad5b09…
+  checked 7 objects, 0 bad, 2 dangling
+  pruned 2 objects
+  ```
+
+  This is the same shape as the S-27 missing-referent bug 1.4.0 closed — the
+  walk not knowing about an edge, rather than the edge being absent. Pinned by
+  an integration test that drops `.sit/logs` first, so reflog protection cannot
+  mask a regression.
+
+### Changed
+
+- **Commands that consume a commit now peel annotated tags**, via a single
+  `resolve_commit_hash` helper rather than eleven scattered call sites: `log`,
+  `diff`, `show`, `reset`, `merge`, `merge-base`. `cat-file` deliberately does
+  **not** peel — it must show the tag object itself.
+
+- **`sf_rename` splits on target arity.** Linux is `rename(old, new)`; AGNOS is
+  `rename(old, oldlen, new, newlen)`. cyrius has treated a syscall-arity
+  mismatch as a **hard error** since 6.5.4 and the check is static, not
+  reachability-based, so the two forms are split textually. `cyrius build
+  --agnos` verified clean.
+
+- **30 commands**, up from 27.
+
+### Tests
+
+- **358 unit assertions** (was 345): `parse_tag_body` — well-formed parse,
+  missing `tag` header, wrong lead header, non-hex oid, truncated oid, missing
+  newline after the oid, empty and 1-byte bodies, and a headers-only tag.
+- **133 integration checks** (was 102): annotated vs lightweight ref targets,
+  peeling across `log`/`merge-base`/`show` with `cat-file` *not* peeling, the
+  reachability regression above, signed/unsigned/lightweight `verify-tag`, `mv`
+  including all five refusal paths and the blob-reuse assertion, and `describe`
+  for exact, offset, annotated and no-tag cases.
+- **15 fuzz harnesses** (was 14): `parse_tag_body`, seed-and-mutate for the
+  reason 1.4.7 established — random bytes never synthesise `object <64 hex>\n`
+  and would exercise only the reject path. Measured non-vacuous: **117,250 of
+  200,000** rounds parse a well-formed body.
+
 ## [1.4.9] — 2026-08-19 — ignore-file completeness, and three roadmap items resolved by measurement
 
 The `1.4.x` patch line is now empty. Of the five items it carried into this

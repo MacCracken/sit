@@ -850,7 +850,7 @@ fn cmd_log() {
     var current_hex = 0;
     if (start_ref != 0) {
         var resolved[72];
-        var rr = resolve_hash(start_ref, &resolved);
+        var rr = resolve_commit_hash(start_ref, &resolved);
         if (rr != 1) {
             syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
             syscall(SYS_WRITE, STDERR, start_ref, strlen(start_ref));

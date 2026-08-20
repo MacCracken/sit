@@ -443,7 +443,7 @@ fn cmd_merge_base() {
     }
 
     var resa[72];
-    if (resolve_hash(argv(2), &resa) != 1) {
+    if (resolve_commit_hash(argv(2), &resa) != 1) {
         syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
         syscall(SYS_WRITE, STDERR, argv(2), strlen(argv(2)));
         syscall(SYS_WRITE, STDERR, "'\n", 2);
@@ -454,7 +454,7 @@ fn cmd_merge_base() {
     store8(ha + 64, 0);
 
     var resb[72];
-    if (resolve_hash(argv(3), &resb) != 1) {
+    if (resolve_commit_hash(argv(3), &resb) != 1) {
         syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
         syscall(SYS_WRITE, STDERR, argv(3), strlen(argv(3)));
         syscall(SYS_WRITE, STDERR, "'\n", 2);
@@ -603,7 +603,7 @@ fn cmd_merge() {
     var tnlen = strlen(target_name);
 
     var target_hex[72];
-    var rr = resolve_hash(target_name, &target_hex);
+    var rr = resolve_commit_hash(target_name, &target_hex);
     if (rr == 0 - 2) { eprintln("sit: merge target too short"); return 1; }
     if (rr == 0 - 1) { eprintln("sit: ambiguous merge target"); return 1; }
     if (rr == 0)     {

@@ -970,7 +970,7 @@ fn cmd_diff() {
     var tree_b_entries = 0;
     if (ref_a != 0) {
         var r[72];
-        if (resolve_hash(ref_a, &r) != 1) {
+        if (resolve_commit_hash(ref_a, &r) != 1) {
             syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
             syscall(SYS_WRITE, STDERR, ref_a, strlen(ref_a));
             syscall(SYS_WRITE, STDERR, "'\n", 2);
@@ -984,7 +984,7 @@ fn cmd_diff() {
     }
     if (ref_b != 0) {
         var r[72];
-        if (resolve_hash(ref_b, &r) != 1) {
+        if (resolve_commit_hash(ref_b, &r) != 1) {
             syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
             syscall(SYS_WRITE, STDERR, ref_b, strlen(ref_b));
             syscall(SYS_WRITE, STDERR, "'\n", 2);
@@ -1235,7 +1235,7 @@ fn cmd_show() {
         store8(&hex + 64, 0);
     }
     else {
-        var rr = resolve_hash(hash_arg, &hex);
+        var rr = resolve_commit_hash(hash_arg, &hex);
         if (rr == 0 - 2) { eprintln("sit: hash prefix too short (min 4 chars)"); return 1; }
         if (rr == 0 - 1) { eprintln("sit: ambiguous hash prefix"); return 1; }
         if (rr == 0)     { eprintln("sit: no object matches"); return 1; }

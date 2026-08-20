@@ -46,16 +46,19 @@ fn print_usage() {
     eprintln("  init                    create an empty sit repository");
     eprintln("  add [-f] <path>         hash and store a file as a blob object");
     eprintln("  rm [--cached] <path>    remove a tracked file from working tree and index");
+    eprintln("  mv <src> <dst>          rename a tracked file in the working tree and index");
     eprintln("  branch [-d <name>|<name>]  list / create / delete branch (-d deletes)");
     eprintln("  checkout [-b] <branch>  switch to <branch>, optionally creating it first");
-    eprintln("  tag [-d <name>|<name> [<commit>]]  list / create / delete tag (-d deletes)");
+    eprintln("  tag [-a|-s] [-d <name>|<name> [-m <msg>] [<commit>]]  list / create / delete tag");
     eprintln("  merge <branch>          merge <branch> into HEAD (fast-forward or 3-way)");
     eprintln("  merge-base <a> <b>      print the lowest common ancestor of two commits");
+    eprintln("  describe [<commit>]     name a commit by the nearest tag (tag-N-g<short>)");
     eprintln("  reset <path> | --hard <ref>  unstage a path, or move HEAD to <ref>");
     eprintln("  config [--global] <key> [<value>]  read or write a config value");
     eprintln("  fsck [--prune]          verify object integrity; --prune removes dangling objects");
     eprintln("  key generate | show     manage the local ed25519 signing key (~/.sit/)");
     eprintln("  verify-commit [<hash>]  verify a commit's sitsig signature (defaults HEAD)");
+    eprintln("  verify-tag <tag>        verify an annotated tag's sitsig signature");
     eprintln("  remote add|list|remove  manage named remotes (file/http/https/ssh)");
     eprintln("  fetch <remote> [<ref>]  copy objects + ref from a remote (no merge)");
     eprintln("  pull <remote> [<ref>]   fetch + fast-forward merge (diverged → use merge)");
@@ -87,6 +90,7 @@ fn main() {
     if (streq(cmd, "init")     == 1) { return cmd_init(); }
     if (streq(cmd, "add")      == 1) { return cmd_add(); }
     if (streq(cmd, "rm")       == 1) { return cmd_rm(); }
+    if (streq(cmd, "mv")       == 1) { return cmd_mv(); }
     if (streq(cmd, "branch")   == 1) { return cmd_branch(); }
     if (streq(cmd, "checkout") == 1) { return cmd_checkout(); }
     if (streq(cmd, "tag")      == 1) { return cmd_tag(); }
@@ -97,6 +101,8 @@ fn main() {
     if (streq(cmd, "fsck")     == 1) { return cmd_fsck(); }
     if (streq(cmd, "key")      == 1) { return cmd_key(); }
     if (streq(cmd, "verify-commit") == 1) { return cmd_verify_commit(); }
+    if (streq(cmd, "verify-tag")    == 1) { return cmd_verify_tag(); }
+    if (streq(cmd, "describe")      == 1) { return cmd_describe(); }
     if (streq(cmd, "remote")   == 1) { return cmd_remote(); }
     if (streq(cmd, "fetch")    == 1) { return cmd_fetch(); }
     if (streq(cmd, "pull")     == 1) { return cmd_pull(); }

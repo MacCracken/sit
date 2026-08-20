@@ -401,6 +401,9 @@ fn type_code_of(type_str, type_len) {
     if (type_len == 6) {
         if (memeq(type_str, "commit", 6) == 1) { return 2; }
     }
+    if (type_len == 3) {
+        if (memeq(type_str, "tag", 3) == 1) { return 3; }
+    }
     return 0 - 1;
 }
 
@@ -893,6 +896,26 @@ fn fsck_walk_reachable(root, seen) {
                         }
                     }
                 }
+                # v1.5.0: an annotated tag object names its target in an
+                # `object` header. Without this the walk treats a tag as a LEAF
+                # and never reaches the commit it tags — so a commit reachable
+                # only through a tag reads as dangling, and `fsck --prune-now`
+                # deletes it. Same shape as the S-27 missing-referent bug: the
+                # walk not knowing about an edge, not the edge being absent.
+                #
+                # "tag " (4) cannot collide with "tree " (5) — second byte
+                # differs — so the prefix test is unambiguous.
+                if (blen >= 4) {
+                    if (memeq(buf, "tag ", 4) == 1) {
+                        var tinfo[40];
+                        if (parse_tag_body(body, body_len, &tinfo) == 0) {
+                            var tgt = load64(&tinfo);
+                            if (tgt != 0) {
+                                if (map_has(seen, tgt) == 0) { vec_push(queue, tgt); }
+                            }
+                        }
+                    }
+                }
                 # blob: leaf — no further enqueue.
             }
         }
@@ -906,6 +929,7 @@ fn fsck_ty_word(ty) {
     if (ty == 0) { return "blob"; }
     if (ty == 1) { return "tree"; }
     if (ty == 2) { return "commit"; }
+    if (ty == 3) { return "tag"; }
     return 0;
 }
 

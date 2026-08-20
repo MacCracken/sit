@@ -1,0 +1,441 @@
+# tag.cyr — annotated (and signed) tag objects.
+#
+# Until v1.5.0 every `sit tag` was a LIGHTWEIGHT tag: a file under
+# `.sit/refs/tags/<name>` holding a commit oid. That stays the default, exactly
+# as in git. `-a` / `-s` instead write a real **tag object** and point the ref
+# at that, so the tag carries a tagger, a timestamp and a message of its own.
+#
+# Body framing is byte-compatible with git's tag object:
+#
+#   object <64-hex>\n
+#   type commit\n
+#   tag <name>\n
+#   tagger <name> <email> <ts> +0000\n
+#   \n
+#   <message>\n
+#
+# A signed tag reuses the commit machinery verbatim — `sign_commit_body` only
+# needs a body with a `\n\n` header/message split, which this has, and it signs
+# the payload without the sitsig line so `verify_commit_body` re-parses it the
+# same way. No tag-specific crypto path exists, and none should: a second
+# signing path is a second thing to get wrong.
+
+# patra `ty` code for a tag object. blob=0, tree=1, commit=2 (object_db.cyr).
+var OBJ_TY_TAG = 3;
+
+# Max links followed by peel_tag. A tag object may name another tag, and two
+# hostile tags can name each other; the cap makes that terminate. Same shape as
+# _WIRE_MAX_DEPTH in the tree walk.
+var TAG_PEEL_MAX = 16;
+
+# Upper bound on the first-parent walk in `describe`. A repository with more
+# history than this simply reports no tag rather than walking indefinitely on a
+# cyclic or hostile parent chain.
+var SIT_DESCRIBE_MAX = 100000;
+
+# Build an annotated tag object body. `seed` non-zero also signs it.
+# Returns the heap body with its length at *out_len, or 0 on failure.
+fn build_tag_body(target_hex, name, message, seed, out_len) {
+    # Same identity resolution and sanitisation as build_commit_signed:
+    # env -> .sit/config -> ~/.sitconfig -> fallback, then S-27 stripping of
+    # control bytes and <> BEFORE framing, so a newline in SIT_AUTHOR_NAME
+    # cannot forge a `object`/`type`/`tag` header line here either.
+    var tname = getenv("SIT_AUTHOR_NAME");
+    if (tname == 0) { tname = config_get("user.name"); }
+    if (tname == 0) { tname = "sit user"; }
+    var temail = getenv("SIT_AUTHOR_EMAIL");
+    if (temail == 0) { temail = config_get("user.email"); }
+    if (temail == 0) { temail = "user@localhost"; }
+    tname = ident_sanitized(tname);
+    temail = ident_sanitized(temail);
+    if (strlen(tname) == 0) { tname = "sit user"; }
+    if (strlen(temail) == 0) { temail = "user@localhost"; }
+
+    var ts = clock_epoch_secs();
+    var nlen = strlen(name);
+    var tnlen = strlen(tname);
+    var telen = strlen(temail);
+    var mlen = strlen(message);
+
+    var cap = 512 + nlen + tnlen + telen + mlen;
+    var body = alloc_or_die(cap);
+    var pos = 0;
+
+    memcpy(body + pos, "object ", 7); pos = pos + 7;
+    memcpy(body + pos, target_hex, 64); pos = pos + 64;
+    store8(body + pos, 10); pos = pos + 1;
+
+    # sit tags always point at a commit today; `type` is emitted anyway so the
+    # object stays git-shaped and a future tag-of-tag has somewhere to say so.
+    memcpy(body + pos, "type commit\n", 12); pos = pos + 12;
+
+    memcpy(body + pos, "tag ", 4); pos = pos + 4;
+    memcpy(body + pos, name, nlen); pos = pos + nlen;
+    store8(body + pos, 10); pos = pos + 1;
+
+    memcpy(body + pos, "tagger ", 7); pos = pos + 7;
+    memcpy(body + pos, tname, tnlen); pos = pos + tnlen;
+    memcpy(body + pos, " <", 2); pos = pos + 2;
+    memcpy(body + pos, temail, telen); pos = pos + telen;
+    memcpy(body + pos, "> ", 2); pos = pos + 2;
+    var digits = write_decimal(body + pos, ts); pos = pos + digits;
+    memcpy(body + pos, " +0000\n", 7); pos = pos + 7;
+
+    store8(body + pos, 10); pos = pos + 1;          # blank line
+    memcpy(body + pos, message, mlen); pos = pos + mlen;
+    if (mlen > 0) {
+        if (load8(body + pos - 1) != 10) { store8(body + pos, 10); pos = pos + 1; }
+    }
+
+    if (seed == 0) {
+        store64(out_len, pos);
+        return body;
+    }
+    var slen[8];
+    var signed_body = sign_commit_body(body, pos, seed, &slen);
+    if (signed_body == 0) { return 0; }
+    store64(out_len, load64(&slen));
+    return signed_body;
+}
+
+# Write an annotated tag object. Returns its heap hex oid, or 0.
+fn write_tag_object(target_hex, name, message, seed) {
+    var blen[8];
+    var body = build_tag_body(target_hex, name, message, seed, &blen);
+    if (body == 0) { return 0; }
+    return write_typed_object("tag", 3, body, load64(&blen));
+}
+
+# Parse a tag object body. Writes to `out` (40 bytes):
+#   0..8   target oid (heap cstring, 64 hex + NUL)
+#   8..16  tag name (heap cstring)
+#   16..24 tagger line start offset, or 0 - 1 if absent
+#   24..32 message start offset, or 0 - 1 if absent
+#   32..40 tagger timestamp (epoch secs), or 0
+# Returns 0 on success, non-zero if the body is not a well-formed tag.
+#
+# Every field is bounds-checked against `body_len` before it is read: a tag
+# object can arrive from any remote, and `_serve_rehash_and_insert` validates
+# framing and SHA-256 but does not parse bodies.
+fn parse_tag_body(body, body_len, out) {
+    store64(out, 0);
+    store64(out + 8, 0);
+    store64(out + 16, 0 - 1);
+    store64(out + 24, 0 - 1);
+    store64(out + 32, 0);
+
+    if (body_len < 7) { return 0 - 1; }
+    if (memeq(body, "object ", 7) == 0) { return 0 - 1; }
+    if (body_len < 7 + 64 + 1) { return 0 - 1; }
+    if (hex_prefix_valid(body + 7, 64) == 0) { return 0 - 1; }
+    if (load8(body + 7 + 64) != 10) { return 0 - 1; }
+    var target = alloc(65);
+    memcpy(target, body + 7, 64);
+    store8(target + 64, 0);
+    store64(out, target);
+
+    var pos = 7 + 64 + 1;
+    var found_name = 0;
+    var in_headers = 1;
+    while (in_headers == 1) {
+        if (pos >= body_len) { in_headers = 0; }
+        else {
+            if (load8(body + pos) == 10) {
+                store64(out + 24, pos + 1);       # blank line ends the headers
+                in_headers = 0;
+            }
+            else {
+                var eol = pos;
+                while (eol < body_len) {
+                    if (load8(body + eol) == 10) { break; }
+                    eol = eol + 1;
+                }
+                var line_len = eol - pos;
+                if (line_len > 4) {
+                    if (memeq(body + pos, "tag ", 4) == 1) {
+                        var tl = line_len - 4;
+                        var tg = alloc(tl + 1);
+                        memcpy(tg, body + pos + 4, tl);
+                        store8(tg + tl, 0);
+                        store64(out + 8, tg);
+                        found_name = 1;
+                    }
+                }
+                if (line_len > 7) {
+                    if (memeq(body + pos, "tagger ", 7) == 1) {
+                        store64(out + 16, pos);
+                        var info[24];
+                        if (parse_author_line(body + pos, line_len, 7, &info) == 0) {
+                            store64(out + 32, load64(&info + 8));
+                        }
+                    }
+                }
+                if (eol >= body_len) { in_headers = 0; }
+                else { pos = eol + 1; }
+            }
+        }
+    }
+    if (found_name == 0) { return 0 - 1; }
+    return 0;
+}
+
+# If `hex` names a tag object, follow `object` until a non-tag is reached and
+# return that oid (heap cstring). If it is not a tag, returns a copy of `hex`.
+# Returns 0 if an object in the chain is missing or malformed.
+#
+# Bounded at TAG_PEEL_MAX links: a tag object can name another tag, and a
+# hostile pair can name each other. Refusing at the cap is the same shape as
+# _WIRE_MAX_DEPTH in the tree walk.
+fn peel_tag(hex) {
+    var cur = alloc(65);
+    memcpy(cur, hex, 64);
+    store8(cur + 64, 0);
+
+    var links = 0;
+    var peeling = 1;
+    while (peeling == 1) {
+        var obj[24];
+        if (read_object(cur, &obj) != 0) { return 0; }
+        var buf = load64(&obj);
+        var blen = load64(&obj + 8);
+        var coff = load64(&obj + 16);
+        if (memeq(buf, "tag ", 4) == 0) { peeling = 0; }
+        else {
+            links = links + 1;
+            if (links > TAG_PEEL_MAX) {
+                eprintln("sit: tag chain exceeds 16 links — refusing to peel further");
+                return 0;
+            }
+            var info[40];
+            if (parse_tag_body(buf + coff, blen - coff, &info) != 0) { return 0; }
+            var nxt = load64(&info);
+            if (nxt == 0) { return 0; }
+            cur = nxt;
+        }
+    }
+    return cur;
+}
+
+# Resolve `prefix` to a COMMIT oid, peeling an annotated tag if that is what it
+# names. Same contract as resolve_hash: writes 64 hex + NUL into out_buf and
+# returns 1 on success, so it is a drop-in at the sites that need a commit.
+#
+# Used by the commands that consume a commit (`log`, `diff`, `show`, `reset`,
+# `merge`, `merge-base`, `checkout`). Deliberately NOT used by `cat-file`, which
+# must show the tag object itself, or by `verify-commit`, which is told exactly
+# which object to check.
+#
+# Costs one extra read_object per command invocation on a non-tag argument —
+# once per command, not per object walked.
+fn resolve_commit_hash(prefix, out_buf) {
+    if (resolve_hash(prefix, out_buf) != 1) { return 0; }
+    var peeled = peel_tag(out_buf);
+    if (peeled == 0) { return 0; }
+    memcpy(out_buf, peeled, 64);
+    store8(out_buf + 64, 0);
+    return 1;
+}
+
+# `sit verify-tag [<tag>]` — verify an annotated tag's sitsig signature.
+#
+# Mirrors cmd_verify_commit, and deliberately does NOT peel: the signature
+# covers the TAG object's body, so peeling to the commit would verify the wrong
+# object (and would report "no signature" on a perfectly good signed tag whose
+# commit happens to be unsigned).
+fn cmd_verify_tag() {
+    if (sf_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+    if (argc() < 3) {
+        eprintln("usage: sit verify-tag <tag>");
+        return 1;
+    }
+
+    var arg = argv_heap(2);
+    var hex[72];
+    # A bare tag name resolves via refs/tags/; anything else goes through the
+    # normal oid/prefix path, so `sit verify-tag <oid>` works too.
+    var nlen = strlen(arg);
+    var tpath = alloc(15 + nlen + 1);
+    memcpy(tpath, ".sit/refs/tags/", 15);
+    memcpy(tpath + 15, arg, nlen);
+    store8(tpath + 15 + nlen, 0);
+    var resolved = 0;
+    if (refname_valid(arg) == 1) {
+        if (sf_exists(tpath) == 1) {
+            var pair[16];
+            if (read_file_heap(tpath, &pair) == 0) {
+                var rb = load64(&pair);
+                var rl = load64(&pair + 8);
+                if (rl >= 64) {
+                    if (hex_prefix_valid(rb, 64) == 1) {
+                        memcpy(&hex, rb, 64);
+                        store8(&hex + 64, 0);
+                        resolved = 1;
+                    }
+                }
+            }
+        }
+    }
+    if (resolved == 0) {
+        var rr = resolve_hash(arg, &hex);
+        if (rr == 0 - 2) { eprintln("sit: hash prefix too short (min 4 chars)"); return 1; }
+        if (rr == 0 - 1) { eprintln("sit: ambiguous hash prefix"); return 1; }
+        if (rr == 0)     { eprintln("sit: no such tag or object"); return 1; }
+    }
+
+    var obj[24];
+    if (read_object(&hex, &obj) != 0) {
+        eprintln("sit: cannot read object");
+        return 1;
+    }
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    if (blen < 4) { eprintln("sit: not a tag object"); return 1; }
+    if (memeq(buf, "tag ", 4) == 0) {
+        eprintln("sit: not an annotated tag (lightweight tags carry no signature)");
+        return 1;
+    }
+    var body = buf + coff;
+    var body_len = blen - coff;
+
+    var pk[32];
+    var vr = verify_commit_body(body, body_len, &pk);
+    if (vr == 0 - 1) {
+        stdout_write("no signature on tag ", 20);
+        stdout_write(arg, nlen);
+        stdout_write("\n", 1);
+        return 1;
+    }
+    var pk_hex = hex_encode(&pk, 32);
+    if (vr == 1) {
+        stdout_write("good signature on tag ", 22);
+        stdout_write(arg, nlen);
+        stdout_write(" (key ", 6);
+        stdout_write(pk_hex, 64);
+        stdout_write(")\n", 2);
+        return 0;
+    }
+    stdout_write("BAD signature on tag ", 21);
+    stdout_write(arg, nlen);
+    stdout_write(" (key ", 6);
+    stdout_write(pk_hex, 64);
+    stdout_write(")\n", 2);
+    return 1;
+}
+
+# `sit describe [<commit>]` — name a commit by the nearest tag reachable from
+# it, git-style: `<tag>` when the commit IS the tag, else
+# `<tag>-<n>-g<short>` where n is the number of commits since the tag.
+#
+# Both tag kinds are honoured: a lightweight tag names its commit directly, an
+# annotated tag is peeled first, so `describe` does not care which was used.
+fn cmd_describe() {
+    if (sf_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+
+    var start = 0;
+    if (argc() >= 3) {
+        var hex[72];
+        if (resolve_commit_hash(argv_heap(2), &hex) != 1) {
+            eprintln("sit: cannot resolve commit");
+            return 1;
+        }
+        start = alloc(65);
+        memcpy(start, &hex, 64);
+        store8(start + 64, 0);
+    }
+    else {
+        start = read_head_ref();
+        if (start == 0) { eprintln("sit: no commits yet"); return 1; }
+    }
+
+    # commit-oid -> tag-name, built once. Annotated tags are peeled so both
+    # kinds land on the commit they describe.
+    if (sf_exists(".sit/refs/tags") != 1) {
+        eprintln("sit: no tags found to describe");
+        return 1;
+    }
+    var raw = sf_dir_list(str_from(".sit/refs/tags"));
+    var tagmap = map_new();
+    var tn = vec_len(raw);
+    var ti = 0;
+    while (ti < tn) {
+        var s = vec_get(raw, ti);
+        var slen = str_len(s);
+        var nm = alloc(slen + 1);
+        memcpy(nm, str_data(s), slen);
+        store8(nm + slen, 0);
+
+        var tpath = alloc(15 + slen + 1);
+        memcpy(tpath, ".sit/refs/tags/", 15);
+        memcpy(tpath + 15, nm, slen);
+        store8(tpath + 15 + slen, 0);
+        var pair[16];
+        if (read_file_heap(tpath, &pair) == 0) {
+            var rb = load64(&pair);
+            var rl = load64(&pair + 8);
+            if (rl >= 64) {
+                if (hex_prefix_valid(rb, 64) == 1) {
+                    var oid = alloc(65);
+                    memcpy(oid, rb, 64);
+                    store8(oid + 64, 0);
+                    var peeled = peel_tag(oid);
+                    if (peeled != 0) {
+                        # First tag wins for a given commit — deterministic
+                        # because sf_dir_list is sorted below.
+                        if (map_has(tagmap, peeled) == 0) { map_set(tagmap, peeled, nm); }
+                    }
+                }
+            }
+        }
+        ti = ti + 1;
+    }
+
+    # Walk back from `start`, counting distance. First-parent order matches
+    # git's default `describe` behaviour on merge-bearing history.
+    var cur = start;
+    var depth = 0;
+    var walking = 1;
+    var found = 0;
+    while (walking == 1) {
+        if (map_has(tagmap, cur) == 1) { found = 1; walking = 0; }
+        else {
+            var parents = commit_parents_of(cur);
+            if (parents == 0) { walking = 0; }
+            else {
+                if (vec_len(parents) == 0) { walking = 0; }
+                else {
+                    cur = vec_get(parents, 0);
+                    depth = depth + 1;
+                    if (depth > SIT_DESCRIBE_MAX) {
+                        eprintln("sit: describe walked too far without finding a tag");
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if (found == 0) {
+        eprintln("sit: no tag found describing this commit");
+        return 1;
+    }
+
+    var tagname = map_get(tagmap, cur);
+    stdout_write(tagname, strlen(tagname));
+    if (depth > 0) {
+        stdout_write("-", 1);
+        var nbuf[24];
+        var d = write_decimal(&nbuf, depth);
+        stdout_write(&nbuf, d);
+        stdout_write("-g", 2);
+        stdout_write(start, 12);
+    }
+    stdout_write("\n", 1);
+    return 0;
+}

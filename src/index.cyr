@@ -283,6 +283,29 @@ fn index_upsert(hash_hex, path) {
     return 0;
 }
 
+# Remove one path from the staging index. Mirrors index_upsert's targeted
+# delete (v1.4.6) rather than going through rewrite_index, so removing a path
+# stays O(1) rows written instead of rewriting the whole table.
+fn index_remove_path(path) {
+    var db = get_index_db();
+    if (db == 0) { return 0 - 1; }
+    var plen = strlen(path);
+    if (plen == 0) { return 0 - 1; }
+
+    # `path` is external data, so it is escaped into the statement rather than
+    # concatenated raw — same reasoning as index_upsert.
+    var sql = alloc_or_die(plen + plen + 64);
+    var pfx = "DELETE FROM entries WHERE path = '";
+    var pl = strlen(pfx);
+    memcpy(sql, pfx, pl);
+    var w = pl + patra_quote_str(sql + pl, path, plen);
+    store8(sql + w, 39);
+    w = w + 1;
+    store8(sql + w, 0);
+    if (patra_exec(db, sql) != 0) { return 0 - 1; }
+    return 0;
+}
+
 # Staging entry layout (40 bytes):
 #   0..32:  raw hash bytes (SHA-256, decoded from the hex in .sit/index)
 #   32..40: path ptr (heap, null-terminated)
@@ -460,7 +483,7 @@ fn cmd_reset() {
         }
         var target = argv_heap(3);
         var hex[72];
-        var rr = resolve_hash(target, &hex);
+        var rr = resolve_commit_hash(target, &hex);
         if (rr != 1) {
             syscall(SYS_WRITE, STDERR, "sit: cannot resolve '", 21);
             syscall(SYS_WRITE, STDERR, target, strlen(target));
@@ -1075,3 +1098,97 @@ fn load_sitignore() {
 # Recursive working-dir walker. Entries are pushed as full repo-relative
 # paths ("src/main.cyr"). Hardcoded skip: `.sit/`. Everything else is
 # included unless it matches a `.sitignore` pattern.
+
+# Rename a path on disk.
+#
+# Linux is `rename(old, new)`; AGNOS is `rename(old, oldlen, new, newlen)` —
+# different ARITY, and cyrius has treated a syscall-arity mismatch as a hard
+# error since 6.5.4 (it is a static check, not reachability-based), so the two
+# forms must be split textually rather than behind a runtime branch. Same shape
+# as wire_ssh.cyr's SYS_ACCESS gate.
+fn sf_rename(old, new) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return syscall(SYS_RENAME, old, strlen(old), new, strlen(new));
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return syscall(SYS_RENAME, old, new);
+    #endif
+}
+
+# `sit mv <src> <dst>` — rename in the working tree AND restage in one step.
+#
+# The point is the index half: `mv` on its own leaves the old path staged and
+# the new one untracked, so the next commit records a delete plus an unrelated
+# add. Doing both together keeps the staged content identical and only the path
+# changes — which is what makes a rename readable in history.
+fn cmd_mv() {
+    if (sf_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+    if (argc() < 4) {
+        eprintln("usage: sit mv <src> <dst>");
+        return 1;
+    }
+    var src = argv_heap(2);
+    var dst = argv_heap(3);
+
+    # Both paths are external input that become on-disk targets AND tree entry
+    # names, so they get the same gate `add` applies (S-03): no traversal, no
+    # absolute path, no reserved or unsafe name.
+    if (tree_flat_path_valid(src) == 0) {
+        eprintln("sit: invalid source path");
+        return 1;
+    }
+    if (tree_flat_path_valid(dst) == 0) {
+        eprintln("sit: invalid destination path");
+        return 1;
+    }
+    if (streq(src, dst) == 1) {
+        eprintln("sit: source and destination are the same path");
+        return 1;
+    }
+    if (sf_exists(src) != 1) {
+        eprintln("sit: source path does not exist");
+        return 1;
+    }
+    if (sf_exists(dst) == 1) {
+        eprintln("sit: destination already exists");
+        return 1;
+    }
+
+    # The source must be tracked; moving an untracked file is `mv`, not `sit mv`,
+    # and silently staging it would be a surprise.
+    var entries = parse_index();
+    var e = index_find(entries, src);
+    if (e == 0) {
+        eprintln("sit: source path is not tracked (run 'sit add' first)");
+        return 1;
+    }
+    var hash_hex = hex_encode(entry_hash(e), 32);
+
+    ensure_parent_dirs(dst);
+    if (sf_rename(src, dst) != 0) {
+        eprintln("sit: failed to rename");
+        return 1;
+    }
+
+    # Index: drop the old path, stage the new one at the SAME blob. No rehash —
+    # the content did not change, and rehashing would be both wasted work and a
+    # chance for the two paths to disagree.
+    if (index_remove_path(src) != 0) {
+        eprintln("sit: renamed on disk but failed to unstage the old path");
+        return 1;
+    }
+    if (index_upsert(hash_hex, dst) != 0) {
+        eprintln("sit: renamed on disk but failed to stage the new path");
+        return 1;
+    }
+
+    stdout_write("renamed ", 8);
+    stdout_write(src, strlen(src));
+    stdout_write(" -> ", 4);
+    stdout_write(dst, strlen(dst));
+    stdout_write("\n", 1);
+    return 0;
+}

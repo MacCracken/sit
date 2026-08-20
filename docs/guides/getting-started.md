@@ -413,7 +413,12 @@ Simplifications vs git (documented in `src/index.cyr`): a non-segment `**` (e.g.
 - `sit rm [--cached] <path>` — remove a tracked file from working tree + index (or just the index with `--cached`)
 - `sit branch [<name>]` — list branches, or create one at HEAD
 - `sit checkout [-b] <branch>` — switch branches; `-b` creates the branch first at HEAD
-- `sit tag [<name> [<commit>]]` — list tags, or create a lightweight tag at HEAD (or at a given commit)
+- `sit tag [<name> [<commit>]]` — list tags, or create a **lightweight** tag at HEAD (or at a given commit): a ref file holding a commit oid, which is what every tag was before 1.5.0
+- `sit tag -a <name> [-m <msg>] [<commit>]` — create an **annotated** tag (1.5.0): writes a real *tag object* carrying a tagger, timestamp and message, and points the ref at that object rather than at the commit. The framing is byte-compatible with git's tag object. Commands that need a commit (`log`, `diff`, `show`, `reset`, `merge`, `merge-base`, `describe`) peel the tag automatically; `cat-file` shows the tag object itself
+- `sit tag -s <name> [-m <msg>] [<commit>]` — annotated **and** ed25519-signed, using the same `sitsig` machinery as `sit commit -S`
+- `sit verify-tag <tag>` — check an annotated tag's signature. Does *not* peel: the signature covers the tag object, so a signed tag verifies even when the commit it names is unsigned. Lightweight tags are refused (they carry no signature)
+- `sit describe [<commit>]` — name a commit by the nearest tag: `v1.0` if the commit *is* the tag, otherwise `v1.0-2-g<short>` (tag, commits since, abbreviated oid). Works with either tag kind
+- `sit mv <src> <dst>` — rename a **tracked** file in the working tree *and* the index in one step. Doing both together keeps the staged content identical so the commit reads as a rename rather than an unrelated delete + add; the blob is reused, not rehashed. Refuses a missing or untracked source, an existing destination, a no-op rename, and any path that fails the same validation `sit add` applies
 - `sit merge <branch>` — fast-forward when possible; otherwise 3-way merge with line-level diff3. Edits on different regions of the same file auto-merge; truly overlapping edits fall back to `<<<<<<<`/`=======`/`>>>>>>>` markers, save `.sit/MERGE_HEAD`, and wait for you to resolve + `sit add` + `sit commit` (which emits a 2-parent commit). `sit merge --abort` cancels the merge and restores HEAD.
 - `sit reset <path>` — unstage: rewrite the index entry for the path to HEAD's tree hash (or drop it if HEAD doesn't have it). Working tree untouched.
 - `sit reset --hard <ref>` — move the current branch's ref to `<ref>` (branch / tag / commit hex) and restore the working tree to that commit.

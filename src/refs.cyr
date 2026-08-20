@@ -370,7 +370,27 @@ fn cmd_tag() {
         return 0;
     }
 
-    var name = argv_heap(2);
+    # v1.5.0: -a (annotated) / -s (annotated + signed) write a real tag object
+    # and point the ref at IT rather than at the commit. Without either flag a
+    # tag stays lightweight — a ref file holding a commit oid — which is what
+    # every tag before 1.5.0 was, and what git does too.
+    var annotated = 0;
+    var sign_tag = 0;
+    var argi = 2;
+    if (streq(argv(2), "-a") == 1) { annotated = 1; argi = 3; }
+    else {
+        if (streq(argv(2), "-s") == 1) { annotated = 1; sign_tag = 1; argi = 3; }
+    }
+
+    var tagmsg = 0;
+    if (annotated == 1) {
+        if (argc() <= argi) {
+            eprintln("usage: sit tag -a|-s <name> [-m <msg>] [<commit>]");
+            return 1;
+        }
+    }
+
+    var name = argv_heap(argi);
     var nlen = strlen(name);
     # S-02: tag names follow the same ref-format grammar as branches.
     if (refname_valid(name) == 0) {
@@ -389,9 +409,25 @@ fn cmd_tag() {
         return 1;
     }
 
+    # -m <msg> and an optional <commit>, in either order after the name.
+    var targ_i = argi + 1;
+    if (annotated == 1) {
+        if (argc() > targ_i) {
+            if (streq(argv(targ_i), "-m") == 1) {
+                if (argc() <= targ_i + 1) {
+                    eprintln("sit: -m requires a message");
+                    return 1;
+                }
+                tagmsg = argv_heap(targ_i + 1);
+                targ_i = targ_i + 2;
+            }
+        }
+        if (tagmsg == 0) { tagmsg = name; }
+    }
+
     var target_hex = 0;
-    if (argc() >= 4) {
-        var prefix = argv_heap(3);
+    if (argc() > targ_i) {
+        var prefix = argv_heap(targ_i);
         var hex[72];
         var rr = resolve_hash(prefix, &hex);
         if (rr != 1) {
@@ -413,8 +449,29 @@ fn cmd_tag() {
     ensure_dir(".sit/refs/tags");
     ensure_parent_dirs(path);
 
+    # An annotated tag stores an object and the ref points at THAT; the commit
+    # is reachable by peeling. fsck's reachability walk peels the same way, so
+    # the tagged commit is not reported dangling.
+    var ref_hex = target_hex;
+    if (annotated == 1) {
+        var seed = 0;
+        if (sign_tag == 1) {
+            seed = load_signing_seed();
+            if (seed == 0) {
+                eprintln("sit: no signing key (run 'sit key generate')");
+                return 1;
+            }
+        }
+        var tag_hex = write_tag_object(target_hex, name, tagmsg, seed);
+        if (tag_hex == 0) {
+            eprintln("sit: failed to write tag object");
+            return 1;
+        }
+        ref_hex = tag_hex;
+    }
+
     var buf = alloc(66);
-    memcpy(buf, target_hex, 64);
+    memcpy(buf, ref_hex, 64);
     store8(buf + 64, 10);
     store8(buf + 65, 0);
     if (sf_write_all(path, buf, 65) < 0) {

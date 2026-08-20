@@ -589,6 +589,114 @@ printf '!d.tmp\n' > sub/deep/.sitignore
 assert_contains "$("$SIT" status)" "sub/deep/d.tmp" \
   "deeper '!' rule re-includes what the shallower rule ignored"
 
+# ── 16. Annotated + signed tags (1.5.0) ────────────────────────────
+hr "annotated + signed tags (1.5.0)"
+
+R="$WORK/tag150"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'one\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c1 >/dev/null
+C1=$(tr -d '\n' < .sit/refs/heads/main)
+printf 'two\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c2 >/dev/null
+C2=$(tr -d '\n' < .sit/refs/heads/main)
+
+# A lightweight tag still points straight at the commit.
+"$SIT" tag lw >/dev/null
+assert_eq "$(tr -d '\n' < .sit/refs/tags/lw)" "$C2" "lightweight tag points at the commit"
+
+# An annotated tag points at a TAG OBJECT, not the commit.
+"$SIT" tag -a ann -m "annotated" >/dev/null
+ANN=$(tr -d '\n' < .sit/refs/tags/ann)
+assert_eq "$([ "$ANN" != "$C2" ] && echo ok || echo same)" "ok" \
+  "annotated tag ref points at a tag object, not the commit"
+assert_contains "$("$SIT" cat-file "$ANN")" "type commit" "tag object carries a type header"
+assert_contains "$("$SIT" cat-file "$ANN")" "tag ann" "tag object carries its name"
+assert_contains "$("$SIT" cat-file "$ANN")" "object $C2" "tag object names the commit"
+
+# Commands that need a commit peel the tag; cat-file does not.
+assert_contains "$("$SIT" log ann --oneline)" "c2" "log peels an annotated tag"
+assert_eq "$("$SIT" merge-base ann HEAD)" "$C2" "merge-base peels an annotated tag"
+assert_contains "$("$SIT" show ann)" "commit $C2" "show peels an annotated tag"
+
+# 16b. REACHABILITY: a commit reachable ONLY through an annotated tag must not
+# be reported dangling. Pre-1.5.0 the fsck walk treated a tag object as a leaf,
+# so `--prune-now` DELETED the tagged commit and its tree.
+R="$WORK/tagreach"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'one\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c1 >/dev/null
+B1=$(tr -d '\n' < .sit/refs/heads/main)
+printf 'two\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c2 >/dev/null
+"$SIT" tag -a rel -m "tagged" >/dev/null
+printf '%s\n' "$B1" > .sit/refs/heads/main
+rm -rf .sit/logs                    # drop reflog protection: the walk is all that is left
+assert_contains "$("$SIT" fsck)" "0 dangling" \
+  "a commit reachable only through an annotated tag is not dangling"
+"$SIT" fsck --prune-now >/dev/null 2>&1
+assert_contains "$("$SIT" fsck)" "0 bad" "prune-now does not delete a tagged commit"
+assert_contains "$("$SIT" log rel --oneline)" "c2" "the tagged commit is still readable after prune"
+
+# 16c. Signed tags.
+R="$WORK/tagsign"; mkdir -p "$R"; cd "$R"
+export HOME="$WORK/tagsign-home"; mkdir -p "$HOME"
+"$SIT" init >/dev/null
+printf 'x\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c1 >/dev/null
+"$SIT" key generate >/dev/null 2>&1
+"$SIT" tag -s sig -m "signed" >/dev/null
+assert_contains "$("$SIT" verify-tag sig)" "good signature on tag sig" "signed tag verifies"
+"$SIT" tag -a plain -m "unsigned" >/dev/null
+assert_contains "$("$SIT" verify-tag plain)" "no signature" "unsigned annotated tag reports no signature"
+"$SIT" tag light >/dev/null
+assert_contains "$("$SIT" verify-tag light 2>&1)" "not an annotated tag" \
+  "lightweight tag is refused by verify-tag"
+assert_contains "$("$SIT" fsck)" "0 bad" "repo with signed + unsigned tags is clean"
+
+# ── 17. sit mv + sit describe (1.5.0) ──────────────────────────────
+hr "sit mv + sit describe (1.5.0)"
+
+R="$WORK/mv150"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'hello\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c1 >/dev/null
+BLOB_BEFORE=$("$SIT" fsck | grep -oE 'checked [0-9]+' | grep -oE '[0-9]+')
+"$SIT" mv a.txt b.txt >/dev/null
+assert_eq "$([ -f b.txt ] && [ ! -f a.txt ] && echo ok)" "ok" "mv renames on disk"
+assert_contains "$("$SIT" status)" "b.txt" "new path is staged"
+assert_contains "$("$SIT" status)" "a.txt" "old path is staged as deleted"
+"$SIT" commit -m rename >/dev/null
+assert_eq "$(cat b.txt)" "hello" "content survives the rename"
+# The blob must be REUSED, not rehashed into a second object: 1 blob, 2 trees,
+# 2 commits = 5. A rehash would show 6.
+assert_eq "$("$SIT" fsck | grep -oE 'checked [0-9]+' | grep -oE '[0-9]+')" "5" \
+  "mv reuses the existing blob rather than rewriting it"
+assert_contains "$("$SIT" fsck)" "0 bad" "repo is clean after mv"
+
+# mv guards: every one of these must refuse and change nothing.
+printf 'z\n' > z.txt
+assert_contains "$("$SIT" mv nosuch.txt q.txt 2>&1)" "does not exist" "mv refuses a missing source"
+assert_contains "$("$SIT" mv b.txt z.txt 2>&1)" "already exists" "mv refuses an existing destination"
+assert_contains "$("$SIT" mv b.txt ../escape.txt 2>&1)" "invalid destination" "mv refuses path traversal"
+assert_contains "$("$SIT" mv b.txt b.txt 2>&1)" "same path" "mv refuses a no-op rename"
+assert_eq "$([ -f b.txt ] && echo ok)" "ok" "a refused mv leaves the source in place"
+
+# An untracked file is not sit's to move.
+printf 'u\n' > untracked.txt
+assert_contains "$("$SIT" mv untracked.txt moved.txt 2>&1)" "not tracked" "mv refuses an untracked source"
+
+# 17b. describe
+R="$WORK/desc150"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+for i in 1 2 3; do printf 'v%s\n' "$i" > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m "c$i" >/dev/null; done
+FIRST=$("$SIT" log --oneline | tail -1 | awk '{print $1}')
+"$SIT" tag base "$FIRST" >/dev/null
+assert_contains "$("$SIT" describe)" "base-2-g" "describe reports tag, distance and short hash"
+assert_eq "$("$SIT" describe "$FIRST")" "base" "describe on the tagged commit is the bare tag"
+# An annotated tag is peeled, so describe treats both kinds alike.
+"$SIT" tag -a head-tag -m "at head" >/dev/null
+assert_eq "$("$SIT" describe)" "head-tag" "describe peels an annotated tag"
+
+R="$WORK/desc-none"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'x\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c >/dev/null
+assert_contains "$("$SIT" describe 2>&1)" "no tag" "describe with no tags fails cleanly"
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

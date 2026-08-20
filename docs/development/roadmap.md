@@ -4,7 +4,7 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.4.9`. The `1.3.x` line went almost entirely to audit work
+**Where we are**: `1.5.0`. The `1.3.x` line went almost entirely to audit work
 (two security audits, see [`../audit/`](../audit/)); `1.4.0` closed the last two
 integrity gaps; `1.4.1`–`1.4.3` flattened the object-lookup curve; `1.4.4` made
 the benchmark fixture a knob and exposed two superlinear paths; `1.4.5`–`1.4.6`
@@ -123,9 +123,8 @@ structural item — but for a **narrower reason than first written**.
 
 ## Minor line — themed `1.x.0`
 
-Each is a self-contained minor; the heavier ones earn their own slot. **Next: `1.5.0`** — and it is the first *feature* work since 1.3.0: every release from 1.3.1 through 1.4.7 was hardening, perf, or toolchain.
+Each is a self-contained minor; the heavier ones earn their own slot. **Next: `1.6.0`.** `1.5.0` shipped annotated + signed tags, `sit mv` and `sit describe` — the first feature work since 1.3.0, after the whole 1.3.1–1.4.9 run of hardening, perf and toolchain releases.
 
-- **`1.5.0` — Annotated & signed tags + ref ergonomics** *(light; high git-parity value).* Annotated tags (a real tag object with tagger + message, not just a lightweight ref); **ed25519-signed tags** (reuse the sitsig machinery from signed commits); `sit mv` (rename in working tree + index); `sit describe` (nearest tag + offset). Completes the tag + signing story; low risk — a good cadence-setter after the entire 1.3.1–1.4.8 run of hardening, perf and toolchain work.
 - **`1.6.0` — History tools** *(medium; reflog-backed).* `sit revert` (inverse commit); `sit cherry-pick` (apply a commit onto HEAD via the existing 3-way merge + `merge-base`); `sit stash` (save / restore the working tree). Safe now that the reflog (1.1.0) makes them recoverable.
 
   ⚠ All three route through `three_way_line_merge`, which 1.3.8 found could not terminate on an insert-only hunk. That is fixed, but this minor is the one that will exercise the merge core hardest — budget for merge-correctness testing, not just command plumbing.
