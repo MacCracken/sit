@@ -4,7 +4,7 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.6.1`. The `1.3.x` line went almost entirely to audit work
+**Where we are**: `1.6.2`. The `1.3.x` line went almost entirely to audit work
 (two security audits, see [`../audit/`](../audit/)) and `1.4.x` to correctness
 and growth curves — `status` is no longer superlinear (4.98× git at 1,000 files,
 was 26.64×), the last four unfuzzed parsers have harnesses, every deferral
@@ -69,6 +69,13 @@ re-attempted blindly; neither is work.
   is closed rather than carried.
 
 ### Test & tooling debt
+
+- **`sit merge -m <msg>` is accepted and ignored.** It has been since the
+  command existed, and CI has passed it since v0.5.x without noticing. git uses
+  it to set the merge commit's message. Honouring it is small but changes commit
+  text, so it wants its own tests rather than riding along with a fix — 1.6.2
+  restored the tolerance rather than expanding scope.
+
 
 - **~~Memoize `_wildmatch`~~ — built, measured, and declined in 1.4.9.**
   Kept here as a decision, not a task, so it is not re-attempted blindly.

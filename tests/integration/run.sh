@@ -766,6 +766,45 @@ assert_contains "$("$SIT" fsck)" "0 dangling" "a live stash is reachable from th
 "$SIT" stash pop >/dev/null
 assert_eq "$(cat a.txt)" "modified" "the stash survives fsck --prune-now"
 
+# ── 18e. merge argument dispatch (regression, 1.6.2) ───────────────
+hr "merge argument dispatch (1.6.2 regression)"
+
+# 1.5.2 added octopus merge on "two or more arguments", which took EVERY
+# argument after `merge` as a branch name — so `sit merge <branch> -m <msg>`
+# tried to resolve "-m" as a branch. `cmd_merge` has never implemented -m; it
+# ignored trailing arguments, and the CI smoke had relied on that since v0.5.x.
+# Octopus now requires that every argument is a real branch name.
+R="$WORK/mdisp"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'base\n' > base.txt; "$SIT" add base.txt >/dev/null; "$SIT" commit -m base >/dev/null
+"$SIT" checkout -b feature >/dev/null 2>&1
+printf 'b\n' > b.txt; "$SIT" add b.txt >/dev/null; "$SIT" commit -m "on feature" >/dev/null
+"$SIT" checkout main >/dev/null 2>&1
+printf 'm\n' > m.txt; "$SIT" add m.txt >/dev/null; "$SIT" commit -m "on main" >/dev/null
+MOUT=$("$SIT" merge feature -m "merge feature" 2>&1); MRC=$?
+assert_eq "$MRC" "0" "'merge <branch> -m <msg>' succeeds"
+assert_eq "$(printf '%s' "$MOUT" | grep -c "cannot resolve")" "0" \
+  "a trailing flag is not mistaken for a branch name"
+assert_eq "$("$SIT" cat-file HEAD | grep -c '^parent')" "2" \
+  "it produced a normal two-parent merge, not an octopus"
+
+# The octopus path itself must still fire on two or more REAL branches.
+R="$WORK/mdisp2"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'base\n' > base.txt; "$SIT" add base.txt >/dev/null; "$SIT" commit -m base >/dev/null
+for b in o1 o2; do
+  "$SIT" checkout -b "$b" >/dev/null 2>&1
+  printf '%s\n' "$b" > "$b.txt"; "$SIT" add "$b.txt" >/dev/null; "$SIT" commit -m "add $b" >/dev/null
+  "$SIT" checkout main >/dev/null 2>&1
+done
+"$SIT" merge o1 o2 >/dev/null
+assert_eq "$("$SIT" cat-file HEAD | grep -c '^parent')" "3" \
+  "two real branch names still octopus-merge"
+
+# -S and --abort keep their own dispatch.
+assert_contains "$("$SIT" merge --abort 2>&1)" "no merge in progress" "--abort still dispatches"
+assert_contains "$("$SIT" merge -S nosuchbranch 2>&1)" "not a known branch" "-S still dispatches"
+
 # ── 19. Wider merge + inspection (1.5.2) ───────────────────────────
 hr "octopus merge / blame / dir-only ignores (1.5.2)"
 
