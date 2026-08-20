@@ -4,6 +4,217 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-08-20 — TLS trust hardening
+
+A real minor this time: new config keys and a lifted deployment restriction.
+The `tls_native` primitives all existed already — this is the wiring, the policy,
+and the tests.
+
+### Added
+
+- **CA-chain + hostname verification, opt-in.** `http.sslVerify = true` switches
+  HTTPS from TOFU pinning to full chain validation; `http.caBundle` names a PEM
+  bundle, otherwise the system store is used.
+
+  **TOFU remains the default, deliberately.** sit's own `sit serve --tls` uses a
+  self-signed certificate — the common case for a personal remote — and a
+  CA-verifying default would refuse it out of the box.
+
+  Hostname verification is checked **explicitly** after the handshake rather than
+  assumed to be part of chain validation, because without it any CA-issued
+  certificate for any host would be accepted. That is the CVE class this mode
+  exists to close.
+
+  When verification is on, **no TOFU pin is consulted or recorded**. Mixing the
+  two would let a pin from an earlier unverified session override a CA decision,
+  which is a downgrade.
+
+- **mTLS client certificates.** `http.sslCert` + `http.sslKey`. Both must be
+  present — a cert with no key cannot authenticate, and offering half a
+  credential is worse than offering none because it *looks* configured.
+
+- **Bearer auth over SSH.** The `_ssh_handle_auth_token` slot has been reserved
+  and hardwired to `0` since v0.8.3; it now loads `~/.sit/serve.token` through
+  the same loader HTTP uses, so the token format and validation live in one
+  place. This is belt-and-suspenders, not the primary control — SSH already
+  authenticates end-to-end — but it means a server run with `--require-auth`
+  behaves identically over `ssh://` and `https://` instead of leaving one
+  transport silently exempt from a policy the operator set.
+
+  If `~/.sit/serve.token` is absent the token stays 0 and no header is injected,
+  byte-identical to every previous release, so an existing `ssh://` remote
+  cannot break.
+
+### Changed
+
+- **`sit serve` can bind a non-loopback address, gated on `--tls`.** `--listen`
+  now accepts any IPv4 literal or `localhost`; binding anything other than
+  loopback **requires `--tls`**, and plain HTTP on a routable interface is
+  refused with the fix in the message.
+
+  What is deliberately *not* required is bearer auth: a public read-only mirror
+  over HTTPS is a legitimate deployment and `--require-auth` stays the
+  operator's call. What is not negotiable is that bytes on a routable interface
+  are encrypted.
+
+  Parsing and policy are kept apart — `serve_parse_listen` accepts any address,
+  and `cmd_serve` decides — so the rule is stated once instead of smuggled into
+  a string comparison.
+
+- **The startup banner reports the address actually bound.** It hardcoded
+  `127.0.0.1`, which stopped being true the moment the lock lifted; a banner
+  that lies about exposure is worse than no banner.
+
+- **TLS handshake failures name the real cause.** A refused chain reported
+  *"is the server speaking TLS 1.3?"*, which sends the reader to entirely the
+  wrong problem — and with `http.sslVerify` on, a refused chain is the *expected*
+  outcome against a self-signed server. `TLS_ERR_CERT_INVALID` and
+  `TLS_ERR_CERT_HOSTNAME_MISMATCH` are now reported as themselves, with both
+  remedies.
+
+- **Toolchain pin `6.5.29` → `6.5.31`**, which folds patra **1.13.9** — sit's own
+  upstream report, both halves: `ORDER BY` is no longer quadratic, and `DELETE`
+  returns emptied data pages to the free list.
+
+  ⚠ **What that does *not* fix for sit:** `.sit/index.patra` still grows under
+  repeated full-index rewrites (56 → 540 KB across 80 checkout round-trips at 61
+  live entries). Measured inside patra, bulk-delete reclaim lands at
+  **0.0155 KB/insert** while indexed churn lands at **0.119** — and sit's index,
+  which carries `entries(path)`, measures **0.099**. The residual is B-tree
+  index-page churn, which patra's roadmap now tracks with these numbers.
+
+  ⚠ An attempt to A/B this by flipping the pin was **invalid and is recorded as
+  such**: `cyrius deps` resolves the stdlib snapshot from the *installed* cycc,
+  not from the pin, so both builds used the same patra. That is the trap that
+  cost a day in the patra 1.13.1 investigation.
+
+### Tests
+
+- **201 integration checks** (was 192): the non-loopback refusal and its
+  guidance, a malformed `--listen`, and — guarded on `openssl` — TOFU accepting
+  a self-signed server, `http.sslVerify` refusing that same server, `caBundle`
+  making it verify again (which also exercises hostname matching via the SAN),
+  and a non-loopback TLS bind whose banner reports the real address.
+
+## [1.5.3] — 2026-08-20 — `sit rebase`
+
+⚠ Adds a command — *minor* surface by this project's SemVer tiers, numbered as a
+patch by direction, per the convention started at 1.5.1.
+
+The heaviest rewrite tool, and short because the hard part already shipped: a
+rebase is cherry-pick in a loop, and 1.5.1 built the per-commit half as
+`_apply_one_commit`. What this adds is the loop, resumable state, and the
+guarantee that a failure leaves the branch exactly where it started.
+
+### Added
+
+- **`sit rebase <upstream>`** — replays the commits on the current branch that
+  are not on `<upstream>` (first-parent, oldest first) onto it.
+- **`sit rebase --continue`** — after resolving a conflict and `sit add`,
+  commits the resolution under the stopped commit's original message and carries
+  on with the rest of the todo.
+- **`sit rebase --abort`** — restores the branch tip and working tree exactly as
+  they were before the rebase began.
+
+State is two files, both cleared on completion: `.sit/REBASE_ORIG` (the original
+tip) and `.sit/rebase-todo` (one oid per line, what is left). The original tip is
+saved **before** anything moves, so every subsequent step is recoverable.
+
+⚠ Rebase **rewrites history** — replayed commits are new objects with new oids.
+The originals stay reachable through the reflog, which is what makes `--abort`
+and after-the-fact recovery work, and is why this waited for 1.1.0.
+
+### Changed
+
+- Two error messages were being **truncated mid-sentence** because their
+  `syscall(SYS_WRITE, …)` byte counts were written by hand and the em-dash in
+  each is 3 bytes in UTF-8, not 1. Counted properly. (A third, in 1.5.2's
+  octopus refusal, had the same cause and was fixed there.)
+
+- `CLAUDE.md`'s reserved-identifier list gains **`stack`** and **`callptr`** —
+  `var stack` is a compile error in Cyrius, which the list did not say.
+
+### Tests
+
+- **192 integration checks** (was 168): a clean rebase producing linear history
+  with *new* oids and cleared state; a conflicting rebase saving both state
+  files and marking the file, then `--abort` restoring the exact tip and
+  content; resolve + `--continue` landing the commit with its original message;
+  and the guards — `--continue` / `--abort` outside a rebase, and rebasing onto
+  the current tip being a no-op.
+
+## [1.5.2] — 2026-08-20 — Wider merge + inspection: octopus, `sit blame`, directory-only ignores
+
+⚠ Adds a command and a merge form — *minor* surface by this project's SemVer
+tiers. Numbered as a patch at the maintainer's direction, following the
+convention started at 1.5.1 and recorded here rather than re-argued.
+
+### Added
+
+- **Octopus / N-way merge.** `sit merge <a> <b> [<c> …]` folds each branch in
+  against the merge base it shares with the accumulated result and writes one
+  commit with N+1 parents, HEAD first. Built on 1.5.1's
+  `three_way_merge_entries`; `find_merge_base` already walked N parents
+  correctly.
+
+  Like git's octopus, it **refuses to produce conflicts**: the first conflict
+  aborts with nothing written and HEAD untouched. A conflicted octopus has no
+  good resolution story — you cannot tell which of N sides a marker came from —
+  so refusing and saying "merge these pairwise instead" is the honest outcome.
+
+- **`sit blame <path>`** — per-line last-touch. Walks first-parent history,
+  diffing the file against its parent at each step; a line the diff calls an
+  INSERT was introduced there. The bookkeeping is one array mapping each HEAD
+  line to its position in the version under inspection, which is what makes it a
+  single pass over history rather than a diff per line. Reuses
+  `compute_file_diff` — the annotated-op layer `sit_diff_path` already exports
+  for owl — so blame and diff cannot disagree about what an inserted line is.
+
+- **`.sitignore` directory-only rules.** A trailing `/` now means what it does
+  in git: `build/` matches a **directory** named `build` and not a file of the
+  same name. Previously the slash was stripped and forgotten, so both matched —
+  the last documented git-parity gap in the ignore matcher.
+
+  The working-tree walk now determines an entry's kind *before* testing it, and
+  `is_ignored_kind` takes that kind. `is_ignored` keeps its signature and passes
+  "not a directory", so a caller that cannot know errs toward **showing** a file
+  rather than silently hiding it.
+
+### Fixed
+
+Two bugs in the octopus work, both found by running it rather than reading it.
+
+- ⚠ **Type confusion between the merge's input and output shapes.**
+  `three_way_merge_entries` *consumes* 24-byte tree entries
+  (`[mode, name, hash_hex]`) but *returns* 40-byte index-style entries
+  (`[raw hash, path]`), because `build_tree` wants the latter. A single merge
+  never notices. An octopus feeds each result back in as `ours` for the next
+  branch, so the second branch made `tree_find_hash` dereference a raw hash byte
+  as a pointer — **SIGSEGV on every octopus merge of two or more branches**.
+  A conversion step now restores tree shape between rounds.
+
+- **`argv` read across deep-stack work.** The first cut called `argc()` /
+  `argv_heap(n)` inside the merge loop, between patra reads, the merge-base DAG
+  walk and a full diff. `lib/args.cyr` keeps a pointer into a 4 KiB stack buffer
+  that is already out of scope
+  ([architecture 001](docs/architecture/001-args-stack-buffer-lifetime.md)), and
+  that note names this as *"the first suspect"* for a crash that looks like
+  corrupted argv — correctly. All argv values are now read up front.
+
+  (This was not the cause of the segfault above, only a second latent one found
+  while chasing it. Both are fixed.)
+
+### Tests
+
+- **369 unit assertions** (was 358): directory-only rules — directory vs file,
+  at depth, composed with negation and with a nested-file scope, and the
+  kind-unknown caller's conservative behaviour.
+- **168 integration checks** (was 149): octopus parent count and merged files;
+  a conflicting octopus leaving HEAD, `MERGE_HEAD` and the working file
+  untouched; blame attribution across an unchanged line, an edited line, a line
+  following an edit, and an appended line, plus the author field and an
+  untracked path; and both directory-only cases.
+
 ## [1.5.1] — 2026-08-20 — History tools: `cherry-pick`, `revert`, `stash`
 
 ⚠ **This adds three commands, which sit's own SemVer tiers put on the *minor*

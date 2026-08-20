@@ -174,17 +174,148 @@ fn tofu_check_pin(host, port, spki_der, der_len) {
 # pin rejection. Trust model is TOFU: set_verify(NONE) so the handshake accepts
 # the cert without a CA chain, then pin the SPKI ourselves. The caller still owns
 # and closes `fd`.
+# v1.6.0 — is CA-chain + hostname verification switched on?
+#
+# `http.sslVerify = true` opts in. **TOFU remains the default** and that is
+# deliberate: sit's own `sit serve --tls` uses a self-signed certificate, which
+# is the common case for a personal remote, and a CA-verifying default would
+# refuse it out of the box. ADR 0007 records the reasoning.
+fn _https_verify_enabled() {
+    var v = config_get("http.sslVerify");
+    if (v == 0) { return 0; }
+    if (streq(v, "true") == 1) { return 1; }
+    if (streq(v, "1") == 1) { return 1; }
+    if (streq(v, "yes") == 1) { return 1; }
+    return 0;
+}
+
+# Client certificate for mTLS, or 0. Both halves must be present — a cert with
+# no key cannot authenticate, and offering half a credential is worse than
+# offering none because it looks configured.
+fn _https_client_cert_paths(out_key) {
+    var c = config_get("http.sslCert");
+    if (c == 0) { return 0; }
+    var k = config_get("http.sslKey");
+    if (k == 0) {
+        eprintln("sit: http.sslCert is set but http.sslKey is not — refusing to connect with half a client credential");
+        return 0 - 1;
+    }
+    store64(out_key, k);
+    return c;
+}
+
+# Apply the configured trust policy to a fresh client ctx.
+# Returns 0 on success, non-zero to abort the connection.
+fn _https_apply_trust(ctx, host) {
+    if (_https_verify_enabled() == 0) {
+        # TOFU: accept the chain, then pin the SPKI ourselves below.
+        tls_native_set_verify(ctx, TLS_VERIFY_NONE);
+        return 0;
+    }
+
+    # CA-verifying mode. A bundle path wins over the system store, so a
+    # consumer can pin a private CA without touching the machine's trust.
+    var bundle = config_get("http.caBundle");
+    if (bundle != 0) {
+        var pair[16];
+        if (read_file_heap(bundle, &pair) != 0) {
+            syscall(SYS_WRITE, STDERR, "sit: cannot read http.caBundle '", 32);
+            syscall(SYS_WRITE, STDERR, bundle, strlen(bundle));
+            syscall(SYS_WRITE, STDERR, "'\n", 2);
+            return 0 - 1;
+        }
+        if (tls_native_set_ca_bundle(ctx, load64(&pair), load64(&pair + 8), 0) != TLS_OK) {
+            eprintln("sit: could not load the CA bundle");
+            return 0 - 1;
+        }
+    }
+    else {
+        if (tls_native_set_ca_system(ctx) != TLS_OK) {
+            eprintln("sit: could not load the system CA store (set http.caBundle to name one)");
+            return 0 - 1;
+        }
+    }
+    tls_native_set_verify(ctx, TLS_VERIFY_PEER);
+    return 0;
+}
+
 fn _wire_https_connect(host, port, fd) {
     # 30s recv timeout: bound every TLS read (handshake + app data) so a stalled
     # or hostile server can't pin the clone/fetch indefinitely (v0.8.9 hardening).
     sock_set_recv_timeout(fd, 30, 0);
     var ctx = tls_native_new_client(host, 0);
     if (ctx == 0) { eprintln("sit: tls: out of memory"); return 0; }
-    tls_native_set_verify(ctx, TLS_VERIFY_NONE);   # TOFU: pin SPKI instead of CA-verify
-    if (tls_native_connect(ctx, fd) != TLS_OK) {
-        eprintln("sit: tls handshake failed (is the server speaking TLS 1.3?)");
+
+    var verifying = _https_verify_enabled();
+    if (_https_apply_trust(ctx, host) != 0) { return 0; }
+
+    # v1.6.0 mTLS: present a client certificate when one is configured.
+    var ckey[8];
+    var ccert = _https_client_cert_paths(&ckey);
+    if (ccert == (0 - 1)) { return 0; }
+    if (ccert != 0) {
+        var cpair[16];
+        var kpair[16];
+        if (read_file_heap(ccert, &cpair) != 0) {
+            eprintln("sit: cannot read http.sslCert");
+            return 0;
+        }
+        if (read_file_heap(load64(&ckey), &kpair) != 0) {
+            eprintln("sit: cannot read http.sslKey");
+            return 0;
+        }
+        if (tls_native_set_client_cert(ctx, load64(&cpair), load64(&cpair + 8), 0) != TLS_OK) {
+            eprintln("sit: could not load the client certificate");
+            return 0;
+        }
+        if (tls_native_set_client_key(ctx, load64(&kpair), load64(&kpair + 8)) != TLS_OK) {
+            eprintln("sit: could not load the client key");
+            return 0;
+        }
+    }
+
+    var hr = tls_native_connect(ctx, fd);
+    if (hr != TLS_OK) {
+        # v1.6.0: name the actual failure. With http.sslVerify on, a refused
+        # chain is the EXPECTED outcome against a self-signed server, and
+        # reporting it as "is the server speaking TLS 1.3?" sends the reader
+        # to the wrong problem entirely.
+        if (hr == TLS_ERR_CERT_INVALID) {
+            eprintln("sit: server certificate chain did not verify");
+            eprintln("sit:   http.sslVerify is on; set http.caBundle to trust a private CA,");
+            eprintln("sit:   or unset http.sslVerify to fall back to TOFU pinning");
+        }
+        else {
+            if (hr == TLS_ERR_CERT_HOSTNAME_MISMATCH) {
+                eprintln("sit: server certificate is not valid for this host name");
+            }
+            else {
+                eprintln("sit: tls handshake failed (is the server speaking TLS 1.3?)");
+            }
+        }
         return 0;
     }
+
+    if (verifying == 1) {
+        # The chain verified during the handshake; the NAME still has to match,
+        # or any CA-issued certificate for any host would be accepted. That is
+        # the CVE-class this mode exists to close, so it is checked explicitly
+        # rather than assumed to be part of chain validation.
+        # The ctx already carries the SNI host it was created with, so the
+        # check takes no name argument — it compares that host against the
+        # cert's SubjectAltName.
+        if (tls_native_client_verify_hostname(ctx) != TLS_OK) {
+            syscall(SYS_WRITE, STDERR, "sit: server certificate is not valid for '", 42);
+            syscall(SYS_WRITE, STDERR, host, strlen(host));
+            syscall(SYS_WRITE, STDERR, "'\n", 2);
+            return 0;
+        }
+        # Verified by CA + name: no TOFU pin is consulted or recorded. Mixing
+        # the two would let a pin from an earlier unverified session override a
+        # CA decision, which is a downgrade.
+        return ctx;
+    }
+
     # Pin the peer's SubjectPublicKeyInfo (survives cert renewal that keeps the key).
     var spki[2048];
     var sl = tls_native_get_peer_spki_der(ctx, &spki, 2048);

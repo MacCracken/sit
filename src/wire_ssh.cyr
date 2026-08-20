@@ -30,6 +30,7 @@
 #   [16..24] read-fd  ← ssh stdout (we recv responses here)
 #   [24..32] reserved (capabilities flags; populated by check_batch)
 #   [32..40] read-buffer carryover length from last recv (pipelining)
+#   [40..48] auth-token cstring pointer, or 0 (v1.6.0)
 # Followed by a 16 MiB recv buffer right after the handle.
 
 var WIRE_SSH_RECV_INITIAL = 4096;
@@ -47,15 +48,19 @@ fn _ssh_set_read_fd(h, v)     { store64(h + 16, v); }
 fn _ssh_set_batch_known(h, v) { store64(h + 24, v); }
 fn _ssh_set_carry(h, v)       { store64(h + 32, v); }
 
-# v0.8.3: bearer-token slot reserved but always 0 in this release.
-# SSH authenticates the user end-to-end at session open, so an extra
-# bearer-token on top is redundant for the canonical use case. The
-# accessor exists because _wire_ssh_post_xhdr already mirrors the
-# HTTP shape (which DOES inject bearer auth); leaving the if-token
-# branch DCE-callable now keeps the code reviewable when a v0.8.3.x
-# patch wires up belt-and-suspenders auth (server has --require-auth
-# AND clients must present a bearer over the encrypted SSH channel).
-fn _ssh_handle_auth_token(h) { return 0; }
+# Bearer token over SSH (v1.6.0 — the slot was reserved and hardwired to 0
+# from v0.8.3).
+#
+# SSH already authenticates the user end-to-end at session open, so this is
+# **belt-and-suspenders, not the primary control**: it exists so a server run
+# with `--require-auth` behaves identically over ssh:// and https://, rather
+# than having one transport silently exempt from a policy the operator set.
+#
+# The token is loaded only if `~/.sit/serve.token` exists. When it does not,
+# this stays 0 and no Authorization header is injected — byte-identical to
+# every release before this one, so an existing ssh:// remote cannot break.
+fn _ssh_handle_auth_token(h)  { return load64(h + 40); }
+fn _ssh_set_auth_token(h, v)  { store64(h + 40, v); }
 
 # ── URL parsing ────────────────────────────────────────────────────
 #
@@ -436,12 +441,16 @@ fn wire_ssh_open(url) {
     sys_close(in_read);
     sys_close(out_write);
 
-    var h = alloc(40);
+    var h = alloc(48);
     _ssh_set_pid(h, pid);
     _ssh_set_write_fd(h, in_write);
     _ssh_set_read_fd(h, out_read);
     _ssh_set_batch_known(h, 0);
     _ssh_set_carry(h, 0);
+    # Reuses the HTTP loader, so the token format and its validation (16+
+    # chars, no control bytes) are defined in exactly one place. Absent file
+    # -> 0 -> no header, which is the pre-1.6.0 behaviour.
+    _ssh_set_auth_token(h, _wire_http_load_client_token());
 
     # Probe capabilities so the early "ssh user@host: command not
     # found" / auth failures surface here as a clean error rather than

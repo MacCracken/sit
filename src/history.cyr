@@ -139,7 +139,7 @@ fn _apply_one_commit(target_hex, invert, marker_path, verb, verb_len) {
         var nb[24];
         var d = write_decimal(&nb, vec_len(conflicts));
         syscall(SYS_WRITE, STDERR, &nb, d);
-        syscall(SYS_WRITE, STDERR, " file(s) — resolve, then 'sit add' + 'sit commit'\n", 50);
+        syscall(SYS_WRITE, STDERR, " file(s) — resolve, then 'sit add' + 'sit commit'\n", 52);
         return 1;
     }
 

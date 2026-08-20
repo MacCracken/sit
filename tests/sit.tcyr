@@ -558,12 +558,18 @@ fn _mkpat(text, negated, anchored) {
 
 # v1.4.9: patterns carry a scope (the nested-ignore directory prefix, or 0).
 fn _mkpat_scoped(text, negated, anchored, scope) {
-    var p = alloc(40);
+    return _mkpat_full(text, negated, anchored, scope, 0);
+}
+
+# v1.5.2: patterns also carry dir_only (the rule ended in '/').
+fn _mkpat_full(text, negated, anchored, scope, dir_only) {
+    var p = alloc(48);
     store64(p, text);
     store64(p + 8, strlen(text));
     store64(p + 16, negated);
     store64(p + 24, anchored);
     store64(p + 32, scope);
+    store64(p + 40, dir_only);
     return p;
 }
 
@@ -1070,6 +1076,44 @@ fn test_parse_tag_body() {
     return 0;
 }
 
+# ── .sitignore directory-only rules (v1.5.2) ──────────────────────────────
+# `build/` must match a DIRECTORY named build and not a file of the same name.
+# Before 1.5.2 the trailing slash was stripped and forgotten, so both matched —
+# the last documented git-parity gap in the ignore matcher.
+fn test_ignore_dir_only() {
+    test_group("index.cyr — .sitignore directory-only rules (v1.5.2)");
+
+    var a = vec_new();
+    vec_push(a, _mkpat_full("build", 0, 0, 0, 1));   # from "build/"
+    assert_eq(is_ignored_kind("build", a, 1), 1, "build/ ignores a directory named build");
+    assert_eq(is_ignored_kind("build", a, 0), 0, "build/ does NOT ignore a file named build");
+    assert_eq(is_ignored_kind("sub/build", a, 1), 1, "dir-only rule matches at any depth");
+    assert_eq(is_ignored_kind("sub/build", a, 0), 0, "and still not the file form at depth");
+
+    # A rule without the slash matches either kind, as before.
+    var b = vec_new();
+    vec_push(b, _mkpat_full("build", 0, 0, 0, 0));
+    assert_eq(is_ignored_kind("build", b, 0), 1, "no-slash rule matches a file");
+    assert_eq(is_ignored_kind("build", b, 1), 1, "no-slash rule matches a directory");
+
+    # is_ignored (kind unknown) treats the path as a non-directory, which errs
+    # toward showing a file rather than silently hiding it.
+    assert_eq(is_ignored("build", a), 0, "kind-unknown caller does not fire a dir-only rule");
+    assert_eq(is_ignored("build", b), 1, "kind-unknown caller still fires a plain rule");
+
+    # dir_only composes with negation and with scope.
+    var c = vec_new();
+    vec_push(c, _mkpat_full("build", 0, 0, 0, 1));
+    vec_push(c, _mkpat_full("build", 1, 0, 0, 1));   # "!build/"
+    assert_eq(is_ignored_kind("build", c, 1), 0, "a later !build/ re-includes the directory");
+
+    var d = vec_new();
+    vec_push(d, _mkpat_full("build", 0, 0, "sub/", 1));
+    assert_eq(is_ignored_kind("sub/build", d, 1), 1, "scoped dir-only rule fires under its scope");
+    assert_eq(is_ignored_kind("build", d, 1), 0, "scoped dir-only rule does not escape its scope");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -1099,6 +1143,7 @@ fn main() {
     test_hfs_dotdir_spoofing();
     test_nested_ignore_scope();
     test_parse_tag_body();
+    test_ignore_dir_only();
     return assert_summary();
 }
 

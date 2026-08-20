@@ -917,6 +917,10 @@ fn _wildmatch_rec(pat, plen, str, slen) {
 # re-includes a file an earlier pattern excluded (git semantics). Each pattern is
 # a struct: [text, text_len, negated, anchored, scope] (see _parse_ignore_file).
 #
+#   dir_only (v1.5.2): the pattern ended in '/', so it matches directories only.
+#     `is_ignored` (no kind) passes "not a directory", which is the conservative
+#     direction — a dir-only rule simply does not fire for a caller that cannot
+#     say. The working-tree walk knows, and passes it.
 #   scope (v1.4.9): 0 for a root-level rule, else the directory prefix the rule
 #     came from, WITH its trailing '/' (e.g. "sub/"). A scoped rule only applies
 #     to paths under that directory and is matched against the path relative to
@@ -926,7 +930,15 @@ fn _wildmatch_rec(pat, plen, str, slen) {
 #     from the repo root via _wildmatch (its '**' handles any-depth cases).
 #   non-anchored (no '/'): matches at ANY level — tried against the full path and
 #     against every suffix beginning just after a '/'.
+# Kind-aware ignore test. `path_is_dir` lets a trailing-slash rule (`build/`)
+# match a directory and not a same-named file. Callers that do not know the
+# kind use is_ignored, which passes 0 — a dir-only rule then does not fire,
+# which errs toward SHOWING a file rather than silently hiding it.
 fn is_ignored(path, patterns) {
+    return is_ignored_kind(path, patterns, 0);
+}
+
+fn is_ignored_kind(path, patterns, path_is_dir) {
     if (patterns == 0) { return 0; }
     var path_len = strlen(path);
     var n = vec_len(patterns);
@@ -939,12 +951,16 @@ fn is_ignored(path, patterns) {
         var negated = load64(p + 16);
         var anchored = load64(p + 24);
         var scope = load64(p + 32);
+        var dir_only = load64(p + 40);
 
         # A scoped rule (from a nested ignore file) only applies below its own
         # directory, and matches against the path relative to it.
         var mpath = path;
         var mlen = path_len;
         var applies = 1;
+        if (dir_only == 1) {
+            if (path_is_dir != 1) { applies = 0; }
+        }
         if (scope != 0) {
             var sclen = strlen(scope);
             if (path_len <= sclen) { applies = 0; }
@@ -1049,8 +1065,13 @@ fn _parse_ignore_file(fname, patterns, scope) {
                 if (load8(data + s) == 47) { anchored = 1; s = s + 1; }   # leading '/'
             }
             var e = le;
+            var dir_only = 0;
             if (e > s) {
-                if (load8(data + e - 1) == 47) { e = e - 1; }   # strip trailing '/'
+                # v1.5.2: a trailing '/' means DIRECTORY-ONLY, not decoration.
+                # `build/` must not match a plain file named `build`. The slash
+                # is still stripped from the match text; the fact that it was
+                # there is now carried on the pattern.
+                if (load8(data + e - 1) == 47) { e = e - 1; dir_only = 1; }
             }
             if (anchored == 0) {
                 var k = s;
@@ -1065,12 +1086,13 @@ fn _parse_ignore_file(fname, patterns, scope) {
                 var text = alloc(tlen + 1);
                 memcpy(text, data + s, tlen);
                 store8(text + tlen, 0);
-                var p = alloc(40);
+                var p = alloc(48);
                 store64(p, text);
                 store64(p + 8, tlen);
                 store64(p + 16, negated);
                 store64(p + 24, anchored);
                 store64(p + 32, scope);
+                store64(p + 40, dir_only);
                 vec_push(patterns, p);
                 added = added + 1;
             }

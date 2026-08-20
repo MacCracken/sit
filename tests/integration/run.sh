@@ -766,6 +766,215 @@ assert_contains "$("$SIT" fsck)" "0 dangling" "a live stash is reachable from th
 "$SIT" stash pop >/dev/null
 assert_eq "$(cat a.txt)" "modified" "the stash survives fsck --prune-now"
 
+# ── 19. Wider merge + inspection (1.5.2) ───────────────────────────
+hr "octopus merge / blame / dir-only ignores (1.5.2)"
+
+# 19a. Octopus: N branches, one commit with N+1 parents.
+R="$WORK/oct152"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'base\n' > base.txt; "$SIT" add base.txt >/dev/null; "$SIT" commit -m base >/dev/null
+for b in f1 f2 f3; do
+  "$SIT" checkout -b "$b" >/dev/null 2>&1
+  printf '%s\n' "$b" > "$b.txt"; "$SIT" add "$b.txt" >/dev/null; "$SIT" commit -m "add $b" >/dev/null
+  "$SIT" checkout main >/dev/null 2>&1
+done
+"$SIT" merge f1 f2 f3 >/dev/null
+assert_eq "$("$SIT" cat-file HEAD | grep -c '^parent')" "4" "octopus commit has HEAD + 3 parents"
+for b in f1 f2 f3; do
+  assert_eq "$([ -f "$b.txt" ] && echo ok)" "ok" "octopus merged $b.txt into the working tree"
+done
+assert_contains "$("$SIT" fsck)" "0 bad" "repo is clean after an octopus merge"
+# The parent order must put HEAD first — first-parent walks depend on it.
+assert_contains "$("$SIT" log --oneline)" "Merge branches" "octopus commit is on the first-parent chain"
+
+# 19b. A conflicting octopus refuses and writes NOTHING.
+R="$WORK/octconf"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'v0\n' > c.txt; "$SIT" add c.txt >/dev/null; "$SIT" commit -m base >/dev/null
+H0=$(tr -d '\n' < .sit/refs/heads/main)
+"$SIT" checkout -b x >/dev/null 2>&1; printf 'vX\n' > c.txt; "$SIT" add c.txt >/dev/null; "$SIT" commit -m x >/dev/null
+"$SIT" checkout main >/dev/null 2>&1; "$SIT" checkout -b y >/dev/null 2>&1
+printf 'vY\n' > c.txt; "$SIT" add c.txt >/dev/null; "$SIT" commit -m y >/dev/null
+"$SIT" checkout main >/dev/null 2>&1
+OUT=$("$SIT" merge x y 2>&1); RC=$?
+assert_eq "$RC" "1" "a conflicting octopus exits non-zero"
+assert_contains "$OUT" "merge these pairwise" "and says what to do instead"
+assert_eq "$(tr -d '\n' < .sit/refs/heads/main)" "$H0" "HEAD is unchanged after a refused octopus"
+assert_eq "$([ ! -f .sit/MERGE_HEAD ] && echo ok)" "ok" "no MERGE_HEAD is left behind"
+assert_eq "$(grep -c '<<<<' c.txt || true)" "0" "no conflict markers are written to the working tree"
+
+# 19c. blame
+R="$WORK/blame152"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'alpha\nbeta\ngamma\n' > f.txt; "$SIT" add f.txt >/dev/null
+SIT_AUTHOR_NAME="Ann" "$SIT" commit -m c1 >/dev/null
+C1=$("$SIT" log --oneline | head -1 | awk '{print $1}')
+printf 'alpha\nBETA2\ngamma\n' > f.txt; "$SIT" add f.txt >/dev/null
+SIT_AUTHOR_NAME="Bob" "$SIT" commit -m c2 >/dev/null
+C2=$("$SIT" log --oneline | head -1 | awk '{print $1}')
+printf 'alpha\nBETA2\ngamma\ndelta\n' > f.txt; "$SIT" add f.txt >/dev/null
+SIT_AUTHOR_NAME="Cid" "$SIT" commit -m c3 >/dev/null
+C3=$("$SIT" log --oneline | head -1 | awk '{print $1}')
+B=$("$SIT" blame f.txt)
+assert_contains "$(printf '%s' "$B" | sed -n '1p')" "$C1" "unchanged first line is attributed to the commit that added it"
+assert_contains "$(printf '%s' "$B" | sed -n '2p')" "$C2" "the edited line is attributed to the commit that edited it"
+assert_contains "$(printf '%s' "$B" | sed -n '3p')" "$C1" "the line after an edit keeps its original attribution"
+assert_contains "$(printf '%s' "$B" | sed -n '4p')" "$C3" "the appended line is attributed to the newest commit"
+assert_contains "$(printf '%s' "$B" | sed -n '2p')" "Bob" "blame reports the author"
+assert_contains "$("$SIT" blame nosuch.txt 2>&1)" "not tracked" "blame refuses an untracked path"
+
+# 19d. Directory-only ignore rules.
+R="$WORK/dironly"; mkdir -p "$R/build"; cd "$R"
+"$SIT" init >/dev/null
+printf 'build/\n' > .sitignore
+printf 'o\n' > build/out.o
+OUT=$("$SIT" status)
+assert_eq "$(printf '%s' "$OUT" | grep -c 'build')" "0" "build/ ignores the directory"
+# The same rule must NOT hide a FILE named build.
+R="$WORK/dironly2"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'build/\n' > .sitignore
+printf 'i am a file\n' > build
+assert_contains "$("$SIT" status)" "build" "build/ does NOT ignore a file named build"
+
+# ── 20. sit rebase (1.5.3) ─────────────────────────────────────────
+hr "sit rebase (1.5.3)"
+
+# 20a. Clean rebase: the branch replays onto upstream as new commits.
+R="$WORK/rb153"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'base\n' > base.txt; "$SIT" add base.txt >/dev/null; "$SIT" commit -m base >/dev/null
+"$SIT" checkout -b feat >/dev/null 2>&1
+printf 'f1\n' > f1.txt; "$SIT" add f1.txt >/dev/null; "$SIT" commit -m "feat 1" >/dev/null
+printf 'f2\n' > f2.txt; "$SIT" add f2.txt >/dev/null; "$SIT" commit -m "feat 2" >/dev/null
+OLD_TIP=$(tr -d '\n' < .sit/refs/heads/feat)
+"$SIT" checkout main >/dev/null 2>&1
+printf 'up\n' > up.txt; "$SIT" add up.txt >/dev/null; "$SIT" commit -m "upstream work" >/dev/null
+"$SIT" checkout feat >/dev/null 2>&1
+"$SIT" rebase main >/dev/null
+assert_eq "$("$SIT" log --oneline | wc -l)" "4" "rebase produces a linear 4-commit history"
+assert_contains "$("$SIT" log --oneline | sed -n '3p')" "upstream work" "upstream sits below the replayed commits"
+for f in base.txt up.txt f1.txt f2.txt; do
+  assert_eq "$([ -f "$f" ] && echo ok)" "ok" "$f is present after rebase"
+done
+# History is REWRITTEN: the tip must be a new object.
+assert_eq "$([ "$(tr -d '\n' < .sit/refs/heads/feat)" != "$OLD_TIP" ] && echo ok)" "ok" \
+  "rebase rewrites commits (new oids)"
+assert_eq "$([ ! -f .sit/REBASE_ORIG ] && [ ! -f .sit/rebase-todo ] && echo ok)" "ok" \
+  "rebase state files are cleared on success"
+assert_contains "$("$SIT" fsck)" "0 bad" "repo is clean after rebase"
+
+# 20b. Conflicting rebase stops, and --abort restores the branch exactly.
+R="$WORK/rbconf"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'v0\n' > c.txt; "$SIT" add c.txt >/dev/null; "$SIT" commit -m base >/dev/null
+"$SIT" checkout -b feat >/dev/null 2>&1
+printf 'vFEAT\n' > c.txt; "$SIT" add c.txt >/dev/null; "$SIT" commit -m "feat edit" >/dev/null
+FEAT_TIP=$(tr -d '\n' < .sit/refs/heads/feat)
+"$SIT" checkout main >/dev/null 2>&1
+printf 'vMAIN\n' > c.txt; "$SIT" add c.txt >/dev/null; "$SIT" commit -m "main edit" >/dev/null
+"$SIT" checkout feat >/dev/null 2>&1
+"$SIT" rebase main >/dev/null 2>&1
+assert_eq "$([ -f .sit/REBASE_ORIG ] && echo ok)" "ok" "a stopped rebase saves its original tip"
+assert_eq "$([ -f .sit/rebase-todo ] && echo ok)" "ok" "a stopped rebase saves the remaining todo"
+assert_eq "$(grep -c '<<<<' c.txt)" "1" "the conflicting file carries markers"
+"$SIT" rebase --abort >/dev/null
+assert_eq "$(tr -d '\n' < .sit/refs/heads/feat)" "$FEAT_TIP" "--abort restores the exact branch tip"
+assert_eq "$(cat c.txt)" "vFEAT" "--abort restores the working tree"
+assert_eq "$([ ! -f .sit/REBASE_ORIG ] && echo ok)" "ok" "--abort clears the state"
+assert_contains "$("$SIT" fsck)" "0 bad" "repo is clean after an aborted rebase"
+
+# 20c. Resolve + --continue finishes the rebase.
+R="$WORK/rbcont"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'v0\n' > c.txt; "$SIT" add c.txt >/dev/null; "$SIT" commit -m base >/dev/null
+"$SIT" checkout -b feat >/dev/null 2>&1
+printf 'vFEAT\n' > c.txt; "$SIT" add c.txt >/dev/null; "$SIT" commit -m "feat edit" >/dev/null
+"$SIT" checkout main >/dev/null 2>&1
+printf 'vMAIN\n' > c.txt; "$SIT" add c.txt >/dev/null; "$SIT" commit -m "main edit" >/dev/null
+"$SIT" checkout feat >/dev/null 2>&1
+"$SIT" rebase main >/dev/null 2>&1
+printf 'resolved\n' > c.txt; "$SIT" add c.txt >/dev/null
+"$SIT" rebase --continue >/dev/null
+assert_eq "$(cat c.txt)" "resolved" "--continue keeps the resolved content"
+assert_eq "$("$SIT" log --oneline | wc -l)" "3" "--continue lands the replayed commit"
+assert_contains "$("$SIT" log --oneline | head -1)" "feat edit" "the replayed commit keeps its message"
+assert_eq "$([ ! -f .sit/rebase-todo ] && echo ok)" "ok" "--continue clears the todo"
+assert_contains "$("$SIT" fsck)" "0 bad" "repo is clean after --continue"
+
+# 20d. Guards.
+assert_contains "$("$SIT" rebase --continue 2>&1)" "no rebase in progress" "--continue outside a rebase is refused"
+assert_contains "$("$SIT" rebase --abort 2>&1)" "no rebase in progress" "--abort outside a rebase is refused"
+# Rebasing onto your own tip has nothing above the merge base. (Rebasing onto a
+# plain ancestor is NOT a no-op — the commits above it still replay, which is
+# what git does too.)
+assert_contains "$("$SIT" rebase feat 2>&1)" "up to date" "rebasing onto the current tip is a no-op"
+
+# ── 21. TLS trust hardening (1.6.0) ────────────────────────────────
+hr "TLS trust hardening (1.6.0)"
+
+# 21a. Non-loopback policy needs no certs — always run it.
+R="$WORK/tls160"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'x\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c1 >/dev/null
+OUT=$("$SIT" serve "$R" --listen 0.0.0.0:18740 2>&1); RC=$?
+assert_eq "$RC" "1" "non-loopback plain HTTP is refused"
+assert_contains "$OUT" "refusing to serve plain HTTP" "and says why"
+assert_contains "$OUT" "--tls" "and says how to fix it"
+assert_contains "$("$SIT" serve "$R" --listen nonsense 2>&1)" "requires <ipv4>:<port>" \
+  "a malformed --listen is still refused"
+
+if command -v openssl > /dev/null 2>&1; then
+  cd "$R"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout k.pem -out c.pem -days 2 -nodes -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost" > /dev/null 2>&1
+
+  # 21b. TOFU (the default) accepts a self-signed cert.
+  PORT=18741
+  "$SIT" serve "$R" --tls --cert c.pem --key k.pem --listen 127.0.0.1:$PORT > /dev/null 2>&1 &
+  TP=$!
+  trap 'kill $TP 2>/dev/null || true' EXIT
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1; then break; fi
+    sleep 0.5
+  done
+  export HOME="$R/home"; mkdir -p "$HOME"
+  CL="$WORK/tlsclone"; rm -rf "$CL"
+  "$SIT" clone --force-absolute "https://localhost:$PORT" "$CL" > /dev/null 2>&1
+  assert_eq "$(cat "$CL/a.txt" 2>/dev/null)" "x" "TOFU accepts a self-signed server by default"
+
+  # 21c. http.sslVerify=true refuses that same self-signed cert.
+  cd "$CL"
+  "$SIT" config http.sslVerify true
+  VOUT=$("$SIT" fetch origin main 2>&1)
+  assert_contains "$VOUT" "did not verify" "sslVerify refuses an unverifiable chain"
+  assert_contains "$VOUT" "http.caBundle" "and names the remedy"
+
+  # 21d. Naming that cert as the CA bundle makes it verify again — this also
+  # exercises hostname checking, since the cert's SAN is localhost.
+  "$SIT" config http.caBundle "$R/c.pem"
+  assert_contains "$("$SIT" fetch origin main 2>&1)" "fetched origin/main" \
+    "sslVerify + caBundle accepts a chain that verifies"
+
+  # 21e. Non-loopback WITH --tls is allowed, and the banner reports the real
+  # address rather than a hardcoded 127.0.0.1.
+  cd "$R"
+  "$SIT" serve "$R" --tls --cert c.pem --key k.pem --listen 0.0.0.0:18742 > "$R/banner.out" 2>&1 &
+  BP=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if (echo > /dev/tcp/127.0.0.1/18742) >/dev/null 2>&1; then break; fi
+    sleep 0.5
+  done
+  assert_contains "$(cat "$R/banner.out")" "listening on 0.0.0.0" \
+    "non-loopback is allowed with --tls, and the banner is honest about it"
+  kill $BP 2>/dev/null || true
+  kill $TP 2>/dev/null || true
+  trap - EXIT
+else
+  echo "  (skipped 21b-21e: openssl not available)"
+fi
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

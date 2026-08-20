@@ -4,7 +4,7 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.5.1`. The `1.3.x` line went almost entirely to audit work
+**Where we are**: `1.6.0`. The `1.3.x` line went almost entirely to audit work
 (two security audits, see [`../audit/`](../audit/)) and `1.4.x` to correctness
 and growth curves — `status` is no longer superlinear (4.98× git at 1,000 files,
 was 26.64×), the last four unfuzzed parsers have harnesses, every deferral
@@ -13,7 +13,7 @@ comment in `src/` was swept, and an HFS dot-directory spoofing hole
 items by measuring them rather than coding them. `1.5.0`–`1.5.1` are the first
 feature work since 1.3.0: annotated + signed tags, `sit mv`, `sit describe`,
 then `cherry-pick`, `revert` and `stash`. **33 commands.** Audit backlogs are
-empty.
+empty. Next up: `1.6.0` (TLS trust hardening).
 
 ⚠ **Three data-loss bugs were found in that feature work, all one root cause** —
 the fsck reachability walk not knowing about an edge. S-27 missing referents
@@ -130,13 +130,15 @@ structural item — but for a **narrower reason than first written**.
 
 ## Minor line — themed `1.x.0`
 
-> The `1.6.0` slot is **free**: it had been scoped as the history tools, which
-> shipped early as `1.5.1`.
+Each is a self-contained scope commitment. **The themed line is empty** — `1.6.0` (TLS trust hardening) shipped, and nothing below is scheduled. Next scope commitment is an open choice; the strongest candidate is **pack bundles + `gc`** under *Structural*, which is the largest measured gap left.
 
-Each is a self-contained minor; the heavier ones earn their own slot. **Next: `1.7.0` — TLS trust hardening.** `1.5.0` shipped annotated + signed tags, `sit mv` and `sit describe`; `1.5.1` shipped the history tools (`cherry-pick`, `revert`, `stash`) that had been scoped as `1.6.0`, so that slot is now free.
+> ⚠ **Numbering note.** `1.5.2` and `1.5.3` add commands and flags, which this
+> file's own SemVer tiers call *minor* surface. They are numbered as patches at
+> the maintainer's direction; each CHANGELOG entry records the discrepancy so
+> the policy and the version number do not silently disagree. The convention
+> started at `1.5.1` and is applied consistently rather than re-argued per
+> release.
 
-- **`1.7.0` — TLS trust hardening** *(medium).* HTTPS **CA-chain + hostname verification** (opt-in: `http.sslVerify` / `http.caBundle`, system store via `tls_native_set_ca_system`; TOFU stays the default); **mTLS** (client certs — the `tls_native` verify primitives already exist); **non-loopback `sit serve`** (lift the `127.0.0.1` lock, gated on `--tls`, refuse non-loopback plain HTTP); **bearer auth over SSH** (`_ssh_handle_auth_token` stub → real). A cohesive transport-trust minor.
-- **`1.8.0` — Wider merge + inspection.** **Octopus / N-way merge** (`cmd_merge` → N branches; `find_merge_base` already walks N parents correctly); **`sit blame`** (per-line last-touch — also a natural `dist/sit.cyr` library export for owl, alongside `sit_diff_path`); **`.sitignore` directory-only (`build/`) enforcement** (closes the last documented git-parity gap).
 - **Reflog `expire` / `delete` + `@{<date>}` selector, and HTTP base-path
   routing** *(unscheduled; moved off the patch line in 1.4.9).* Both were filed
   under "Patch line — no new surface", and both plainly add surface: `expire` /
@@ -157,12 +159,6 @@ Each is a self-contained minor; the heavier ones earn their own slot. **Next: `1
 
 Each earns its own minor when its time comes.
 
-- **`sit rebase`** — the heaviest rewrite tool. **No longer blocked**: it depends
-  on the reflog (1.1.0) for safety and on cherry-pick's apply machinery, which
-  shipped in 1.5.1 as `_apply_one_commit` / `three_way_merge_entries`. A rebase
-  is that applied in a loop with the branch ref moved at the end, so the missing
-  pieces are the loop, `--continue` / `--abort` state, and the interactive todo
-  list — not the merge core.
 - **Hooks** (`pre-commit`, `pre-push`, …) — if a consumer asks.
 
 ---

@@ -67,21 +67,33 @@ fn list_working_walk(prefix, fs_path, out, patterns) {
             if (memeq(sdata, ".git", 4) == 1) { skip = 1; }
         }
 
+        # v1.5.2: the child's path and KIND are needed before the ignore test,
+        # because a trailing-slash rule (`build/`) matches directories only.
+        # This used to run the ignore test first and discover the kind after.
+        var child_fs = alloc(fs_path_len + 1 + slen + 1);
+        memcpy(child_fs, fs_path, fs_path_len);
+        store8(child_fs + fs_path_len, 47);
+        memcpy(child_fs + fs_path_len + 1, sdata, slen);
+        store8(child_fs + fs_path_len + 1 + slen, 0);
+
+        var child_is_dir = 0;
+        if (skip == 0) {
+            # S-25: a symlink is a LEAF, never descended — see the note below.
+            if (is_dir(str_from(child_fs)) == 1) {
+                if (path_is_symlink(child_fs) != 1) { child_is_dir = 1; }
+            }
+        }
+
         if (skip == 0) {
             var rel_path_len = prefix_len + slen;
             var rel_path = alloc(rel_path_len + 1);
             memcpy(rel_path, prefix, prefix_len);
             memcpy(rel_path + prefix_len, sdata, slen);
             store8(rel_path + rel_path_len, 0);
-            if (is_ignored(rel_path, patterns) == 1) { skip = 1; }
+            if (is_ignored_kind(rel_path, patterns, child_is_dir) == 1) { skip = 1; }
         }
 
         if (skip == 0) {
-            var child_fs = alloc(fs_path_len + 1 + slen + 1);
-            memcpy(child_fs, fs_path, fs_path_len);
-            store8(child_fs + fs_path_len, 47);
-            memcpy(child_fs + fs_path_len + 1, sdata, slen);
-            store8(child_fs + fs_path_len + 1 + slen, 0);
 
             # S-25: never DESCEND through a symlink.
             #
@@ -96,10 +108,6 @@ fn list_working_walk(prefix, fs_path, out, patterns) {
             # merely the safe one: git records a symlink as a symlink blob and
             # never traverses it. So this is emitted as an entry (below) rather
             # than walked.
-            var child_is_dir = 0;
-            if (is_dir(str_from(child_fs)) == 1) {
-                if (path_is_symlink(child_fs) != 1) { child_is_dir = 1; }
-            }
             if (child_is_dir == 1) {
                 var new_prefix = alloc(prefix_len + slen + 2);
                 memcpy(new_prefix, prefix, prefix_len);

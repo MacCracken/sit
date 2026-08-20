@@ -992,13 +992,17 @@ fn serve_handle_request(ctx, cfd, buf, n) {
 
 # ── --listen parser ────────────────────────────────────────────────
 #
-# Parses "<addr>:<port>". Only "127.0.0.1:<n>" is accepted today —
-# any other address is rejected at parse time so users don't
-# accidentally expose the no-auth daemon. Non-loopback exposure
-# unlocks alongside bearer auth in v0.7.5. Writes the parsed port
-# to *out_port and returns 1 on success, 0 on any malformation.
-
-fn serve_parse_listen(arg, out_port) {
+# Parses "<addr>:<port>" into *out_addr (packed IPv4) and *out_port.
+# Returns 1 on success, 0 on any malformation.
+#
+# v1.6.0 lifts the loopback lock: any IPv4 literal, plus "localhost", is
+# accepted here. **Whether a non-loopback bind is ALLOWED is decided by the
+# caller, not here** — cmd_serve refuses one unless `--tls` is on, because the
+# thing that made the lock necessary was shipping an unencrypted, optionally
+# unauthenticated daemon onto a routable interface. Parsing and policy are kept
+# apart so the policy is stated once, in one place, rather than smuggled into a
+# string comparison.
+fn serve_parse_listen(arg, out_addr, out_port) {
     var alen = strlen(arg);
     var colon = 0 - 1;
     var i = 0;
@@ -1013,8 +1017,18 @@ fn serve_parse_listen(arg, out_port) {
         i = i + 1;
     }
     if (colon < 0) { return 0; }
-    if (colon != 9) { return 0; }
-    if (memeq(arg, "127.0.0.1", 9) != 1) { return 0; }
+    if (colon == 0) { return 0; }
+
+    var hbuf = alloc_or_die(colon + 1);
+    memcpy(hbuf, arg, colon);
+    store8(hbuf + colon, 0);
+    var addr = sandhi_net_parse_ipv4(hbuf);
+    if (addr < 0) {
+        if (streq(hbuf, "localhost") == 1) { addr = INADDR_LOOPBACK(); }
+        else { return 0; }
+    }
+    store64(out_addr, addr);
+
     var port = 0;
     var j = colon + 1;
     var saw_digit = 0;
@@ -1251,12 +1265,12 @@ fn _serve_tls_recv_request(ctx, buf, max) {
 # request → dispatch with _serve_tls_ctx set so the response goes back over TLS →
 # close. Single-threaded/sequential like sandhi_server_run, so the global ctx is
 # connection-safe. cert/key DER buffers are loaded once by the caller.
-fn _serve_run_tls(port, cert, cert_len, key, key_len) {
+fn _serve_run_tls(listen_addr, port, cert, cert_len, key, key_len) {
     var sfd_r = tcp_socket();
     if (is_err_result(sfd_r) == 1) { eprintln("sit: tcp_socket failed"); return 1; }
     var sfd = payload(sfd_r);
     sock_reuse(sfd);
-    if (is_err_result(sock_bind(sfd, INADDR_LOOPBACK(), port)) == 1) {
+    if (is_err_result(sock_bind(sfd, listen_addr, port)) == 1) {
         eprintln("sit: bind failed"); return 1;
     }
     if (is_err_result(sock_listen(sfd, 16)) == 1) {
@@ -1300,13 +1314,36 @@ fn _serve_run_tls(port, cert, cert_len, key, key_len) {
     return 0;
 }
 
+# Report the address actually bound, not a hardcoded 127.0.0.1 — since v1.6.0
+# that is no longer always true, and a banner that lies about the exposure is
+# worse than no banner.
+fn _serve_print_banner(addr, tls_on, auth_on) {
+    stdout_write("sit serve listening on ", 23);
+    var a0 = addr & 0xFF;
+    var a1 = (addr >> 8) & 0xFF;
+    var a2 = (addr >> 16) & 0xFF;
+    var a3 = (addr >> 24) & 0xFF;
+    var nb[24];
+    var d = write_decimal(&nb, a0); stdout_write(&nb, d); stdout_write(".", 1);
+    d = write_decimal(&nb, a1); stdout_write(&nb, d); stdout_write(".", 1);
+    d = write_decimal(&nb, a2); stdout_write(&nb, d); stdout_write(".", 1);
+    d = write_decimal(&nb, a3); stdout_write(&nb, d);
+    if (tls_on == 1) { stdout_write(" (tls, auth: ", 13); }
+    else { stdout_write(" (auth: ", 8); }
+    if (auth_on == 1) { stdout_write("bearer)", 7); }
+    else { stdout_write("none)", 5); }
+    stdout_write("\n", 1);
+    return 0;
+}
+
 fn cmd_serve() {
     if (argc() < 3) {
-        eprintln("usage: sit serve <repo-path> [--stdio | --listen 127.0.0.1:<port>] [--tls --cert <f> --key <f>] [--require-auth] [--token <path>]");
+        eprintln("usage: sit serve <repo-path> [--stdio | --listen <addr>:<port>] [--tls --cert <f> --key <f>] [--require-auth] [--token <path>]");
         return 1;
     }
     var repo_path = argv_heap(2);
     var port = SIT_SERVE_DEFAULT_PORT;
+    var bind_addr = INADDR_LOOPBACK();
     var stdio_mode = 0;
     var token_path = "~/.sit/serve.token";   # default; overridable via --token
     var custom_token_path = 0;
@@ -1329,12 +1366,15 @@ fn cmd_serve() {
                 return 1;
             }
             var port_cell = alloc(8);
+            var addr_cell = alloc(8);
             store64(port_cell, 0);
-            if (serve_parse_listen(argv(ai + 1), port_cell) != 1) {
-                eprintln("sit: --listen requires 127.0.0.1:<port> (non-loopback waits on first-party TLS, ADR 0007)");
+            store64(addr_cell, 0);
+            if (serve_parse_listen(argv(ai + 1), addr_cell, port_cell) != 1) {
+                eprintln("sit: --listen requires <ipv4>:<port> or localhost:<port>");
                 return 1;
             }
             port = load64(port_cell);
+            bind_addr = load64(addr_cell);
             ai = ai + 2;
         }
         else {
@@ -1470,24 +1510,43 @@ fn cmd_serve() {
         return _serve_run_stdio();
     }
 
+    # v1.6.0 — the loopback lock becomes a POLICY, stated once, here.
+    #
+    # Until now `--listen` refused anything but 127.0.0.1, because the daemon
+    # can be unencrypted and optionally unauthenticated: putting that on a
+    # routable interface is what the lock existed to prevent. Encryption is what
+    # changes the calculus, so a non-loopback bind now requires --tls.
+    #
+    # Note what is deliberately NOT required: bearer auth. A public read-only
+    # mirror over HTTPS is a legitimate deployment and `--require-auth` stays the
+    # operator's call. What is not negotiable is that bytes on a routable
+    # interface are encrypted.
+    if (bind_addr != INADDR_LOOPBACK()) {
+        if (tls_mode == 0) {
+            eprintln("sit: refusing to serve plain HTTP on a non-loopback address");
+            eprintln("sit:   add --tls --cert <f> --key <f>, or bind 127.0.0.1");
+            return 1;
+        }
+    }
+
     if (tls_mode == 1) {
         if (_serve_require_auth == 1) {
-            println("sit serve listening on 127.0.0.1 (tls, auth: bearer)");
+            _serve_print_banner(bind_addr, 1, 1);
         }
         else {
-            println("sit serve listening on 127.0.0.1 (tls, auth: none)");
+            _serve_print_banner(bind_addr, 1, 0);
         }
         stdout_flush();
-        return _serve_run_tls(port, load64(&cert_pair), load64(&cert_pair + 8),
+        return _serve_run_tls(bind_addr, port, load64(&cert_pair), load64(&cert_pair + 8),
           load64(&key_pair), load64(&key_pair + 8));
     }
 
     if (_serve_require_auth == 1) {
-        println("sit serve listening on 127.0.0.1 (auth: bearer)");
+        _serve_print_banner(bind_addr, 0, 1);
     }
     else {
-        println("sit serve listening on 127.0.0.1 (auth: none)");
+        _serve_print_banner(bind_addr, 0, 0);
     }
     stdout_flush();
-    return sandhi_server_run(INADDR_LOOPBACK(), port, &serve_handle_request, 0);
+    return sandhi_server_run(bind_addr, port, &serve_handle_request, 0);
 }

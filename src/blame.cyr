@@ -1,0 +1,196 @@
+# Upper bound on the first-parent walk, mirroring SIT_DESCRIBE_MAX. A cyclic or
+# hostile parent chain reports rather than spinning.
+var SIT_BLAME_MAX_COMMITS = 100000;
+
+# blame.cyr — `sit blame <path>`: per-line last-touch attribution.
+#
+# Walks first-parent history from HEAD. At each step the file's content in the
+# commit is diffed against its content in the parent; a line the diff calls an
+# INSERT was introduced by that commit, so any HEAD line still tracking it is
+# attributed there and stops being tracked. A line the diff calls a KEEP simply
+# moves to its position in the parent and keeps going.
+#
+# The bookkeeping is one array: `cur_of_head[h]` is where HEAD's line `h` sits
+# in the version currently under inspection, or 0 once it has been attributed.
+# Walking that mapping backwards is what makes this a single pass over history
+# rather than a diff per line.
+#
+# Reuses `compute_file_diff` (diff.cyr) — the same annotated-op layer
+# `sit_diff_path` exports for owl — so blame and diff can never disagree about
+# what counts as an inserted line.
+
+# Content of `path` in `commit_hex`, as (ptr,len) into out_pair.
+# Returns 0 on success, non-zero when the commit does not contain the path.
+fn _blame_content_at(commit_hex, path, out_pair) {
+    var entries = commit_tree_entries(commit_hex);
+    if (entries == 0) { return 0 - 1; }
+    var h = tree_find_hash(entries, path);
+    if (h == 0) { return 0 - 1; }
+    return read_blob_content(h, out_pair);
+}
+
+# Short author name of a commit, or "unknown".
+fn _blame_author_of(commit_hex) {
+    var obj[24];
+    if (read_object(commit_hex, &obj) != 0) { return "unknown"; }
+    var buf = load64(&obj);
+    var blen = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    var info[56];
+    if (parse_commit_body(buf + coff, blen - coff, &info) != 0) { return "unknown"; }
+    var ident = load64(&info + 16);
+    if (ident == 0) { return "unknown"; }
+    return ident;
+}
+
+fn cmd_blame() {
+    if (sf_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+    if (argc() < 3) {
+        eprintln("usage: sit blame <path>");
+        return 1;
+    }
+    var path = argv_heap(2);
+    # The path becomes a tree lookup key; gate it the way `add` does.
+    if (tree_flat_path_valid(path) == 0) {
+        eprintln("sit: invalid path");
+        return 1;
+    }
+
+    var head_hex = read_head_ref();
+    if (head_hex == 0) {
+        eprintln("sit: no commits yet");
+        return 1;
+    }
+
+    var head_pair[16];
+    if (_blame_content_at(head_hex, path, &head_pair) != 0) {
+        eprintln("sit: path is not tracked at HEAD");
+        return 1;
+    }
+    var head_lines = split_lines(load64(&head_pair), load64(&head_pair + 8));
+    var nlines = vec_len(head_lines);
+    if (nlines == 0) { return 0; }
+
+    # cur_of_head[h] (1-indexed): where HEAD line h sits in the version being
+    # inspected; 0 once attributed. attrib[h]: the commit that introduced it.
+    var cur_of_head = fl_alloc((nlines + 1) * 8);
+    var attrib = fl_alloc((nlines + 1) * 8);
+    var i = 0;
+    while (i <= nlines) {
+        store64(cur_of_head + i * 8, i);
+        store64(attrib + i * 8, 0);
+        i = i + 1;
+    }
+
+    var cur = head_hex;
+    var remaining = nlines;
+    var guard = 0;
+    var walking = 1;
+    while (walking == 1) {
+        if (cur == 0) { walking = 0; }
+        else {
+            if (remaining == 0) { walking = 0; }
+            else {
+                guard = guard + 1;
+                if (guard > SIT_BLAME_MAX_COMMITS) {
+                    eprintln("sit: blame walked too far — history longer than the cap");
+                    walking = 0;
+                }
+                else {
+                    var cur_pair[16];
+                    var have_cur = _blame_content_at(cur, path, &cur_pair);
+                    var parents = commit_parents_of(cur);
+                    var parent = 0;
+                    if (parents != 0) {
+                        if (vec_len(parents) > 0) { parent = vec_get(parents, 0); }
+                    }
+
+                    var par_pair[16];
+                    var have_par = 0 - 1;
+                    if (parent != 0) { have_par = _blame_content_at(parent, path, &par_pair); }
+
+                    if (have_cur != 0) {
+                        # The path does not exist here; nothing left to trace.
+                        walking = 0;
+                    }
+                    else {
+                        var cur_lines_n = vec_len(split_lines(load64(&cur_pair), load64(&cur_pair + 8)));
+                        # new_to_old[nl] = the line's position in the parent, or
+                        # 0 when this commit introduced it.
+                        var n2o = fl_alloc((cur_lines_n + 2) * 8);
+                        var z = 0;
+                        while (z <= cur_lines_n + 1) { store64(n2o + z * 8, 0); z = z + 1; }
+
+                        if (have_par == 0) {
+                            var ops = compute_file_diff(load64(&par_pair), load64(&par_pair + 8),
+                              load64(&cur_pair), load64(&cur_pair + 8));
+                            if (ops != 0) {
+                                var oi = 0;
+                                var on = vec_len(ops);
+                                while (oi < on) {
+                                    var a = vec_get(ops, oi);
+                                    if (ann_kind(a) == 0) {
+                                        var nl = ann_new(a);
+                                        if (nl > 0) {
+                                            if (nl <= cur_lines_n) { store64(n2o + nl * 8, ann_old(a)); }
+                                        }
+                                    }
+                                    oi = oi + 1;
+                                }
+                            }
+                        }
+                        # have_par != 0 leaves n2o all zeros: the parent lacks
+                        # the file (or there is no parent), so every line here
+                        # is an introduction by `cur`. That is exactly right for
+                        # the commit that first added the file.
+
+                        var h = 1;
+                        while (h <= nlines) {
+                            var c = load64(cur_of_head + h * 8);
+                            if (c > 0) {
+                                var o = 0;
+                                if (c <= cur_lines_n) { o = load64(n2o + c * 8); }
+                                if (o == 0) {
+                                    store64(attrib + h * 8, cur);
+                                    store64(cur_of_head + h * 8, 0);
+                                    remaining = remaining - 1;
+                                }
+                                else { store64(cur_of_head + h * 8, o); }
+                            }
+                            h = h + 1;
+                        }
+                        fl_free(n2o);
+                        cur = parent;
+                    }
+                }
+            }
+        }
+    }
+
+    # Emit: <12-hex> (<author> <lineno>) <line>
+    var li = 1;
+    while (li <= nlines) {
+        var who = load64(attrib + li * 8);
+        if (who == 0) { stdout_write("^unattributed", 13); }
+        else { stdout_write(who, 12); }
+        stdout_write(" (", 2);
+        var nm = "unknown";
+        if (who != 0) { nm = _blame_author_of(who); }
+        stdout_write(nm, strlen(nm));
+        stdout_write(" ", 1);
+        var nb[24];
+        var d = write_decimal(&nb, li);
+        stdout_write(&nb, d);
+        stdout_write(") ", 2);
+        var s = vec_get(head_lines, li - 1);
+        stdout_write(str_data(s), str_len(s));
+        stdout_write("\n", 1);
+        li = li + 1;
+    }
+    fl_free(cur_of_head);
+    fl_free(attrib);
+    return 0;
+}

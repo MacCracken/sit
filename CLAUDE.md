@@ -159,7 +159,7 @@ Run a closeout pass before tagging `X.Y.0` or `X.0.0`. Ship as the last patch of
 - `break` in while loops with `var` declarations is unreliable — use flag + `continue`.
 - No negative literals — write `(0 - N)` not `-N`.
 - No mixed `&&` / `||` in one expression — nest `if` blocks instead.
-- Reserved names to avoid as variables: `match`, `in`, `pub`.
+- Reserved names to avoid as variables: `match`, `in`, `pub`, `stack`, `callptr`.
 - `return;` without value is invalid — always `return 0;`.
 - All `var` declarations are function-scoped — no block scoping.
 - Max limits per compilation unit: 4,096 variables, 1,024 functions, 4,096 initialized globals.

@@ -1,0 +1,270 @@
+# Upper bound on the branch-range walk, mirroring SIT_DESCRIBE_MAX.
+var SIT_REBASE_MAX = 100000;
+
+# rebase.cyr — `sit rebase <upstream>`.
+#
+# A rebase is cherry-pick in a loop: reset the branch to <upstream>, then replay
+# each commit that was on the branch but not on upstream. 1.5.1 already built
+# the per-commit half as `_apply_one_commit` (history.cyr), which is why this
+# file is short — what it adds is the loop, the resumable state, and the
+# guarantee that a failure leaves the branch exactly where it started.
+#
+# State lives in two files, both under .sit/ and both removed on completion:
+#   .sit/REBASE_ORIG   the branch tip before the rebase began (for --abort)
+#   .sit/rebase-todo   one oid per line, oldest first, of what is left to apply
+#
+# ⚠ Rebase REWRITES history: the replayed commits are new objects with new oids.
+# The originals stay reachable through the reflog, which is what makes --abort
+# and after-the-fact recovery possible, and is why this waited for 1.1.0.
+
+fn rebase_orig_path() { return ".sit/REBASE_ORIG"; }
+fn rebase_todo_path() { return ".sit/rebase-todo"; }
+
+# Commits reachable from `tip` but not from `upstream`, oldest-first, along the
+# first-parent chain. That is the set a rebase replays.
+fn _rebase_pending(tip, upstream) {
+    var base = find_merge_base(tip, upstream);
+    var newest_first = vec_new();
+    var cur = tip;
+    var guard = 0;
+    var walking = 1;
+    while (walking == 1) {
+        if (cur == 0) { walking = 0; }
+        else {
+            var at_base = 0;
+            if (base != 0) {
+                if (streq(cur, base) == 1) { at_base = 1; }
+            }
+            if (at_base == 1) { walking = 0; }
+            else {
+                guard = guard + 1;
+                if (guard > SIT_REBASE_MAX) {
+                    eprintln("sit: rebase range too long");
+                    return 0;
+                }
+                var c = alloc(65);
+                memcpy(c, cur, 64);
+                store8(c + 64, 0);
+                vec_push(newest_first, c);
+                var parents = commit_parents_of(cur);
+                cur = 0;
+                if (parents != 0) {
+                    if (vec_len(parents) > 0) { cur = vec_get(parents, 0); }
+                }
+            }
+        }
+    }
+    # Collected newest-first; replay oldest-first.
+    var out = vec_new();
+    var i = vec_len(newest_first);
+    while (i > 0) {
+        i = i - 1;
+        vec_push(out, vec_get(newest_first, i));
+    }
+    return out;
+}
+
+fn _rebase_write_todo(todo, from_index) {
+    var n = vec_len(todo);
+    var cap = (n - from_index) * 65 + 1;
+    if (cap < 1) { cap = 1; }
+    var buf = alloc_or_die(cap);
+    var w = 0;
+    var i = from_index;
+    while (i < n) {
+        memcpy(buf + w, vec_get(todo, i), 64);
+        w = w + 64;
+        store8(buf + w, 10);
+        w = w + 1;
+        i = i + 1;
+    }
+    if (w == 0) {
+        if (sf_exists(rebase_todo_path()) == 1) { return sf_unlink(rebase_todo_path()); }
+        return 0;
+    }
+    if (sf_write_all(rebase_todo_path(), buf, w) < 0) { return 0 - 1; }
+    return 0;
+}
+
+fn _rebase_read_todo() {
+    var out = vec_new();
+    if (sf_exists(rebase_todo_path()) != 1) { return out; }
+    var pair[16];
+    if (read_file_heap(rebase_todo_path(), &pair) != 0) { return out; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+    var pos = 0;
+    while (pos + 64 <= len) {
+        if (hex_prefix_valid(buf + pos, 64) == 1) {
+            var c = alloc(65);
+            memcpy(c, buf + pos, 64);
+            store8(c + 64, 0);
+            vec_push(out, c);
+        }
+        pos = pos + 65;
+    }
+    return out;
+}
+
+fn _rebase_clear_state() {
+    if (sf_exists(rebase_todo_path()) == 1) { sf_unlink(rebase_todo_path()); }
+    if (sf_exists(rebase_orig_path()) == 1) { sf_unlink(rebase_orig_path()); }
+    return 0;
+}
+
+# Apply `todo` from `start` onward. Returns 0 when the whole list lands.
+fn _rebase_run(todo, start) {
+    var n = vec_len(todo);
+    var i = start;
+    while (i < n) {
+        var c = vec_get(todo, i);
+        # _apply_one_commit is cherry-pick: (base = parent(c), ours = HEAD,
+        # theirs = c). On conflict it writes the marker files and returns
+        # non-zero, and HEAD is left where it was — so the todo we persist
+        # starts AT this commit, and --continue re-applies it after the user
+        # resolves.
+        if (_apply_one_commit(c, 0, cherry_pick_head_path(), "rebase", 6) != 0) {
+            _rebase_write_todo(todo, i);
+            syscall(SYS_WRITE, STDERR, "sit: rebase stopped at ", 23);
+            syscall(SYS_WRITE, STDERR, c, 12);
+            syscall(SYS_WRITE, STDERR, " — resolve, 'sit add', then 'sit rebase --continue'\n", 54);
+            return 1;
+        }
+        i = i + 1;
+    }
+    _rebase_clear_state();
+    stdout_write("rebase complete\n", 16);
+    return 0;
+}
+
+fn cmd_rebase() {
+    if (sf_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+    if (argc() < 3) {
+        eprintln("usage: sit rebase <upstream> | sit rebase --continue | --abort");
+        return 1;
+    }
+    var arg = argv_heap(2);
+
+    if (streq(arg, "--abort") == 1) {
+        if (sf_exists(rebase_orig_path()) != 1) {
+            eprintln("sit: no rebase in progress");
+            return 1;
+        }
+        var pair[16];
+        if (read_file_heap(rebase_orig_path(), &pair) != 0) {
+            eprintln("sit: cannot read saved rebase state");
+            return 1;
+        }
+        var b = load64(&pair);
+        if (load64(&pair + 8) < 64) { eprintln("sit: corrupt rebase state"); return 1; }
+        var orig = alloc(65);
+        memcpy(orig, b, 64);
+        store8(orig + 64, 0);
+        # Materialize before the ref moves — see the note in cmd_merge.
+        if (materialize_target(orig) != 0) {
+            eprintln("sit: failed to restore the working tree — branch unchanged");
+            return 1;
+        }
+        if (write_head_ref(orig) != 0) {
+            eprintln("sit: failed to restore the branch ref");
+            return 1;
+        }
+        _rebase_clear_state();
+        if (sf_exists(".sit/CHERRY_PICK_HEAD") == 1) { sf_unlink(".sit/CHERRY_PICK_HEAD"); }
+        stdout_write("rebase aborted; branch restored to ", 35);
+        stdout_write(orig, 12);
+        stdout_write("\n", 1);
+        return 0;
+    }
+
+    if (streq(arg, "--continue") == 1) {
+        if (sf_exists(rebase_orig_path()) != 1) {
+            eprintln("sit: no rebase in progress");
+            return 1;
+        }
+        if (sf_exists(".sit/CHERRY_PICK_HEAD") == 1) { sf_unlink(".sit/CHERRY_PICK_HEAD"); }
+        var todo = _rebase_read_todo();
+        if (vec_len(todo) == 0) {
+            _rebase_clear_state();
+            stdout_write("rebase complete\n", 16);
+            return 0;
+        }
+        # The stopped commit is todo[0]; the user has resolved and staged it, so
+        # commit that resolution rather than re-applying the same conflict.
+        var head_now = read_head_ref();
+        var msg = commit_message_of(vec_get(todo, 0));
+        if (msg == 0) { msg = "rebase: resolved"; }
+        var entries = parse_index();
+        if (entries == 0) { entries = vec_new(); }
+        sort_entries(entries);
+        var tree_hex = build_tree(entries, 0);
+        if (tree_hex == 0) { eprintln("sit: failed to write tree"); return 1; }
+        var new_hex = build_commit_signed(tree_hex, head_now, msg, 0);
+        if (new_hex == 0) { eprintln("sit: failed to write commit"); return 1; }
+        if (materialize_target(new_hex) != 0) {
+            eprintln("sit: commit written but working tree not updated");
+            return 1;
+        }
+        if (write_head_ref(new_hex) != 0) { eprintln("sit: failed to update branch ref"); return 1; }
+        return _rebase_run(todo, 1);
+    }
+
+    if (sf_exists(rebase_orig_path()) == 1) {
+        eprintln("sit: a rebase is already in progress ('--continue' or '--abort')");
+        return 1;
+    }
+    if (sf_exists(".sit/MERGE_HEAD") == 1) {
+        eprintln("sit: a merge is in progress — finish it before rebasing");
+        return 1;
+    }
+
+    var up[72];
+    if (resolve_commit_hash(arg, &up) != 1) {
+        eprintln("sit: cannot resolve upstream");
+        return 1;
+    }
+    var head_hex = read_head_ref();
+    if (head_hex == 0) { eprintln("sit: no commits yet"); return 1; }
+
+    var todo = _rebase_pending(head_hex, &up);
+    if (todo == 0) { return 1; }
+    if (vec_len(todo) == 0) {
+        stdout_write("already up to date — nothing to rebase\n", 39);
+        return 0;
+    }
+
+    # Save the original tip FIRST: everything after this is recoverable with
+    # --abort, and the reflog keeps the original commits reachable regardless.
+    var obuf = alloc(66);
+    memcpy(obuf, head_hex, 64);
+    store8(obuf + 64, 10);
+    if (sf_write_all(rebase_orig_path(), obuf, 65) < 0) {
+        eprintln("sit: cannot save rebase state");
+        return 1;
+    }
+
+    # Move the branch to upstream, then replay.
+    if (materialize_target(&up) != 0) {
+        eprintln("sit: failed to check out upstream — branch unchanged");
+        _rebase_clear_state();
+        return 1;
+    }
+    if (write_head_ref(&up) != 0) {
+        eprintln("sit: failed to move the branch ref");
+        _rebase_clear_state();
+        return 1;
+    }
+    reflog_head_move(head_hex, &up, reflog_msg_subject("rebase: onto ", arg));
+
+    stdout_write("rebasing ", 9);
+    var nb[24];
+    var d = write_decimal(&nb, vec_len(todo));
+    stdout_write(&nb, d);
+    stdout_write(" commit(s) onto ", 16);
+    stdout_write(&up, 12);
+    stdout_write("\n", 1);
+    return _rebase_run(todo, 0);
+}

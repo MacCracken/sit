@@ -50,9 +50,10 @@ fn print_usage() {
     eprintln("  branch [-d <name>|<name>]  list / create / delete branch (-d deletes)");
     eprintln("  checkout [-b] <branch>  switch to <branch>, optionally creating it first");
     eprintln("  tag [-a|-s] [-d <name>|<name> [-m <msg>] [<commit>]]  list / create / delete tag");
-    eprintln("  merge <branch>          merge <branch> into HEAD (fast-forward or 3-way)");
+    eprintln("  merge <branch> [<branch> ...]  merge into HEAD (fast-forward, 3-way, or octopus)");
     eprintln("  cherry-pick <commit>    apply <commit>'s change onto HEAD as a new commit");
     eprintln("  revert <commit>         apply the inverse of <commit> as a new commit");
+    eprintln("  rebase <upstream>       replay this branch onto <upstream> (--continue|--abort)");
     eprintln("  stash [push|list|pop|drop]  save / restore working-tree changes");
     eprintln("  merge-base <a> <b>      print the lowest common ancestor of two commits");
     eprintln("  describe [<commit>]     name a commit by the nearest tag (tag-N-g<short>)");
@@ -74,6 +75,7 @@ fn print_usage() {
     eprintln("  status                  show working tree status");
     eprintln("  diff [--staged|HEAD]    show unstaged / staged / working-vs-HEAD diffs");
     eprintln("  show [--stat] [<hash>]  show a single commit (full diff or per-file stat)");
+    eprintln("  blame <path>            show the commit that last touched each line");
     eprintln("  cat-file <hash>         emit object content to stdout (plumbing)");
     eprintln("  owl-file <hash>         view object through owl (bat-like viewer)");
     return 0;
@@ -101,6 +103,8 @@ fn main() {
     if (streq(cmd, "cherry-pick") == 1) { return cmd_cherry_pick(); }
     if (streq(cmd, "revert")   == 1) { return cmd_revert(); }
     if (streq(cmd, "stash")    == 1) { return cmd_stash(); }
+    if (streq(cmd, "blame")    == 1) { return cmd_blame(); }
+    if (streq(cmd, "rebase")   == 1) { return cmd_rebase(); }
     if (streq(cmd, "merge-base") == 1) { return cmd_merge_base(); }
     if (streq(cmd, "reset")    == 1) { return cmd_reset(); }
     if (streq(cmd, "config")   == 1) { return cmd_config(); }
