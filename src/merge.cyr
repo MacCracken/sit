@@ -717,7 +717,8 @@ fn cmd_merge() {
         # S-16: a stale MERGE_HEAD silently turns the next commit into a
         # 2-parent merge. Same cliff as cmd_commit's clear path.
         if (sf_unlink(".sit/MERGE_HEAD") != 0) {
-            eprintln("sit: failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove manually");
+            eprintln("sit: failed to clear .sit/MERGE_HEAD");
+            eprintln("sit:   the next commit may wrongly become a merge — remove it manually");
             return 1;
         }
         stdout_write("merge aborted\n", 14);
@@ -938,7 +939,6 @@ fn cmd_merge() {
     stdout_write("'\n", 2);
     return 0;
 }
-
 
 # N-parent (octopus) commit. Same framing as build_merge_commit_signed, with
 # one `parent` header per entry of `parents` in order — first parent first, as

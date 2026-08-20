@@ -515,7 +515,7 @@ var VAL_CONFIG_VALUE_MAX = 1024;   # S-05
 var VAL_CONFIG_KEY_MAX = 128;      # S-05
 var VAL_REMOTE_URL_MAX = 4096;     # S-04
 
-# ── Hex prefix (S-01) ───────────────────────────────────────────────
+# ── Hex prefix (S-01) ───────────────────────────────
 #
 # Accept only [0-9a-f], length 4..64. Used by resolve_hash before interpolating
 # the prefix into `LIKE '<prefix>%'`. Preserves sit's existing "too short" (-2)
@@ -538,7 +538,7 @@ fn hex_prefix_valid(s, len) {
     return 1;
 }
 
-# ── Ref name (S-02, S-26) ───────────────────────────────────────────
+# ── Ref name (S-02, S-26) ─────────────────────────────
 #
 # Enforces git check-ref-format rules:
 #   - non-empty, <= VAL_REFNAME_MAX
@@ -640,7 +640,7 @@ fn refname_valid(name) {
     return 1;
 }
 
-# ── Tree entry name (S-03) ──────────────────────────────────────────
+# ── Tree entry name (S-03) ─────────────────────────────
 #
 # Called by parse_tree on each entry, AND by materialize_target before the
 # write, so attackers have to clear two hurdles. Belt-and-suspenders.
@@ -718,7 +718,7 @@ fn _is_ntfs_reserved(name, name_len) {
     return 0;
 }
 
-# ── HFS-ignorable codepoints (v1.4.8) ───────────────────────────────
+# ── HFS-ignorable codepoints (v1.4.8) ─────────────────────────
 #
 # macOS HFS+ ignores a set of Unicode formatting codepoints when comparing
 # filenames, so `.g<U+200C>it` and `.git` name the SAME directory there while
@@ -947,7 +947,7 @@ fn tree_entry_mode_valid(mode) {
     return 0;
 }
 
-# ── Config key / value (S-05) ───────────────────────────────────────
+# ── Config key / value (S-05) ────────────────────────────
 #
 # Reject control chars (includes \n, \r, \0), cap lengths, and for the key
 # require dot-separated tokens that look reasonable.
@@ -989,7 +989,7 @@ fn config_key_valid(k) {
     return 1;
 }
 
-# ── Remote URL (S-04) ───────────────────────────────────────────────
+# ── Remote URL (S-04) ───────────────────────────────
 #
 # Scheme-aware validator. v0.6.x accepted only local-path schemes; v0.7.1
 # extends acceptance to http://, https://, ssh:// (transport itself lands in
@@ -1102,7 +1102,7 @@ fn remote_url_valid(url) {
     return 0;
 }
 
-# ── Filesystem symlink guard (S-04, S-12) ──────────────────────────
+# ── Filesystem symlink guard (S-04, S-12) ────────────────────────
 #
 # Calls newfstatat(AT_FDCWD, path, &stat, AT_SYMLINK_NOFOLLOW) and returns:
 #   1 if path exists and is a SYMLINK
@@ -2816,7 +2816,8 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
             if (body >= plen) { return 0 - 11; }
             var content = alloc(size + 16);
             if (content == 0) { return 0 - 11; }
-            var got = zlib_decompress_with_ratio_cap(pdata + body, plen - body, content, size + 16, SIT_MAX_INFLATE_RATIO);
+            var got = zlib_decompress_with_ratio_cap(pdata + body, plen - body,
+              content, size + 16, SIT_MAX_INFLATE_RATIO);
             if (got <= 0) { return 0 - 12; }
             store64(out24, content);
             store64(out24 + 8, got);
@@ -3469,12 +3470,14 @@ fn object_db_migrate_from_loose(db) {
                         if (dec_cap < 4096) { dec_cap = 4096; }
                         if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
                         var decompressed = alloc_or_die(dec_cap);
-                        var dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
+                        var dlen = zlib_decompress_with_ratio_cap(compressed, clen,
+                          decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
                         if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
                             if (dec_cap < 16 * 1024 * 1024) {
                                 dec_cap = 16 * 1024 * 1024;
                                 decompressed = alloc_or_die(dec_cap);
-                                dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
+                                dlen = zlib_decompress_with_ratio_cap(compressed, clen,
+                                  decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
                             }
                         }
                         var type_code = 0;
@@ -9154,7 +9157,7 @@ fn print_commit_oneline(commit_hex, body, body_len, msg_start) {
     return 0;
 }
 
-# ── sit log --graph (v0.8.12) ──────────────────────────────────────
+# ── sit log --graph (v0.8.12) ────────────────────────────
 #
 # An ASCII commit-DAG renderer. Unlike the default `cmd_log` (which walks
 # only the first-parent chain via out+8), `--graph` walks the FULL DAG via
@@ -9693,7 +9696,8 @@ fn cmd_commit() {
             # an unintended 2-parent merge. Refuse to declare success on the
             # commit if we couldn't clear it.
             if (sf_unlink(".sit/MERGE_HEAD") != 0) {
-                eprintln("sit: commit object written but failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove the file manually");
+                eprintln("sit: commit written but .sit/MERGE_HEAD could not be cleared");
+                eprintln("sit:   the next commit may wrongly become a merge — remove the file manually");
                 return 1;
             }
         }
@@ -10471,7 +10475,8 @@ fn cmd_merge() {
         # S-16: a stale MERGE_HEAD silently turns the next commit into a
         # 2-parent merge. Same cliff as cmd_commit's clear path.
         if (sf_unlink(".sit/MERGE_HEAD") != 0) {
-            eprintln("sit: failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove manually");
+            eprintln("sit: failed to clear .sit/MERGE_HEAD");
+            eprintln("sit:   the next commit may wrongly become a merge — remove it manually");
             return 1;
         }
         stdout_write("merge aborted\n", 14);

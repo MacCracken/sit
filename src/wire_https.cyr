@@ -197,7 +197,8 @@ fn _https_client_cert_paths(out_key) {
     if (c == 0) { return 0; }
     var k = config_get("http.sslKey");
     if (k == 0) {
-        eprintln("sit: http.sslCert is set but http.sslKey is not — refusing to connect with half a client credential");
+        eprintln("sit: http.sslCert is set but http.sslKey is not");
+        eprintln("sit:   refusing to connect with half a client credential");
         return 0 - 1;
     }
     store64(out_key, k);

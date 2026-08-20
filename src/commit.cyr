@@ -498,7 +498,7 @@ fn print_commit_oneline(commit_hex, body, body_len, msg_start) {
     return 0;
 }
 
-# ── sit log --graph (v0.8.12) ──────────────────────────────────────
+# ── sit log --graph (v0.8.12) ────────────────────────────
 #
 # An ASCII commit-DAG renderer. Unlike the default `cmd_log` (which walks
 # only the first-parent chain via out+8), `--graph` walks the FULL DAG via
@@ -1037,7 +1037,8 @@ fn cmd_commit() {
             # an unintended 2-parent merge. Refuse to declare success on the
             # commit if we couldn't clear it.
             if (sf_unlink(".sit/MERGE_HEAD") != 0) {
-                eprintln("sit: commit object written but failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove the file manually");
+                eprintln("sit: commit written but .sit/MERGE_HEAD could not be cleared");
+                eprintln("sit:   the next commit may wrongly become a merge — remove the file manually");
                 return 1;
             }
         }

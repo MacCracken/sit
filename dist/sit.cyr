@@ -528,7 +528,7 @@ var VAL_CONFIG_VALUE_MAX = 1024;   # S-05
 var VAL_CONFIG_KEY_MAX = 128;      # S-05
 var VAL_REMOTE_URL_MAX = 4096;     # S-04
 
-# ── Hex prefix (S-01) ───────────────────────────────────────────────
+# ── Hex prefix (S-01) ───────────────────────────────
 #
 # Accept only [0-9a-f], length 4..64. Used by resolve_hash before interpolating
 # the prefix into `LIKE '<prefix>%'`. Preserves sit's existing "too short" (-2)
@@ -551,7 +551,7 @@ fn hex_prefix_valid(s, len) {
     return 1;
 }
 
-# ── Ref name (S-02, S-26) ───────────────────────────────────────────
+# ── Ref name (S-02, S-26) ─────────────────────────────
 #
 # Enforces git check-ref-format rules:
 #   - non-empty, <= VAL_REFNAME_MAX
@@ -653,7 +653,7 @@ fn refname_valid(name) {
     return 1;
 }
 
-# ── Tree entry name (S-03) ──────────────────────────────────────────
+# ── Tree entry name (S-03) ─────────────────────────────
 #
 # Called by parse_tree on each entry, AND by materialize_target before the
 # write, so attackers have to clear two hurdles. Belt-and-suspenders.
@@ -731,7 +731,7 @@ fn _is_ntfs_reserved(name, name_len) {
     return 0;
 }
 
-# ── HFS-ignorable codepoints (v1.4.8) ───────────────────────────────
+# ── HFS-ignorable codepoints (v1.4.8) ─────────────────────────
 #
 # macOS HFS+ ignores a set of Unicode formatting codepoints when comparing
 # filenames, so `.g<U+200C>it` and `.git` name the SAME directory there while
@@ -960,7 +960,7 @@ fn tree_entry_mode_valid(mode) {
     return 0;
 }
 
-# ── Config key / value (S-05) ───────────────────────────────────────
+# ── Config key / value (S-05) ────────────────────────────
 #
 # Reject control chars (includes \n, \r, \0), cap lengths, and for the key
 # require dot-separated tokens that look reasonable.
@@ -1002,7 +1002,7 @@ fn config_key_valid(k) {
     return 1;
 }
 
-# ── Remote URL (S-04) ───────────────────────────────────────────────
+# ── Remote URL (S-04) ───────────────────────────────
 #
 # Scheme-aware validator. v0.6.x accepted only local-path schemes; v0.7.1
 # extends acceptance to http://, https://, ssh:// (transport itself lands in
@@ -1115,7 +1115,7 @@ fn remote_url_valid(url) {
     return 0;
 }
 
-# ── Filesystem symlink guard (S-04, S-12) ──────────────────────────
+# ── Filesystem symlink guard (S-04, S-12) ────────────────────────
 #
 # Calls newfstatat(AT_FDCWD, path, &stat, AT_SYMLINK_NOFOLLOW) and returns:
 #   1 if path exists and is a SYMLINK
@@ -2829,7 +2829,8 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
             if (body >= plen) { return 0 - 11; }
             var content = alloc(size + 16);
             if (content == 0) { return 0 - 11; }
-            var got = zlib_decompress_with_ratio_cap(pdata + body, plen - body, content, size + 16, SIT_MAX_INFLATE_RATIO);
+            var got = zlib_decompress_with_ratio_cap(pdata + body, plen - body,
+              content, size + 16, SIT_MAX_INFLATE_RATIO);
             if (got <= 0) { return 0 - 12; }
             store64(out24, content);
             store64(out24 + 8, got);
@@ -3676,12 +3677,14 @@ fn object_db_migrate_from_loose(db) {
                         if (dec_cap < 4096) { dec_cap = 4096; }
                         if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
                         var decompressed = alloc_or_die(dec_cap);
-                        var dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
+                        var dlen = zlib_decompress_with_ratio_cap(compressed, clen,
+                          decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
                         if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
                             if (dec_cap < 16 * 1024 * 1024) {
                                 dec_cap = 16 * 1024 * 1024;
                                 decompressed = alloc_or_die(dec_cap);
-                                dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
+                                dlen = zlib_decompress_with_ratio_cap(compressed, clen,
+                                  decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
                             }
                         }
                         var type_code = 0;
@@ -9361,7 +9364,7 @@ fn print_commit_oneline(commit_hex, body, body_len, msg_start) {
     return 0;
 }
 
-# ── sit log --graph (v0.8.12) ──────────────────────────────────────
+# ── sit log --graph (v0.8.12) ────────────────────────────
 #
 # An ASCII commit-DAG renderer. Unlike the default `cmd_log` (which walks
 # only the first-parent chain via out+8), `--graph` walks the FULL DAG via
@@ -9900,7 +9903,8 @@ fn cmd_commit() {
             # an unintended 2-parent merge. Refuse to declare success on the
             # commit if we couldn't clear it.
             if (sf_unlink(".sit/MERGE_HEAD") != 0) {
-                eprintln("sit: commit object written but failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove the file manually");
+                eprintln("sit: commit written but .sit/MERGE_HEAD could not be cleared");
+                eprintln("sit:   the next commit may wrongly become a merge — remove the file manually");
                 return 1;
             }
         }
@@ -10678,7 +10682,8 @@ fn cmd_merge() {
         # S-16: a stale MERGE_HEAD silently turns the next commit into a
         # 2-parent merge. Same cliff as cmd_commit's clear path.
         if (sf_unlink(".sit/MERGE_HEAD") != 0) {
-            eprintln("sit: failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove manually");
+            eprintln("sit: failed to clear .sit/MERGE_HEAD");
+            eprintln("sit:   the next commit may wrongly become a merge — remove it manually");
             return 1;
         }
         stdout_write("merge aborted\n", 14);
@@ -11374,7 +11379,7 @@ fn cmd_revert() {
     return _apply_one_commit(&hex, 1, revert_head_path(), "revert", 6);
 }
 
-# ── stash ────────────────────────────────────────────────────────────
+# ── stash ───────────────────────────────────
 #
 # A stash entry is a real commit, so it is reachable, fsck-clean, and readable
 # with the ordinary tools. `.sit/refs/stash` names the newest entry; each entry
@@ -12675,7 +12680,7 @@ fn db_object_insert_raw(db, hex, type_code, compressed, clen) {
     return 0;
 }
 
-# ── obj_src abstraction (v0.7.3) ───────────────────────────────────
+# ── obj_src abstraction (v0.7.3) ───────────────────────────
 #
 # walk_reachable_* and copy_objects need to operate against either a
 # local patra DB (file:// fetch + push, both ends of clone) or an
@@ -12829,7 +12834,7 @@ fn _walk_cache_insert(raw_cache, hex, raw_struct_ptr) {
     return 0;
 }
 
-# ── Walk-side phasing (v0.7.5) ─────────────────────────────────────
+# ── Walk-side phasing (v0.7.5) ────────────────────────────
 #
 # Same reachability + same `out` contents as `walk_reachable_from_commit`,
 # but reorganised into phases so HTTP transports can batch the tree
@@ -14411,7 +14416,7 @@ fn wire_http_close(h) {
     return 0;
 }
 
-# ── Low-level request loop ─────────────────────────────────────────
+# ── Low-level request loop ─────────────────────────────
 #
 # Issue `GET <sub_path> HTTP/1.0` against the handle and collect the
 # whole response into a freelist-backed buffer. `out_quad` (32 bytes)
@@ -14918,7 +14923,7 @@ fn _wire_http_post(h, sub_path, body, body_len, out_quad) {
     return 0;
 }
 
-# ── Capabilities probe (v0.7.4) ────────────────────────────────────
+# ── Capabilities probe (v0.7.4) ───────────────────────────
 #
 # One-time GET /sit/v1/capabilities; record whether the server
 # advertises "batch":true. Idempotent — the handle's batch_probed
@@ -15092,7 +15097,7 @@ fn http_remote_read_batch(h, hashes, start_idx, count, raw_cache) {
     return cached;
 }
 
-# ── Frame stream decoder (v0.7.5) ──────────────────────────────────
+# ── Frame stream decoder (v0.7.5) ───────────────────────────
 #
 # Walks a `buf[0..blen]` byte stream of `[64 hex][8B i64 LE ty][8B
 # i64 LE clen][clen bytes compressed]` frames per ADR 0006. For each
@@ -15174,7 +15179,7 @@ fn _wire_http_decode_frames(buf, blen, raw_cache) {
     return cached;
 }
 
-# ── /sit/v1/refs JSON parser ───────────────────────────────────────
+# ── /sit/v1/refs JSON parser ────────────────────────────
 #
 # Body shape (per serve_build_refs):
 #   {"refs":[{"name":"...","hash":"..."}, ...]}
@@ -15277,7 +15282,7 @@ fn http_remote_resolve_branch(h, branch) {
     return 0;
 }
 
-# ── Object fetch ───────────────────────────────────────────────────
+# ── Object fetch ────────────────────────────────
 #
 # Issue GET /sit/v1/objects/<hex>; populate raw_out with
 # {compressed_ptr@0, clen@8, ty@16}. The compressed bytes are
@@ -15366,7 +15371,7 @@ fn http_remote_read_both(h, hex, raw_out, deco_out) {
     return 0;
 }
 
-# ── Push primitives (v0.7.6) ───────────────────────────────────────
+# ── Push primitives (v0.7.6) ────────────────────────────
 #
 # `http_remote_push_object` uploads one compressed sit object via
 # POST /sit/v1/objects/<hex> with the patra type code in an
@@ -15629,7 +15634,7 @@ var _serve_token = 0;
 var _serve_tls_ctx = 0;
 fn _serve_set_tls_ctx(ctx) { _serve_tls_ctx = ctx; return 0; }
 
-# ── Ref-file reader ────────────────────────────────────────────────
+# ── Ref-file reader ───────────────────────────────
 #
 # Read a ref file's content as a 64-char SHA-256 hex string. Strips
 # the trailing newline conventionally written by `write_head_ref`
@@ -15658,7 +15663,7 @@ fn serve_read_ref_file(path) {
     return out;
 }
 
-# ── JSON builders ──────────────────────────────────────────────────
+# ── JSON builders ────────────────────────────────
 #
 # Hand-rolled JSON because the response shapes are tiny and
 # entirely under our control — every field name we emit is a
@@ -15829,7 +15834,7 @@ fn _serve_send_response(cfd, code, msg, ctype, body, body_len, extra) {
     return 0;
 }
 
-# ── /sit/v1/objects/<hash> handler ────────────────────────────────
+# ── /sit/v1/objects/<hash> handler ──────────────────────────
 #
 # Returns the raw compressed bytes of an object addressed by its
 # 64-hex SHA-256. The patra type code rides on an X-Sit-Type
@@ -16055,7 +16060,7 @@ fn serve_handle_want(cfd, buf, n) {
     return 0;
 }
 
-# ── Bearer auth (v0.7.6) ──────────────────────────────────────────
+# ── Bearer auth (v0.7.6) ──────────────────────────────
 #
 # `_serve_load_token(path)` — read a token file from disk. Returns
 # the heap-allocated cstring on success, 0 on any failure (missing
@@ -16497,7 +16502,7 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
     return 0;
 }
 
-# ── Request dispatcher ─────────────────────────────────────────────
+# ── Request dispatcher ──────────────────────────────
 #
 # Signature dictated by sandhi: (ctx, cfd, req_buf, req_len) → 0.
 # `ctx` is unused in v0.7.3; v0.7.5+ will pass the bearer-token
@@ -16568,7 +16573,7 @@ fn serve_handle_request(ctx, cfd, buf, n) {
     return 0;
 }
 
-# ── --listen parser ────────────────────────────────────────────────
+# ── --listen parser ───────────────────────────────
 #
 # Parses "<addr>:<port>" into *out_addr (packed IPv4) and *out_port.
 # Returns 1 on success, 0 on any malformation.
@@ -16625,7 +16630,7 @@ fn serve_parse_listen(arg, out_addr, out_port) {
     return 1;
 }
 
-# ── --stdio dispatch loop (v0.8.2) ─────────────────────────────────
+# ── --stdio dispatch loop (v0.8.2) ──────────────────────────
 #
 # When invoked as `sit serve <repo> --stdio`, sit reads HTTP/1.1
 # requests from STDIN and writes responses to STDOUT — no socket. The
@@ -16774,7 +16779,7 @@ fn _serve_run_stdio() {
     return 0;
 }
 
-# ── Top-level command ──────────────────────────────────────────────
+# ── Top-level command ───────────────────────────────
 
 # ── TLS server (bite 3b) ──
 #
@@ -16916,7 +16921,8 @@ fn _serve_print_banner(addr, tls_on, auth_on) {
 
 fn cmd_serve() {
     if (argc() < 3) {
-        eprintln("usage: sit serve <repo-path> [--stdio | --listen <addr>:<port>] [--tls --cert <f> --key <f>] [--require-auth] [--token <path>]");
+        eprintln("usage: sit serve <repo-path> [--stdio | --listen <addr>:<port>]");
+        eprintln("                 [--tls --cert <f> --key <f>] [--require-auth] [--token <path>]");
         return 1;
     }
     var repo_path = argv_heap(2);

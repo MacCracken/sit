@@ -392,7 +392,8 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
             if (body >= plen) { return 0 - 11; }
             var content = alloc(size + 16);
             if (content == 0) { return 0 - 11; }
-            var got = zlib_decompress_with_ratio_cap(pdata + body, plen - body, content, size + 16, SIT_MAX_INFLATE_RATIO);
+            var got = zlib_decompress_with_ratio_cap(pdata + body, plen - body,
+              content, size + 16, SIT_MAX_INFLATE_RATIO);
             if (got <= 0) { return 0 - 12; }
             store64(out24, content);
             store64(out24 + 8, got);

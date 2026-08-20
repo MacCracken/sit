@@ -51,7 +51,7 @@ var _serve_token = 0;
 var _serve_tls_ctx = 0;
 fn _serve_set_tls_ctx(ctx) { _serve_tls_ctx = ctx; return 0; }
 
-# ── Ref-file reader ────────────────────────────────────────────────
+# ── Ref-file reader ───────────────────────────────
 #
 # Read a ref file's content as a 64-char SHA-256 hex string. Strips
 # the trailing newline conventionally written by `write_head_ref`
@@ -80,7 +80,7 @@ fn serve_read_ref_file(path) {
     return out;
 }
 
-# ── JSON builders ──────────────────────────────────────────────────
+# ── JSON builders ────────────────────────────────
 #
 # Hand-rolled JSON because the response shapes are tiny and
 # entirely under our control — every field name we emit is a
@@ -251,7 +251,7 @@ fn _serve_send_response(cfd, code, msg, ctype, body, body_len, extra) {
     return 0;
 }
 
-# ── /sit/v1/objects/<hash> handler ────────────────────────────────
+# ── /sit/v1/objects/<hash> handler ──────────────────────────
 #
 # Returns the raw compressed bytes of an object addressed by its
 # 64-hex SHA-256. The patra type code rides on an X-Sit-Type
@@ -477,7 +477,7 @@ fn serve_handle_want(cfd, buf, n) {
     return 0;
 }
 
-# ── Bearer auth (v0.7.6) ──────────────────────────────────────────
+# ── Bearer auth (v0.7.6) ──────────────────────────────
 #
 # `_serve_load_token(path)` — read a token file from disk. Returns
 # the heap-allocated cstring on success, 0 on any failure (missing
@@ -919,7 +919,7 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
     return 0;
 }
 
-# ── Request dispatcher ─────────────────────────────────────────────
+# ── Request dispatcher ──────────────────────────────
 #
 # Signature dictated by sandhi: (ctx, cfd, req_buf, req_len) → 0.
 # `ctx` is unused in v0.7.3; v0.7.5+ will pass the bearer-token
@@ -990,7 +990,7 @@ fn serve_handle_request(ctx, cfd, buf, n) {
     return 0;
 }
 
-# ── --listen parser ────────────────────────────────────────────────
+# ── --listen parser ───────────────────────────────
 #
 # Parses "<addr>:<port>" into *out_addr (packed IPv4) and *out_port.
 # Returns 1 on success, 0 on any malformation.
@@ -1047,7 +1047,7 @@ fn serve_parse_listen(arg, out_addr, out_port) {
     return 1;
 }
 
-# ── --stdio dispatch loop (v0.8.2) ─────────────────────────────────
+# ── --stdio dispatch loop (v0.8.2) ──────────────────────────
 #
 # When invoked as `sit serve <repo> --stdio`, sit reads HTTP/1.1
 # requests from STDIN and writes responses to STDOUT — no socket. The
@@ -1196,7 +1196,7 @@ fn _serve_run_stdio() {
     return 0;
 }
 
-# ── Top-level command ──────────────────────────────────────────────
+# ── Top-level command ───────────────────────────────
 
 # ── TLS server (bite 3b) ──
 #
@@ -1338,7 +1338,8 @@ fn _serve_print_banner(addr, tls_on, auth_on) {
 
 fn cmd_serve() {
     if (argc() < 3) {
-        eprintln("usage: sit serve <repo-path> [--stdio | --listen <addr>:<port>] [--tls --cert <f> --key <f>] [--require-auth] [--token <path>]");
+        eprintln("usage: sit serve <repo-path> [--stdio | --listen <addr>:<port>]");
+        eprintln("                 [--tls --cert <f> --key <f>] [--require-auth] [--token <path>]");
         return 1;
     }
     var repo_path = argv_heap(2);

@@ -13,7 +13,7 @@ var VAL_CONFIG_VALUE_MAX = 1024;   # S-05
 var VAL_CONFIG_KEY_MAX = 128;      # S-05
 var VAL_REMOTE_URL_MAX = 4096;     # S-04
 
-# ── Hex prefix (S-01) ───────────────────────────────────────────────
+# ── Hex prefix (S-01) ───────────────────────────────
 #
 # Accept only [0-9a-f], length 4..64. Used by resolve_hash before interpolating
 # the prefix into `LIKE '<prefix>%'`. Preserves sit's existing "too short" (-2)
@@ -36,7 +36,7 @@ fn hex_prefix_valid(s, len) {
     return 1;
 }
 
-# ── Ref name (S-02, S-26) ───────────────────────────────────────────
+# ── Ref name (S-02, S-26) ─────────────────────────────
 #
 # Enforces git check-ref-format rules:
 #   - non-empty, <= VAL_REFNAME_MAX
@@ -138,7 +138,7 @@ fn refname_valid(name) {
     return 1;
 }
 
-# ── Tree entry name (S-03) ──────────────────────────────────────────
+# ── Tree entry name (S-03) ─────────────────────────────
 #
 # Called by parse_tree on each entry, AND by materialize_target before the
 # write, so attackers have to clear two hurdles. Belt-and-suspenders.
@@ -216,7 +216,7 @@ fn _is_ntfs_reserved(name, name_len) {
     return 0;
 }
 
-# ── HFS-ignorable codepoints (v1.4.8) ───────────────────────────────
+# ── HFS-ignorable codepoints (v1.4.8) ─────────────────────────
 #
 # macOS HFS+ ignores a set of Unicode formatting codepoints when comparing
 # filenames, so `.g<U+200C>it` and `.git` name the SAME directory there while
@@ -445,7 +445,7 @@ fn tree_entry_mode_valid(mode) {
     return 0;
 }
 
-# ── Config key / value (S-05) ───────────────────────────────────────
+# ── Config key / value (S-05) ────────────────────────────
 #
 # Reject control chars (includes \n, \r, \0), cap lengths, and for the key
 # require dot-separated tokens that look reasonable.
@@ -487,7 +487,7 @@ fn config_key_valid(k) {
     return 1;
 }
 
-# ── Remote URL (S-04) ───────────────────────────────────────────────
+# ── Remote URL (S-04) ───────────────────────────────
 #
 # Scheme-aware validator. v0.6.x accepted only local-path schemes; v0.7.1
 # extends acceptance to http://, https://, ssh:// (transport itself lands in
@@ -600,7 +600,7 @@ fn remote_url_valid(url) {
     return 0;
 }
 
-# ── Filesystem symlink guard (S-04, S-12) ──────────────────────────
+# ── Filesystem symlink guard (S-04, S-12) ────────────────────────
 #
 # Calls newfstatat(AT_FDCWD, path, &stat, AT_SYMLINK_NOFOLLOW) and returns:
 #   1 if path exists and is a SYMLINK

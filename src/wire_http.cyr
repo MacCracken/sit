@@ -207,7 +207,7 @@ fn wire_http_close(h) {
     return 0;
 }
 
-# ── Low-level request loop ─────────────────────────────────────────
+# ── Low-level request loop ─────────────────────────────
 #
 # Issue `GET <sub_path> HTTP/1.0` against the handle and collect the
 # whole response into a freelist-backed buffer. `out_quad` (32 bytes)
@@ -714,7 +714,7 @@ fn _wire_http_post(h, sub_path, body, body_len, out_quad) {
     return 0;
 }
 
-# ── Capabilities probe (v0.7.4) ────────────────────────────────────
+# ── Capabilities probe (v0.7.4) ───────────────────────────
 #
 # One-time GET /sit/v1/capabilities; record whether the server
 # advertises "batch":true. Idempotent — the handle's batch_probed
@@ -888,7 +888,7 @@ fn http_remote_read_batch(h, hashes, start_idx, count, raw_cache) {
     return cached;
 }
 
-# ── Frame stream decoder (v0.7.5) ──────────────────────────────────
+# ── Frame stream decoder (v0.7.5) ───────────────────────────
 #
 # Walks a `buf[0..blen]` byte stream of `[64 hex][8B i64 LE ty][8B
 # i64 LE clen][clen bytes compressed]` frames per ADR 0006. For each
@@ -970,7 +970,7 @@ fn _wire_http_decode_frames(buf, blen, raw_cache) {
     return cached;
 }
 
-# ── /sit/v1/refs JSON parser ───────────────────────────────────────
+# ── /sit/v1/refs JSON parser ────────────────────────────
 #
 # Body shape (per serve_build_refs):
 #   {"refs":[{"name":"...","hash":"..."}, ...]}
@@ -1073,7 +1073,7 @@ fn http_remote_resolve_branch(h, branch) {
     return 0;
 }
 
-# ── Object fetch ───────────────────────────────────────────────────
+# ── Object fetch ────────────────────────────────
 #
 # Issue GET /sit/v1/objects/<hex>; populate raw_out with
 # {compressed_ptr@0, clen@8, ty@16}. The compressed bytes are
@@ -1162,7 +1162,7 @@ fn http_remote_read_both(h, hex, raw_out, deco_out) {
     return 0;
 }
 
-# ── Push primitives (v0.7.6) ───────────────────────────────────────
+# ── Push primitives (v0.7.6) ────────────────────────────
 #
 # `http_remote_push_object` uploads one compressed sit object via
 # POST /sit/v1/objects/<hex> with the patra type code in an

@@ -235,7 +235,7 @@ fn cmd_revert() {
     return _apply_one_commit(&hex, 1, revert_head_path(), "revert", 6);
 }
 
-# ── stash ────────────────────────────────────────────────────────────
+# ── stash ───────────────────────────────────
 #
 # A stash entry is a real commit, so it is reachable, fsck-clean, and readable
 # with the ordinary tools. `.sit/refs/stash` names the newest entry; each entry

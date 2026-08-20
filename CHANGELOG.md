@@ -71,6 +71,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the fixture's tree content is quadratic in commit count and successive trees
   are near-identical, which is precisely what deltas collapse.
 
+### Changed (lint)
+
+- **`src/` is lint-clean: 39 warnings → 0.** CI began failing on warnings that
+  `cyrius audit` had been reporting as advisory, and 32 of the 39 were section
+  dividers — `# ── Title ─────…` — where each `─` is **3 bytes** in UTF-8, so a
+  rule that looks ~60 columns wide trips a 120-**byte** limit. Those were
+  trimmed mechanically.
+
+  The other 7 were real: three `zlib_decompress_with_ratio_cap` calls wrapped
+  at argument boundaries (no behaviour change at all), four over-long error
+  strings split into two lines each in the same style the 1.6.0 TLS errors use,
+  and one stray double blank line. No test asserts on any of those strings —
+  checked before rewording, since the integration suite does assert on error
+  text elsewhere.
+
 ### Not in this release
 
 `sit gc` — delta **storage** and repack — is the next bite and is deliberately

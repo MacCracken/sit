@@ -22,7 +22,7 @@
 # Push over SSH lands in v0.8.2.x or v0.8.3 (mirrors the v0.7.6 HTTP
 # push pipeline but over the persistent stdio session).
 
-# ── Handle layout ─────────────────────────────────────────────────
+# ── Handle layout ────────────────────────────────
 #
 # 40 bytes:
 #   [0..8]   pid of ssh child (for waitpid on close)
@@ -62,7 +62,7 @@ fn _ssh_set_carry(h, v)       { store64(h + 32, v); }
 fn _ssh_handle_auth_token(h)  { return load64(h + 40); }
 fn _ssh_set_auth_token(h, v)  { store64(h + 40, v); }
 
-# ── URL parsing ────────────────────────────────────────────────────
+# ── URL parsing ─────────────────────────────────
 #
 # ssh://[user@]host[:port]/<repo-path>
 #
@@ -299,7 +299,7 @@ fn _ssh_port_str(port) {
     return out;
 }
 
-# ── Spawn ssh child + set up pipes ─────────────────────────────────
+# ── Spawn ssh child + set up pipes ──────────────────────────
 #
 # Returns a wire_ssh handle (40 bytes) on success, 0 on failure.
 fn wire_ssh_open(url) {
@@ -319,7 +319,8 @@ fn wire_ssh_open(url) {
     var p_cell = alloc(8); store64(p_cell, 0);
     var path_cell = alloc(8); store64(path_cell, 0);
     if (_ssh_parse_url(url, u_cell, h_cell, p_cell, path_cell) != 1) {
-        eprintln("sit: malformed ssh URL (expected ssh://[user@]host[:port]/repo-path); leading-dash components rejected");
+        eprintln("sit: malformed ssh URL (expected ssh://[user@]host[:port]/repo-path)");
+        eprintln("sit:   leading-dash components are rejected");
         return 0;
     }
     var user = load64(u_cell);
@@ -781,7 +782,7 @@ fn _wire_ssh_parse_content_length(buf, header_end) {
     return 0 - 1;
 }
 
-# ── Public surface (mirrors http_remote_*) ─────────────────────────
+# ── Public surface (mirrors http_remote_*) ────────────────────────
 
 # Parse the /sit/v1/refs JSON body and append (name, hash) cstring
 # pairs into `out_pairs`. Same JSON shape as the HTTP variant.
@@ -920,7 +921,7 @@ fn ssh_remote_read_both(h, hex, raw_out, deco_out) {
     return _decompress_raw_into(raw_out, deco_out);
 }
 
-# ── Push helpers (v0.8.3) ──────────────────────────────────────────
+# ── Push helpers (v0.8.3) ─────────────────────────────
 #
 # Same shape as wire_http.cyr's http_remote_push_object /
 # http_remote_push_ref but use the persistent ssh pipe via
