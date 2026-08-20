@@ -491,11 +491,22 @@ fn cmd_reset() {
             return 1;
         }
         var rl_old = read_head_ref();
+        # v1.5.1: materialize BEFORE the ref moves. materialize_target removes
+        # paths that HEAD's CURRENT tree has and the target's does not, and it
+        # finds "current" by reading HEAD — so moving the ref first makes that
+        # removal a no-op and leaves stale files on disk. `checkout` already had
+        # this order (with a comment saying why); `reset --hard` and `merge` did
+        # not, so their stale-file removal had never run. Doing it in this order
+        # is also the safer failure mode: a materialize that fails leaves HEAD
+        # where it was.
+        if (materialize_target(&hex) != 0) {
+            eprintln("sit: failed to update working tree — HEAD unchanged");
+            return 1;
+        }
         if (write_head_ref(&hex) != 0) {
             eprintln("sit: failed to update branch ref");
             return 1;
         }
-        materialize_target(&hex);
         reflog_head_move(rl_old, &hex, reflog_msg_subject("reset: moving to ", target));
         stdout_write("HEAD reset --hard to ", 21);
         stdout_write(&hex, 12);

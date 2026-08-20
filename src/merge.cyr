@@ -554,123 +554,19 @@ fn build_merge_commit_signed(tree_hex, p1_hex, p2_hex, message, seed) {
 }
 
 # Find a tree entry's hash_hex for a given path, or 0 if absent.
-fn cmd_merge() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
-    if (argc() < 3) {
-        eprintln("usage: sit merge [-S] <branch> | sit merge --abort");
-        return 1;
-    }
-
-    # --abort: restore working tree to HEAD, clear MERGE_HEAD.
-    if (streq(argv(2), "--abort") == 1) {
-        if (sf_exists(".sit/MERGE_HEAD") != 1) {
-            eprintln("sit: no merge in progress");
-            return 1;
-        }
-        var head = read_head_ref();
-        if (head != 0) {
-            # S-16: propagate materialize failure so we don't claim "merge
-            # aborted" when the working tree wasn't actually restored.
-            if (materialize_target(head) != 0) {
-                eprintln("sit: failed to restore working tree from HEAD; .sit/MERGE_HEAD left in place");
-                return 1;
-            }
-        }
-        # S-16: a stale MERGE_HEAD silently turns the next commit into a
-        # 2-parent merge. Same cliff as cmd_commit's clear path.
-        if (sf_unlink(".sit/MERGE_HEAD") != 0) {
-            eprintln("sit: failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove manually");
-            return 1;
-        }
-        stdout_write("merge aborted\n", 14);
-        return 0;
-    }
-
-    var merge_sign = 0;
-    var merge_target_idx = 2;
-    if (streq(argv(2), "-S") == 1) {
-        merge_sign = 1;
-        merge_target_idx = 3;
-        if (argc() < 4) {
-            eprintln("usage: sit merge [-S] <branch>");
-            return 1;
-        }
-    }
-    var target_name = argv_heap(merge_target_idx);
-    var tnlen = strlen(target_name);
-
-    var target_hex[72];
-    var rr = resolve_commit_hash(target_name, &target_hex);
-    if (rr == 0 - 2) { eprintln("sit: merge target too short"); return 1; }
-    if (rr == 0 - 1) { eprintln("sit: ambiguous merge target"); return 1; }
-    if (rr == 0)     {
-        syscall(SYS_WRITE, STDERR, "sit: '", 6);
-        syscall(SYS_WRITE, STDERR, target_name, tnlen);
-        syscall(SYS_WRITE, STDERR, "' is not a known branch, tag, or commit\n", 40);
-        return 1;
-    }
-
-    var head_hex = read_head_ref();
-    if (head_hex == 0) {
-        eprintln("sit: current branch has no commits");
-        return 1;
-    }
-
-    if (streq(&target_hex, head_hex) == 1) {
-        stdout_write("already up to date\n", 19);
-        return 0;
-    }
-    if (is_ancestor(&target_hex, head_hex) == 1) {
-        stdout_write("already up to date\n", 19);
-        return 0;
-    }
-
-    if (is_ancestor(head_hex, &target_hex) == 1) {
-        if (is_dirty() == 1) {
-            eprintln("sit: working tree has uncommitted changes");
-            eprintln("sit:   commit or revert before merging");
-            return 1;
-        }
-        if (write_head_ref(&target_hex) != 0) {
-            eprintln("sit: failed to update branch ref");
-            return 1;
-        }
-        materialize_target(&target_hex);
-        reflog_head_move(head_hex, &target_hex,
-          reflog_msg_join("merge ", target_name, ": Fast-forward"));
-
-        stdout_write("fast-forward to ", 16);
-        stdout_write(&target_hex, 12);
-        stdout_write("\n", 1);
-        return 0;
-    }
-
-    # Divergent → 3-way merge (file-level)
-    if (is_dirty() == 1) {
-        eprintln("sit: working tree has uncommitted changes");
-        eprintln("sit:   commit or revert before merging");
-        return 1;
-    }
-
-    var base_hex = find_merge_base(head_hex, &target_hex);
-    if (base_hex == 0) {
-        eprintln("sit: no common ancestor between current branch and target");
-        return 1;
-    }
-
-    var base_entries = commit_tree_entries(base_hex);
-    var ours_entries = commit_tree_entries(head_hex);
-    var theirs_entries = commit_tree_entries(&target_hex);
-    if (ours_entries == 0) { ours_entries = vec_new(); }
-    if (theirs_entries == 0) { theirs_entries = vec_new(); }
-    if (base_entries == 0) { base_entries = vec_new(); }
-
+# Three-way tree merge over entry sets. Fills `merged` with result entries
+# (40-byte [raw hash, path ptr] structs) and appends conflicted paths to
+# `conflicts`. Line-level diff3 is attempted before a path is declared
+# conflicted, so non-overlapping edits to the same file auto-merge.
+#
+# v1.5.1: extracted from cmd_merge, which had this inline. `cherry-pick` and
+# `revert` are the same operation with the three roles assigned differently —
+# cherry-pick is (base = the commit's parent, ours = HEAD, theirs = the commit)
+# and revert is that with base and theirs swapped — so all three share this
+# body rather than carrying three copies of a 130-line merge that 1.3.8 already
+# found one non-termination bug in.
+fn three_way_merge_entries(base_entries, ours_entries, theirs_entries, merged, conflicts) {
     var paths = three_way_path_set(base_entries, ours_entries, theirs_entries);
-    var merged = vec_new();
-    var conflicts = vec_new();
 
     var pn = vec_len(paths);
     var pi = 0;
@@ -779,6 +675,137 @@ fn cmd_merge() {
         }
         pi = pi + 1;
     }
+    return 0;
+}
+
+fn cmd_merge() {
+    if (sf_exists(".sit/HEAD") != 1) {
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+    if (argc() < 3) {
+        eprintln("usage: sit merge [-S] <branch> | sit merge --abort");
+        return 1;
+    }
+
+    # --abort: restore working tree to HEAD, clear MERGE_HEAD.
+    if (streq(argv(2), "--abort") == 1) {
+        if (sf_exists(".sit/MERGE_HEAD") != 1) {
+            eprintln("sit: no merge in progress");
+            return 1;
+        }
+        var head = read_head_ref();
+        if (head != 0) {
+            # S-16: propagate materialize failure so we don't claim "merge
+            # aborted" when the working tree wasn't actually restored.
+            if (materialize_target(head) != 0) {
+                eprintln("sit: failed to restore working tree from HEAD; .sit/MERGE_HEAD left in place");
+                return 1;
+            }
+        }
+        # S-16: a stale MERGE_HEAD silently turns the next commit into a
+        # 2-parent merge. Same cliff as cmd_commit's clear path.
+        if (sf_unlink(".sit/MERGE_HEAD") != 0) {
+            eprintln("sit: failed to clear .sit/MERGE_HEAD — next commit may incorrectly become a merge; remove manually");
+            return 1;
+        }
+        stdout_write("merge aborted\n", 14);
+        return 0;
+    }
+
+    var merge_sign = 0;
+    var merge_target_idx = 2;
+    if (streq(argv(2), "-S") == 1) {
+        merge_sign = 1;
+        merge_target_idx = 3;
+        if (argc() < 4) {
+            eprintln("usage: sit merge [-S] <branch>");
+            return 1;
+        }
+    }
+    var target_name = argv_heap(merge_target_idx);
+    var tnlen = strlen(target_name);
+
+    var target_hex[72];
+    var rr = resolve_commit_hash(target_name, &target_hex);
+    if (rr == 0 - 2) { eprintln("sit: merge target too short"); return 1; }
+    if (rr == 0 - 1) { eprintln("sit: ambiguous merge target"); return 1; }
+    if (rr == 0)     {
+        syscall(SYS_WRITE, STDERR, "sit: '", 6);
+        syscall(SYS_WRITE, STDERR, target_name, tnlen);
+        syscall(SYS_WRITE, STDERR, "' is not a known branch, tag, or commit\n", 40);
+        return 1;
+    }
+
+    var head_hex = read_head_ref();
+    if (head_hex == 0) {
+        eprintln("sit: current branch has no commits");
+        return 1;
+    }
+
+    if (streq(&target_hex, head_hex) == 1) {
+        stdout_write("already up to date\n", 19);
+        return 0;
+    }
+    if (is_ancestor(&target_hex, head_hex) == 1) {
+        stdout_write("already up to date\n", 19);
+        return 0;
+    }
+
+    if (is_ancestor(head_hex, &target_hex) == 1) {
+        if (is_dirty() == 1) {
+            eprintln("sit: working tree has uncommitted changes");
+            eprintln("sit:   commit or revert before merging");
+            return 1;
+        }
+        # v1.5.1: materialize BEFORE the ref moves. materialize_target removes
+        # paths that HEAD's CURRENT tree has and the target's does not, and it
+        # finds "current" by reading HEAD — so moving the ref first makes that
+        # removal a no-op and leaves stale files on disk. `checkout` already had
+        # this order (with a comment saying why); `reset --hard` and `merge` did
+        # not, so their stale-file removal had never run. Doing it in this order
+        # is also the safer failure mode: a materialize that fails leaves HEAD
+        # where it was.
+        if (materialize_target(&target_hex) != 0) {
+            eprintln("sit: failed to update working tree — HEAD unchanged");
+            return 1;
+        }
+        if (write_head_ref(&target_hex) != 0) {
+            eprintln("sit: failed to update branch ref");
+            return 1;
+        }
+        reflog_head_move(head_hex, &target_hex,
+          reflog_msg_join("merge ", target_name, ": Fast-forward"));
+
+        stdout_write("fast-forward to ", 16);
+        stdout_write(&target_hex, 12);
+        stdout_write("\n", 1);
+        return 0;
+    }
+
+    # Divergent → 3-way merge (file-level)
+    if (is_dirty() == 1) {
+        eprintln("sit: working tree has uncommitted changes");
+        eprintln("sit:   commit or revert before merging");
+        return 1;
+    }
+
+    var base_hex = find_merge_base(head_hex, &target_hex);
+    if (base_hex == 0) {
+        eprintln("sit: no common ancestor between current branch and target");
+        return 1;
+    }
+
+    var base_entries = commit_tree_entries(base_hex);
+    var ours_entries = commit_tree_entries(head_hex);
+    var theirs_entries = commit_tree_entries(&target_hex);
+    if (ours_entries == 0) { ours_entries = vec_new(); }
+    if (theirs_entries == 0) { theirs_entries = vec_new(); }
+    if (base_entries == 0) { base_entries = vec_new(); }
+
+    var merged = vec_new();
+    var conflicts = vec_new();
+    three_way_merge_entries(base_entries, ours_entries, theirs_entries, merged, conflicts);
 
     if (vec_len(conflicts) > 0) {
         # Write auto-merged files to working tree so clean paths don't appear
@@ -874,11 +901,22 @@ fn cmd_merge() {
         return 1;
     }
 
+    # v1.5.1: materialize BEFORE the ref moves. materialize_target removes
+    # paths that HEAD's CURRENT tree has and the target's does not, and it
+    # finds "current" by reading HEAD — so moving the ref first makes that
+    # removal a no-op and leaves stale files on disk. `checkout` already had
+    # this order (with a comment saying why); `reset --hard` and `merge` did
+    # not, so their stale-file removal had never run. Doing it in this order
+    # is also the safer failure mode: a materialize that fails leaves HEAD
+    # where it was.
+    if (materialize_target(merge_hex) != 0) {
+        eprintln("sit: failed to update working tree — HEAD unchanged");
+        return 1;
+    }
     if (write_head_ref(merge_hex) != 0) {
         eprintln("sit: failed to update branch ref");
         return 1;
     }
-    materialize_target(merge_hex);
     reflog_head_move(head_copy, merge_hex,
       reflog_msg_join("merge ", target_name, ": Merge made by the '3-way' strategy"));
 

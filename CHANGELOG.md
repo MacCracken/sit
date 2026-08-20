@@ -4,6 +4,78 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.1] — 2026-08-20 — History tools: `cherry-pick`, `revert`, `stash`
+
+⚠ **This adds three commands, which sit's own SemVer tiers put on the *minor*
+line** — the rule 1.4.9 used to move `reflog expire` and base-path routing off
+the patch line. Released as `1.5.1` at the maintainer's direction; recorded here
+so the policy and the version number do not silently disagree.
+
+### Added
+
+- **`sit cherry-pick <commit>`** — apply a commit's change onto HEAD as a new
+  commit.
+- **`sit revert <commit>`** — apply a commit's inverse as a new commit, messaged
+  `Revert "<original>"`.
+- **`sit stash [push|list|pop|drop]`** — save tracked working-tree changes and
+  restore HEAD, then bring them back. Entries are real commits: `.sit/refs/stash`
+  names the newest, each carrying HEAD-at-stash-time as first parent and the
+  previous stash as second, so the stack *is* the parent chain rather than a
+  side file that could drift from the objects it names. Only tracked files are
+  stashed, as in git.
+
+Cherry-pick and revert are **one operation with the merge roles assigned
+differently** — cherry-pick is `(base = parent(C), ours = HEAD, theirs = C)` and
+revert is that with `base` and `theirs` swapped. `cmd_merge`'s 130-line 3-way
+loop was extracted to `three_way_merge_entries` so all three share it rather
+than carrying three copies of a merge core that 1.3.8 already found a
+non-termination bug in.
+
+### Fixed
+
+Three bugs, all found by building on top of existing code rather than by review.
+
+- ⚠ **`fsck --prune-now` deleted the entire stash.** `.sit/refs/stash` is a
+  single ref *file*, so `fsck_collect_roots`'s refs-*directory* walk never saw
+  it and every stashed blob, tree and commit read as dangling. A/B'd against a
+  build without the fix, on a repo with the reflog removed:
+
+  ```
+  dangling blob 29d413c5…  dangling tree 51c156a6…  dangling commit 7535e2ba…
+  pruned 3 objects
+  ```
+
+  This is the **third** instance of one root cause — the reachability walk not
+  knowing about an edge — after S-27's missing referents (1.4.0) and tag objects
+  (1.5.0). The stash ref is now a root.
+
+- ⚠ **`reset --hard` and `merge` never removed files absent from the target.**
+  `materialize_target` deletes paths that HEAD's *current* tree has and the
+  target's does not, and it finds "current" by reading HEAD — but both commands
+  moved the ref **first**, so that comparison was HEAD against itself and the
+  removal had never once run. `checkout` had the correct order all along, with a
+  comment explaining why, which is how the discrepancy was spotted.
+
+  All four sites now materialize before moving the ref. That is also the safer
+  failure mode: a materialize that fails leaves HEAD where it was.
+
+  Visible as: `sit reset --hard HEAD@{1}` left a file the target commit does not
+  contain sitting in the working tree, and would have made `revert` claim to
+  remove a file while leaving it on disk.
+
+- **`stash` wrote trees naming blobs it never stored.** `_stash_working_tree`
+  used `hash_file_as_blob`, which only *hashes* — `status` uses it to compare —
+  so `stash pop` failed with `cannot read blob`. It now writes the content it
+  snapshots.
+
+### Tests
+
+- **149 integration checks** (was 133): revert removing a file from the working
+  tree and not just the tree; cherry-pick restoring it; a no-op cherry-pick
+  creating no commit; `reset --hard` stale-file removal; the full stash
+  lifecycle including LIFO ordering; and the prune-survival regression, which
+  drops `.sit/logs` first so reflog protection cannot mask it.
+
 ## [1.5.0] — 2026-08-20 — Annotated & signed tags, `sit mv`, `sit describe`
 
 **The first feature work since 1.3.0** — every release from 1.3.1 through 1.4.9

@@ -697,6 +697,75 @@ R="$WORK/desc-none"; mkdir -p "$R"; cd "$R"
 printf 'x\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c >/dev/null
 assert_contains "$("$SIT" describe 2>&1)" "no tag" "describe with no tags fails cleanly"
 
+# ── 18. History tools: cherry-pick / revert / stash (1.5.1) ────────
+hr "history tools: cherry-pick / revert / stash (1.5.1)"
+
+R="$WORK/hist151"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'l1\nl2\nl3\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m base >/dev/null
+printf 'x\n' > b.txt; "$SIT" add b.txt >/dev/null; "$SIT" commit -m "add b" >/dev/null
+ADDB=$(tr -d '\n' < .sit/refs/heads/main)
+
+# revert must remove the file the reverted commit added — both from the tree
+# AND from the working directory.
+"$SIT" revert HEAD >/dev/null
+assert_eq "$([ ! -f b.txt ] && echo gone)" "gone" "revert removes the file from the working tree"
+assert_contains "$("$SIT" log --oneline)" 'Revert "add b"' "revert writes an inverse commit"
+assert_contains "$("$SIT" status)" "nothing to commit" "working tree is clean after revert"
+
+# cherry-pick brings it back.
+"$SIT" cherry-pick "$ADDB" >/dev/null
+assert_eq "$(cat b.txt)" "x" "cherry-pick restores the file and its content"
+assert_contains "$("$SIT" fsck)" "0 bad" "repo is clean after revert + cherry-pick"
+
+# A cherry-pick that changes nothing must not create an empty commit.
+BEFORE=$("$SIT" log --oneline | wc -l)
+"$SIT" cherry-pick "$ADDB" >/dev/null
+assert_eq "$("$SIT" log --oneline | wc -l)" "$BEFORE" "a no-op cherry-pick creates no commit"
+
+# 18b. reset --hard / merge stale-file removal (fixed in 1.5.1). Before this,
+# materialize_target ran AFTER the ref moved, so its stale-path removal
+# compared HEAD against itself and never fired.
+R="$WORK/stale151"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'a\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c1 >/dev/null
+printf 'b\n' > b.txt; "$SIT" add b.txt >/dev/null; "$SIT" commit -m c2 >/dev/null
+"$SIT" reset --hard 'HEAD@{1}' >/dev/null 2>&1
+assert_eq "$([ ! -f b.txt ] && echo gone)" "gone" "reset --hard removes a file absent from the target"
+
+# 18c. stash
+R="$WORK/stash151"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'orig\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m base >/dev/null
+printf 'modified\n' > a.txt
+"$SIT" stash >/dev/null
+assert_eq "$(cat a.txt)" "orig" "stash restores the working tree to HEAD"
+assert_contains "$("$SIT" stash list)" "stash@{0}" "stash list shows the entry"
+"$SIT" stash pop >/dev/null
+assert_eq "$(cat a.txt)" "modified" "stash pop restores the snapshot"
+assert_contains "$("$SIT" stash list)" "no stash entries" "pop empties the stack"
+printf 'orig\n' > a.txt      # back to HEAD's content, so the tree is clean
+assert_contains "$("$SIT" stash)" "no local changes" "stash with a clean tree is a no-op"
+
+# The stack is LIFO and pop restores newest first.
+printf 'v1\n' > a.txt; "$SIT" stash >/dev/null
+printf 'v2\n' > a.txt; "$SIT" stash >/dev/null
+"$SIT" stash pop >/dev/null; assert_eq "$(cat a.txt)" "v2" "pop restores the newest entry first"
+"$SIT" stash pop >/dev/null; assert_eq "$(cat a.txt)" "v1" "pop then restores the next one"
+
+# 18d. REACHABILITY: a live stash must survive fsck --prune-now. Pre-1.5.1
+# .sit/refs/stash was not a root (it is a file, not a refs directory), so every
+# stashed object dangled and prune DELETED the stash.
+R="$WORK/stashreach"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'orig\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m base >/dev/null
+printf 'modified\n' > a.txt; "$SIT" stash >/dev/null
+rm -rf .sit/logs                    # drop reflog protection: the ref walk is all that is left
+assert_contains "$("$SIT" fsck)" "0 dangling" "a live stash is reachable from the ref walk"
+"$SIT" fsck --prune-now >/dev/null 2>&1
+"$SIT" stash pop >/dev/null
+assert_eq "$(cat a.txt)" "modified" "the stash survives fsck --prune-now"
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

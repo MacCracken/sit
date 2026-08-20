@@ -38,6 +38,7 @@ modules = [
     "src/diff.cyr",
     "src/commit.cyr",
     "src/merge.cyr",
+    "src/history.cyr",
     "src/sign.cyr",
     "src/wire.cyr",
     "src/wire_http.cyr",

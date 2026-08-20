@@ -667,6 +667,27 @@ fn fsck_collect_roots() {
     fsck_walk_refs_dir(".sit/refs/tags",    roots);
     fsck_walk_refs_dir(".sit/refs/remotes", roots);
 
+    # v1.5.1: .sit/refs/stash is a root. It is a single ref file rather than a
+    # directory, so the refs-dir walk above never sees it — and without this
+    # every stashed blob and tree reads as dangling and `fsck --prune-now`
+    # DELETES the stash. Same class as the 1.5.0 tag-object bug and the S-27
+    # missing-referent bug: the walk not knowing about an edge.
+    if (sf_exists(".sit/refs/stash") == 1) {
+        var spair[16];
+        if (read_file_heap(".sit/refs/stash", &spair) == 0) {
+            var sdata = load64(&spair);
+            var slen = load64(&spair + 8);
+            if (slen >= 64) {
+                if (hex_prefix_valid(sdata, 64) == 1) {
+                    var shex = alloc(65);
+                    memcpy(shex, sdata, 64);
+                    store8(shex + 64, 0);
+                    vec_push(roots, shex);
+                }
+            }
+        }
+    }
+
     if (sf_exists(".sit/HEAD") == 1) {
         var pair[16];
         if (read_file_heap(".sit/HEAD", &pair) == 0) {
