@@ -4,6 +4,79 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.2] — 2026-08-23 — arm64 builds again: two legacy syscall constants that do not exist on aarch64
+
+### Changed — cyrius pin 6.5.31 → **6.6.2**
+
+cyrius 6.6.0 flipped `Result` / `Option` / `Either` declared `: stack` to a value form — a payload
+variant returns a `(tag, payload)` register pair and allocates nothing; `payload()` is gone. 6.6.2
+is the repair release.
+
+15 declarations split across `src/` and the test/fuzz entries. Fully mechanical: no propagation
+traps (`return res;` on an Err path), no reassignment sites, and no `callptr` Results — the three
+shapes that need hand work elsewhere in the sweep.
+
+### Fixed — the manifest's `test` key pointed at a file that never existed
+
+`cyrius.cyml` declared `test = "src/test.cyr"`. That path is absent at HEAD and in every earlier
+commit. CI never noticed because its Test step names `tests/sit.tcyr` explicitly, so the stale key
+was only reachable via a bare `cyrius test`, which failed with `no such file`. Repointed at the
+real suite.
+
+### Fixed
+
+- ⛔ **`SYS_RENAME` broke every aarch64 consumer of the read bundle.**
+  `sf_rename` (`src/index.cyr`) named the constant directly on its non-AGNOS
+  arm — `syscall(SYS_RENAME, old, new)`. **arm64 Linux has no `rename`
+  syscall**; it was never given one. `lib/syscalls_aarch64_linux.cyr` therefore
+  defines only `SYS_RENAMEAT = 38` and implements the 2-arg `sys_rename` as
+  `sys_renameat(AT_FDCWD, old, AT_FDCWD, new)`. Naming the constant meant
+  `error: undefined variable 'SYS_RENAME'` — a **hard build failure**, not a
+  warning — for anyone compiling `dist/sit-read.cyr` with `--aarch64`.
+
+  Two things made this worse than it looks. The check is **static, not
+  reachability-based**, so it fired even though `sf_rename` is reachable only
+  from `sit mv`, which a read-only consumer never calls — the bundle would not
+  compile over dead code. And `src/index.cyr` is in **both** `[lib]` and
+  `[lib.read]`, so the breakage reached the lean read profile that exists
+  precisely for report-only consumers. Found by thoth, whose aarch64 build went
+  green → `FAIL` on adopting 1.6.1.
+
+  Now `sys_rename(old, new)`. The stdlib wrapper is 2-arg and present on x86_64
+  Linux, aarch64 Linux **and** macOS, so one arm covers all three; the AGNOS arm
+  keeps its own 4-arg `syscall(SYS_RENAME, old, oldlen, new, newlen)`, which is
+  a genuinely different ABI and the reason the two forms are split textually.
+
+- ⛔ **`SYS_ACCESS` broke sit's own aarch64 binary**, the same root cause one
+  file over. `_wire_ssh_find` (`src/wire_ssh.cyr`) probed for an executable
+  `ssh` with `syscall(SYS_ACCESS, cand, 1)`; **arm64 Linux has no `access`
+  syscall** either, only `faccessat`, which is why
+  `lib/syscalls_aarch64_linux.cyr` defines `SYS_FACCESSAT` and implements
+  `sys_access` as `faccessat(AT_FDCWD, path, mode, 0)`. Now `sys_access(cand, 1)`.
+  `wire_ssh.cyr` is in neither `[lib]` profile, so no consumer bundle carried
+  this one — but `cyrius build --aarch64 src/main.cyr` failed on it, so **sit
+  had no working arm64 build at all**. It does now.
+
+  The `#ifndef CYRIUS_TARGET_AGNOS` gate stays: the agnos syscalls peer defines
+  no `sys_access` in any form, so the probe must remain textually absent there
+  rather than merely unreachable.
+
+**The lesson generalises past these two sites**: a raw `syscall(SYS_FOO, ...)`
+is a portability claim, and for the legacy pre-`*at` file syscalls it is a claim
+arm64 does not honour. The stdlib's `sys_*` wrappers exist to absorb exactly
+that difference. Reach for the wrapper unless the ABI genuinely differs per
+target — as AGNOS's `rename` arity does.
+
+### Verified
+
+- `cyrius build src/main.cyr` **and** `cyrius build --aarch64 src/main.cyr` both
+  `OK` (the latter for the first time).
+- Suite green: **383 + 1**, unchanged — the two changed lines are on the `sit mv`
+  and SSH-transport paths, so the fix is a portability change with no behavioural
+  delta on x86_64, where both wrappers compile to the same syscall they replaced.
+- `dist/sit.cyr` and `dist/sit-read.cyr` regenerated (both profiles carry
+  `index.cyr`).
+
 ## [1.6.1] — 2026-08-20 — the index churn was sit's bug; delta generation lands
 
 ### Fixed

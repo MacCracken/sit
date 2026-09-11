@@ -1095,9 +1095,9 @@ fn _stdio_recv_request(buf, max, start_have) {
     }
 
     while (have < max) {
-        var r = sock_recv(STDIN_FILENO, buf + have, max - have);
-        if (is_err_result(r) == 1) { return 0 - 1; }
-        var n = payload(r);
+        var r_t, r_v = sock_recv(STDIN_FILENO, buf + have, max - have);
+        if (is_err_result(r_t) == 1) { return 0 - 1; }
+        var n = r_v;
         if (n <= 0) {
             store8(buf + have, 0);
             return have;
@@ -1266,9 +1266,9 @@ fn _serve_tls_recv_request(ctx, buf, max) {
 # close. Single-threaded/sequential like sandhi_server_run, so the global ctx is
 # connection-safe. cert/key DER buffers are loaded once by the caller.
 fn _serve_run_tls(listen_addr, port, cert, cert_len, key, key_len) {
-    var sfd_r = tcp_socket();
-    if (is_err_result(sfd_r) == 1) { eprintln("sit: tcp_socket failed"); return 1; }
-    var sfd = payload(sfd_r);
+    var sfd_r_t, sfd_r_v = tcp_socket();
+    if (is_err_result(sfd_r_t) == 1) { eprintln("sit: tcp_socket failed"); return 1; }
+    var sfd = sfd_r_v;
     sock_reuse(sfd);
     if (is_err_result(sock_bind(sfd, listen_addr, port)) == 1) {
         eprintln("sit: bind failed"); return 1;
@@ -1278,9 +1278,9 @@ fn _serve_run_tls(listen_addr, port, cert, cert_len, key, key_len) {
     }
     var reqbuf = alloc(SERVE_TLS_REQ_MAX);
     while (1 == 1) {
-        var cr = sock_accept(sfd);
-        if (is_err_result(cr) == 0) {
-            var cfd = payload(cr);
+        var cr_t, cr_v = sock_accept(sfd);
+        if (is_err_result(cr_t) == 0) {
+            var cfd = cr_v;
             # 30s recv timeout per connection — slowloris bound on the TLS
             # handshake + request read (v0.8.9 hardening; mirrors what
             # sandhi_server_run_opts does for the plain-http path).

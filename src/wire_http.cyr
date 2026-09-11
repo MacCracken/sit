@@ -230,14 +230,14 @@ fn _wire_http_request(h, sub_path, out_quad) {
     if (_http_remote_is_tls(h) == 1) {
         return _wire_https_exchange(h, 0, sub_path, 0, 0, 0, out_quad);
     }
-    var fd_r = tcp_socket();
-    if (is_err_result(fd_r) == 1) {
+    var fd_r_t, fd_r_v = tcp_socket();
+    if (is_err_result(fd_r_t) == 1) {
         eprintln("sit: tcp_socket failed");
         return 0 - 1;
     }
-    var fd = payload(fd_r);
-    var c_r = sock_connect(fd, _http_remote_addr(h), _http_remote_port(h));
-    if (is_err_result(c_r) == 1) {
+    var fd = fd_r_v;
+    var c_r_t, c_r_v = sock_connect(fd, _http_remote_addr(h), _http_remote_port(h));
+    if (is_err_result(c_r_t) == 1) {
         sys_close(fd);
         eprintln("sit: sock_connect failed (is sit serve running?)");
         return 0 - 1;
@@ -411,9 +411,9 @@ fn _wire_http_response_free(out_quad) {
 # live connection, 0 on failure.
 fn _wire_https_acquire(h) {
     if (_http_remote_ka_fd(h) != 0) { return 1; }
-    var fd_r = tcp_socket();
-    if (is_err_result(fd_r) == 1) { eprintln("sit: tcp_socket failed"); return 0; }
-    var fd = payload(fd_r);
+    var fd_r_t, fd_r_v = tcp_socket();
+    if (is_err_result(fd_r_t) == 1) { eprintln("sit: tcp_socket failed"); return 0; }
+    var fd = fd_r_v;
     if (is_err_result(sock_connect(fd, _http_remote_addr(h), _http_remote_port(h))) == 1) {
         sys_close(fd);
         eprintln("sit: sock_connect failed (is sit serve running?)");
@@ -587,14 +587,14 @@ fn _wire_http_post(h, sub_path, body, body_len, out_quad) {
     if (_http_remote_is_tls(h) == 1) {
         return _wire_https_exchange(h, 1, sub_path, body, body_len, 0, out_quad);
     }
-    var fd_r = tcp_socket();
-    if (is_err_result(fd_r) == 1) {
+    var fd_r_t, fd_r_v = tcp_socket();
+    if (is_err_result(fd_r_t) == 1) {
         eprintln("sit: tcp_socket failed");
         return 0 - 1;
     }
-    var fd = payload(fd_r);
-    var c_r = sock_connect(fd, _http_remote_addr(h), _http_remote_port(h));
-    if (is_err_result(c_r) == 1) {
+    var fd = fd_r_v;
+    var c_r_t, c_r_v = sock_connect(fd, _http_remote_addr(h), _http_remote_port(h));
+    if (is_err_result(c_r_t) == 1) {
         sys_close(fd);
         eprintln("sit: sock_connect failed (is sit serve running?)");
         return 0 - 1;
@@ -1263,14 +1263,14 @@ fn _wire_http_post_xhdr(h, sub_path, body, body_len, extra_hdr, out_quad) {
     if (_http_remote_is_tls(h) == 1) {
         return _wire_https_exchange(h, 1, sub_path, body, body_len, extra_hdr, out_quad);
     }
-    var fd_r = tcp_socket();
-    if (is_err_result(fd_r) == 1) {
+    var fd_r_t, fd_r_v = tcp_socket();
+    if (is_err_result(fd_r_t) == 1) {
         eprintln("sit: tcp_socket failed");
         return 0 - 1;
     }
-    var fd = payload(fd_r);
-    var c_r = sock_connect(fd, _http_remote_addr(h), _http_remote_port(h));
-    if (is_err_result(c_r) == 1) {
+    var fd = fd_r_v;
+    var c_r_t, c_r_v = sock_connect(fd, _http_remote_addr(h), _http_remote_port(h));
+    if (is_err_result(c_r_t) == 1) {
         sys_close(fd);
         eprintln("sit: sock_connect failed (is sit serve running?)");
         return 0 - 1;

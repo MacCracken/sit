@@ -5,11 +5,11 @@ description = "Sovereign version control — a Cyrius-native git replacement"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sit"
 language = "cyrius"
-cyrius = "6.5.31"
+cyrius = "6.6.2"
 
 [build]
 entry = "src/main.cyr"
-test = "src/test.cyr"
+test = "tests/sit.tcyr"
 output = "sit"
 
 # `[lib]` drives `cyrius distlib` — concatenates the listed modules in

@@ -225,15 +225,25 @@ fn _ssh_find_binary() {
                 store8(cand + seg_len, 47);             # '/'
                 memcpy(cand + seg_len + 1, "ssh", 3);
                 store8(cand + seg_len + 4, 0);
-                # access(path, X_OK=1). 0 = ok. Linux-host-only: the SSH
-                # wire transport shells out to `ssh` (fork/exec/pipe), which
-                # agnos sit never does — and SYS_ACCESS is undefined on the
-                # agnos target (syscalls.cyr includes no agnos peer). Gate the
-                # executability probe so this file has no eager undefined-var
+                # access(path, X_OK=1). 0 = ok. Host-only: the SSH wire
+                # transport shells out to `ssh` (fork/exec/pipe), which agnos
+                # sit never does — and the agnos target has no `sys_access` at
+                # all (syscalls.cyr includes no agnos peer for it). Gate the
+                # executability probe so this file has no eager undefined
                 # reference on --agnos; the whole spawn path stays unreachable
                 # there via wire_ssh_open. See ADR 0008.
+                #
+                # ⚠ Go through the stdlib's `sys_access`, NOT a raw
+                # `syscall(SYS_ACCESS, ...)`. **arm64 Linux has no `access`
+                # syscall** — `lib/syscalls_aarch64_linux.cyr` defines only
+                # `SYS_FACCESSAT` and implements `sys_access` as
+                # `faccessat(AT_FDCWD, path, mode, 0)`. Naming the constant
+                # directly failed the aarch64 build outright with
+                # `undefined variable 'SYS_ACCESS'`, since the check is static
+                # rather than reachability-based. Same root cause as
+                # index.cyr's `sf_rename`, fixed the same way.
                 #ifndef CYRIUS_TARGET_AGNOS
-                if (syscall(SYS_ACCESS, cand, 1) == 0) {
+                if (sys_access(cand, 1) == 0) {
                     return cand;
                 }
                 #endif
@@ -517,8 +527,8 @@ fn _wire_ssh_request(h, sub_path, out_body) {
     # detection on the next iteration).
     memcpy(req + pos, " HTTP/1.1\r\nHost: ssh\r\nContent-Length: 0\r\n\r\n", 43);
     pos = pos + 43;
-    var sw = sock_send(wfd, req, pos);
-    if (is_err_result(sw) == 1) {
+    var sw_t, sw_v = sock_send(wfd, req, pos);
+    if (is_err_result(sw_t) == 1) {
         eprintln("sit: write to ssh stdin failed");
         return 0 - 1;
     }
@@ -567,14 +577,14 @@ fn _wire_ssh_post_xhdr(h, sub_path, body, body_len, extra_hdr, out_body) {
     }
     memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
 
-    var sw1 = sock_send(wfd, hdr, pos);
-    if (is_err_result(sw1) == 1) {
+    var sw1_t, sw1_v = sock_send(wfd, hdr, pos);
+    if (is_err_result(sw1_t) == 1) {
         eprintln("sit: write to ssh stdin failed");
         return 0 - 1;
     }
     if (body_len > 0) {
-        var sw2 = sock_send(wfd, body, body_len);
-        if (is_err_result(sw2) == 1) {
+        var sw2_t, sw2_v = sock_send(wfd, body, body_len);
+        if (is_err_result(sw2_t) == 1) {
             eprintln("sit: write of POST body to ssh stdin failed");
             return 0 - 1;
         }
@@ -622,13 +632,13 @@ fn _wire_ssh_recv_response(rfd, out_body) {
             buf = new_buf;
             cap = new_cap;
         }
-        var rd = sock_recv(rfd, buf + used, cap - used);
-        if (is_err_result(rd) == 1) {
+        var rd_t, rd_v = sock_recv(rfd, buf + used, cap - used);
+        if (is_err_result(rd_t) == 1) {
             fl_free(buf);
             eprintln("sit: read from ssh stdout failed");
             return 0 - 1;
         }
-        var n = payload(rd);
+        var n = rd_v;
         if (n <= 0) {
             # EOF before response complete — ssh child died.
             fl_free(buf);
