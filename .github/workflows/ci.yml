@@ -825,5 +825,6 @@ jobs:
             exit 1
           fi
           # Match the call site, not a comment that merely names the function.
-          grep -q 'str_builder_add_cstr(sb, sit_version_string())' src/serve.cyr || { echo "FAIL: serve_build_capabilities() no longer emits sit_version_string()"; exit 1; }
+          # (1.7.4: the builder appends through the request arena, `_a` form.)
+          grep -q 'str_builder_add_cstr_a(a, sb, sit_version_string())' src/serve.cyr || { echo "FAIL: serve_build_capabilities() no longer emits sit_version_string()"; exit 1; }
           echo "capabilities banner is generated, not hand-copied"

@@ -4,6 +4,95 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.4] — 2026-10-19 — resource bounds: `sit serve` keeps nothing per request; git read mode past 64 MiB and depth 64
+
+The 1.7.4 slot: the two resource bounds the 2026-10-19 audit ([`docs/audit/2026-10-19-audit.md`](docs/audit/2026-10-19-audit.md)) left open, C1's residual and D6. Working on C1 turned up a larger leak on the `--tls` path. There is no new surface, and the toolchain stays at cyrius 6.7.15.
+
+### Fixed — `sit serve` keeps nothing per request (audit C1 residual)
+
+sit's global heap is a bump allocator with no free, and `sit serve` runs until it is killed. 1.6.4 moved the large per-request buffers to the freelist. The small ones stayed on the bump heap, and stayed for good: the parsed method and path, the response head, the JSON bodies, and the refs walk.
+
+Every request now allocates in an arena that `serve_handle_request` rewinds before routing:
+- sandhi's `_a` forms parse the request and build the response.
+- `GET /refs` lists each directory with `dir_list_into` into arena buffers and reads each ref file through a stack buffer. It used `dir_walk`, which keeps a `Str`, a vec slot and a joined path per entry. Bodies are byte-identical to 1.7.3, nested refs included.
+- The push handlers build their paths in the arena. A pushed object's hash is compared as a raw digest on the stack, not as `hash_data`'s heap-allocated hex.
+- `Content-Length` is parsed over the arena (`_serve_content_length`), because `sandhi_server_content_length` allocates on every call and has no `_a` form. It is the same strict parse. The unit suite and a 200,000-round fuzz target compare the two on every input.
+- `db_object_has` takes its SQL buffer from the freelist, as `db_object_read_raw` has since 1.6.4.
+- `sit_abs_a` (util.cyr) is `sit_abs` with the joined path drawn from a given allocator. `sit_abs` itself is `sit_abs_a(0, ·)`, so there is still one prefix rule.
+
+Bytes kept on the global heap per request, measured by calling the handler directly:
+
+| request | 1.7.3 | 1.7.4 |
+|---|---:|---:|
+| `GET /sit/v1/refs` (two refs; more per ref) | 3,528 | 0 |
+| `GET /sit/v1/capabilities` | 704 | 0 |
+| `GET /sit/v1/objects/<id>` | 472 | 0 |
+| the same, not found | 272 | 0 |
+| `POST /sit/v1/want` | 368 | 0 |
+| an unknown path | 192 | 0 |
+| `POST /sit/v1/objects/<id>` (push) | 384 | 32 |
+| `POST /sit/v1/refs/<name>` (push, no-op) | 1,056 | 152 |
+
+Against a live server, 5,000 requests to each of the six read endpoints took RSS from 4.9 to 38.1 MB on 1.7.3. On 1.7.4 it went from 6.9 to 7.2 MB.
+
+What remains is on the push path, in code this release did not reach:
+- the shared helpers a ref push calls (`read_head_ref_path`, `ensure_parent_dirs`, `sf_write_all`, and `is_ancestor_in_db`'s walk on the fast-forward check)
+- 32 B that sankoch's `zlib_decompress` keeps per call
+- about 8 B that sandhi's own accept loop keeps for each request with a body
+
+The last two are upstream asks (roadmap).
+
+### Security — `sit serve --tls` kept ~77 KB per connection (HIGH)
+
+The `--tls` loop built each connection's TLS context with `tls_native_new_server`, on the global heap: the context, the handshake, the transcript, the key schedule and the record buffers. All of it was kept after the connection closed. 1,000 handshakes took RSS from 7.9 to 83.6 MB. Any client that can reach the port can do this without authenticating, and since 1.6.0 `--tls` is the mode for routable interfaces.
+
+Each connection now builds its TLS state with `tls_native_new_server_in` in an arena that is rewound at the next accept. 1,000 connections: 7.2 → 7.2 MB. 5,000 keep-alive requests on one connection: flat.
+
+### Fixed — git read mode reads packs over 64 MiB and delta chains deeper than 64 (audit D6, MEDIUM)
+
+Either limit made objects read as missing, so `sit_repo_status` reported a clean file as modified or untracked. That was confidently wrong, and it ran in-process for owl and thoth.
+- **Pack size.** Each `.idx` and `.pack` is now mapped read-only (`mmap_file_ro`) rather than read onto the heap through `read_file_heap`'s 64 MiB cap. A mapping costs no heap at any size. Where mmap is unavailable (agnos) the file is read as before. `mmap` comes into the read bundle through `freelist.cyr`'s own include, at owl's 6.6.2 pin as well, so consumers list nothing new.
+- **Chain depth.** Delta chains resolve iteratively up to git's own ceiling of 4095; the recursion stopped at 64.
+  - The walk goes down to the base first. An OFS_DELTA steps back in the same pack. A REF_DELTA's base is found by id, loose or in any pack, through the new `_git_pack_locate`.
+  - The deltas are then applied upward. An OFS chain cannot loop, and a REF cycle stops at the bound.
+- **Memory.** The recursion kept every level of every chain on the bump heap. The resolver now reuses two freelist result buffers and one delta buffer per read: `_git_apply_delta_into` writes into a caller's buffer, and `_git_apply_delta` is the allocating wrapper. Reading all 320 blobs of a depth-50 repo in-process:
+
+  | | 1.7.3 | 1.7.4 |
+  |---|---:|---:|
+  | time | 455–462 ms | 459–463 ms |
+  | bump heap kept | 220 MB | 568 KB |
+
+  A first version took a fresh freelist block per step and was 28% slower, because every block over 4 KiB is its own mapping.
+- **No base cache.** git stores the newest version of an object whole, and the read API reads each file's HEAD blob once. A cache would only pay for walks over many versions of one file, which git mode does not do before the 1.11.0 CLI parity.
+
+### Fixed in passing (LOW)
+
+- **`GET /refs` no longer blocks on a FIFO.** A FIFO under `.sit/refs/`, or a symlink to one, was opened for reading, and the single-threaded server blocked until a writer appeared. Only regular files, and symlinks to them, are read now.
+- **The ref-push symlink guard checks the right file.** S-04's `path_is_symlink` was handed the repo-relative path. With the served repo anywhere but the cwd, it looked at the wrong file. `sf_write_all` already refused to write through a symlink, so nothing was written through one.
+
+### Tests
+
+- **Unit, 464 → 514.**
+  - A serve group: the `Content-Length` differential against sandhi, the ref-file reader's edges, and the refs walk on a fixture repo (nested refs, symlinks, invalid names).
+  - An exact assertion that 150 requests leave the global heap where it was. With the arena rewind removed, it fails with 1.26 MB kept.
+  - The delta-into group.
+- **Fuzz, 16 → 18 targets:**
+  - `serve_content_length`: 200,000 rounds against sandhi. With the trailing-junk check removed, it reports a disagreement.
+  - `pack_obj`: 50,000 rounds of real OFS_DELTA chains up to 90 deep, mutated three rounds in four. With the depth bound put back to 64, it fails on a valid chain.
+  - The poison A/B output is identical.
+- **Integration, 324 → 341:**
+  - Section 27: RSS bounds for 3,000 `GET /refs` and 300 TLS handshakes, and the FIFO cases, using the new `serve_load.py`.
+  - Section 28: `deep_pack.py`, 11 cases.
+    - chains of 100 and 4095, and 4096, which is refused
+    - a REF_DELTA chain crossing two packs, a mixed chain, and a REF cycle
+    - a 75 MiB pack
+    - a real `git repack --depth=300` repo whose 237 blobs deeper than 64 all match `git cat-file`
+
+    9 of its cases fail on 1.7.3; the two refusals pass on both.
+- **Other targets and downstream.** The aarch64 build passes `deep_pack.py` under qemu. `--agnos` builds, DCE included. owl (cyrius 6.6.2) and thoth (6.6.6) build against the new `dist/sit-read.cyr`.
+
+**Benchmarks** ([`docs/benchmarks/2026-10-19-v1.7.4.md`](docs/benchmarks/2026-10-19-v1.7.4.md)): the serve and read-mode numbers are above. Every micro and head-to-head row is flat against 1.7.3: `log-100commits` 9.44 → 9.14 ms, `clone-100commits` 62.00 → 62.21 ms, `zlib-decompress-65536B` 335.57 → 336.11 µs.
+
 ## [1.7.3] — 2026-10-19 — rebase and describe walk every parent; nested ref names
 
 The 1.7.3 slot: the two history-walk findings the 2026-10-19 audit ([`docs/audit/2026-10-19-audit.md`](docs/audit/2026-10-19-audit.md)) deferred, A8 and E14. There is no new surface, and the toolchain stays at cyrius 6.7.15.
