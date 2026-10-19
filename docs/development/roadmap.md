@@ -226,3 +226,97 @@ Dropping sandhi for a hand-rolled `net`-direct loopback HTTP/1.0 server (surface
 ---
 
 *Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/) — latest [`2026-08-19-v1.4.8.md`](../benchmarks/2026-08-19-v1.4.8.md). Security audit reports are in [`../audit/`](../audit/).*
+
+---
+
+## Adopting cmdit (CLI parsing)
+
+Surveyed 2026-10-14 against cmdit 1.2.6 (1.3.0 has the same API). Demand-gated, not a forced
+sweep. sit has the most hand-rolled CLI of the tier-2 verb tools — 35 commands, ~100
+`argc()`/`argv()` sites in 16 `src/` files — but **no global flags**, so the before-or-after-verb
+fix behind `cmdit_dispatch` buys it nothing. The gain is one verb table, `--help`/`--version`,
+completions and uniform errors, in two independent steps.
+
+**Hand-rolled today**
+
+- `src/main.cyr:84-134`: `streq(argv(1), …)` over 35 commands, no aliases. No args →
+  `print_usage` (`main.cyr:42-82`, stderr) + exit 1; unknown → "sit: unknown command" + usage,
+  exit 1. No `--help`/`--version` anywhere; every usage error exits **1**.
+- `cmd_*` read `argv(n)` by fixed index, and most flags count **only at `argv(2)`**: `add -f`
+  (`index.cyr:16`), `rm --cached` (`:639`), `reset --hard` (`:540`), `checkout -b`
+  (`refs.cyr:643`), `branch -d` (`:529`), `tag -d`/`-a`/`-s` (`:339,380-382`),
+  `merge --abort`/`-S` (`merge.cyr:715,742`), `rebase --abort`/`--continue`
+  (`rebase.cyr:151,183`), `config --global` (`config.cyr:299`). So a dash-leading path or
+  message is a positional today.
+- Scanning loops: `log` (`commit.cyr:824-845`), `commit -S`/`-m` (`:977-990`), `reflog -n`
+  (`reflog.cyr:386-389`, missing value ignored), `fsck --prune`/`--prune-now`
+  (`object_db.cyr:1073-1075`, all else ignored), `clone` (`wire.cyr:1256-1280`), `serve`
+  (`serve.cyr:1357-1425`, `<repo>` fixed at `argv(2)`), `diff`/`show`
+  (`diff.cyr:941-975,1209-1230`).
+- Sub-commands: `stash push|list|pop|drop` (default push, `history.cyr:439-446`),
+  `key generate|show` (`sign.cyr:271-279`), `remote add|list|remove` (default list,
+  `wire.cyr:999-1006`).
+- Silent tolerance is load-bearing: `merge <branch> -m <msg>` ignores `-m` (`merge.cyr:693-711`,
+  the patch-line item above); `tests/integration/run.sh:784` and `ci.yml:545` both pass it.
+  The `getenv` reads (`SIT_AUTHOR_*`, `SIT_OWL`, `HOME`, …) are not flag fallbacks and stay.
+
+**Placement constraint.** Every `cmd_*` is in a `[lib]` module and ships in `dist/sit.cyr` (40
+`fn cmd_`) and `dist/sit-read.cyr` (22). `cmdit_*` calls must stay out of `[lib]`/`[lib.read]` —
+in `src/main.cyr` or a new `src/cli.cyr` neither profile lists — or owl and thoth inherit an
+unresolved dependency. That is also why a `[deps.cmdit]` git block is safe despite the
+`cyrius.cyml:149` warning: the warning covers the four stdlib-folded modules, cmdit is not
+folded, and `distlib` leaving it out of `dist/sit.deps` is harmless when no bundled module calls
+it.
+
+**Step 1 — top level only (no `cmd_*` or dist change)**
+
+- [ ] 35 `cmdit_verb` rows + `cmdit_dispatch` in `main.cyr`; switch on `cmdit_verb_matched` and
+  call the existing `cmd_*()`. Handlers still index raw argv, so check the verb is `argv(1)` — a
+  pre-verb `--` (consumed by cmdit) would shift every index.
+- [ ] `CMDIT_HELP` → keep `print_usage` (generated help has no synopsis column; named-positional
+  help is cmdit v2 backlog). `CMDIT_VERSION` → `cmdit_version(h, sit_version_string())`
+  (`src/version.cyr:11`). Unknown verb → `cmdit_error(h) == CMDIT_ERR_UNKNOWN_VERB`, today's
+  text, exit 1. Optional `completions` verb via `cmdit_completions`, as stiva does.
+
+**Step 2 — per-command handles (only if wanted)**
+
+- [ ] Parse each command in `cli.cyr` (child handle + `cmdit_parse_verb`), pass values into
+  `cmd_*`, regenerate both dist bundles. Bools: `-f --cached -b -a -s -S --abort --continue
+  --global --list --oneline --graph --staged --stat --prune --prune-now --force-absolute --stdio
+  --tls --require-auth`; strings: `-d -m --hard --unset --listen --token --cert --key`; ints:
+  `-n`, `--depth` (`cmdit_range` ≥ 1). stash/key/remote as nested re-entry
+  (`cmdit_dispatch_argv` on `cmdit_verb_argc`/`_argv`), each keeping its own
+  unknown-sub-command text.
+- **Gap — blocks diff/show only:** `-U<N>` is an *attached* short value (`diff.cyr:949,1215`);
+  cmdit rejects `-U3` as `CMDIT_ERR_BUNDLED`. Pinned by `run.sh:434-440` (`show -U0`,
+  `show -U4611686018427387904`) and the `ci.yml:383` "diff -U<N>" smoke. Keep diff/show
+  hand-rolled or strip `-U*` before `cmdit_parse_verb`. This is concrete demand for cmdit's
+  v2-backlog "attached short value" as an opt-in per-flag modifier.
+- Caller-side, not gaps: serve's `--stdio`/`--listen` and `--tls`/`--stdio` exclusions and
+  `--tls` needing `--cert`/`--key` (`serve.cyr:1430-1477`); `merge` registering `-m` (accept,
+  ignore) and keeping "any flag → single-branch path" (`merge.cyr:703-711`); config's
+  `--list`/`--unset`/`<key>` exclusivity.
+- Decide, don't drift: dash-leading paths/messages will need `--`; `atoi` junk (`-n x`) becomes
+  an int error; arguments ignored today (fsck, reflog, extras) become errors.
+- `sit serve <repo> --stdio` is a cross-version contract — the SSH client builds exactly that
+  remote command line (`wire_ssh.cyr:403-407`) — so it must keep parsing byte-for-byte.
+
+**cyrius.cyml, tests, identity**
+
+- [ ] No stdlib `flags` to drop; `args` + `io` already in `[deps] stdlib`. No pin bump (cmdit's
+  dist compiles on 6.6.2). 1.3.0 is untagged as of 2026-10-14; 1.2.6 is the same API.
+  ```
+  [deps.cmdit]
+  git = "https://github.com/MacCracken/cmdit.git"
+  tag = "1.3.0"
+  modules = ["dist/cmdit.cyr"]
+  ```
+- [ ] `tests/sit.tcyr`/`tests/sit.fcyr` don't touch CLI parsing. The bar is
+  `tests/integration/run.sh` + the CI smoke steps in `.github/workflows/ci.yml` (and
+  `scripts/benchmark.sh`'s invocations), stdout/stderr byte-identical.
+- [ ] `docs/architecture/001` and `merge.cyr:1079-1088` describe `args_init` reading into a stack
+  buffer; the 6.6.2 stdlib heap-allocates it (`lib/args.cyr:132-143`), so `cmdit_argv`'s stored
+  pointers are safe. Update both notes when this lands.
+
+References: cmdit `README.md` and `docs/adr/0002-verb-dispatch.md` (identify-and-return,
+nesting as re-entry); stiva `src/main.cyr` is the worked verb tool.
