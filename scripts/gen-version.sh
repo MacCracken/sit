@@ -34,6 +34,7 @@ cat > src/version.cyr <<CYR
 # \`var NAME = <non-literal>\` consumes one of the 4,096 initialized-globals
 # slots, and a bare string literal in a function body does not.
 
+# sit's version, as reported by the /sit/v1/capabilities banner.
 fn sit_version_string() { return "$VERSION"; }
 CYR
 echo "src/version.cyr: $VERSION"

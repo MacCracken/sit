@@ -104,6 +104,7 @@ fn _http_remote_host(h)          { return load64(h + 56); }
 # Anything else (a different host, a non-trivial path) is rejected
 # with an eprintln so the user gets a precise message.
 
+# Parse an http:// or https:// URL into a remote handle.
 fn wire_http_open(url) {
     var s = url_scheme(url);
     var is_tls = 0;
@@ -200,6 +201,7 @@ fn wire_http_open(url) {
     return _http_remote_alloc(addr, port, is_tls, host);
 }
 
+# Close a remote handle, tearing down any https keep-alive connection.
 fn wire_http_close(h) {
     # v0.8.9: tear down the persistent https keep-alive connection if one is
     # live (no-op for plain http, which holds no persistent socket).
@@ -216,10 +218,13 @@ fn wire_http_close(h) {
 # reachable undefined call, which cyrius >= 6.6.9 refuses to emit.
 
 # Transport-uniform send. `tls` == 0 → plain socket; else TLS, fragmenting into
-# <= TLS_RECORD_MAX_PLAINTEXT records. Returns 0 on success, -1 on error.
+# <= TLS_RECORD_MAX_PLAINTEXT records. Returns 0 only when ALL `len` bytes went
+# out, -1 otherwise. The plain path must loop: a stream write may return fewer
+# bytes than asked, and until 1.6.4 a single `sock_send` with its count dropped
+# turned a short write into a silently truncated request or response.
 fn _wire_io_send(tls, fd, buf, len) {
     if (tls == 0) {
-        sock_send(fd, buf, len);
+        if (sock_send_all(fd, buf, len) != len) { return 0 - 1; }
         return 0;
     }
     var off = 0;
@@ -301,12 +306,12 @@ fn _wire_http_request(h, sub_path, out_quad) {
         return 0 - 1;
     }
 
-    # https:// → TLS 1.3 handshake + TOFU pin over the connected socket.
+    # Plain http only: https:// returned through _wire_https_exchange above
+    # (keep-alive, v0.8.9), so this connection never carries TLS.
     var tls = 0;
-    if (_http_remote_is_tls(h) == 1) {
-        tls = _wire_https_connect(_http_remote_host(h), _http_remote_port(h), fd);
-        if (tls == 0) { sys_close(fd); return 0 - 1; }
-    }
+    # 1.6.4 (C10): the same 30 s receive bound the https path has always set —
+    # a stalled or hostile http:// server otherwise hangs clone / fetch / push.
+    sock_set_recv_timeout(fd, 30, 0);
 
     # Build "GET <path> HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".
     # Host: literal "127.0.0.1" — RFC 7230 allows any host so long as the
@@ -319,7 +324,12 @@ fn _wire_http_request(h, sub_path, out_quad) {
     memcpy(req + pos, sub_path, sp_len); pos = pos + sp_len;
     memcpy(req + pos, " HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", 49);
     pos = pos + 49;
-    _wire_io_send(tls, fd, req, pos);
+    if (_wire_io_send(tls, fd, req, pos) != 0) {
+        if (tls != 0) { tls_native_close(tls); }
+        sys_close(fd);
+        eprintln("sit: http request send failed");
+        return 0 - 1;
+    }
 
     # Recv loop with growing fl_alloc buffer.
     var cap = WIRE_HTTP_INITIAL_BUF;
@@ -658,12 +668,12 @@ fn _wire_http_post(h, sub_path, body, body_len, out_quad) {
         return 0 - 1;
     }
 
-    # https:// → TLS 1.3 handshake + TOFU pin over the connected socket.
+    # Plain http only: https:// returned through _wire_https_exchange above
+    # (keep-alive, v0.8.9), so this connection never carries TLS.
     var tls = 0;
-    if (_http_remote_is_tls(h) == 1) {
-        tls = _wire_https_connect(_http_remote_host(h), _http_remote_port(h), fd);
-        if (tls == 0) { sys_close(fd); return 0 - 1; }
-    }
+    # 1.6.4 (C10): the same 30 s receive bound the https path has always set —
+    # a stalled or hostile http:// server otherwise hangs clone / fetch / push.
+    sock_set_recv_timeout(fd, 30, 0);
 
     # Request line + framing headers. body_len rendered as decimal
     # via write_decimal (src/util.cyr). Authorization header injected
@@ -689,8 +699,16 @@ fn _wire_http_post(h, sub_path, body, body_len, out_quad) {
         memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
     }
     memcpy(hdr + pos, "Connection: close\r\n\r\n", 21); pos = pos + 21;
-    _wire_io_send(tls, fd, hdr, pos);
-    if (body_len > 0) { _wire_io_send(tls, fd, body, body_len); }
+    var send_rc = _wire_io_send(tls, fd, hdr, pos);
+    if (send_rc == 0) {
+        if (body_len > 0) { send_rc = _wire_io_send(tls, fd, body, body_len); }
+    }
+    if (send_rc != 0) {
+        if (tls != 0) { tls_native_close(tls); }
+        sys_close(fd);
+        eprintln("sit: http request send failed");
+        return 0 - 1;
+    }
 
     # Response read — identical loop to _wire_http_request.
     var cap = WIRE_HTTP_INITIAL_BUF;
@@ -785,6 +803,7 @@ fn _wire_http_post(h, sub_path, body, body_len, out_quad) {
 # into the cap-probe critical path buys nothing. Looks for the
 # byte sequence `"batch":true` anywhere in the body.
 
+# Probe /sit/v1/capabilities once per handle; 1 if the server supports batched want.
 fn http_remote_check_batch(h) {
     if (_http_remote_probed(h) == 1) { return _http_remote_batch(h); }
     _http_remote_set_probed(h, 1);
@@ -899,6 +918,7 @@ fn _wire_http_load_client_token() {
 # fail loudly rather than silently — they signal a wire-protocol
 # violation that the user should know about.
 
+# Fetch `count` objects starting at start_idx in one POST /sit/v1/want into raw_cache.
 fn http_remote_read_batch(h, hashes, start_idx, count, raw_cache) {
     if (count <= 0) { return 0; }
 
@@ -1089,6 +1109,7 @@ fn _wire_http_parse_refs(body, blen, out_pairs) {
     return 0;
 }
 
+# GET /sit/v1/refs into out_pairs; -1 on transport or parse failure.
 fn http_remote_read_refs(h, out_pairs) {
     var quad[48];
     if (_wire_http_request(h, "/sit/v1/refs", &quad) != 0) { return 0 - 1; }
@@ -1142,6 +1163,7 @@ fn http_remote_resolve_branch(h, branch) {
 #
 # Returns 0 on success, negative on any failure.
 
+# GET one object's compressed bytes and type from the remote.
 fn http_remote_read_raw(h, hex, raw_out) {
     if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
     var sub = alloc(16 + 64 + 1);
@@ -1189,6 +1211,7 @@ fn http_remote_read_raw(h, hex, raw_out) {
 # walk_reachable_* sees identical failure modes regardless of
 # transport.
 
+# GET one object and also inflate it (ratio- and 16 MiB-capped).
 fn http_remote_read_both(h, hex, raw_out, deco_out) {
     if (http_remote_read_raw(h, hex, raw_out) != 0) { return 0 - 1; }
     var compressed = load64(raw_out);
@@ -1239,6 +1262,7 @@ fn http_remote_read_both(h, hex, raw_out, deco_out) {
 # allocations are program-lifetime so this is automatically true
 # for anything walked out of the local objects.patra.
 
+# POST one compressed object (type 0..2) to the remote.
 fn http_remote_push_object(h, hex, ty, compressed, clen) {
     if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
     if (ty < 0) { return 0 - 1; }
@@ -1284,6 +1308,7 @@ fn http_remote_push_object(h, hex, ty, compressed, clen) {
 #   1  — non-FF (409 Conflict)
 #   -1 — any other failure (400, 401, network, etc.)
 
+# POST a ref update (validated name, 64-hex) to the remote.
 fn http_remote_push_ref(h, refname, hex) {
     if (refname_valid(refname) == 0) { return 0 - 1; }
     if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
@@ -1334,15 +1359,12 @@ fn _wire_http_post_xhdr(h, sub_path, body, body_len, extra_hdr, out_quad) {
         return 0 - 1;
     }
 
-    # https:// → TLS 1.3 handshake + TOFU pin. Shipped v0.8.9 (CHANGELOG:
-    # "https push"), which lit up wire_transport_check_writable for https and
-    # routed cmd_push through _url_is_http_family; this comment previously
-    # claimed https was still gated off, which stopped being true then.
+    # Plain http only: https:// returned through _wire_https_exchange above
+    # (keep-alive, v0.8.9), so this connection never carries TLS.
     var tls = 0;
-    if (_http_remote_is_tls(h) == 1) {
-        tls = _wire_https_connect(_http_remote_host(h), _http_remote_port(h), fd);
-        if (tls == 0) { sys_close(fd); return 0 - 1; }
-    }
+    # 1.6.4 (C10): the same 30 s receive bound the https path has always set —
+    # a stalled or hostile http:// server otherwise hangs clone / fetch / push.
+    sock_set_recv_timeout(fd, 30, 0);
 
     var sp_len = strlen(sub_path);
     var clen_buf[24];
@@ -1368,8 +1390,16 @@ fn _wire_http_post_xhdr(h, sub_path, body, body_len, extra_hdr, out_quad) {
         memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
     }
     memcpy(hdr + pos, "Connection: close\r\n\r\n", 21); pos = pos + 21;
-    _wire_io_send(tls, fd, hdr, pos);
-    if (body_len > 0) { _wire_io_send(tls, fd, body, body_len); }
+    var send_rc = _wire_io_send(tls, fd, hdr, pos);
+    if (send_rc == 0) {
+        if (body_len > 0) { send_rc = _wire_io_send(tls, fd, body, body_len); }
+    }
+    if (send_rc != 0) {
+        if (tls != 0) { tls_native_close(tls); }
+        sys_close(fd);
+        eprintln("sit: http request send failed");
+        return 0 - 1;
+    }
 
     var cap = WIRE_HTTP_INITIAL_BUF;
     var buf = fl_alloc(cap);

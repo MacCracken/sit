@@ -3,6 +3,7 @@
 
 include "src/lib.cyr"
 
+# `sit init` — create an empty .sit/ repository in the current directory.
 fn cmd_init() {
     # init always runs in the target repo directory; make that explicit.
     # On Linux a "." root is a sit_abs no-op → byte-identical behavior.
@@ -39,6 +40,7 @@ fn cmd_init() {
     }
     return 0;
 }
+# Print the command table to stderr.
 fn print_usage() {
     eprintln("usage: sit <command> [<args>]");
     eprintln("");
@@ -81,6 +83,7 @@ fn print_usage() {
     return 0;
 }
 
+# Entry point: dispatch argv[1] to its cmd_* handler.
 fn main() {
     alloc_init();
     args_init();

@@ -29,6 +29,8 @@ Which sites use which path:
 
 ## Invariant 2 — `reflog.cyr` is ordered before `object_db.cyr`
 
+> **Obsolete since at least cyrius 6.6.20 (re-checked for 1.6.4, 2026-10-19).** The bundle is no longer single-pass in practice: `object_db.cyr` has long called functions defined in LATER modules — `parse_tree` (tree.cyr), `parse_tag_body` (tag.cyr), `parse_index` (index.cyr), and since 1.6.4 `parse_commit_body` (commit.cyr) — and `dist/sit.cyr` / `dist/sit-read.cyr` still compile into consumers on cyrius 6.6.2 (owl), 6.6.6 (thoth) and 6.6.20. Module order is logical grouping, as `src/lib.cyr` already is (CLAUDE.md, *Cyrius Conventions*). The constraint below is kept as the record of why the order looks the way it does; it no longer has to be preserved. What DOES still constrain the bundles is reachability, not order — see [006](006-bundle-closure.md).
+
 The `dist/sit.cyr` bundle is compiled **single-pass**: a `[lib].modules` entry may only reference symbols defined in an *earlier* entry (the main build via `src/lib.cyr` is two-pass and wouldn't catch a violation — but CI's `Verify dist/sit.cyr is in sync` step builds the bundle). `fsck` (in `object_db.cyr`) treats reflog entry oids as reachability roots, so it calls `_reflog_collect_oids`. That forces the order:
 
 ```

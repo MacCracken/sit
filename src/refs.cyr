@@ -47,6 +47,7 @@ fn resolve_reflog_spec(name, out_buf) {
     return 0;
 }
 
+# Resolve a ref name (HEAD, <ref>@{N}, or a name under refs/) to 64-hex in `out_buf`; 1 on success.
 fn resolve_ref_name(name, out_buf) {
     # Storage seam (roadmap 1.2.0): a .git/ repo resolves refs from .git/HEAD,
     # .git/refs/, and .git/packed-refs. @{N} reflog specs are .sit-only for now (roadmap: `.git/` CLI parity).
@@ -190,6 +191,12 @@ fn read_head_ref_path() {
     # refname_valid rejects `..` components, leading/trailing '/', and the
     # control/space/special bytes git forbids.
     if (refname_valid(ref) == 0) { return 0; }
+    # 1.6.4 (E2): and it must name something under refs/, as git requires of
+    # HEAD. refname_valid accepts single-component names, so `ref:
+    # objects.patra` passed, and the next `sit commit` overwrote the whole
+    # object database with 65 bytes (likewise config, index.patra, HEAD).
+    if (ref_len < 6) { return 0; }
+    if (memeq(ref, "refs/", 5) == 0) { return 0; }
     return ref;
 }
 
@@ -328,7 +335,10 @@ fn cmd_tag() {
         i = 0;
         while (i < m) {
             var nm = vec_get(names, i);
-            stdout_write(nm, strlen(nm));
+            # 1.6.4 (E8): names come from the directory listing, not from
+            # refname_valid — a `.sit/refs/tags/$'\e]0;...'` file set the
+            # terminal title. Control bytes print as '?'.
+            write_sanitized(STDOUT, nm, strlen(nm));
             stdout_write("\n", 1);
             i = i + 1;
         }
@@ -485,6 +495,7 @@ fn cmd_tag() {
     return 0;
 }
 
+# `sit branch [-d <name> | <name>]` — list, create or delete a branch.
 fn cmd_branch() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -518,7 +529,7 @@ fn cmd_branch() {
             }
             if (is_current == 1) { stdout_write("* ", 2); }
             else                 { stdout_write("  ", 2); }
-            stdout_write(nm, strlen(nm));
+            write_sanitized(STDOUT, nm, strlen(nm));   # E8, as for tags
             stdout_write("\n", 1);
             i = i + 1;
         }
@@ -651,12 +662,15 @@ fn cmd_checkout() {
     var target = argv_heap(arg_idx);
     var tlen = strlen(target);
 
+    # S-02 for every checkout, not only -b (1.6.4, E7): `sit checkout
+    # ../tags/lt` was accepted and wrote `ref: refs/heads/../tags/lt` into HEAD,
+    # which every reader then rejected — HEAD bricked until hand-edited.
+    if (refname_valid(target) == 0) {
+        eprintln("sit: invalid branch name (see git check-ref-format rules)");
+        return 1;
+    }
+
     if (create == 1) {
-        # S-02: validate branch name before touching the filesystem.
-        if (refname_valid(target) == 0) {
-            eprintln("sit: invalid branch name (see git check-ref-format rules)");
-            return 1;
-        }
         var new_branch = alloc(16 + tlen + 1);
         memcpy(new_branch, ".sit/refs/heads/", 16);
         memcpy(new_branch + 16, target, tlen);
@@ -746,29 +760,15 @@ fn cmd_checkout() {
     }
     store8(target_hex + 64, 0);
 
-    var target_entries = commit_tree_entries(target_hex);
-    if (target_entries == 0) { target_entries = vec_new(); }
-    var curr_entries = read_head_tree_entries();
-    if (curr_entries == 0) { curr_entries = vec_new(); }
-
-    # Collision check: untracked files on disk that would be overwritten
-    var working = list_working_files();
-    var wn = vec_len(working);
-    var wi = 0;
-    while (wi < wn) {
-        var wpath = vec_get(working, wi);
-        if (tree_find(curr_entries, wpath) == 0) {
-            if (tree_find(target_entries, wpath) != 0) {
-                syscall(SYS_WRITE, STDERR, "sit: untracked file '", 21);
-                syscall(SYS_WRITE, STDERR, wpath, strlen(wpath));
-                syscall(SYS_WRITE, STDERR, "' would be overwritten\n", 23);
-                return 1;
-            }
-        }
-        wi = wi + 1;
+    # Untracked files in the way, symlinked parents, and a failed write all
+    # refuse inside materialize_target_safe (is_dirty already ran above). Its
+    # failure must stop the switch: through 1.6.3 the return was ignored, so
+    # HEAD moved onto a tree the worktree and index did not hold and the next
+    # commit silently reverted the branch.
+    if (materialize_target_safe(target_hex, 1) != 0) {
+        eprintln("sit: checkout aborted — HEAD unchanged");
+        return 1;
     }
-
-    materialize_target(target_hex);
 
     # Capture the old HEAD tip before the symref moves (materialize doesn't
     # touch refs, so this still resolves the branch we're leaving).

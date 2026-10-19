@@ -17,6 +17,7 @@ fn signing_home_dir() {
     store8(p + hlen + 5, 0);
     return p;
 }
+# ~/.sit/signing_key, or 0 if HOME is unset.
 fn signing_key_path() {
     var home = getenv("HOME");
     if (home == 0) { return 0; }
@@ -27,6 +28,7 @@ fn signing_key_path() {
     store8(p + hlen + 17, 0);
     return p;
 }
+# ~/.sit/signing_key.pub, or 0 if HOME is unset.
 fn signing_pub_path() {
     var home = getenv("HOME");
     if (home == 0) { return 0; }
@@ -152,6 +154,11 @@ fn extract_sitsig(body, body_len, out_sig, out_pub, out_stripped_ptr, out_stripp
                                     sig_bytes = hex_decode(body + pos + 7, 128);
                                     pub_bytes = hex_decode(body + pos + 136, 64);
                                 } }
+                            # 1.6.4 (E5): only a TERMINATED sitsig line. As the
+                            # final unterminated line, `body_len - 201` also cut
+                            # the preceding LF and the tail copy got length -1,
+                            # so the verified bytes were not "body minus line".
+                            if (nl >= body_len) { sig_bytes = 0; }
                             if (sig_bytes != 0) {
                                 if (pub_bytes != 0) {
                                     memcpy(out_sig, sig_bytes, 64);
@@ -197,6 +204,7 @@ fn verify_commit_body(body, body_len, out_pk) {
     return ed25519_verify(&pk, stripped, slen, &sig);
 }
 
+# `sit key generate` — create the local ed25519 signing key under ~/.sit/ (refuses to overwrite).
 fn cmd_key_generate() {
     var dir = signing_home_dir();
     if (dir == 0) { eprintln("sit: HOME not set"); return 1; }
@@ -232,16 +240,29 @@ fn cmd_key_generate() {
     # the TOCTOU guard degrades to the path_is_symlink check above — accepted).
     var fd = file_open(priv_path, O_WRONLY | O_CREAT | O_TRUNC | 0x80, 0x180);
     if (fd < 0) { eprintln("sit: cannot write signing key"); return 1; }
-    syscall(SYS_WRITE, fd, seed_hex, 64);
-    syscall(SYS_WRITE, fd, "\n", 1);
+    var kbuf[72];
+    memcpy(&kbuf, seed_hex, 64);
+    store8(&kbuf + 64, 10);
+    var kw = sit_write_full(fd, &kbuf, 65);
     sys_close(fd);
+    # 1.6.4 (E15): checked. An unchecked short write (ENOSPC, a file-size
+    # limit) left a 0-byte private key that locked `sit key generate` out
+    # ("already exists") while signing said no key existed. A failure now
+    # removes what was written, so generate can simply be re-run.
+    if (kw != 65) {
+        xunlink(priv_path);
+        eprintln("sit: cannot write signing key — nothing kept; run 'sit key generate' again");
+        return 1;
+    }
 
     var pub_hex = hex_encode(&pk, 32);
     var pub_out = alloc(66);
     memcpy(pub_out, pub_hex, 64);
     store8(pub_out + 64, 10);
-    if (file_write_all(pub_path, pub_out, 65) < 0) {
-        eprintln("sit: cannot write public key");
+    if (file_write_all(pub_path, pub_out, 65) != 65) {
+        xunlink(pub_path);
+        xunlink(priv_path);
+        eprintln("sit: cannot write public key — nothing kept; run 'sit key generate' again");
         return 1;
     }
 
@@ -255,6 +276,7 @@ fn cmd_key_generate() {
     return 0;
 }
 
+# `sit key show` — print the local signing public key.
 fn cmd_key_show() {
     var pk = load_signing_pubkey();
     if (pk == 0) {
@@ -267,6 +289,7 @@ fn cmd_key_show() {
     return 0;
 }
 
+# `sit key generate | show` — dispatch the key sub-commands.
 fn cmd_key() {
     if (argc() < 3) {
         eprintln("usage: sit key generate | sit key show");
@@ -279,6 +302,7 @@ fn cmd_key() {
     return 1;
 }
 
+# `sit verify-commit [<hash>]` — verify a commit's sitsig signature (defaults to HEAD).
 fn cmd_verify_commit() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -308,6 +332,15 @@ fn cmd_verify_commit() {
     var coff = load64(&obj + 16);
     var body = buf + coff;
     var body_len = blen - coff;
+    # 1.6.4 (E6): only a COMMIT. `sit verify-commit v1.0` verified the signed TAG
+    # object and printed "good signature" while the commit it points at was
+    # unsigned — a CI gate on verify-commit passed unsigned releases.
+    var is_commit = 0;
+    if (blen >= 7) { if (memeq(buf, "commit ", 7) == 1) { is_commit = 1; } }
+    if (is_commit == 0) {
+        eprintln("sit: not a commit object (use 'sit verify-tag' for tags)");
+        return 1;
+    }
 
     var pk[32];
     var vr = verify_commit_body(body, body_len, &pk);

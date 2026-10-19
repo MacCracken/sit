@@ -4,8 +4,11 @@
 # tree entry parse / build / flatten, and tree_find lookups. Trees encode
 # directories as `40000 <name>\0<32B hash>` entries and files as `100644 ...`.
 
+# Mode of a build_tree level entry.
 fn tlvl_mode(e) { return load64(e); }
+# Name of a build_tree level entry.
 fn tlvl_name(e) { return load64(e + 8); }
+# Raw (binary) id of a build_tree level entry.
 fn tlvl_bytes(e) { return load64(e + 16); }
 
 # Recursive tree writer.
@@ -91,6 +94,23 @@ fn build_tree(entries, prefix_len) {
         }
     }
 
+    # 1.6.4 (A11): a name may appear once per level. A merge where one side
+    # added file `a` and the other `a/b` handed both through as clean, and this
+    # wrote a tree naming `a` twice — a file AND a directory — which readers
+    # now drop (parse_tree's order check) and git rejects. Refuse to write it.
+    var seen_names = map_new();
+    var dn = vec_len(level);
+    var di = 0;
+    while (di < dn) {
+        var dname = tlvl_name(vec_get(level, di));
+        if (map_has(seen_names, dname) == 1) {
+            eprint3("sit: '", dname, "' would be both a file and a directory — resolve the clash first\n");
+            return 0;
+        }
+        map_set(seen_names, dname, 1);
+        di = di + 1;
+    }
+
     var body_size = 0;
     var k = 0;
     var nl = vec_len(level);
@@ -120,20 +140,45 @@ fn build_tree(entries, prefix_len) {
     return write_typed_object("tree", 4, body, body_size);
 }
 
-# Parse .sit/HEAD. If symbolic (`ref: refs/heads/<branch>\n`), returns the
-# ref path (heap cstring, e.g. "refs/heads/main"). Returns 0 on missing HEAD,
-# detached (raw hex), or malformed content.
-# S-26: count of tree entries `parse_tree` silently discarded (bad mode or
-# unsafe name). fsck resets this before its walk and treats a non-zero value as
-# structural corruption, because a discarded entry's object is invisible to the
+# S-26: count of tree entries `parse_tree` silently discarded (bad mode,
+# unsafe name, or — since 1.6.4 — a duplicate or out-of-order name). fsck
+# resets this before its walk and treats a non-zero value as structural
+# corruption, because a discarded entry's object is invisible to the
 # reachability walk and would otherwise be pruned while still referenced.
 var _tree_dropped_entries = 0;
+# Zero the count of tree entries parse_tree had to drop.
 fn tree_dropped_reset() { _tree_dropped_entries = 0; return 0; }
+# Tree entries parse_tree dropped since the last reset (fsck refuses to prune if nonzero).
 fn tree_dropped_count() { return _tree_dropped_entries; }
 
+# Mode string of a parsed tree entry.
 fn tree_entry_mode(e) { return load64(e); }
+# Name of a parsed tree entry.
 fn tree_entry_name(e) { return load64(e + 8); }
+# Hex id of a parsed tree entry.
 fn tree_entry_hash(e) { return load64(e + 16); }
+
+# git's tree order (base_name_compare): byte-compare the common prefix; where
+# one name ends, a tree continues as if followed by '/', a file by NUL. <0, 0
+# or >0, like memcmp.
+fn _tree_order_cmp(a, alen, a_tree, b, blen, b_tree) {
+    var n = alen;
+    if (blen < n) { n = blen; }
+    var i = 0;
+    while (i < n) {
+        var ca = load8(a + i) & 0xFF;
+        var cb = load8(b + i) & 0xFF;
+        if (ca != cb) { return ca - cb; }
+        i = i + 1;
+    }
+    var c1 = 0;
+    var c2 = 0;
+    if (alen > n) { c1 = load8(a + n) & 0xFF; }
+    else { if (a_tree == 1) { c1 = 47; } }
+    if (blen > n) { c2 = load8(b + n) & 0xFF; }
+    else { if (b_tree == 1) { c2 = 47; } }
+    return c1 - c2;
+}
 
 # Parse tree object body. Returns vec of entries.
 fn parse_tree(body, body_len) {
@@ -141,6 +186,10 @@ fn parse_tree(body, body_len) {
     # Raw hash width per active backend: 32 (sit SHA-256) or 20 (git SHA-1).
     var rawlen = _id_rawlen();
     var pos = 0;
+    # Previous RAW entry (kept or not), for the order / duplicate check below.
+    var prev_name = 0;
+    var prev_len = 0;
+    var prev_tree = 0;
     while (pos < body_len) {
         var sp = pos;
         while (sp < body_len) {
@@ -189,16 +238,40 @@ fn parse_tree(body, body_len) {
                     #
                     # The counter lets fsck treat "this tree has entries I could
                     # not parse" as a structural defect and refuse to prune.
+                    # 1.6.4: every entry must sort STRICTLY after the one before
+                    # it in git order, which rules out duplicate names. A tree
+                    # naming `a` twice made `sit show` list both blobs while
+                    # checkout wrote the second — the review-vs-checkout split
+                    # behind Gitea's CVE-2026-95106 — and fsck called it clean.
+                    # git's fsck rejects both shapes (duplicateEntries,
+                    # treeNotSorted). Every sit writer sorts before build_tree,
+                    # so this never drops an entry sit wrote; a later duplicate
+                    # is dropped, leaving every reader the same first entry.
+                    var is_tree = 0;
+                    if (streq(mode, "40000") == 1) { is_tree = 1; }
+                    var in_order = 1;
+                    if (prev_name != 0) {
+                        if (_tree_order_cmp(prev_name, prev_len, prev_tree,
+                            name, name_len, is_tree) >= 0) { in_order = 0; }
+                        if (prev_len == name_len) {
+                            if (memeq(prev_name, name, name_len) == 1) { in_order = 0; }
+                        }
+                    }
+                    prev_name = name;
+                    prev_len = name_len;
+                    prev_tree = is_tree;
                     var kept = 0;
-                    if (tree_entry_mode_valid(mode) == 1) {
-                        if (tree_entry_name_valid(name) == 1) {
-                            var hash_hex = hex_encode(body + nu + 1, rawlen);
-                            var e = alloc_or_die(24);
-                            store64(e, mode);
-                            store64(e + 8, name);
-                            store64(e + 16, hash_hex);
-                            vec_push(entries, e);
-                            kept = 1;
+                    if (in_order == 1) {
+                        if (tree_entry_mode_valid(mode) == 1) {
+                            if (tree_entry_name_valid(name) == 1) {
+                                var hash_hex = hex_encode(body + nu + 1, rawlen);
+                                var e = alloc_or_die(24);
+                                store64(e, mode);
+                                store64(e + 8, name);
+                                store64(e + 16, hash_hex);
+                                vec_push(entries, e);
+                                kept = 1;
+                            }
                         }
                     }
                     if (kept == 0) { _tree_dropped_entries = _tree_dropped_entries + 1; }
@@ -244,6 +317,7 @@ fn flatten_tree_reset() {
     return 0;
 }
 
+# Push one {mode, full path, hash} entry per file under `tree_hex`; depth- and node-capped.
 fn flatten_tree(tree_hex, prefix, out) {
     if (_tree_walk_depth >= _TREE_MAX_DEPTH) {
         eprintln("sit: tree depth exceeds 256 — refusing to walk further");
@@ -368,12 +442,14 @@ fn _tree_find_map(entries) {
     return m;
 }
 
+# Entry named `name` in a parsed tree (hashmap-backed), or 0.
 fn tree_find(entries, name) {
     if (entries == 0) { return 0; }
     var m = _tree_find_map(entries);
     return map_get(m, name);
 }
 
+# Hex id of the entry at `path`, or 0.
 fn tree_find_hash(entries, path) {
     if (entries == 0) { return 0; }
     var e = tree_find(entries, path);

@@ -5,6 +5,7 @@
 # BFS reachability, object copy loop, fast-forward check, and all five wire
 # commands: remote, fetch, pull, push, clone.
 
+# Configured URL of remote `name` (remote.<name>.url), or 0.
 fn remote_url(name) {
     var nlen = strlen(name);
     var key = alloc(nlen + 12);
@@ -23,6 +24,7 @@ fn remote_url(name) {
 #   if (wire_transport_check_readable(url) != 0) { return 1; }
 #   if (wire_transport_check_writable(url) != 0) { return 1; }
 
+# 0 if `url`'s scheme can be fetched / cloned from, else 1 with an error.
 fn wire_transport_check_readable(url) {
     var s = url_scheme(url);
     if (s == URL_SCHEME_FILE) { return 0; }
@@ -33,6 +35,7 @@ fn wire_transport_check_readable(url) {
     return 1;
 }
 
+# 0 if `url`'s scheme can be pushed to, else 1 with an error.
 fn wire_transport_check_writable(url) {
     var s = url_scheme(url);
     if (s == URL_SCHEME_FILE) { return 0; }
@@ -132,19 +135,26 @@ fn db_object_read_raw(db, hex, out) {
     # from a remote's commit body reached this literal unvalidated, and the
     # unconditional 64-byte memcpy made a shorter string an out-of-bounds read.
     if (hex_prefix_valid(hex, 64) == 0) { return 0 - 1; }
-    var sql = alloc(128);
+    # 1.6.4 (C1): freelist, not the never-freed bump heap — `sit serve` calls
+    # this on every anonymous read. The returned buffer is fl_alloc memory the
+    # caller MAY fl_free (the server does); client callers keep it, as before.
+    var sql = fl_alloc(128);
+    if (sql == 0) { return 0 - 1; }
     memcpy(sql, "SELECT content, ty FROM objects WHERE hash = '", 46);
     memcpy(sql + 46, hex, 64);
     memcpy(sql + 46 + 64, "'", 1);
     store8(sql + 46 + 64 + 1, 0);
     var rs = patra_query(db, sql);
+    fl_free(sql);
     if (rs == 0) { return 0 - 1; }
     if (patra_result_count(rs) == 0) { patra_result_free(rs); return 0 - 2; }
     var blen = patra_result_get_bytes_len(rs, 0, 0);
     if (blen <= 0) { patra_result_free(rs); return 0 - 3; }
-    var compressed = alloc(blen);
+    var compressed = fl_alloc(blen);
+    if (compressed == 0) { patra_result_free(rs); return 0 - 4; }
     if (patra_result_read_bytes(db, rs, 0, 0, compressed) != 0) {
         patra_result_free(rs);
+        fl_free(compressed);
         return 0 - 4;
     }
     var ty = patra_result_get_int(rs, 0, 1);
@@ -173,24 +183,32 @@ fn _decompress_raw_into(raw, deco_out) {
     var dec_cap = clen * 4;
     if (dec_cap < 4096) { dec_cap = 4096; }
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
-    var decompressed = alloc(dec_cap);
+    # 1.6.4 (C1): freelist memory, so `sit serve`'s PUT path can release it per
+    # request (it calls this on every pushed object). Callers may fl_free
+    # deco_out's buffer; the client walkers keep it, as before.
+    var decompressed = fl_alloc(dec_cap);
     if (decompressed == 0) { return 0 - 2; }
     var dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
     if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
         if (dec_cap < 16 * 1024 * 1024) {
+            fl_free(decompressed);
             dec_cap = 16 * 1024 * 1024;
-            decompressed = alloc(dec_cap);
+            decompressed = fl_alloc(dec_cap);
             if (decompressed == 0) { return 0 - 2; }
             dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
         }
     }
-    if (dlen <= 0) { return 0 - 3; }
+    if (dlen <= 0) { fl_free(decompressed); return 0 - 3; }
     var nul = 0;
-    while (nul < dlen) {
-        if (load8(decompressed + nul) == 0) { break; }
-        nul = nul + 1;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (nul >= dlen) { scanning = 0; }
+        else {
+            if (load8(decompressed + nul) == 0) { scanning = 0; }
+            else { nul = nul + 1; }
+        }
     }
-    if (nul >= dlen) { return 0 - 4; }
+    if (nul >= dlen) { fl_free(decompressed); return 0 - 4; }
     store64(deco_out,      decompressed);
     store64(deco_out +  8, dlen);
     store64(deco_out + 16, nul + 1);
@@ -296,6 +314,7 @@ var OBJ_SRC_DB = 0;
 var OBJ_SRC_HTTP = 1;
 var OBJ_SRC_SSH = 2;
 
+# Object source backed by a local patra DB.
 fn obj_src_for_db(db) {
     var s = alloc(16);
     store64(s, OBJ_SRC_DB);
@@ -303,6 +322,7 @@ fn obj_src_for_db(db) {
     return s;
 }
 
+# Object source backed by an http(s) remote handle.
 fn obj_src_for_http(handle) {
     var s = alloc(16);
     store64(s, OBJ_SRC_HTTP);
@@ -310,6 +330,7 @@ fn obj_src_for_http(handle) {
     return s;
 }
 
+# Object source backed by an ssh remote handle.
 fn obj_src_for_ssh(handle) {
     var s = alloc(16);
     store64(s, OBJ_SRC_SSH);
@@ -317,9 +338,12 @@ fn obj_src_for_ssh(handle) {
     return s;
 }
 
+# Kind tag of an object source (OBJ_SRC_*).
 fn obj_src_kind(s) { return load64(s); }
+# DB pointer or remote handle of an object source.
 fn obj_src_payload(s) { return load64(s + 8); }
 
+# Read an object's compressed bytes from whichever source backs `src`.
 fn obj_src_read_raw(src, hex, raw_out) {
     var k = obj_src_kind(src);
     if (k == OBJ_SRC_DB)   { return db_object_read_raw(obj_src_payload(src), hex, raw_out); }
@@ -328,6 +352,7 @@ fn obj_src_read_raw(src, hex, raw_out) {
     return 0 - 99;
 }
 
+# Read an object's compressed and decompressed bytes from `src`.
 fn obj_src_read_both(src, hex, raw_out, deco_out) {
     var k = obj_src_kind(src);
     if (k == OBJ_SRC_DB)   { return db_object_read_both(obj_src_payload(src), hex, raw_out, deco_out); }
@@ -464,6 +489,7 @@ fn _walk_cache_insert(raw_cache, hex, raw_struct_ptr) {
 # common file:// case. We keep `walk_reachable_from_commit` as the
 # fallback path and dispatch on src kind in `do_fetch` / `cmd_push`.
 
+# Collect every object reachable from root_hex in `src` — commits first, then trees — honouring the shallow depth cap.
 fn walk_reachable_phased(src, root_hex, out, seen, raw_cache) {
     # Phase 1: commit chain walk (sequential).
     # `qdepth` shadows `queue` 1:1 carrying each commit's distance from the
@@ -887,6 +913,7 @@ fn is_ancestor_in_db(db, ancestor_hex, desc_hex) {
     return 0;
 }
 
+# `sit remote add <name> <url>` — record a named remote after validating its URL.
 fn cmd_remote_add() {
     if (argc() < 5) {
         eprintln("usage: sit remote add <name> <url>");
@@ -920,6 +947,7 @@ fn cmd_remote_add() {
     return 0;
 }
 
+# `sit remote list` — print every configured remote and its URL.
 fn cmd_remote_list() {
     if (sf_exists(".sit/config") != 1) { return 0; }
     var pair[16];
@@ -950,7 +978,7 @@ fn cmd_remote_list() {
                 if (dot < stop) {
                     if (dot + 4 <= stop) {
                         if (memeq(data + dot, ".url", 4) == 1) {
-                            stdout_write(data + start + 7, dot - (start + 7));
+                            write_sanitized(STDOUT, data + start + 7, dot - (start + 7));   # E9
                             stdout_write("\t", 1);
                             # skip past " = "
                             var eq = dot + 4;
@@ -959,7 +987,7 @@ fn cmd_remote_list() {
                                 eq = eq + 1;
                             }
                             eq = skip_ws(data, eq, stop);
-                            stdout_write(data + eq, stop - eq);
+                            write_sanitized(STDOUT, data + eq, stop - eq);
                             stdout_write("\n", 1);
                         }
                     }
@@ -971,6 +999,7 @@ fn cmd_remote_list() {
     return 0;
 }
 
+# `sit remote remove <name>` — delete a named remote.
 fn cmd_remote_remove() {
     if (argc() < 4) {
         eprintln("usage: sit remote remove <name>");
@@ -995,6 +1024,7 @@ fn cmd_remote_remove() {
     return 0;
 }
 
+# `sit remote add | list | remove` — dispatch the remote sub-commands (default list).
 fn cmd_remote() {
     if (argc() < 3) { return cmd_remote_list(); }
     var sub = argv(2);
@@ -1096,7 +1126,10 @@ fn do_fetch(name, branch) {
     # S-26: a walk that hit the object cap returns -1 with a partial `hashes`.
     # Proceeding would copy that partial set and then move the ref, producing a
     # repo whose tip has missing ancestors — worse than the DoS. Abort instead.
-    if (walk_reachable_phased(src, remote_tip, hashes, seen, raw_cache) != 0) { return 1; }
+    # 1.6.4 (C6): with 0, the failure value of THIS function — it returns the
+    # fetched tip. `return 1` handed callers the pointer 1: fetch exited 0 and
+    # pull / clone dereferenced address 1 (SIGSEGV).
+    if (walk_reachable_phased(src, remote_tip, hashes, seen, raw_cache) != 0) { return 0; }
     var copied = copy_objects(src, dst_db, hashes, raw_cache);
 
     if (src_db_local != 0) { patra_close(src_db_local); }
@@ -1125,6 +1158,7 @@ fn do_fetch(name, branch) {
     return remote_tip;
 }
 
+# `sit fetch <remote> [<ref>]` — copy objects and the remote-tracking ref, without merging.
 fn cmd_fetch() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository");
@@ -1162,12 +1196,17 @@ fn cmd_pull() {
 
     var head_hex = read_head_ref();
     if (head_hex == 0) {
-        # No local commits yet — adopt the fetched tip as HEAD, materialize.
+        # No local commits yet — materialize the fetched tip, then adopt it as
+        # HEAD. 1.6.4 (B3/B9): HEAD moved first and the materialize result was
+        # ignored, so a failed or refused write still "initialized" the branch.
+        if (materialize_target_safe(tip, 1) != 0) {
+            eprintln("sit: pull aborted — HEAD unchanged");
+            return 1;
+        }
         if (write_head_ref(tip) != 0) {
             eprintln("sit: failed to update HEAD");
             return 1;
         }
-        materialize_target(tip);
         reflog_head_move(0, tip, reflog_msg_join("pull ", name, ": storing head"));
         stdout_write("initialized from ", 17);
         stdout_write(name, strlen(name));
@@ -1190,11 +1229,19 @@ fn cmd_pull() {
             eprintln("sit: working tree has uncommitted changes; commit or revert before pulling");
             return 1;
         }
+        # 1.6.4 (B9): materialize BEFORE the ref moves — the same ordering
+        # 1.5.1 fixed for reset and merge, missed here. With HEAD moved first,
+        # the stale-path removal compared the target against itself, so files
+        # deleted upstream stayed on disk as untracked. (B3/B6) The result is
+        # checked, and untracked work in the way refuses.
+        if (materialize_target_safe(tip, 1) != 0) {
+            eprintln("sit: pull aborted — HEAD unchanged");
+            return 1;
+        }
         if (write_head_ref(tip) != 0) {
             eprintln("sit: failed to update HEAD");
             return 1;
         }
-        materialize_target(tip);
         reflog_head_move(head_hex, tip, reflog_msg_join("pull ", name, ": Fast-forward"));
         stdout_write("fast-forward to ", 16);
         stdout_write(tip, 12);
@@ -1239,6 +1286,7 @@ fn _write_shallow_file(boundary) {
     return 0;
 }
 
+# `sit clone [--depth <n>] <url> [<dir>]` — init, add origin, fetch and check out.
 fn cmd_clone() {
     if (argc() < 3) {
         eprintln("usage: sit clone [--force-absolute] [--depth <n>] <url> [<dir>]");
@@ -1443,11 +1491,17 @@ fn cmd_clone() {
     }
     if (tip == 0) { return 1; }
 
+    # 1.6.4 (B3): checked, and before HEAD moves. Clone ignored this result and
+    # printed "cloned" with an empty or partial worktree and an index that
+    # showed every file deleted (an unreadable blob was enough).
+    if (materialize_target_safe(tip, 1) != 0) {
+        eprintln("sit: objects fetched, but the checkout failed — see above");
+        return 1;
+    }
     if (write_head_ref(tip) != 0) {
         eprintln("sit: failed to update HEAD");
         return 1;
     }
-    materialize_target(tip);
     reflog_head_move(0, tip, reflog_msg_subject("clone: from ", url));
 
     stdout_write("cloned ", 7);
@@ -1458,6 +1512,7 @@ fn cmd_clone() {
     return 0;
 }
 
+# `sit push <remote> [<ref>]` — push HEAD's branch to a remote (fast-forward only).
 fn cmd_push() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository");

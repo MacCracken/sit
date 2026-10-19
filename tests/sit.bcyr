@@ -9,6 +9,7 @@
 
 include "src/lib.cyr"
 
+# Fill `buf` with deterministic pseudo-random bytes.
 fn fill_pseudo_random(buf, len) {
     var i = 0;
     while (i < len) {
@@ -20,6 +21,7 @@ fn fill_pseudo_random(buf, len) {
 
 # ── Phase 1: sigil + sankoch primitive throughput ──────────────────
 
+# SHA-256 throughput at 64 B, 1 KiB and 64 KiB.
 fn bench_sigil_sha256(size, iters) {
     var name_prefix = "sha256-";
     var nb = alloc(32);
@@ -43,6 +45,7 @@ fn bench_sigil_sha256(size, iters) {
     return 0;
 }
 
+# zlib compress at 1 KiB and 64 KiB.
 fn bench_sankoch_compress(size, iters) {
     var nb = alloc(32);
     memcpy(nb, "zlib-compress-", 14);
@@ -67,6 +70,7 @@ fn bench_sankoch_compress(size, iters) {
     return 0;
 }
 
+# zlib decompress at 1 KiB and 64 KiB.
 fn bench_sankoch_decompress(size, iters) {
     var nb = alloc(32);
     memcpy(nb, "zlib-decompress-", 16);
@@ -102,6 +106,7 @@ fn bench_sankoch_decompress(size, iters) {
 # to collapse into a single transaction. Commit-parse and iso8601 scale
 # directly with sit log history length (P-05).
 
+# patra database open + close round trip.
 fn bench_patra_open_close(iters) {
     var path = "/tmp/sit-bench-openclose.patra";
     sys_unlink(path);
@@ -218,7 +223,7 @@ fn bench_copy_objects_per_row(count) {
 
 # commit-body parse + iso8601 — the per-commit cost during `sit log`.
 fn bench_commit_parse(iters) {
-    var body = "tree 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nparent fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\nauthor Test Author <test@example.com> 1776999445 +0000\ncommitter Test Author <test@example.com> 1776999445 +0000\n\nTypical commit message body on one line.\n";
+    var body = "tree 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nparent fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\nauthor Test Author <test@example.com> 1776999445 +0000\ncommitter Test Author <test@example.com> 1776999445 +0000\n\nTypical commit message body on one line.\n";  #skip-lint (fixture literal)
     var body_len = strlen(body);
 
     var b = bench_new("commit-parse+iso8601");
@@ -467,6 +472,7 @@ fn bench_blob_hash(size, iters) {
     return 0;
 }
 
+# Run every benchmark.
 fn main() {
     alloc_init();
 

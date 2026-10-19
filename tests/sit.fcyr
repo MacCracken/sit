@@ -11,6 +11,7 @@
 # Stdlib + deps are auto-included via cyrius.cyml.
 include "src/lib.cyr"
 
+# Fill `buf` with deterministic pseudo-random bytes.
 fn fill_pseudo_random(buf, len, seed) {
     var s = seed;
     var i = 0;
@@ -698,6 +699,7 @@ fn fuzz_parse_tag_body(rounds) {
     return 0;
 }
 
+# Run every bounded fuzz harness; nonzero on the first crash or invariant break.
 fn main() {
     alloc_init();
     println("fuzz: zlib_decompress (10000 rounds)");

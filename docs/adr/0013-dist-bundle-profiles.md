@@ -24,7 +24,7 @@ A single full bundle forces the report-only kind to compile sit's signing module
 Membership rules:
 
 - **`[lib.read]` is `[lib]` minus `sign`, `wire`, `wire_http`, `serve`** (and minus `version`, `delta`, `history`, `blame`, `rebase`, which are not on the read path). It **keeps** `reflog`, `index`, `commit` and `merge`. Those are on the read path: status honours `.gitignore` and the index, reading HEAD parses its commit object into a tree, and ref resolution touches the reflog. Dropping them would silently break status / diff.
-- **Module order is the same in both profiles** and mirrors `src/lib.cyr`: primitives → storage → refs / objects / commands → `api.cyr` last. The bundle compiles single-pass, so a module may reference only modules before it ([architecture 005](../architecture/005-reflog-two-line-invariant.md)).
+- **Module order is the same in both profiles** and mirrors `src/lib.cyr`: primitives → storage → refs / objects / commands → `api.cyr` last. (The order is logical grouping; the single-pass constraint once recorded in [architecture 005](../architecture/005-reflog-two-line-invariant.md) no longer holds — 1.6.4.)
 - **Transport internals are in neither profile.** `wire_ssh.cyr` (exec of the system `ssh`) and `wire_https.cyr` (the TLS client handshake and TOFU pin store) stay out of consumer bundles. Code inside `[lib]` must therefore never *reach* them; see [architecture 006](../architecture/006-bundle-closure.md).
 - **A source change to any module in `[lib]` regenerates `dist/sit.cyr`; a change to one also in `[lib.read]` regenerates both** (`cyrius distlib && cyrius distlib read`), in the same commit as the source.
 
@@ -39,4 +39,4 @@ Membership rules:
 ## Alternatives considered
 
 - **One full bundle only.** Rejected: it forces every report-only consumer to carry and shim the network and signing stack.
-- **Per-module bundles that consumers compose.** Rejected for now: the single-pass ordering constraint would move onto every consumer, and two profiles cover the consumers that exist.
+- **Per-module bundles that consumers compose.** Rejected for now: every consumer would have to assemble and keep a module set closed under reachability ([architecture 006](../architecture/006-bundle-closure.md)), and two profiles cover the consumers that exist.

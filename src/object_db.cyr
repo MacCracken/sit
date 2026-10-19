@@ -6,6 +6,7 @@
 # loose-file layout auto-migrates on first access. Read verbs: cat-file,
 # owl-file, fsck. Also the blob-hash primitives used by add + status.
 
+# Write the loose-object path .sit/objects/xx/<62 hex> into `buf`; returns its length (78).
 fn object_path(buf, hex) {
     memcpy(buf, ".sit/objects/", 13);
     store8(buf + 13, load8(hex));
@@ -85,7 +86,14 @@ fn read_object(hex, out) {
     # are loose files or packed. _git_read_any tries loose then every packfile.
     # Dispatch on the backend set by sit_repo_open's _detect_repo_backend.
     # SIT mode (default) is unchanged.
+    #
+    # 1.6.4 (D8): the gate below now covers this branch too, at the backend's
+    # width (40 or 64). git mode returned before it, so a hostile `.git/` whose
+    # tree header was `../../outside/evil` made _git_read_any open and inflate
+    # a path outside .git/objects — the S-25 "single check covers every one of
+    # them" claim did not hold in git mode.
     if (_repo_backend == 1) {
+        if (hex_prefix_valid(hex, _id_hexlen()) == 0) { return 0 - 1; }
         return _git_read_any(hex, out);
     }
 
@@ -170,6 +178,7 @@ fn read_object(hex, out) {
     return 0;
 }
 
+# Frame `<type> <len>\0<content>`, hash it, compress and store it; returns the 64-hex id or 0.
 fn write_typed_object(type_str, type_len, content, content_len) {
     var hdr_max = 32;
     var full_cap = hdr_max + content_len;
@@ -230,10 +239,12 @@ fn write_typed_object(type_str, type_len, content, content_len) {
     return hex;
 }
 
+# write_typed_object for a blob.
 fn write_blob_object(content, content_len) {
     return write_typed_object("blob", 4, content, content_len);
 }
 
+# Shared front half of cat-file / owl-file: detect the backend, resolve argv[2]'s prefix, read the object.
 fn resolve_and_read(obj_out, hex_out) {
     # Backend detection (roadmap 1.2.0): read verbs work on a native .sit/ or an
     # existing .git/ repo; sets the process-global backend that read_object /
@@ -257,6 +268,7 @@ fn resolve_and_read(obj_out, hex_out) {
     return 0;
 }
 
+# `sit cat-file <hash>` — write an object's content to stdout (plumbing; .sit/ or .git/).
 fn cmd_cat_file() {
     if (argc() < 3) {
         eprintln("usage: sit cat-file <hash>");
@@ -297,6 +309,7 @@ fn find_owl() {
     return 0;
 }
 
+# `sit owl-file <hash>` — view an object through owl, falling back to raw content if owl is absent.
 fn cmd_owl_file() {
     if (argc() < 3) {
         eprintln("usage: sit owl-file <hash>");
@@ -441,6 +454,7 @@ fn _ensure_object_index(db) {
     return 0;
 }
 
+# Open (creating if needed) .sit/objects.patra with its objects table and hash index.
 fn object_db_open() {
     patra_init();
     var db = sf_patra_open(".sit/objects.patra");
@@ -459,6 +473,7 @@ fn object_db_open() {
 # and closes the fd — no WAL flush — so skipping it at exit is safe).
 var _object_db_cached = 0;
 
+# Process-cached object DB handle; migrates loose objects into patra on first open.
 fn get_object_db() {
     if (_object_db_cached != 0) { return _object_db_cached; }
     _object_db_cached = object_db_open();
@@ -598,7 +613,12 @@ fn fsck_read_ref_tip(path) {
             }
         }
     }
-    if (len != 64) { return 0; }
+    # 1.6.4 (D9): accept exactly what the ref resolver accepts (refs.cyr: the
+    # first 64 bytes hex, whatever follows). Requiring exactly 64 bytes made a
+    # ref with a trailing space or a comment usable by every command yet NOT an
+    # fsck root, so with no reflog behind it `--prune-now` deleted the branch.
+    # A root that is too generous only keeps objects; a strict one loses them.
+    if (len < 64) { return 0; }
     if (hex_prefix_valid(data, 64) == 0) { return 0; }
     var out = alloc(65);
     memcpy(out, data, 64);
@@ -766,12 +786,16 @@ fn fsck_collect_commit_parents(body, body_len, parents) {
 # 65-byte hex cstring, or 0 if absent / malformed. Looks at the first
 # line only — git always emits `tree` as the very first header.
 fn fsck_extract_commit_tree(body, body_len) {
-    if (body_len < 70) { return 0; }
-    if (memeq(body, "tree ", 5) == 0) { return 0; }
-    if (hex_prefix_valid(body + 5, 64) == 0) { return 0; }
-    var t = alloc(65);
-    memcpy(t, body + 5, 64);
-    store8(t + 64, 0);
+    # 1.6.4 (D4): the SAME header parser log, show, checkout and the wire walk
+    # use. This accepted `tree` only on the first line while parse_commit_body
+    # takes it from any header line, so a commit with `parent` first (a hostile
+    # fetch or push could deliver one) was fully usable everywhere — yet fsck
+    # never walked its tree, and `--prune-now` deleted it.
+    var info[56];
+    if (parse_commit_body(body, body_len, &info) != 0) { return 0; }
+    var t = load64(&info);
+    if (t == 0) { return 0; }
+    if (hex_prefix_valid(t, 64) == 0) { return 0; }
     return t;
 }
 
@@ -836,13 +860,18 @@ fn load_shallow_set() {
 
 # Boundary set for the active fsck walk; 0 outside one.
 var _fsck_shallow = 0;
+# Oids a shallow boundary commit names as parents: walked when present, never
+# reported missing when absent (D2, 1.6.4). Reset per fsck run.
+var _fsck_optional = 0;
 
+# Reset fsck's missing-object list and its dedup set.
 fn fsck_missing_reset() {
     _fsck_missing = vec_new();
     _fsck_missing_seen = map_new();
     return 0;
 }
 
+# Record `hex` as referenced-but-missing, once.
 fn fsck_missing_record(hex) {
     if (_fsck_missing_seen == 0) { return 0; }
     if (map_has(_fsck_missing_seen, hex) == 1) { return 0; }
@@ -854,8 +883,10 @@ fn fsck_missing_record(hex) {
     return 0;
 }
 
+# Objects fsck found referenced but absent.
 fn fsck_missing_vec() { return _fsck_missing; }
 
+# Mark every object reachable from `root` in `seen`, recording referenced-but-missing ones.
 fn fsck_walk_reachable(root, seen) {
     var queue = vec_new();
     vec_push(queue, root);
@@ -868,7 +899,12 @@ fn fsck_walk_reachable(root, seen) {
             # One read, branched on — fsck walks the whole graph, so a second
             # probe here would double every object's DB read.
             var rc = read_object(hex, &obj);
-            if (rc != 0) { fsck_missing_record(hex); }
+            if (rc != 0) {
+                # A shallow boundary's parent may legitimately be absent.
+                var optional = 0;
+                if (_fsck_optional != 0) { optional = map_has(_fsck_optional, hex); }
+                if (optional == 0) { fsck_missing_record(hex); }
+            }
             if (rc == 0) {
                 var buf = load64(&obj);
                 var blen = load64(&obj + 8);
@@ -883,21 +919,30 @@ fn fsck_walk_reachable(root, seen) {
                             if (map_has(seen, t) == 0) { vec_push(queue, t); }
                         }
                         # S-27: a shallow boundary commit's parents were never
-                        # fetched, so they are absent on purpose — don't walk
-                        # them and don't record them as missing.
+                        # fetched, so they may be absent on purpose — don't
+                        # record them as missing.
+                        #
+                        # 1.6.4 (D2): but DO walk the ones that are present.
+                        # This skipped them outright, and `fetch` on a shallow
+                        # clone brings the full history in without touching
+                        # .sit/shallow — so every fetched ancestor read as
+                        # dangling and `--prune-now` deleted the history,
+                        # which the repo then served to clones as missing.
                         var at_boundary = 0;
                         if (_fsck_shallow != 0) {
                             if (map_has(_fsck_shallow, hex) == 1) { at_boundary = 1; }
                         }
-                        if (at_boundary == 0) {
-                            var parents = vec_new();
-                            fsck_collect_commit_parents(body, body_len, parents);
-                            var pi = 0;
-                            while (pi < vec_len(parents)) {
-                                var p = vec_get(parents, pi);
-                                if (map_has(seen, p) == 0) { vec_push(queue, p); }
-                                pi = pi + 1;
+                        var parents = vec_new();
+                        fsck_collect_commit_parents(body, body_len, parents);
+                        var pi = 0;
+                        while (pi < vec_len(parents)) {
+                            var p = vec_get(parents, pi);
+                            if (at_boundary == 1) {
+                                if (_fsck_optional == 0) { _fsck_optional = map_new(); }
+                                map_set(_fsck_optional, p, 1);
                             }
+                            if (map_has(seen, p) == 0) { vec_push(queue, p); }
+                            pi = pi + 1;
                         }
                     }
                 }
@@ -1050,6 +1095,7 @@ fn _fsck_commit_author_ts(body, len) {
     return val;
 }
 
+# `sit fsck [--prune|--prune-now]` — verify object integrity and reachability; --prune removes dangling objects.
 fn cmd_fsck() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -1076,6 +1122,22 @@ fn cmd_fsck() {
         ai = ai + 1;
     }
     if (prune == 1) {
+        # 1.6.4 (A9): a rebase, cherry-pick or revert in progress holds commits
+        # only its state files name — the original tip in REBASE_ORIG, the rest
+        # of the branch in rebase-todo. With the reflog gone those were pruned,
+        # and --abort then wrote a dangling oid and emptied the worktree.
+        if (sf_exists(".sit/REBASE_ORIG") == 1) {
+            eprintln("sit: refusing --prune during an in-progress rebase (.sit/REBASE_ORIG present)");
+            return 1;
+        }
+        if (sf_exists(".sit/CHERRY_PICK_HEAD") == 1) {
+            eprintln("sit: refusing --prune during an in-progress cherry-pick (.sit/CHERRY_PICK_HEAD present)");
+            return 1;
+        }
+        if (sf_exists(".sit/REVERT_HEAD") == 1) {
+            eprintln("sit: refusing --prune during an in-progress revert (.sit/REVERT_HEAD present)");
+            return 1;
+        }
         if (sf_exists(".sit/MERGE_HEAD") == 1) {
             eprintln("sit: refusing --prune during an in-progress merge (.sit/MERGE_HEAD present)");
             return 1;
@@ -1149,6 +1211,7 @@ fn cmd_fsck() {
     # `clone --depth` boundary are not mistaken for corruption.
     fsck_missing_reset();
     _fsck_shallow = load_shallow_set();
+    _fsck_optional = 0;
     var roots = fsck_collect_roots();
     var ref_root_count = vec_len(roots);
     fsck_collect_reflog_roots(roots);
@@ -1220,6 +1283,19 @@ fn cmd_fsck() {
         mi = mi + 1;
     }
 
+    # 1.6.4: a reachable tree with entries parse_tree had to drop (bad mode,
+    # unsafe name, duplicate or out-of-order name) is a structural defect in
+    # its own right — git's fsck errors on duplicateEntries / treeNotSorted —
+    # not only a reason to refuse --prune (below). Report it and fail.
+    var dropped = tree_dropped_count();
+    if (dropped > 0) {
+        var dbuf[24];
+        var dd = write_decimal(&dbuf, dropped);
+        syscall(SYS_WRITE, STDERR, "malformed tree entries: ", 24);
+        syscall(SYS_WRITE, STDERR, &dbuf, dd);
+        syscall(SYS_WRITE, STDERR, " (bad mode, unsafe name, duplicate or out-of-order) — checkout ignores them\n", 78);
+    }
+
     stdout_write("checked ", 8);
     write_unsigned(total);
     stdout_write(" objects, ", 10);
@@ -1250,7 +1326,7 @@ fn cmd_fsck() {
         # as merely `dangling`. Pruning then deleted an object a live tree still
         # references. A malformed tree is structural corruption; refuse.
         if (tree_dropped_count() > 0) {
-            eprintln("sit: refusing --prune — a reachable tree has unparseable entries (bad mode or unsafe name)");
+            eprintln("sit: refusing --prune — a reachable tree has entries sit cannot use (see above)");
             eprintln("sit:   their objects cannot be proven reachable and would be deleted while still referenced");
             return 1;
         }
@@ -1325,9 +1401,11 @@ fn cmd_fsck() {
     }
 
     if (bad > 0) { return 1; }
+    if (dropped > 0) { return 1; }
     return 0;
 }
 
+# The blob id `content` would get, without storing it.
 fn hash_blob_of_content(content, content_len) {
     var full_cap = 32 + content_len;
     var full = alloc_or_die(full_cap);

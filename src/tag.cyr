@@ -233,6 +233,32 @@ fn resolve_commit_hash(prefix, out_buf) {
     if (peeled == 0) { return 0; }
     memcpy(out_buf, peeled, 64);
     store8(out_buf + 64, 0);
+    # 1.6.4 (E4): and it must BE a commit. A tag (or a typo'd prefix, or a ref)
+    # naming a tree went through: `reset --hard <it>` unlinked every tracked
+    # file and wrote the tree's oid into the branch, after which `log` failed,
+    # `status` said clean, and the next commit recorded the tree as a parent.
+    var probe[24];
+    if (read_object(out_buf, &probe) != 0) { return 0; }
+    var pbuf = load64(&probe);
+    var plen = load64(&probe + 8);
+    var poff = load64(&probe + 16);
+    var is_commit = 0;
+    if (_repo_backend == 1) {
+        # git packed objects carry no framing — require a parseable `tree` header.
+        var info[56];
+        if (parse_commit_body(pbuf + poff, plen - poff, &info) == 0) {
+            if (load64(&info) != 0) { is_commit = 1; }
+        }
+    }
+    else {
+        if (plen >= 7) {
+            if (memeq(pbuf, "commit ", 7) == 1) { is_commit = 1; }
+        }
+    }
+    if (is_commit == 0) {
+        eprint3("sit: '", prefix, "' does not name a commit\n");
+        return 0;
+    }
     return 1;
 }
 
@@ -311,11 +337,32 @@ fn cmd_verify_tag() {
     }
     var pk_hex = hex_encode(&pk, 32);
     if (vr == 1) {
+        # 1.6.4 (E3): report what the signature actually covers — the SIGNED
+        # tag name and target — not the name typed on the command line. A
+        # signed `v1.0` copied to refs/tags/v2.1 (or refs/heads/v3.0) verified
+        # as "good signature on tag v2.1", a release rollback that a CI gate
+        # on verify-tag would wave through. git shows the tag content here.
+        var tinfo[40];
+        if (parse_tag_body(body, body_len, &tinfo) != 0) {
+            eprintln("sit: signature is good but the tag body does not parse — refusing");
+            return 1;
+        }
+        var signed_name = load64(&tinfo + 8);
+        var target = load64(&tinfo);
         stdout_write("good signature on tag ", 22);
-        stdout_write(arg, nlen);
+        stdout_write(signed_name, strlen(signed_name));
+        stdout_write(" -> ", 4);
+        stdout_write(target, 12);
         stdout_write(" (key ", 6);
         stdout_write(pk_hex, 64);
         stdout_write(")\n", 2);
+        if (resolved == 1) {
+            if (streq(signed_name, arg) == 0) {
+                eprint3("sit: but it was found as refs/tags/", arg,
+                  " — this tag object was signed under a different name; refusing\n");
+                return 1;
+            }
+        }
         return 0;
     }
     stdout_write("BAD signature on tag ", 21);
@@ -427,7 +474,7 @@ fn cmd_describe() {
     }
 
     var tagname = map_get(tagmap, cur);
-    stdout_write(tagname, strlen(tagname));
+    write_sanitized(STDOUT, tagname, strlen(tagname));   # E8: a ref filename
     if (depth > 0) {
         stdout_write("-", 1);
         var nbuf[24];

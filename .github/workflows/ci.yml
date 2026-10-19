@@ -96,6 +96,22 @@ jobs:
         # 10M rounds (~46s on the dev host); the others are 5K–10K.
         run: cyrius run tests/sit.fcyr
 
+      - name: Tests + fuzz under poisoned allocators (v1.6.4)
+        # CYRIUS_POISON=1 (cyrius >= 6.6.18) gives every alloc / fl_alloc block
+        # redzones; an overwrite exits 86. Plain fuzzing cannot see a heap
+        # overflow that stays inside mapped memory — 1.6.4 re-ran 1.4.7's
+        # demonstration (parse_tree's name buffer shrunk to 8 bytes): the plain
+        # suite still says "no crashes", this one exits 86 on the first
+        # overflow. The A/B leg (fill 0xA5, then 0x5A via CYRIUS_POISON_B) is
+        # what catches OVERREADS: a read of poison bytes makes the two runs'
+        # output diverge. The harnesses are seeded deterministically, so
+        # identical output is the pass condition.
+        run: |
+          CYRIUS_POISON=1 cyrius test tests/sit.tcyr
+          CYRIUS_POISON=1 cyrius run tests/sit.fcyr > /tmp/fuzz-a.out
+          CYRIUS_POISON=1 cyrius run -D CYRIUS_POISON_B tests/sit.fcyr > /tmp/fuzz-b.out
+          cmp /tmp/fuzz-a.out /tmp/fuzz-b.out || { echo "poison A/B diverged — an overread"; exit 1; }
+
       - name: Verify dist/sit.cyr is in sync (v0.8.1 library export)
         # `dist/sit.cyr` is the consumer-facing library bundle generated
         # by `cyrius distlib` from cyrius.cyml's [lib] block. It's tracked

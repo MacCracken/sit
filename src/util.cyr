@@ -89,11 +89,74 @@ fn sit_mkdir(path, mode) {
     #endif
 }
 
+# rmdir counterpart of sit_mkdir: the AGNOS syscall takes a length, Linux does not.
 fn sit_rmdir(path) {
     #ifdef CYRIUS_TARGET_AGNOS
     return sys_rmdir(path, strlen(path));
     #else
     return sys_rmdir(path);
+    #endif
+}
+
+# ── Filesystem symlink guard (S-04, S-12) ────────────────────────
+#
+# Calls newfstatat(AT_FDCWD, path, &stat, AT_SYMLINK_NOFOLLOW) and returns:
+#   1 if path exists and is a SYMLINK
+#   0 if path exists and is NOT a symlink (regular file, dir, etc.)
+#  -1 if path does not exist or stat failed
+#
+# st_mode is read at the per-target STAT_MODE offset (24 on x86_64 Linux, 16 on
+# aarch64 Linux). Through 1.6.3 it was a hardcoded 24, which on arm64 read st_uid,
+# so every lstat-based guard was a no-op there.
+# S_IFMT = 0xF000, S_IFLNK = 0xA000.
+
+var VAL_AT_FDCWD = 0 - 100;
+var VAL_AT_SYMLINK_NOFOLLOW = 256;
+
+# 1 if `path` is a symlink (lstat), 0 if not, -1 if lstat fails.
+fn path_is_symlink(path) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    # agnos's frozen ABI has no lstat / newfstatat (§4.1 exposes only the
+    # symlink-FOLLOWING sys_stat), so a planted symlink resolves to its target
+    # and cannot be flagged here. Report 0 (not-a-symlink) for any path that
+    # exists, -1 if stat fails — preserving the contract while the S-12 guard
+    # degrades to a no-op on agnos (whose single-user capability floor has no
+    # attacker-writable symlink-plant vector today). Accepted degradation,
+    # matching darshini's lstat→stat fallback.
+    var abuf[128];
+    if (sys_stat(path, strlen(path), &abuf) < 0) { return 0 - 1; }
+    return 0;
+    #else
+    var stbuf[144];
+    var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, VAL_AT_SYMLINK_NOFOLLOW);
+    if (rc < 0) { return 0 - 1; }
+    var mode = load32(&stbuf + STAT_MODE);
+    var fmt = mode & 0xF000;
+    if (fmt == 0xA000) { return 1; }
+    return 0;
+    #endif
+}
+
+# Return the file-type bits (S_IFMT-masked mode) for a path via lstat, or -1
+# if stat failed. Caller compares against 0xA000 (symlink), 0x4000 (dir),
+# 0x8000 (regular), etc. Useful for S-04's "is this a directory" and for
+# S-25's "does target already exist as something other than a dir".
+
+# File-type bits (S_IFMT) of `path` without following symlinks, or -1.
+fn path_lstat_kind(path) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    # No lstat on agnos (see path_is_symlink): sys_stat FOLLOWS symlinks, so a
+    # symlink-to-dir reports 0x4000 (dir), not 0xA000 (symlink). Accepted
+    # degradation. STAT_MODE is the agnos struct-stat mode offset (per-target).
+    var abuf[128];
+    if (sys_stat(path, strlen(path), &abuf) < 0) { return 0 - 1; }
+    return load32(&abuf + STAT_MODE) & 0xF000;
+    #else
+    var stbuf[144];
+    var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, VAL_AT_SYMLINK_NOFOLLOW);
+    if (rc < 0) { return 0 - 1; }
+    var mode = load32(&stbuf + STAT_MODE);
+    return mode & 0xF000;
     #endif
 }
 
@@ -112,22 +175,102 @@ fn sf_exists(p) {
     return file_exists(sit_abs(p));
 }
 
-fn sf_write_all(p, buf, len) {
-    return file_write_all(sit_abs(p), buf, len);
+# 1 if a proper prefix of the repo-relative path `p` ("a", "a/b" for "a/b/c")
+# is a symlink. Absolute paths (HOME, cert and token files) are not checked: a
+# symlinked home directory is legitimate, and those paths are not repo content.
+fn _sf_parent_symlink(p) {
+    if (p == 0) { return 0; }
+    if (load8(p) == 47) { return 0; }
+    var len = strlen(p);
+    var pre = alloc_or_die(len + 1);
+    var i = 0;
+    while (i < len) {
+        if (load8(p + i) == 47) {
+            if (i > 0) {
+                memcpy(pre, p, i);
+                store8(pre + i, 0);
+                if (path_is_symlink(sit_abs(pre)) == 1) { return 1; }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
 }
 
+# Write all `len` bytes to `fd`, looping over short writes (EINTR retried).
+# Returns `len`, or a negative errno — never a silent partial count. sit's own,
+# on the public `file_write`, so the consumer bundles need nothing newer than
+# the toolchains they pin (owl: 6.6.2, which predates stdlib's `_io_write_full`).
+fn sit_write_full(fd, buf, len) {
+    var off = 0;
+    var rc = 0;
+    var going = 1;
+    while (going == 1) {
+        if (off >= len) { going = 0; }
+        else {
+            var n = file_write(fd, buf + off, len - off);
+            if (n == 0 - 4) { }                          # EINTR: nothing written, retry
+            else {
+                if (n > 0) { off = off + n; }
+                else {
+                    rc = n;
+                    if (n == 0) { rc = 0 - 5; }          # EIO: no progress
+                    going = 0;
+                }
+            }
+        }
+    }
+    if (rc < 0) { return rc; }
+    return len;
+}
+
+# Write a whole file at a repo-root-relative path, never through a symlink.
+#
+# 1.6.4: this was a bare file_write_all (O_TRUNC, no O_NOFOLLOW), so a symlink at
+# a ref, HEAD, config or worktree path — or at any directory above it — was
+# written THROUGH: a `.sit/refs/heads/main -> ~/file` made an ordinary `sit
+# commit` truncate ~/file, and a worktree `docs -> /elsewhere` made checkout /
+# pull write into /elsewhere (the CVE-2021-21300 "beyond a symlink" class).
+#
+# Now a symlinked parent refuses with -ELOOP, and whatever sits AT the path is
+# removed (a symlink is removed itself, not its target) and the file created
+# with O_CREAT|O_EXCL — which also refuses a symlink planted in between, and is
+# the same bit on every target (O_NOFOLLOW is not: aarch64 differs, and older
+# stdlibs do not name it). Absolute paths (HOME-side files, not repo content)
+# keep plain write-through semantics: a symlinked dotfile there is the user's.
+fn sf_write_all(p, buf, len) {
+    if (load8(p) == 47) { return file_write_all(p, buf, len); }
+    if (_sf_parent_symlink(p) == 1) { return 0 - 40; }          # -ELOOP
+    var ap = sit_abs(p);
+    if (path_lstat_kind(ap) >= 0) { xunlink(ap); }
+    var fd = file_open(ap, O_WRONLY | O_CREAT | O_EXCL, 0x1A4);
+    if (fd < 0) { return fd; }
+    var written = sit_write_full(fd, buf, len);
+    file_close(fd);
+    return written;
+}
+
+# file_open on a repo-root-relative path.
 fn sf_open(p, flags, mode) {
     return file_open(sit_abs(p), flags, mode);
 }
 
+# file_read_all on a repo-root-relative path.
 fn sf_read_all(p, buf, maxlen) {
     return file_read_all(sit_abs(p), buf, maxlen);
 }
 
+# file_append_locked on a repo-root-relative path; refuses (-ELOOP) to append
+# through a symlink at the path or above it (a `.sit/logs/HEAD -> ~/x` made every
+# reflog entry land in ~/x through 1.6.3).
 fn sf_append_locked(p, buf, len) {
-    return file_append_locked(sit_abs(p), buf, len);
+    if (_sf_parent_symlink(p) == 1) { return 0 - 40; }
+    var ap = sit_abs(p);
+    if (path_is_symlink(ap) == 1) { return 0 - 40; }
+    return file_append_locked(ap, buf, len);
 }
 
+# sit_mkdir on a repo-root-relative path.
 fn sf_mkdir(p, mode) {
     return sit_mkdir(sit_abs(p), mode);
 }
@@ -144,14 +287,42 @@ fn sf_mkdir(p, mode) {
 # syscall class fixed in 1.3.4). DCE strips both from the binary, so the only
 # cost is these lines.
 
+# unlink a repo-root-relative path; refuses (-ELOOP) when a directory above it
+# is a symlink, so a removal can never reach outside the repository.
 fn sf_unlink(p) {
+    if (_sf_parent_symlink(p) == 1) { return 0 - 40; }
     return xunlink(sit_abs(p));
 }
 
+# rmdir a repo-root-relative path.
 fn sf_rmdir(p) {
     return sit_rmdir(sit_abs(p));
 }
 
+# Remove the now-empty directories above `path`, deepest first, stopping at the
+# first one that is not empty (rmdir refuses those). A stale file's directory
+# would otherwise survive and block a later file of the same name (`d/x` → `d`).
+fn _rmdir_empty_parents(path) {
+    var len = strlen(path);
+    var buf = alloc_or_die(len + 1);
+    memcpy(buf, path, len);
+    store8(buf + len, 0);
+    var i = len - 1;
+    var go = 1;
+    while (go == 1) {
+        if (i <= 0) { go = 0; }
+        else {
+            if (load8(buf + i) == 47) {
+                store8(buf + i, 0);
+                if (sf_rmdir(buf) != 0) { go = 0; }
+            }
+            i = i - 1;
+        }
+    }
+    return 0;
+}
+
+# xstat on a repo-root-relative path.
 fn sf_stat(p, buf) {
     return xstat(sit_abs(p), buf);
 }
@@ -186,7 +357,19 @@ fn sf_patra_open(p) {
 # A cap of, say, 200 would reject real objects — trading a rare correctness
 # failure for a marginal security gain on a path the absolute ceiling already
 # bounds. Wrong trade for a VCS.
-var SIT_MAX_INFLATE_RATIO = 1000;
+#
+# ⛔ 1.6.4: and 1000 was ALREADY that wrong trade. sankoch emits 1006:1 for 2 MiB
+# of one byte and 1017:1 for 16 MiB, so `sit add` of a disk image or a padded
+# binary wrote a blob every later read refused — checkout aborted, fsck counted
+# it bad (which also blocks --prune forever), and objects written before 1.4.1
+# turned unreadable on upgrade. The cap now sits above deflate's ~1032:1
+# maximum, so it rejects no valid stream; the 16 MiB ceiling is the bound.
+var SIT_MAX_INFLATE_RATIO = 1100;
+
+# Largest file `sit add` accepts: the read path inflates an object into at most
+# 16 MiB, framing header included, so anything bigger could be committed but
+# never read back (1.6.4; the add cap used to be 1 GiB).
+var SIT_MAX_BLOB = 16777152;
 
 # S-25: validate a Content-Length taken off the wire.
 #
@@ -213,6 +396,17 @@ fn content_length_sane(v, max) {
     return v;
 }
 
+# Write three cstrings to stderr, unbuffered — "<a><path><b>" — so messages
+# that wrap a path need no hand-counted byte lengths (several were short by the
+# 3-byte em dash and lost their newline).
+fn eprint3(a, path, b) {
+    syscall(SYS_WRITE, STDERR, a, strlen(a));
+    syscall(SYS_WRITE, STDERR, path, strlen(path));
+    syscall(SYS_WRITE, STDERR, b, strlen(b));
+    return 0;
+}
+
+# Write `s` and a newline to stderr, unbuffered.
 fn eprintln(s) {
     var len = strlen(s);
     syscall(SYS_WRITE, STDERR, s, len);
@@ -230,6 +424,7 @@ var STDOUT_BUF_SIZE = 65536;
 var _stdout_buf = 0;
 var _stdout_pos = 0;
 
+# Buffered stdout write; writes at least STDOUT_BUF_SIZE go straight to the kernel.
 fn stdout_write(data, len) {
     if (len <= 0) { return 0; }
     if (_stdout_buf == 0) {
@@ -250,6 +445,7 @@ fn stdout_write(data, len) {
     return 0;
 }
 
+# Flush the stdout buffer.
 fn stdout_flush() {
     if (_stdout_pos == 0) { return 0; }
     syscall(SYS_WRITE, STDOUT, _stdout_buf, _stdout_pos);
@@ -287,21 +483,33 @@ fn ensure_dir(path) {
 # sit-owned: each derived segment is repo-relative and gets prefixed by
 # ensure_dir's internal sit_abs — so this fn stays cwd-relative here and
 # must NOT prefix `path` itself (that would double-prefix each segment).
+#
+# 1.6.4: stops (-ELOOP) at a repo-relative segment that is a symlink rather than
+# creating directories beyond it. mkdir's EEXIST used to read a symlinked
+# directory as "already there", so later segments were created outside the repo.
 fn ensure_parent_dirs(path) {
     var len = strlen(path);
+    var abs_path = 0;
+    if (len > 0) { if (load8(path) == 47) { abs_path = 1; } }
     var i = 0;
+    var rc = 0;
     while (i < len) {
-        if (load8(path + i) == 47) {
-            if (i > 0) {
-                var segment = alloc(i + 1);
-                memcpy(segment, path, i);
-                store8(segment + i, 0);
-                ensure_dir(segment);
+        if (rc == 0) {
+            if (load8(path + i) == 47) {
+                if (i > 0) {
+                    var segment = alloc(i + 1);
+                    memcpy(segment, path, i);
+                    store8(segment + i, 0);
+                    ensure_dir(segment);
+                    if (abs_path == 0) {
+                        if (path_is_symlink(sit_abs(segment)) == 1) { rc = 0 - 40; }
+                    }
+                }
             }
         }
         i = i + 1;
     }
-    return 0;
+    return rc;
 }
 
 # Write decimal representation of n into buf. Returns digit count.
@@ -350,6 +558,7 @@ fn skip_ws(data, pos, stop) {
     return i;
 }
 
+# Byte-wise compare of two cstrings: -1, 0 or 1.
 fn strcmp_cstr(a, b) {
     var i = 0;
     var done = 0;
@@ -441,6 +650,7 @@ fn ident_sanitized(s) {
     return out;
 }
 
+# Write bytes to `fd` with control bytes (except tab) and DEL replaced by '?'.
 fn write_sanitized(fd, bytes, len) {
     if (len <= 0) { return 0; }
     var out = alloc_or_die(len);

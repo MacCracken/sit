@@ -20,6 +20,7 @@
 
 # In-progress markers, mirroring .sit/MERGE_HEAD.
 fn cherry_pick_head_path() { return ".sit/CHERRY_PICK_HEAD"; }
+# State file recording the commit an in-progress revert is applying.
 fn revert_head_path() { return ".sit/REVERT_HEAD"; }
 
 # Tree entries of a commit's first parent, or an empty vec for a root commit.
@@ -81,6 +82,15 @@ fn _apply_one_commit(target_hex, invert, marker_path, verb, verb_len) {
         eprintln("sit: no commits yet");
         return 1;
     }
+    # 1.6.4 (A1): cherry-pick / revert / each rebase step rewrite the worktree
+    # (cleanly via materialize, or with conflict markers) and never checked for
+    # local edits — an uncommitted change to a file the commit did not even
+    # touch was replaced with HEAD's version, and it was never hashed, so it
+    # could not be recovered. `merge` and `checkout` have always refused here.
+    if (is_dirty() == 1) {
+        eprintln("sit: working tree has uncommitted changes — commit or stash them first");
+        return 1;
+    }
 
     var target_tree = commit_tree_entries(target_hex);
     if (target_tree == 0) { target_tree = vec_new(); }
@@ -100,38 +110,18 @@ fn _apply_one_commit(target_hex, invert, marker_path, verb, verb_len) {
     three_way_merge_entries(base_entries, ours_entries, theirs_entries, merged, conflicts);
 
     if (vec_len(conflicts) > 0) {
-        # Same shape as cmd_merge's conflict path: write the auto-merged files
-        # so cleanly-merged paths don't sit at stale content while the user
-        # resolves the rest, then the marker files, then refuse.
-        var mi = 0;
-        var mn = vec_len(merged);
-        while (mi < mn) {
-            var me = vec_get(merged, mi);
-            var mpath = load64(me + 32);
-            var mhex = hex_encode(me, 32);
-            ensure_parent_dirs(mpath);
-            var mp[16];
-            if (read_blob_content(mhex, &mp) == 0) {
-                if (sf_write_all(mpath, load64(&mp), load64(&mp + 8)) < 0) {
-                    syscall(SYS_WRITE, STDERR, "sit: cannot write auto-merged file '", 36);
-                    syscall(SYS_WRITE, STDERR, mpath, strlen(mpath));
-                    syscall(SYS_WRITE, STDERR, "' — resolve manually before committing\n", 39);
-                }
-            }
-            mi = mi + 1;
-        }
-        var ci = 0;
-        while (ci < vec_len(conflicts)) {
-            var cp = vec_get(conflicts, ci);
-            write_conflict_file(cp, tree_find_hash(ours_entries, cp),
-              tree_find_hash(theirs_entries, cp), verb);
-            ci = ci + 1;
+        # Same shape as cmd_merge's conflict path — worktree AND index (see
+        # _apply_conflicted_merge for why the index matters).
+        if (_apply_conflicted_merge(merged, conflicts, ours_entries, theirs_entries, verb) != 0) {
+            return 1;
         }
         # Record what was being applied so the next commit can say so.
         var mbuf = alloc(66);
         memcpy(mbuf, target_hex, 64);
         store8(mbuf + 64, 10);
-        sf_write_all(marker_path, mbuf, 65);
+        if (sf_write_all(marker_path, mbuf, 65) < 0) {
+            eprint3("sit: cannot record ", marker_path, "\n");
+        }
 
         syscall(SYS_WRITE, STDERR, "sit: ", 5);
         syscall(SYS_WRITE, STDERR, verb, verb_len);
@@ -156,7 +146,7 @@ fn _apply_one_commit(target_hex, invert, marker_path, verb, verb_len) {
         if (streq(tree_hex, head_tree_hex) == 1) {
             stdout_write("nothing to ", 11);
             stdout_write(verb, verb_len);
-            stdout_write(" — tree unchanged\n", 18);
+            stdout_write(" — tree unchanged\n", 20);
             return 0;
         }
     }
@@ -183,7 +173,7 @@ fn _apply_one_commit(target_hex, invert, marker_path, verb, verb_len) {
     # -path removal inside materialize_target compares against HEAD's current
     # tree, so moving HEAD first would make it a no-op and leave a reverted
     # file sitting on disk.
-    if (materialize_target(new_hex) != 0) {
+    if (materialize_target_safe(new_hex, 1) != 0) {
         eprintln("sit: commit written but working tree not updated — HEAD unchanged");
         return 1;
     }
@@ -191,6 +181,14 @@ fn _apply_one_commit(target_hex, invert, marker_path, verb, verb_len) {
         eprintln("sit: failed to update branch ref");
         return 1;
     }
+    # 1.6.4 (A10): every HEAD move is reflogged (architecture/005); these were
+    # not, so `HEAD@{N}` pointed at the wrong commit after a cherry-pick,
+    # revert or rebase step.
+    var rprefix = alloc_or_die(verb_len + 3);
+    memcpy(rprefix, verb, verb_len);
+    memcpy(rprefix + verb_len, ": ", 2);
+    store8(rprefix + verb_len + 2, 0);
+    reflog_head_move(head_hex, new_hex, reflog_msg_subject(rprefix, msg));
 
     stdout_write(verb, verb_len);
     stdout_write(" ", 1);
@@ -201,6 +199,7 @@ fn _apply_one_commit(target_hex, invert, marker_path, verb, verb_len) {
     return 0;
 }
 
+# `sit cherry-pick <commit>` — apply <commit>'s change onto HEAD as a new commit.
 fn cmd_cherry_pick() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -218,6 +217,7 @@ fn cmd_cherry_pick() {
     return _apply_one_commit(&hex, 0, cherry_pick_head_path(), "cherry-pick", 11);
 }
 
+# `sit revert <commit>` — apply the inverse of <commit> as a new commit.
 fn cmd_revert() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -263,6 +263,7 @@ fn stash_read_top() {
     return hex;
 }
 
+# Point .sit/refs/stash at `hex`, or remove the ref when hex == 0.
 fn stash_write_top(hex) {
     var p = stash_ref_path();
     if (hex == 0) {
@@ -300,6 +301,14 @@ fn _stash_working_tree() {
             if (read_file_heap(path, &pair) == 0) {
                 hex = write_blob_object(load64(&pair), load64(&pair + 8));
             }
+            # 1.6.4 (A14): a tracked file that cannot be read or stored must
+            # stop the stash. It used to be left out — recorded as DELETED — and
+            # the stash then reset the worktree to HEAD, discarding the change
+            # it never saved (and a later pop unlinked the file).
+            if (hex == 0) {
+                eprint3("sit: cannot save '", path, "' — nothing stashed\n");
+                return 0 - 1;
+            }
             if (hex != 0) {
                 var bytes = hex_decode(hex, 64);
                 if (bytes != 0) {
@@ -327,6 +336,7 @@ fn _stash_push() {
         return 1;
     }
     var tree_hex = _stash_working_tree();
+    if (tree_hex == (0 - 1)) { return 1; }
     if (tree_hex == 0) {
         eprintln("sit: nothing tracked to stash");
         return 1;
@@ -414,10 +424,37 @@ fn _stash_pop(drop_only) {
     }
 
     if (drop_only == 0) {
+        # 1.6.4 (A5): a stash is a SNAPSHOT of the whole tree on top of the
+        # commit it was made on, and pop restores it wholesale — so popping
+        # after HEAD has moved rolled every file back to the snapshot, undoing
+        # (and staging the undo of) every commit made since, and dropped the
+        # entry. Until pop learns a three-way apply, it requires HEAD to be the
+        # stash's base commit, and restores through the safe materialize so
+        # uncommitted or untracked work in the way also refuses.
+        var base = 0;
+        if (parents != 0) {
+            if (vec_len(parents) > 0) { base = vec_get(parents, 0); }
+        }
+        var head = read_head_ref();
+        var at_base = 0;
+        if (base != 0) {
+            if (head != 0) {
+                if (streq(head, base) == 1) { at_base = 1; }
+            }
+        }
+        if (at_base == 0) {
+            eprintln("sit: HEAD has moved since this stash was made — pop it on the commit it was made on");
+            if (base != 0) {
+                syscall(SYS_WRITE, STDERR, "sit:   stash@{0} is on ", 23);
+                syscall(SYS_WRITE, STDERR, base, 12);
+                syscall(SYS_WRITE, STDERR, "; the stash is kept\n", 21);
+            }
+            return 1;
+        }
         # Restore the snapshot. HEAD does not move — a stash is working-tree
-        # state, not history — so materialize_target's stale removal compares
-        # the stash tree against HEAD's and drops what the stash did not carry.
-        if (materialize_target(top) != 0) {
+        # state, not history — so the stale removal compares the stash tree
+        # against HEAD's and drops what the stash did not carry.
+        if (materialize_target_safe(top, 0) != 0) {
             eprintln("sit: failed to restore stash — stack unchanged");
             return 1;
         }
@@ -431,6 +468,7 @@ fn _stash_pop(drop_only) {
     return 0;
 }
 
+# `sit stash [push|list|pop|drop]` — save or restore working-tree changes (default push).
 fn cmd_stash() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");

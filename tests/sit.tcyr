@@ -13,6 +13,7 @@
 
 include "src/lib.cyr"
 
+# sigil SHA-256 against published known-answer vectors.
 fn test_sigil_hash_known_answer() {
     test_group("sigil SHA-256 known answers");
 
@@ -30,6 +31,7 @@ fn test_sigil_hash_known_answer() {
     return 0;
 }
 
+# Blob framing hashes byte-for-byte like git's SHA-256 mode.
 fn test_blob_framing_git_compatible() {
     test_group("git-SHA-256 blob framing");
 
@@ -47,6 +49,7 @@ fn test_blob_framing_git_compatible() {
     return 0;
 }
 
+# hex_encode / hex_decode round-trip.
 fn test_hex_roundtrip() {
     test_group("hex encode / decode");
 
@@ -67,6 +70,7 @@ fn test_hex_roundtrip() {
     return 0;
 }
 
+# zlib compress / decompress round-trip on small inputs.
 fn test_sankoch_zlib_roundtrip() {
     test_group("sankoch zlib roundtrip");
 
@@ -129,6 +133,7 @@ fn _zlib_roundtrip_size(n, label) {
     return 0;
 }
 
+# zlib round-trip across sankoch's 1 MiB block boundary (the 1.3.5 corruption fix).
 fn test_sankoch_zlib_large_object() {
     test_group("sankoch zlib >1MiB block-boundary roundtrip");
 
@@ -138,6 +143,7 @@ fn test_sankoch_zlib_large_object() {
     return 0;
 }
 
+# patra COL_BYTES round-trip for a value that fits in one page.
 fn test_patra_col_bytes_small() {
     test_group("patra COL_BYTES small roundtrip");
 
@@ -191,6 +197,7 @@ fn test_patra_col_bytes_small() {
     return 0;
 }
 
+# patra COL_BYTES round-trip for a value spilling onto overflow pages.
 fn test_patra_col_bytes_overflow() {
     test_group("patra COL_BYTES overflow-page roundtrip");
 
@@ -245,6 +252,7 @@ fn test_patra_col_bytes_overflow() {
     return 0;
 }
 
+# ed25519 sign then verify, plus tampered-message rejection.
 fn test_ed25519_sign_verify_roundtrip() {
     test_group("sigil ed25519 sign/verify roundtrip");
 
@@ -284,6 +292,7 @@ fn test_ed25519_sign_verify_roundtrip() {
     return 0;
 }
 
+# refname_valid accepts git-style names and rejects traversal / control bytes.
 fn test_validate_refname() {
     test_group("validate.cyr — refname_valid");
 
@@ -310,6 +319,7 @@ fn test_validate_refname() {
     return 0;
 }
 
+# tree_entry_name_valid rejects names that could escape the worktree.
 fn test_validate_tree_entry_name() {
     test_group("validate.cyr — tree_entry_name_valid");
 
@@ -335,6 +345,7 @@ fn test_validate_tree_entry_name() {
     return 0;
 }
 
+# tree_flat_path_valid on multi-component paths.
 fn test_validate_tree_flat_path() {
     test_group("validate.cyr — tree_flat_path_valid");
 
@@ -351,12 +362,13 @@ fn test_validate_tree_flat_path() {
     return 0;
 }
 
+# hex_prefix_valid on full-length, short and non-hex input.
 fn test_validate_hex_prefix() {
     test_group("validate.cyr — hex_prefix_valid");
 
     assert_eq(hex_prefix_valid("abcd", 4),                                1, "4 hex chars");
     assert_eq(hex_prefix_valid("0123456789abcdef", 16),                    1, "all hex digits");
-    assert_eq(hex_prefix_valid("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 64), 1, "full length");
+    assert_eq(hex_prefix_valid("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 64), 1, "full length");  #skip-lint (fixture literal)
 
     assert_eq(hex_prefix_valid("", 0),                                    0, "empty");
     assert_eq(hex_prefix_valid("abcd' OR 1=1 --", 15),                    0, "SQL injection attempt");
@@ -365,6 +377,7 @@ fn test_validate_hex_prefix() {
     return 0;
 }
 
+# config_value_valid / config_key_valid reject NUL, CR, LF and bad key bytes.
 fn test_validate_config_value() {
     test_group("validate.cyr — config_value_valid / config_key_valid");
 
@@ -384,6 +397,7 @@ fn test_validate_config_value() {
     return 0;
 }
 
+# remote_url_valid on file / http / https / ssh URLs, including leading-dash hosts.
 fn test_validate_remote_url() {
     test_group("validate.cyr — remote_url_valid");
 
@@ -419,6 +433,7 @@ fn test_validate_remote_url() {
     return 0;
 }
 
+# url_scheme classification of remote URLs.
 fn test_validate_url_scheme() {
     test_group("validate.cyr — url_scheme");
 
@@ -452,7 +467,7 @@ fn test_parse_commit_multiparent() {
     var info[56];
 
     # Merge commit — two parent lines.
-    var mbody = "tree 3333333333333333333333333333333333333333333333333333333333333333\nparent 1111111111111111111111111111111111111111111111111111111111111111\nparent 2222222222222222222222222222222222222222222222222222222222222222\nauthor x <x@y> 0 +0000\ncommitter x <x@y> 0 +0000\n\nmerge\n";
+    var mbody = "tree 3333333333333333333333333333333333333333333333333333333333333333\nparent 1111111111111111111111111111111111111111111111111111111111111111\nparent 2222222222222222222222222222222222222222222222222222222222222222\nauthor x <x@y> 0 +0000\ncommitter x <x@y> 0 +0000\n\nmerge\n";  #skip-lint (fixture literal)
     assert_eq(parse_commit_body(mbody, strlen(mbody), &info), 0, "merge body parses");
     var mpv = load64(&info + 48);
     assert_eq((mpv == 0), 0, "merge commit has a parents vec");
@@ -463,14 +478,14 @@ fn test_parse_commit_multiparent() {
     assert_streq(load64(&info + 8), p2, "out+8 keeps last parent (cmd_log/merge_base)");
 
     # Single-parent commit — vec of length 1.
-    var sbody = "tree 3333333333333333333333333333333333333333333333333333333333333333\nparent 1111111111111111111111111111111111111111111111111111111111111111\nauthor x <x@y> 0 +0000\ncommitter x <x@y> 0 +0000\n\nmsg\n";
+    var sbody = "tree 3333333333333333333333333333333333333333333333333333333333333333\nparent 1111111111111111111111111111111111111111111111111111111111111111\nauthor x <x@y> 0 +0000\ncommitter x <x@y> 0 +0000\n\nmsg\n";  #skip-lint (fixture literal)
     assert_eq(parse_commit_body(sbody, strlen(sbody), &info), 0, "single-parent body parses");
     var spv = load64(&info + 48);
     assert_eq(vec_len(spv), 1, "single-parent commit exposes 1 parent");
     assert_streq(vec_get(spv, 0), p1, "single parent = p1");
 
     # Root commit — no parent line, vec stays 0.
-    var rbody = "tree 3333333333333333333333333333333333333333333333333333333333333333\nauthor x <x@y> 0 +0000\ncommitter x <x@y> 0 +0000\n\nroot\n";
+    var rbody = "tree 3333333333333333333333333333333333333333333333333333333333333333\nauthor x <x@y> 0 +0000\ncommitter x <x@y> 0 +0000\n\nroot\n";  #skip-lint (fixture literal)
     assert_eq(parse_commit_body(rbody, strlen(rbody), &info), 0, "root body parses");
     assert_eq((load64(&info + 48) == 0), 1, "root commit has no parents vec");
 
@@ -486,7 +501,7 @@ fn test_tofu_pin_lookup() {
 
     var a64 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     var b64 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    var content = "localhost 8484 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n127.0.0.1 443 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+    var content = "localhost 8484 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n127.0.0.1 443 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";  #skip-lint (fixture literal)
     var clen = strlen(content);
 
     var stored[65];
@@ -515,6 +530,7 @@ fn test_tofu_pin_lookup() {
 # match-wins negation over it.
 fn _wm(p, s) { return _wildmatch(p, strlen(p), s, strlen(s)); }
 
+# _wildmatch glob core: *, ?, ** and character classes.
 fn test_sitignore_wildmatch() {
     test_group("index.cyr — _wildmatch glob core");
 
@@ -573,6 +589,7 @@ fn _mkpat_full(text, negated, anchored, scope, dir_only) {
     return p;
 }
 
+# .sitignore negation (!) and leading-slash anchoring.
 fn test_sitignore_negation_anchor() {
     test_group("index.cyr — .sitignore negation + anchoring");
 
@@ -659,6 +676,7 @@ fn _myers_case(olds, news, label) {
     return 0;
 }
 
+# myers_diff agrees with the DP LCS on hand-picked edit shapes (differential).
 fn test_myers_diff_differential() {
     test_group("diff.cyr — myers_diff matches DP (differential, P-14)");
     _myers_case("a\nb\nc\n", "a\nb\nc\n", "identical → 0 edits");
@@ -674,6 +692,7 @@ fn test_myers_diff_differential() {
     return 0;
 }
 
+# reflog line formatting and @{N} indexing.
 fn test_reflog_format_and_index() {
     test_group("reflog format + @{N} indexing");
 
@@ -738,6 +757,7 @@ fn test_reflog_format_and_index() {
     return 0;
 }
 
+# Parsing of <ref>@{N} selectors.
 fn test_reflog_spec_parse() {
     test_group("reflog @{N} selector parsing");
 
@@ -769,16 +789,17 @@ fn test_reflog_spec_parse() {
     return 0;
 }
 
+# fsck's author-timestamp extraction behind the prune grace window.
 fn test_fsck_commit_author_ts() {
     test_group("fsck commit author-ts extraction (prune grace)");
 
     # A well-formed commit body — author ts is the 2nd-to-last token of the
     # "author NAME <EMAIL> TS TZ" line.
-    var body = "tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nauthor Test User <t@e.x> 1782446793 +0000\ncommitter Test User <t@e.x> 1782446793 +0000\n\nhello\n";
+    var body = "tree aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nauthor Test User <t@e.x> 1782446793 +0000\ncommitter Test User <t@e.x> 1782446793 +0000\n\nhello\n";  #skip-lint (fixture literal)
     assert_eq(_fsck_commit_author_ts(body, strlen(body)), 1782446793, "author ts parsed");
 
     # With a parent line present (merge/normal), still finds author.
-    var body2 = "tree bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nparent cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\nauthor N <e> 1000000000 +0000\ncommitter N <e> 1000000000 +0000\n\nm\n";
+    var body2 = "tree bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nparent cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\nauthor N <e> 1000000000 +0000\ncommitter N <e> 1000000000 +0000\n\nm\n";  #skip-lint (fixture literal)
     assert_eq(_fsck_commit_author_ts(body2, strlen(body2)), 1000000000, "author ts parsed past parent line");
 
     # A blob/tree-shaped body (no author line) is undatable → 0.
@@ -863,6 +884,7 @@ fn _se_case(paths, label) {
 
 fn _se_push(v, s) { vec_push(v, s); return 0; }
 
+# sort_entries merge sort agrees with the pre-1.4.6 insertion sort (differential).
 fn test_sort_entries_differential() {
     test_group("index.cyr — sort_entries merge sort (differential, v1.4.6)");
 
@@ -934,6 +956,7 @@ fn _hfs_case(bytes, expect_valid, label) {
     return 0;
 }
 
+# HFS-ignorable spellings of .sit / .git are rejected, and look-alikes are not over-rejected.
 fn test_hfs_dotdir_spoofing() {
     test_group("validate.cyr — HFS-ignorable dot-directory spoofing");
 
@@ -1032,11 +1055,12 @@ fn test_nested_ignore_scope() {
 # sibling in that respect — so malformed shapes must be rejected, not trusted.
 fn _tag_body(txt) { return txt; }
 
+# parse_tag_body on well-formed and malformed annotated-tag bodies.
 fn test_parse_tag_body() {
     test_group("tag.cyr — parse_tag_body (v1.5.0)");
     var out[40];
 
-    var good = "object 1111111111111111111111111111111111111111111111111111111111111111\ntype commit\ntag v1.0\ntagger sit user <u@l> 1700000000 +0000\n\nrelease notes\n";
+    var good = "object 1111111111111111111111111111111111111111111111111111111111111111\ntype commit\ntag v1.0\ntagger sit user <u@l> 1700000000 +0000\n\nrelease notes\n";  #skip-lint (fixture literal)
     assert_eq(parse_tag_body(good, strlen(good), &out), 0, "well-formed tag parses");
     assert_streq(load64(&out),
       "1111111111111111111111111111111111111111111111111111111111111111",
@@ -1045,7 +1069,7 @@ fn test_parse_tag_body() {
     assert_eq(load64(&out + 32), 1700000000, "tagger timestamp extracted");
 
     # A tag with no `tag` header is not a tag.
-    var noname = "object 2222222222222222222222222222222222222222222222222222222222222222\ntype commit\ntagger sit user <u@l> 1700000000 +0000\n\nmsg\n";
+    var noname = "object 2222222222222222222222222222222222222222222222222222222222222222\ntype commit\ntagger sit user <u@l> 1700000000 +0000\n\nmsg\n";  #skip-lint (fixture literal)
     assert_eq(parse_tag_body(noname, strlen(noname), &out) != 0, 1, "missing 'tag' header rejected");
 
     # Wrong lead header.
@@ -1141,6 +1165,7 @@ fn _delta_roundtrip(base, base_len, tgt, tgt_len, label) {
     return 0;
 }
 
+# delta_generate output reconstructs byte-for-byte through _git_apply_delta.
 fn test_delta_roundtrip() {
     test_group("delta.cyr — generate/apply round-trip (v1.6.1)");
 
@@ -1193,6 +1218,165 @@ fn test_delta_roundtrip() {
     return 0;
 }
 
+# Append one raw tree entry "<mode> <name>\0<32 bytes of `fill`>" at body+pos;
+# returns the new pos.
+fn _tree_put(body, pos, mode, name, fill) {
+    var ml = strlen(mode);
+    memcpy(body + pos, mode, ml); pos = pos + ml;
+    store8(body + pos, 32); pos = pos + 1;
+    var nl = strlen(name);
+    memcpy(body + pos, name, nl); pos = pos + nl;
+    store8(body + pos, 0); pos = pos + 1;
+    memset(body + pos, fill, 32);
+    return pos + 32;
+}
+
+# parse_tree keeps only entries in strict git order, so a duplicate name — the
+# review-vs-checkout split behind Gitea's CVE-2026-95106 — can never reach two
+# readers as two different blobs. Valid git order must survive untouched,
+# including its dir-sorts-as-if-followed-by-'/' rule.
+fn test_parse_tree_order() {
+    test_group("tree.cyr — parse_tree duplicate / order rejection (v1.6.4)");
+    var body = alloc(1024);
+
+    # git order: file "a.txt" < dir "a" ('.' < '/'), dir "a" < file "a0" ('/' < '0').
+    var p = 0;
+    p = _tree_put(body, p, "100644", "a.txt", 1);
+    p = _tree_put(body, p, "40000", "a", 2);
+    p = _tree_put(body, p, "100644", "a0", 3);
+    tree_dropped_reset();
+    var e = parse_tree(body, p);
+    assert_eq(vec_len(e), 3, "valid git order: all 3 entries kept");
+    assert_eq(tree_dropped_count(), 0, "valid git order: nothing dropped");
+
+    # Same name twice, different blobs: only the first survives.
+    p = 0;
+    p = _tree_put(body, p, "100644", "a", 4);
+    p = _tree_put(body, p, "100644", "a", 5);
+    tree_dropped_reset();
+    e = parse_tree(body, p);
+    assert_eq(vec_len(e), 1, "duplicate name: one entry kept");
+    assert_eq(tree_dropped_count(), 1, "duplicate name: one dropped");
+    assert_eq(load8(hex_decode(tree_entry_hash(vec_get(e, 0)), 64)), 4, "duplicate name: the FIRST blob wins");
+
+    # A file and a dir with the same name are a duplicate too (git agrees).
+    p = 0;
+    p = _tree_put(body, p, "100644", "x", 6);
+    p = _tree_put(body, p, "40000", "x", 7);
+    tree_dropped_reset();
+    e = parse_tree(body, p);
+    assert_eq(vec_len(e), 1, "file + dir same name: one entry kept");
+    assert_eq(tree_dropped_count(), 1, "file + dir same name: one dropped");
+
+    # Out of order: "b" then "a".
+    p = 0;
+    p = _tree_put(body, p, "100644", "b", 8);
+    p = _tree_put(body, p, "100644", "a", 9);
+    tree_dropped_reset();
+    e = parse_tree(body, p);
+    assert_eq(vec_len(e), 1, "out-of-order: later entry dropped");
+    assert_eq(tree_dropped_count(), 1, "out-of-order: counted for fsck");
+    tree_dropped_reset();
+    return 0;
+}
+
+# A {base_start, base_end, inserts} hunk for the overlap tests.
+fn _hunk3(s, e) {
+    var h = alloc(24);
+    store64(h, s);
+    store64(h + 8, e);
+    store64(h + 16, vec_new());
+    return h;
+}
+
+# Pure-function guards for the 1.6.4 audit fixes.
+fn test_audit_164_pure() {
+    test_group("1.6.4 audit — merge overlap, binary merge, NTFS 8.3, @{N} cap");
+
+    # A2: a pure insert at the START of the other side's replace overlaps it,
+    # in either order (it was judged disjoint, and the insert was dropped).
+    var rep = _hunk3(1, 2);
+    var ins = _hunk3(1, 1);
+    assert_eq(hunks_overlap(rep, ins), 1, "replace [1,2) vs insert at 1 overlaps");
+    assert_eq(hunks_overlap(ins, rep), 1, "insert at 1 vs replace [1,2) overlaps");
+    # ...while an insert just AFTER a replace stays a clean neighbour.
+    assert_eq(hunks_overlap(rep, _hunk3(2, 2)), 0, "insert at 2 after replace [1,2) is disjoint");
+    # And the line merge itself now conflicts instead of dropping `x`.
+    var ml[8];
+    assert_eq(three_way_line_merge("a\nb\nc\n", 6, "a\nB\nc\n", 6, "a\nx\nb\nc\n", 8, &ml), 0,
+      "replace vs insert at the same line conflicts (no silent drop)");
+
+    # A12: binary content is never line-merged.
+    var bin = alloc(8);
+    memcpy(bin, "a\n", 2); store8(bin + 2, 0); memcpy(bin + 3, "b\n", 2);
+    assert_eq(_merge_looks_binary(bin, 5), 1, "NUL byte marks content binary");
+    assert_eq(_merge_looks_binary("plain\ntext\n", 11), 0, "text is not binary");
+    assert_eq(three_way_line_merge(bin, 5, bin, 5, bin, 5, &ml), 0, "binary three-way merge refuses");
+
+    # E12: NTFS 8.3 short names of the guarded dot-directories.
+    assert_eq(tree_entry_name_valid("GIT~1"), 0, "GIT~1 rejected");
+    assert_eq(tree_entry_name_valid("git~1"), 0, "git~1 rejected");
+    assert_eq(tree_entry_name_valid("SIT~1"), 0, "SIT~1 rejected");
+    assert_eq(tree_entry_name_valid("GIT~2"), 1, "GIT~2 is not an alias, accepted");
+    assert_eq(tree_entry_name_valid("FIT~1"), 1, "FIT~1 accepted");
+
+    # E13: a reflog ordinal is bounded, not wrapped.
+    var spec[24];
+    assert_eq(_reflog_spec_parse("HEAD@{999999999}", &spec), 1, "9-digit ordinal parses");
+    assert_eq(_reflog_spec_parse("HEAD@{18446744073709551617}", &spec), 0, "overflowing ordinal rejected");
+    return 0;
+}
+
+# _wire_io_send must return 0 only when every byte went out. Through 1.6.3 the
+# plain-socket path made ONE sock_send and returned 0 regardless of the count,
+# so a short write became a silently truncated request or response. A
+# non-blocking AF_UNIX pair with no reader forces the short write
+# deterministically: the kernel takes what fits in the socket buffer and then
+# answers EAGAIN.
+fn test_wire_io_send_short_write() {
+    test_group("wire_http.cyr — _wire_io_send short writes (v1.6.4)");
+    var fds[8];
+    store64(&fds, 0);
+    var rc = sys_socketpair(1, SOCK_STREAM, 0, &fds);   # 1 = AF_UNIX
+    assert_eq(rc, 0, "socketpair");
+    if (rc != 0) { return 0; }
+    var wfd = load64(&fds) & 0xFFFFFFFF;
+    var rfd = (load64(&fds) >> 32) & 0xFFFFFFFF;
+
+    # A send that fits is reported as complete, and every byte arrives.
+    var msg = alloc(1000);
+    var i = 0;
+    while (i < 1000) { store8(msg + i, 32 + (i % 90)); i = i + 1; }
+    assert_eq(_wire_io_send(0, wfd, msg, 1000), 0, "1000-byte send that fits returns 0");
+    var got = alloc(1000);
+    var have = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        var n = sys_read(rfd, got + have, 1000 - have);
+        if (n <= 0) { rgo = 0; }
+        else {
+            have = have + n;
+            if (have >= 1000) { rgo = 0; }
+        }
+    }
+    assert_eq(have, 1000, "receiver got all 1000 bytes");
+    assert_eq(memeq(got, msg, 1000), 1, "received bytes match");
+    assert_eq(_wire_io_send(0, wfd, msg, 0), 0, "zero-length send returns 0");
+
+    # A send the peer cannot absorb must be reported as a failure.
+    assert(sock_set_nonblocking(wfd) >= 0, "writer set non-blocking");
+    var big_len = 8 * 1024 * 1024;
+    var big = alloc(big_len);
+    memset(big, 65, big_len);
+    assert_eq(_wire_io_send(0, wfd, big, big_len), 0 - 1,
+      "8 MiB into a full, unread socket returns -1, not 0");
+
+    sys_close(wfd);
+    sys_close(rfd);
+    return 0;
+}
+
+# Run every test group; exit status is the failure count.
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -1224,6 +1408,9 @@ fn main() {
     test_parse_tag_body();
     test_ignore_dir_only();
     test_delta_roundtrip();
+    test_wire_io_send_short_write();
+    test_parse_tree_order();
+    test_audit_164_pure();
     return assert_summary();
 }
 

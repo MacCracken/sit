@@ -238,7 +238,9 @@ fn config_file_list(path) {
         var start = skip_ws(data, pos, stop);
         if (start < stop) {
             if (load8(data + start) != 35) {
-                stdout_write(data + pos, le - pos);
+                # 1.6.4 (E9): sanitized like single-key `sit config <key>`
+                # output already was; --list echoed ESC / BEL / CR raw.
+                write_sanitized(STDOUT, data + pos, le - pos);
                 if (le < len) { stdout_write("\n", 1); }
             }
         }
@@ -292,6 +294,7 @@ fn config_file_unset(path, key) {
     return 0;
 }
 
+# `sit config [--global] [--list|--unset] <key> [<value>]` — read or write a config value.
 fn cmd_config() {
     var global = 0;
     var arg_base = 2;

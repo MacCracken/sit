@@ -4,6 +4,7 @@
 # renderer, MERGE_HEAD marker, find_merge_base, signed/unsigned merge commit
 # builders, cmd_merge (including --abort).
 
+# Turn a diff op stream into {base_start, base_end, inserts} hunks for the three-way line merge.
 fn extract_hunks(ops) {
     var hunks = vec_new();
     var n = vec_len(ops);
@@ -59,6 +60,16 @@ fn hunks_overlap(h1, h2) {
     var e1 = load64(h1 + 8);
     var s2 = load64(h2);
     var e2 = load64(h2 + 8);
+    # 1.6.4: a pure insert at the START of the other side's replace / delete
+    # lands exactly where that hunk consumes base lines, so the two edits touch
+    # the same spot and there is no order-independent answer — git conflicts
+    # here too. The range tests below called it disjoint (`e2 <= s1`), and the
+    # walk in three_way_line_merge then jumped past the insert: base `a b c`,
+    # ours `a B c`, theirs `a x b c` merged "cleanly" to `a B c`, silently
+    # dropping `x`. The mirrored case happened to keep both edits, so the
+    # result also depended on which side was "ours".
+    if (s1 == e1) { if (s1 == s2) { if (e2 > s2) { return 1; } } }
+    if (s2 == e2) { if (s2 == s1) { if (e1 > s1) { return 1; } } }
     # Adjacent ranges (e1 == s2 OR e2 == s1) do NOT overlap.
     if (e1 <= s2) {
         if (e1 == s2) {
@@ -120,9 +131,27 @@ fn hunk_starting_at(hunks, b) {
     return 0;
 }
 
+# 1 if the first 8000 bytes of buf contain a NUL — git's binary test.
+fn _merge_looks_binary(buf, len) {
+    var n = len;
+    if (n > 8000) { n = 8000; }
+    var i = 0;
+    while (i < n) {
+        if (load8(buf + i) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Three-way line-level merge. Returns a heap pointer to merged content on
 # clean merge, or 0 on conflict. Writes the merged length into `out_len_ptr`.
 fn three_way_line_merge(base_buf, base_len, ours_buf, ours_len, theirs_buf, theirs_len, out_len_ptr) {
+    # 1.6.4 (A12): never line-merge binary content. Two edits to a binary on
+    # different "lines" spliced into bytes that are neither version, and were
+    # reported as a clean merge. git's heuristic: a NUL in the first 8000 bytes.
+    if (_merge_looks_binary(base_buf, base_len) == 1) { return 0; }
+    if (_merge_looks_binary(ours_buf, ours_len) == 1) { return 0; }
+    if (_merge_looks_binary(theirs_buf, theirs_len) == 1) { return 0; }
     var base_lines = split_lines(base_buf, base_len);
     var ours_lines = split_lines(ours_buf, ours_len);
     var theirs_lines = split_lines(theirs_buf, theirs_len);
@@ -480,6 +509,7 @@ fn build_merge_commit(tree_hex, p1_hex, p2_hex, message) {
     return build_merge_commit_signed(tree_hex, p1_hex, p2_hex, message, 0);
 }
 
+# Build a two-parent merge commit (signed when `seed` != 0) with a sanitized identity.
 fn build_merge_commit_signed(tree_hex, p1_hex, p2_hex, message, seed) {
     var name = getenv("SIT_AUTHOR_NAME");
     if (name == 0) { name = config_get("user.name"); }
@@ -678,6 +708,7 @@ fn three_way_merge_entries(base_entries, ours_entries, theirs_entries, merged, c
     return 0;
 }
 
+# `sit merge <branch> [<branch> ...]` — fast-forward, three-way or (2+ branches) octopus merge into HEAD.
 fn cmd_merge() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -790,7 +821,7 @@ fn cmd_merge() {
         # not, so their stale-file removal had never run. Doing it in this order
         # is also the safer failure mode: a materialize that fails leaves HEAD
         # where it was.
-        if (materialize_target(&target_hex) != 0) {
+        if (materialize_target_safe(&target_hex, 1) != 0) {
             eprintln("sit: failed to update working tree — HEAD unchanged");
             return 1;
         }
@@ -832,47 +863,18 @@ fn cmd_merge() {
     three_way_merge_entries(base_entries, ours_entries, theirs_entries, merged, conflicts);
 
     if (vec_len(conflicts) > 0) {
-        # Write auto-merged files to working tree so clean paths don't appear
-        # conflicted in subsequent sit status.
-        var mi = 0;
-        var mn = vec_len(merged);
-        while (mi < mn) {
-            var me = vec_get(merged, mi);
-            var mpath = load64(me + 32);
-            var bytes32 = me;
-            var mhex = hex_encode(bytes32, 32);
-            ensure_parent_dirs(mpath);
-            var mp[16];
-            if (read_blob_content(mhex, &mp) == 0) {
-                # S-26: this is the CONFLICT path — the auto-merged files are
-                # written alongside the conflict-marker ones, and the command
-                # then exits non-zero telling the user to resolve. A silently
-                # dropped write here leaves a cleanly-merged file at its OLD
-                # content while the user is told only that OTHER paths
-                # conflicted, so they resolve those, commit, and lose this
-                # file's merge without ever seeing an error. Mirrors the S-16
-                # return-checking the clean-merge path at :299 already does.
-                if (sf_write_all(mpath, load64(&mp), load64(&mp + 8)) < 0) {
-                    syscall(SYS_WRITE, STDERR, "sit: cannot write auto-merged file '", 36);
-                    syscall(SYS_WRITE, STDERR, mpath, strlen(mpath));
-                    syscall(SYS_WRITE, STDERR, "' — resolve manually before committing\n", 39);
-                }
-            }
-            mi = mi + 1;
+        if (_apply_conflicted_merge(merged, conflicts, ours_entries, theirs_entries, target_name) != 0) {
+            eprintln("sit: merge stopped — HEAD unchanged");
+            return 1;
         }
-
-        # Write conflict-marker files for each conflicting path.
         var ci = 0;
-        while (ci < vec_len(conflicts)) {
-            var cp = vec_get(conflicts, ci);
-            var ours_h = tree_find_hash(ours_entries, cp);
-            var theirs_h = tree_find_hash(theirs_entries, cp);
-            write_conflict_file(cp, ours_h, theirs_h, target_name);
-            ci = ci + 1;
-        }
-
         # Track MERGE_HEAD so the next sit commit produces a 2-parent commit.
-        write_merge_head(&target_hex);
+        # Unchecked through 1.6.3: a failed write made the resolving commit a
+        # one-parent commit that recorded the merge as never having happened.
+        if (write_merge_head(&target_hex) != 0) {
+            eprintln("sit: cannot write .sit/MERGE_HEAD — the next commit would not record this merge");
+            return 1;
+        }
 
         syscall(SYS_WRITE, STDERR, "sit: merge conflict in ", 23);
         var buf[24];
@@ -933,7 +935,7 @@ fn cmd_merge() {
     # not, so their stale-file removal had never run. Doing it in this order
     # is also the safer failure mode: a materialize that fails leaves HEAD
     # where it was.
-    if (materialize_target(merge_hex) != 0) {
+    if (materialize_target_safe(merge_hex, 1) != 0) {
         eprintln("sit: failed to update working tree — HEAD unchanged");
         return 1;
     }
@@ -1053,6 +1055,127 @@ fn _merged_to_tree_entries(merged) {
     return out;
 }
 
+# Apply a three-way result that STOPPED on conflicts: worktree, then index.
+# Shared by `merge`, `cherry-pick`, `revert` and `rebase` (via cherry-pick).
+#
+# 1.6.4 (A3): the clean half of a conflicted merge used to reach the worktree
+# only. The index stayed at HEAD, and `sit commit` / `rebase --continue` build
+# from the index — so after the user resolved the conflicted file and ran `sit
+# add` on it, the commit dropped every OTHER change the merge had made cleanly,
+# and `sit merge` afterwards said "already up to date". Now the index holds the
+# merged content for every clean path and HEAD's version for each conflicted
+# one (until `sit add` stages a resolution), and clean deletions leave the
+# worktree too. The untracked/symlink preflight runs first, as for any
+# materialize; callers have already checked the tracked tree is clean.
+# Returns 0, or -1 (after saying why) with nothing written.
+fn _apply_conflicted_merge(merged, conflicts, ours_entries, theirs_entries, label) {
+    if (_materialize_preflight(_merged_to_tree_entries(merged), ours_entries, 2) != 0) {
+        return 0 - 1;
+    }
+    var keep = map_new();
+    var mi = 0;
+    var mn = vec_len(merged);
+    while (mi < mn) {
+        var me = vec_get(merged, mi);
+        var mpath = load64(me + 32);
+        map_set(keep, mpath, 1);
+        ensure_parent_dirs(mpath);
+        var mp[16];
+        # S-26: a dropped write or an unreadable blob here leaves a cleanly
+        # merged path at its old content while the user is told only about the
+        # conflicted ones — say so rather than lose it quietly.
+        if (read_blob_content(hex_encode(me, 32), &mp) != 0) {
+            eprint3("sit: cannot read the auto-merged content of '", mpath, "' — resolve manually before committing\n");
+        }
+        else {
+            if (sf_write_all(mpath, load64(&mp), load64(&mp + 8)) < 0) {
+                eprint3("sit: cannot write auto-merged file '", mpath, "' — resolve manually before committing\n");
+            }
+        }
+        mi = mi + 1;
+    }
+    var idx = vec_new();
+    var mj = 0;
+    while (mj < mn) { vec_push(idx, vec_get(merged, mj)); mj = mj + 1; }
+    var ci = 0;
+    while (ci < vec_len(conflicts)) {
+        var cp = vec_get(conflicts, ci);
+        map_set(keep, cp, 1);
+        if (write_conflict_file(cp, tree_find_hash(ours_entries, cp),
+            tree_find_hash(theirs_entries, cp), label) != 0) {
+            eprint3("sit: cannot write conflict markers for '", cp, "'\n");
+        }
+        var oe = tree_find(ours_entries, cp);
+        if (oe != 0) {
+            var raw = hex_decode(tree_entry_hash(oe), 64);
+            if (raw != 0) {
+                var ie = alloc_or_die(40);
+                memcpy(ie, raw, 32);
+                store64(ie + 32, cp);
+                vec_push(idx, ie);
+            }
+        }
+        ci = ci + 1;
+    }
+    # Clean deletions: tracked by HEAD, absent from the result, not conflicted.
+    var on = vec_len(ours_entries);
+    var oi = 0;
+    while (oi < on) {
+        var opath = tree_entry_name(vec_get(ours_entries, oi));
+        if (map_has(keep, opath) == 0) {
+            if (tree_flat_path_valid(opath) == 1) {
+                if (sf_exists(opath) == 1) { sf_unlink(opath); }
+                _rmdir_empty_parents(opath);
+            }
+        }
+        oi = oi + 1;
+    }
+    sort_entries(idx);
+    if (rewrite_index(idx) != 0) {
+        eprintln("sit: cannot stage the merge result — run 'sit status' before committing");
+        return 0 - 1;
+    }
+    return 0;
+}
+
+# Merge base for the next octopus branch `t`, given every commit merged so far
+# (`parents`: HEAD, then each branch already folded in). 1.6.4: this used the
+# PREVIOUS branch's tip alone, so a change HEAD made after that branch forked
+# looked "unchanged on ours" and `t` silently overrode it — a revert on main
+# could be undone by an octopus merge that a pairwise merge would not undo.
+# git's octopus uses the merge base against all of them; here, the candidate
+# every other candidate is an ancestor of. Returns the base, 0 for none, or
+# -1 when no single best one exists (criss-cross history — refuse).
+fn _octopus_base(parents, t) {
+    var cands = vec_new();
+    var n = vec_len(parents);
+    var i = 0;
+    while (i < n) {
+        var b = find_merge_base(vec_get(parents, i), t);
+        if (b != 0) { vec_push(cands, b); }
+        i = i + 1;
+    }
+    var cn = vec_len(cands);
+    if (cn == 0) { return 0; }
+    var ci = 0;
+    while (ci < cn) {
+        var c = vec_get(cands, ci);
+        var best = 1;
+        var cj = 0;
+        while (cj < cn) {
+            var o = vec_get(cands, cj);
+            if (streq(o, c) == 0) {
+                if (is_ancestor(o, c) == 0) { best = 0; }
+            }
+            cj = cj + 1;
+        }
+        if (best == 1) { return c; }
+        ci = ci + 1;
+    }
+    return 0 - 1;
+}
+
+# Octopus arm of `sit merge`: merge two or more branches into HEAD in one commit, refusing on any conflict.
 fn cmd_merge_octopus(first_arg) {
     var head_hex = read_head_ref();
     if (head_hex == 0) {
@@ -1109,7 +1232,30 @@ fn cmd_merge_octopus(first_arg) {
         memcpy(tcopy, &thex, 64);
         store8(tcopy + 64, 0);
 
-        var base = find_merge_base(acc_tip, tcopy);
+        # 1.6.4: skip a branch HEAD or an earlier argument already contains
+        # (git: "Already up to date with X"); it used to become a redundant
+        # parent — `sit merge b1 b1` wrote three.
+        var contained = 0;
+        var pi = 0;
+        while (pi < vec_len(parents)) {
+            if (contained == 0) {
+                var pp = vec_get(parents, pi);
+                if (streq(pp, tcopy) == 1) { contained = 1; }
+                else { if (is_ancestor(tcopy, pp) == 1) { contained = 1; } }
+            }
+            pi = pi + 1;
+        }
+        if (contained == 1) {
+            eprint3("sit: already up to date with '", nm, "' — skipped\n");
+            ai = ai + 1;
+            continue;
+        }
+
+        var base = _octopus_base(parents, tcopy);
+        if (base == 0 - 1) {
+            eprint3("sit: octopus merge: no single best merge base for '", nm, "' — merge pairwise instead\n");
+            return 1;
+        }
         var base_entries = vec_new();
         if (base != 0) {
             var be = commit_tree_entries(base);
@@ -1122,9 +1268,7 @@ fn cmd_merge_octopus(first_arg) {
         var conflicts = vec_new();
         three_way_merge_entries(base_entries, acc_entries, their_entries, merged, conflicts);
         if (vec_len(conflicts) > 0) {
-            syscall(SYS_WRITE, STDERR, "sit: octopus merge conflicts on '", 33);
-            syscall(SYS_WRITE, STDERR, nm, strlen(nm));
-            syscall(SYS_WRITE, STDERR, "' — nothing written; merge these pairwise instead\n", 51);
+            eprint3("sit: octopus merge conflicts on '", nm, "' — nothing written; merge these pairwise instead\n");
             return 1;
         }
         sort_entries(merged);
@@ -1170,7 +1314,7 @@ fn cmd_merge_octopus(first_arg) {
         return 1;
     }
     # Materialize before the ref moves — see the note in cmd_merge.
-    if (materialize_target(oct_hex) != 0) {
+    if (materialize_target_safe(oct_hex, 1) != 0) {
         eprintln("sit: failed to update working tree — HEAD unchanged");
         return 1;
     }

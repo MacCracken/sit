@@ -5,6 +5,7 @@
 # (is_ancestor, materialize_target, commit_tree_entries), and cmd_commit /
 # cmd_log.
 
+# Unsigned commit — thin wrapper over build_commit_signed (the real builder).
 fn build_commit(tree_hex, parent_hex, message) {
     return build_commit_signed(tree_hex, parent_hex, message, 0);
 }
@@ -135,13 +136,141 @@ fn is_ancestor(ancestor_hex, descendant_hex) {
     return 0;
 }
 
-# Overwrite working tree + index with target commit's tree. Used by both
-# checkout and fast-forward merge. Does NOT update HEAD — caller does that.
+# 1.6.4 preflight for materialize: 0 if the switch is safe, -1 (after saying
+# why) if it would destroy something. Runs before ANY write, so a refusal leaves
+# the worktree, index and HEAD exactly as they were.
+#
+#   every mode: no path to be written or removed lies beyond a symlink — the
+#     write would land outside the repository (CVE-2021-21300 class).
+#   mode 1:     the tracked tree must be clean (is_dirty).
+#   mode >= 1:  no untracked, non-ignored file may be overwritten, sit inside a
+#     directory the target turns into a file, or occupy a path the target needs
+#     as a directory. Only `checkout` checked this through 1.6.3 (files only);
+#     fast-forward merge, pull, cherry-pick, revert, rebase, octopus merge and
+#     stash pop overwrote untracked work silently.
+fn _materialize_preflight(target_entries, curr_entries, mode) {
+    var cn = vec_len(curr_entries);
+    var ci = 0;
+    while (ci < cn) {
+        var cpath = tree_entry_name(vec_get(curr_entries, ci));
+        if (tree_flat_path_valid(cpath) == 1) {
+            if (_sf_parent_symlink(cpath) == 1) {
+                eprint3("sit: refusing to touch '", cpath, "' — it is beyond a symbolic link\n");
+                return 0 - 1;
+            }
+        }
+        ci = ci + 1;
+    }
+    var tn = vec_len(target_entries);
+    var tdirs = map_new();
+    var ti = 0;
+    while (ti < tn) {
+        var tpath = tree_entry_name(vec_get(target_entries, ti));
+        if (tree_flat_path_valid(tpath) == 1) {
+            if (_sf_parent_symlink(tpath) == 1) {
+                eprint3("sit: refusing to write '", tpath, "' — it is beyond a symbolic link\n");
+                return 0 - 1;
+            }
+            # Record every directory prefix the target needs.
+            var tl = strlen(tpath);
+            var k = 0;
+            while (k < tl) {
+                if (load8(tpath + k) == 47) {
+                    var d = alloc_or_die(k + 1);
+                    memcpy(d, tpath, k);
+                    store8(d + k, 0);
+                    map_set(tdirs, d, 1);
+                }
+                k = k + 1;
+            }
+        }
+        ti = ti + 1;
+    }
+    if (mode == 0) { return 0; }
+    if (mode == 1) {
+        if (is_dirty() == 1) {
+            eprintln("sit: working tree has uncommitted changes — commit or stash them first");
+            return 0 - 1;
+        }
+    }
+
+    var working = list_working_files();
+    var wn = vec_len(working);
+    var wi = 0;
+    while (wi < wn) {
+        var wpath = vec_get(working, wi);
+        if (tree_find(curr_entries, wpath) == 0) {
+            # Untracked here. Overwritten outright?
+            var te = tree_find(target_entries, wpath);
+            if (te != 0) {
+                var same = 0;
+                if (path_lstat_kind(sit_abs(wpath)) == 0x8000) {
+                    var wh = hash_file_as_blob(wpath);
+                    if (wh != 0) {
+                        if (streq(wh, tree_entry_hash(te)) == 1) { same = 1; }
+                    }
+                }
+                if (same == 0) {
+                    eprint3("sit: untracked file '", wpath, "' would be overwritten\n");
+                    return 0 - 1;
+                }
+            }
+            # Needed as a directory by the target?
+            if (map_has(tdirs, wpath) == 1) {
+                eprint3("sit: untracked file '", wpath, "' is in the way of a directory\n");
+                return 0 - 1;
+            }
+            # Inside a directory the target replaces with a file?
+            var wl = strlen(wpath);
+            var j = 0;
+            while (j < wl) {
+                if (load8(wpath + j) == 47) {
+                    var pre = alloc_or_die(j + 1);
+                    memcpy(pre, wpath, j);
+                    store8(pre + j, 0);
+                    if (tree_find(target_entries, pre) != 0) {
+                        eprint3("sit: untracked file '", wpath, "' would be lost\n");
+                        return 0 - 1;
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        wi = wi + 1;
+    }
+    return 0;
+}
+
+# Overwrite working tree + index with target commit's tree. Used by reset
+# --hard and the abort / restore paths, which mean to discard local state.
+# Does NOT update HEAD — caller does that, and only after this returns 0.
 fn materialize_target(target_hex) {
+    return _materialize(target_hex, 0);
+}
+
+# materialize_target for operations that must not destroy uncommitted work
+# (checkout, merge, pull, cherry-pick, revert, rebase, stash pop). Refuses up
+# front — nothing written — on a dirty tree or untracked files in the way.
+# `dirty_checked` = 1 when the caller has already run is_dirty() itself.
+fn materialize_target_safe(target_hex, dirty_checked) {
+    if (dirty_checked == 1) { return _materialize(target_hex, 2); }
+    return _materialize(target_hex, 1);
+}
+
+# Shared body; `mode` 0 = forced, 1 = full preflight, 2 = preflight minus is_dirty.
+fn _materialize(target_hex, mode) {
+    # 1.6.4 (E4): an unreadable target — or one that is not a commit — used to
+    # become an EMPTY tree here, so the switch deleted every tracked file and
+    # reported success. Nothing is touched now.
     var target_entries = commit_tree_entries(target_hex);
-    if (target_entries == 0) { target_entries = vec_new(); }
+    if (target_entries == 0) {
+        eprintln("sit: cannot read the target commit's tree — nothing changed");
+        return 0 - 1;
+    }
     var curr_entries = read_head_tree_entries();
     if (curr_entries == 0) { curr_entries = vec_new(); }
+
+    if (_materialize_preflight(target_entries, curr_entries, mode) != 0) { return 0 - 1; }
 
     # S-03 belt-and-suspenders: `flatten_tree` concatenates prefix + name, so
     # even if parse_tree screened each component, a pre-existing bogus tree
@@ -159,12 +288,11 @@ fn materialize_target(target_hex) {
                     # otherwise `sit status` after checkout would still see
                     # it as tracked.
                     if (sf_unlink(cpath) != 0) {
-                        syscall(SYS_WRITE, STDERR, "sit: cannot remove stale path '", 31);
-                        syscall(SYS_WRITE, STDERR, cpath, strlen(cpath));
-                        syscall(SYS_WRITE, STDERR, "' — materialize aborted\n", 24);
+                        eprint3("sit: cannot remove stale path '", cpath, "' — materialize aborted\n");
                         return 0 - 1;
                     }
                 }
+                _rmdir_empty_parents(cpath);
             }
         }
         ci = ci + 1;
@@ -180,12 +308,14 @@ fn materialize_target(target_hex) {
             # Silently skip rather than abort — materialize runs over many
             # paths and we want the valid ones to land. Emit to stderr so
             # operator knows something was filtered.
-            syscall(SYS_WRITE, STDERR, "sit: refusing unsafe tree path: ", 32);
-            syscall(SYS_WRITE, STDERR, tpath, strlen(tpath));
-            syscall(SYS_WRITE, STDERR, "\n", 1);
+            eprint3("sit: refusing unsafe tree path: ", tpath, "\n");
         }
         else {
             ensure_parent_dirs(tpath);
+            # An EMPTY directory where the target wants a file (left by an
+            # earlier removal, or never tracked) is cleared; a non-empty one
+            # makes the write below fail and abort.
+            if (path_lstat_kind(sit_abs(tpath)) == 0x4000) { sf_rmdir(tpath); }
             var tp[16];
             # S-27: a blob the tree references but the object DB can't read
             # is structural corruption — leaving the file silently absent
@@ -195,18 +325,14 @@ fn materialize_target(target_hex) {
             if (read_blob_content(thex, &tp) != 0) {
                 syscall(SYS_WRITE, STDERR, "sit: cannot read blob ", 22);
                 syscall(SYS_WRITE, STDERR, thex, strlen(thex));
-                syscall(SYS_WRITE, STDERR, " for path '", 11);
-                syscall(SYS_WRITE, STDERR, tpath, strlen(tpath));
-                syscall(SYS_WRITE, STDERR, "' — materialize aborted (working tree may be partial)\n", 55);
+                eprint3(" for path '", tpath, "' — materialize aborted (working tree may be partial)\n");
                 return 0 - 1;
             }
             # S-16: file_write_all returns < 0 on any write or open failure
             # (permissions, ENOSPC, EROFS). Same partial-tree problem as the
             # blob-read failure above; abort with a clear pointer to the path.
             if (sf_write_all(tpath, load64(&tp), load64(&tp + 8)) < 0) {
-                syscall(SYS_WRITE, STDERR, "sit: cannot write '", 19);
-                syscall(SYS_WRITE, STDERR, tpath, strlen(tpath));
-                syscall(SYS_WRITE, STDERR, "' — materialize aborted (working tree may be partial)\n", 55);
+                eprint3("sit: cannot write '", tpath, "' — materialize aborted (working tree may be partial)\n");
                 return 0 - 1;
             }
         }
@@ -234,10 +360,17 @@ fn materialize_target(target_hex) {
         }
         ti = ti + 1;
     }
-    rewrite_index(new_index);
+    # 1.6.4: a failed index rewrite left the worktree switched and the index on
+    # the old tree, reported as success — the next commit then reverted the
+    # switch. It is a failure like any other.
+    if (rewrite_index(new_index) != 0) {
+        eprintln("sit: cannot update the index — materialize aborted (run 'sit reset --hard HEAD')");
+        return 0 - 1;
+    }
     return 0;
 }
 
+# Split an author/committer line into ident ("Name <email>") and timestamp; -1 if no closing '>'.
 fn parse_author_line(line, line_len, prefix_len, out) {
     var p = prefix_len;
     var found_close = 0;
@@ -337,12 +470,14 @@ var SIT_MAX_COMMIT_WALK = 10000000;
 # year-at-a-time walk from spinning on a hostile commit timestamp.
 var SIT_TS_MAX = 253402300799;
 
+# Clamp a commit timestamp into [0, SIT_TS_MAX] so a hostile value cannot drive date math.
 fn commit_ts_clamp(ts) {
     if (ts < 0) { return 0; }
     if (ts > SIT_TS_MAX) { return SIT_TS_MAX; }
     return ts;
 }
 
+# Parse a commit body's tree / parent / author / committer headers into `out` (56 bytes).
 fn parse_commit_body(body, body_len, out) {
     store64(out, 0);
     store64(out + 8, 0);
@@ -682,6 +817,7 @@ fn _graph_join_connector(old_nl, rcol) {
     return 0;
 }
 
+# `log --graph`: BFS the DAG from start_hex, then print up to `limit` commits with lane art.
 fn print_graph(start_hex, limit) {
     var nodes = map_new();
     var order = vec_new();
@@ -809,6 +945,7 @@ fn print_graph(start_hex, limit) {
     return 0;
 }
 
+# `sit log [--oneline] [--graph]` — commit history from HEAD.
 fn cmd_log() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -957,10 +1094,13 @@ fn commit_tree_entries(commit_hex) {
 
     var out = vec_new();
     flatten_tree_reset();
-    flatten_tree(tree_hex, "", out);
+    # 1.6.4: a subtree that cannot be read is a failure, not an empty
+    # directory — ignoring it made every file under it look deleted.
+    if (flatten_tree(tree_hex, "", out) < 0) { return 0; }
     return out;
 }
 
+# `sit commit [-S] -m <msg>` — record the staged index as a new commit (-S signs it).
 fn cmd_commit() {
     var ac = argc();
     if (ac < 3) {
@@ -1061,6 +1201,15 @@ fn cmd_commit() {
     if (merge_parent != 0) { rl_prefix = "commit (merge): "; }
     else { if (parent_hex == 0) { rl_prefix = "commit (initial): "; } }
     reflog_head_move(parent_hex, commit_hex, reflog_msg_subject(rl_prefix, message));
+
+    # 1.6.4 (A15): a commit is what resolves a conflicted cherry-pick or revert,
+    # so it clears their state files the way it clears MERGE_HEAD. They used to
+    # linger forever (and `fsck --prune` now refuses while they exist). A rebase
+    # owns CHERRY_PICK_HEAD itself and clears it on --continue / --abort.
+    if (sf_exists(".sit/REVERT_HEAD") == 1) { sf_unlink(".sit/REVERT_HEAD"); }
+    if (sf_exists(".sit/REBASE_ORIG") != 1) {
+        if (sf_exists(".sit/CHERRY_PICK_HEAD") == 1) { sf_unlink(".sit/CHERRY_PICK_HEAD"); }
+    }
 
     var branch = current_branch_name();
     stdout_write("[", 1);

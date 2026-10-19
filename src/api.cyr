@@ -206,4 +206,5 @@ fn sit_repo_status(repo) {
 
 # Accessors on a status record (mirror the ann_* pattern; opaque layout).
 fn sit_status_path(rec) { return load64(rec); }
+# Status kind of a record: 1 = modified, 2 = new (untracked), 3 = deleted.
 fn sit_status_kind(rec) { return load64(rec + 8); }

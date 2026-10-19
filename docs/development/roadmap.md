@@ -4,7 +4,7 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.6.3`. The `1.3.x` line went almost entirely to audit work
+**Where we are**: `1.6.4` — the last 1.6.x patch: a P(-1) audit closed the line (16 HIGH, all fixed; see [`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md)). The `1.3.x` line went almost entirely to audit work
 (two security audits, see [`../audit/`](../audit/)) and `1.4.x` to correctness
 and growth curves — `status` is no longer superlinear (4.98× git at 1,000 files,
 was 26.64×), the last four unfuzzed parsers have harnesses, every deferral
@@ -38,10 +38,68 @@ Nothing below blocks anything else; ordering within a section is a recommendatio
 
 ## Patch line — correctness & hardening (no new surface)
 
+### Deferred from the 2026-10-19 audit (1.6.4)
+
+Confirmed by the P(-1) audit that closed 1.6.x
+([`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md)), and left open
+on purpose. Every CRITICAL / HIGH was fixed in 1.6.4; these are design work or
+lower-severity items. Each names the finding id it came from.
+
+- **Bearer token is not bound to a remote (C3, MEDIUM).** `~/.sit/serve.token`
+  — the credential that guards the user's own `sit serve --require-auth` — goes
+  to any http(s) remote that advertises `"auth":["bearer"]`, and to every ssh
+  remote's POSTs. Pushing to a third-party server hands it that credential, and
+  plain `http://` accepts any IPv4 literal, so it can travel in cleartext. Needs
+  a per-remote credential (e.g. `remote.<name>.tokenFile`) and a refusal to send
+  one over plain http to a non-loopback host — new config surface, so it wants
+  its own release rather than riding a patch.
+- **`rebase` walks first parents only (A8, MEDIUM).** When the merge base is
+  reachable only through a merge's second parent (upstream merged into the
+  feature branch), the pending walk misses it and replays commits upstream
+  already has, down to the root. Needs the "reachable from tip, not from
+  upstream" set over all parents, then a topological replay order.
+- **git read-mode: packs over 64 MiB or deltas deeper than 64 are unreadable
+  (D6, MEDIUM).** Both make `sit_repo_status` report a clean file as modified
+  or untracked — confidently wrong, in-process for owl / thoth. Needs an
+  mmap- or window-based pack reader (the 64 MiB is `read_file_heap`'s cap) and
+  an iterative delta resolver with a base cache instead of recursion.
+- **Index paths are capped at 255 bytes (B7, MEDIUM — partially fixed).** The
+  patra STR column is 255 bytes; 1.6.4 makes `sit add` refuse longer paths and
+  makes `rewrite_index` transactional, so a clone carrying one now fails
+  cleanly instead of truncating the index. Lifting the limit needs a wider
+  column (an index migration) or a BYTES column.
+- **`sit serve` still grows ~3 KB per request (C1 residual).** 1.6.4 frees the
+  large per-request buffers (100 GETs of a 1 MiB object: 107 MB → 7 MB), but
+  small header / SQL allocations still land on the never-freed bump heap. The
+  real fix is a request-scoped arena reset after each response.
+- **`stash pop` needs a three-way apply (A5 follow-on).** 1.6.4 makes pop
+  refuse once HEAD has moved past the stash's base (it used to roll every
+  later commit back). Applying the stash onto a moved HEAD is cherry-pick of
+  the stash commit without committing — `_apply_one_commit` minus the commit.
+- **`sit commit` accepts unresolved conflict markers.** After a conflicted
+  merge / cherry-pick / rebase stop, nothing stops a commit (or `rebase
+  --continue`) of a file still containing `<<<<<<<` once it is `sit add`ed.
+  git tracks unmerged index stages; the cheap version records the conflicted
+  paths in a state file and refuses until each one's content changed.
+- **ssh transport has no read timeout (C10, LOW).** Plain http gained the 30 s
+  bound in 1.6.4; the ssh pipe needs a poll()-based deadline in
+  `_wire_ssh_recv_response`.
+- **`sit add` ignores directory-only and nested ignore rules (B13, LOW).**
+  `status` honours both since 1.4.9 / 1.5.2; `add` matches only the root
+  `.sitignore` and `info/exclude` with `kind = 0`.
+- **No `\ No newline at end of file` marker (B14, LOW).** A change that only adds
+  a trailing newline prints headers and no hunk, and patches across a file with
+  no final newline do not round-trip.
+- **Bytes ≥ 0x80 pass `refname_valid` and `write_sanitized` (E10, LOW).** UTF-8
+  C1 controls (U+009B CSI) and bidi overrides reach terminals and API
+  consumers. git allows non-ASCII ref names, so this wants an escape of the C1
+  / bidi ranges on output rather than a rejection.
+- **`describe` is first-parent only, nondeterministic on ties, and ignores
+  nested tags (E14, LOW).**
+
 ### Closed by measurement — kept as decisions, not tasks
 
-The patch line is **empty**. These two are recorded so they are not
-re-attempted blindly; neither is work.
+These two are recorded so they are not re-attempted blindly; neither is work.
 
 - **`clone` — nothing left on the patch line; the remaining work is packing.**
   *(1.4.8 diagnosed the phases; 1.4.9 finished the job and found no defect.)*
@@ -192,19 +250,6 @@ Each earns its own minor when its time comes.
 
 These are blocked on another repo. Per [CLAUDE.md](../../CLAUDE.md), cross-project requests go on the **target repo's** roadmap, not an issue tracker — so each needs drafting there.
 
-- **cyrius — ASAN / poisoned-allocator mode for `cyrius fuzz`.** The 127-byte heap overread in `_git_apply_delta` (2026-08-17 audit) was invisible to fuzzing because the read landed in mapped memory: it was found by reading and is pinned only by a deterministic corpus that asserts on the leak. **Every OOB *read* in the tree has that blind spot.** Wanted: redzone poisoning so `cyrius fuzz` fails on overreads, not only on faults.
-
-  ⚠ **1.4.7 demonstrated this concretely rather than arguing it.** With the four
-  new parser targets in place, `parse_tree`'s `alloc_or_die(name_len + 1)` was
-  changed to `alloc_or_die(8)` — a straight heap overflow on every entry whose
-  name exceeds 8 bytes, hit ~200,000 times per run — and the fuzz suite **still
-  reported `no crashes` and exited 0**. The allocator has enough slack that the
-  overflow never leaves mapped memory. So the three buffer-parser targets pin
-  *faults and hangs*, not memory errors, and no amount of additional rounds
-  changes that. The `_wildmatch` target does have teeth by construction (see the
-  A/B in the 1.4.7 CHANGELOG entry) because its failure mode is non-termination,
-  which is observable without ASAN. **This is the single highest-leverage thing
-  cyrius could give sit's test suite.**
 - **patra — `ORDER BY` is an insertion sort; `DELETE` never reclaims pages.**
   Filed 2026-08-19 as
   [`2026-08-19-sit-order-by-insertion-sort.md`](https://github.com/MacCracken/patra/blob/main/docs/development/requests/2026-08-19-sit-order-by-insertion-sort.md).

@@ -79,6 +79,9 @@ CYRIUS_DCE=1 cyrius build src/main.cyr build/sit   # dead-code-eliminated releas
 - **`cyrius.cyml` is a manifest, not a ledger or changelog** — keys and values only. Rationale goes in `docs/adr/` or `docs/architecture/`, history in CHANGELOG, and versions in `state.md`.
 - Do not add `[deps.<name>]` git blocks for modules folded into the cyrius stdlib (sakshi / sankoch / sigil / patra / sandhi). The `cyrius` pin is the only version lever — see [ADR 0012](docs/adr/0012-deps-pinned-through-the-toolchain.md).
 - Do not inline volatile state (versions, line counts, dep pins, command counts) into `CLAUDE.md` / `README.md` — that content lives in `docs/development/state.md` and rots fast if copied.
+- **Anything that rewrites the worktree goes through `materialize_target_safe`** (or `_apply_conflicted_merge` on a conflict stop), which refuses a dirty tree, untracked files in the way and symlinked parents before writing anything. Forced `materialize_target` is for `reset --hard` and abort / restore paths only. The 2026-10-19 audit's data-loss findings were commands that skipped a check a sibling made — put new checks in the shared function, not the command.
+- **Repo-path writes go through the `sf_*` wrappers** (`sf_write_all`, `sf_unlink`, `sf_rename`, …), never a raw `file_write_all` / `xunlink` on a repo path — they are what refuses to write through a symlink.
+- **`[lib]` / `[lib.read]` modules use only public stdlib API.** Consumers pin older toolchains (owl: cyrius 6.6.2); a stdlib-internal `_name` that exists only in sit's pin breaks their build. Verify with the downstream check before a release.
 - **Do not re-hash or decompress objects during wire transfer** — `fetch` / `push` copy raw compressed bytes DB-to-DB; SHA-256 roundtrips belong in `fsck`, not the hot path.
 
 ## Process

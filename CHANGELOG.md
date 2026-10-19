@@ -4,6 +4,158 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.4] — 2026-10-19 — closing 1.6.x: short writes, and a P(-1) audit that found sixteen ways to lose data
+
+The last 1.6.x patch. It carries the short-write fix and a full P(-1) hardening pass over everything changed since the 2026-08-18 audit, 1.4.0 → 1.6.3. Five area auditors found 66 issues, each reproduced, re-verified and red/green-tested:
+- **16 HIGH:** all fixed.
+- **21 MEDIUM:** 17 fixed, 1 partial.
+- **29 LOW:** 23 fixed, 2 partial.
+- **7 deferred** to the roadmap.
+
+No CRITICAL. The full report is [`docs/audit/2026-10-19-audit.md`](docs/audit/2026-10-19-audit.md).
+
+**The pattern:** almost every data-loss bug was a command skipping a check that a sibling command already made.
+- `merge` refused a dirty tree; `cherry-pick` did not.
+- `checkout` refused untracked files; `merge` did not.
+- `reset` materialized before moving HEAD; `pull` did not.
+
+The fixes move each check into the shared function, so commands added later inherit it.
+
+### Security
+
+- **Ref, HEAD and reflog writes no longer follow symlinks (E1).** A `.sit/` that came from elsewhere (tarball, shared checkout, CI workspace) could ship `refs/heads/main -> ~/somefile`; the next `sit commit` truncated that file, and `logs/HEAD -> X` appended reflog lines to X.
+  - For repo-relative paths, `sf_write_all` now refuses a symlinked parent, removes whatever sits at the path, and creates the file `O_CREAT|O_EXCL`.
+  - `sf_append_locked`, `sf_unlink`, `sf_rename` and `ensure_parent_dirs` refuse symlinked parents too.
+- **Nothing is written or removed beyond a symlinked worktree directory (B8; CVE-2021-21300 / CVE-2024-32002 class).** With `docs -> /elsewhere` in the worktree, a pull or merge adding `docs/x` used to write `/elsewhere/x`, and a reset removing it deleted it there.
+- **HEAD must name something under `refs/` (E2).** `ref: objects.patra` made the next commit overwrite the object database with 65 bytes.
+- **`verify-tag` reports what was signed (E3).** A signed `v1.0` copied to `refs/tags/v2.1` used to verify as "good signature on tag v2.1". It now prints the signed name and target, and refuses a tag found under another name.
+- **`verify-commit` requires a commit (E6).** It used to verify a tag object and pass unsigned commits.
+- **Duplicate and out-of-order tree entries are dropped and reported (X1; Gitea CVE-2026-95106 class).** A tree naming `a` twice showed both blobs in `sit show` while checkout wrote the second, and `fsck` called it clean.
+  - `parse_tree` requires strict git order.
+  - `fsck` reports malformed entries and exits 1.
+  - `build_tree` refuses to write a duplicate.
+- **NTFS 8.3 names `GIT~1` / `SIT~1` are rejected (E12; CVE-2014-9390 / CVE-2019-1353 class).**
+- **git read-mode ids are hex-gated before dispatch (D8).** A crafted `tree` value opened a file outside `.git/objects`.
+- **Network hardening:**
+  - **C1:** `sit serve` frees per-request buffers. 100 anonymous GETs of a 1 MiB object grew RSS from 4.9 to 107.8 MB; now 6.6 → 7.0 MB.
+  - **C2:** `--tls` arms handshake and request deadlines. One trickling client held the single-threaded loop indefinitely; a second client is now served after 59 s.
+  - **C4:** `http.sslVerify` is a strict boolean. `TRUE` / `on` silently meant TOFU, and an invalid value now refuses to connect.
+  - **C5, C7:** ssh ref advertisements and object types are validated like their http siblings.
+  - **C10:** plain-http reads time out after 30 s.
+- **Terminal escapes in ref names, `config --list` and `remote list` are sanitized (E8, E9).**
+
+### Fixed — data loss in ordinary use
+
+- **Uncommitted work is never overwritten (A1, B6).** cherry-pick, revert, rebase, octopus merge and stash pop replaced uncommitted edits, which were never hashed and so could not be recovered. Fast-forward merge, pull and the conflict paths clobbered untracked files. A new `materialize_target_safe` refuses before writing anything; `reset --hard` and the abort paths keep the forced form.
+- **The three-way merge no longer drops lines (A2).** Base `a b c`, ours `a B c`, theirs `a x b c` merged "cleanly" to `a B c`. A pure insert at the start of the other side's replace is now a conflict, in both orders.
+- **A conflicted merge keeps its clean half (A3).** Clean results reached the worktree only, and `sit commit` / `rebase --continue` build from the index, so resolving the conflict and committing dropped every other change. The index is now staged with the clean results.
+- **Octopus merge uses the right base (A4).** It merged each branch against the previous branch's tip, so a change HEAD had reverted came back. It now uses the best base against everything merged so far.
+- **`stash pop` refuses on a moved HEAD (A5).** Popping restored the whole snapshot over every later commit and staged the undo.
+- **`sit add` validates paths (B1).** `./a.txt` was committed into a `.` subtree no reader sees, and `..`, absolute and `.sit/` paths were staged too.
+- **A file sit cannot hash is "changed", never "clean" (B2).** A 70 MB edit to a tracked file read as clean, and checkout replaced it with the committed 6 bytes.
+- **checkout, pull and clone stop on a failed materialize (B3, B9).** HEAD used to move anyway, and pull moved it before materializing, leaving upstream-deleted files on disk.
+- **Directory ↔ file changes check out (B4).** Emptied directories are removed, including by `sit rm`.
+- **`sit add` caps files at the 16 MiB read ceiling (B5).** A 20 MB file used to commit and then break every checkout and clone of that commit.
+- **Highly compressible objects read back (D1).** The 1000:1 inflate cap was below sankoch's own ratio (1006–1017:1 for 2–16 MiB of one byte), so `sit add` of a disk image wrote an unreadable blob. The cap is now 1100, above deflate's maximum.
+- **`fsck --prune` keeps a shallow clone's fetched history (D2).** The walk stopped at `.sit/shallow` boundaries even with the parents present.
+- **git read-mode reads each `.idx` / `.pack` once (D3).** It re-read every idx per object into the never-freed heap: 4 GB for `sit_repo_status` on 12,000 files, in owl's and thoth's process. A 3,000-file repo now peaks at 13 MB instead of 255 MB.
+- **`fsck` agrees with the readers:**
+  - a commit's `tree` is read through `parse_commit_body` (D4);
+  - any ref the resolver accepts is a root (D9);
+  - `--prune` refuses during a rebase, cherry-pick or revert (A9).
+- **Rebase state is validated and tied to its branch (A6, A7).**
+  - `--abort` after `checkout main` used to reset main to the feature tip.
+  - A NUL-filled `REBASE_ORIG` emptied the worktree.
+  - A CR in `rebase-todo` silently dropped the rest of the branch.
+  - `--continue` refuses unstaged changes.
+- **`reset --hard` / `checkout` to a non-commit refuses (E4).** Peeling a tag to a tree used to delete every tracked file.
+- **`rewrite_index` is one transaction (B7).** A failure part-way left the index half old, half new.
+- **Short writes are failures (W1).** `_wire_io_send`'s plain path made one `sock_send` and dropped the count. It now loops, every client caller checks the result, a failed TLS response closes the connection, and the ssh pipe writes loop too.
+
+### Fixed — smaller
+
+- **Correctness:**
+  - `-U0` hunk headers start at the line before the change, so `patch` now round-trips (B12).
+  - `/want` no longer answers 413 for objects over ~128 KiB (C8).
+  - `do_fetch`'s walk-cap abort crashed pull and clone (C6).
+  - Binary files are not line-merged (A12).
+  - `_git_apply_delta` checks the base size and the 16 MiB result ceiling (D10, D5).
+- **State and history:**
+  - cherry-pick, revert and rebase steps write reflog entries (A10).
+  - `CHERRY_PICK_HEAD` / `REVERT_HEAD` are cleared by commit, and octopus no longer adds duplicate parents (A15).
+  - `@{N}` no longer wraps (E13).
+  - `checkout` validates the branch name (E7).
+  - A failed key write no longer locks `key generate` out (E15).
+  - An unterminated sitsig line is ignored (E5).
+- **Platform and limits:**
+  - `blame` warns when a diff gives up (A13).
+  - The `**` glob scan is charged to the step budget: a hostile 100-line ignore file went from 99.9 s to 1.3 s (B10).
+  - lstat guards read `st_mode` at the per-target offset, so they were no-ops on aarch64 (B11).
+  - The worktree walk goes through the repo-root seam (D7).
+  - The pre-audit `parse_tree` / `fsck` items above (X1).
+
+### Changed — commands that now refuse where they used to destroy data
+
+There is no flag or API change, but these now exit 1 where 1.6.3 succeeded:
+- cherry-pick, revert, rebase, octopus merge and stash pop over uncommitted work
+- any switch over an untracked file in the way
+- writes or removals beyond a symlink
+- `stash pop` after HEAD moved
+- `sit add` of an invalid path, or of a file over 16 MiB
+- `reset --hard` / `checkout` to a non-commit
+- `fsck --prune` mid-rebase
+- an invalid `http.sslVerify`
+- `verify-tag` of a renamed tag, and `verify-commit` of a tag
+
+`fsck` exits 1 on malformed tree entries. One integration test asserted the old behaviour (a second `stash pop` over uncommitted work) and now asserts the refusal.
+
+### Changed — cleanliness
+
+- **`cyrius audit` passes for the first time.**
+  - fmt clean.
+  - lint clean across `src/` and `tests/`: ten long fixture literals carry `#skip-lint`.
+  - docs complete: 185 undocumented functions → 0, with `sit_version_string`'s comment now emitted by `scripts/gen-version.sh`.
+- A sit-local `eprint3` replaces hand-counted literal lengths at the sites touched; two remaining mis-counts were fixed.
+- **Dead code:**
+  - The unreachable TLS-connect blocks in the three plain-http client paths are removed (those paths return early through the https keep-alive path).
+  - `sf_mkdir` / `sf_stat` stay, as the 2026-08-17 closeout decided.
+  - The floor of functions unreachable from `main` is the public `sit_*` API, the `build_*commit` wrappers, the `delta.cyr` generator (staged for `gc`), and the API helpers `_status_push` / `_blob_differs_from_file`.
+- **Architecture note 005's "single-pass bundle" ordering is obsolete.** `object_db.cyr` calls functions from later modules and the bundles compile on cyrius 6.6.2, 6.6.6 and 6.6.20. ADR 0013 is corrected to match, and no longer calls owl a read-profile "candidate", since it already is one.
+- **The consumer bundles use only public stdlib API.** `sit_write_full` replaces stdlib-internal `_io_write_full`, which cyrius 6.6.2 (owl's pin) does not have. Found by the downstream check.
+
+### Deferred (roadmap → *Deferred from the 2026-10-19 audit*)
+
+- **Design work:**
+  - The bearer token is not bound to a remote (C3).
+  - rebase walks first parents only (A8).
+  - git packs over 64 MiB or with deltas deeper than 64 are unreadable (D6).
+  - The 255-byte index path column (B7, rest).
+  - A ~3 KB-per-request serve residual that needs a request arena (C1, rest).
+- **Follow-ons and LOWs:**
+  - Three-way `stash pop`.
+  - Refusing to commit unresolved conflict markers.
+  - An ssh read timeout.
+  - `add` honouring dir-only and nested ignores.
+  - A `\ No newline at end of file` marker.
+  - C1-control / bidi escaping.
+  - `describe` parity.
+
+### Verified
+
+- **Unit:** **413 / 413** (was 383).
+- **Integration:** **244 / 244** (was 207). The new section 22 has one scenario per repro-confirmed finding; **33 of its assertions fail on 1.6.3**.
+- **Fuzz:** 15 harnesses, no crashes. Lint and `cyrius audit` are clean.
+- **New: poisoned-allocator runs** (cyrius 6.6.18 `CYRIUS_POISON=1`, now a CI step). Unit, integration (against a poison-built binary) and fuzz A/B ran clean, with byte-identical A/B output.
+  - Plain fuzzing cannot see a heap overflow that stays in mapped memory: re-injecting 1.4.7's `parse_tree` overflow still prints "no crashes".
+  - Under poison it exits 86 at the first overflow.
+  - The A/B fill comparison is what surfaces overreads.
+- **CI smoke steps,** run locally: all pass except ssh, which needs sshd and wasn't run.
+- **Builds:** x86_64 (plain and DCE), `--aarch64`, and `--agnos` (plain and DCE), all from a clean `lib/`. The arm64 symlink guard was checked under qemu.
+- **Downstream:**
+  - **owl** (cyrius 6.6.2) builds and passes its tests against the new `dist/sit-read.cyr`.
+  - **thoth** (6.6.6) builds on x86_64 and aarch64 and passes 2,330 / 2,331. The one failure is its own "sit-read pinned at 1.6.2" assertion, which flips when it re-vendors.
+- **Micro-benchmarks** (best of two runs, 1.6.3 vs 1.6.4): flat. All are within ±4% except `tree_flat_path_valid` at +7.2% (609 → 653 ns per path, consistent across runs). Snapshot: [`docs/benchmarks/2026-10-19-v1.6.4.md`](docs/benchmarks/2026-10-19-v1.6.4.md).
+
 ## [1.6.3] — 2026-10-19 — cyrius 6.6.20; the full bundle compiles into consumers again
 
 ### Changed — cyrius pin 6.6.2 → **6.6.20**

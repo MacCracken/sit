@@ -759,6 +759,11 @@ assert_contains "$("$SIT" stash)" "no local changes" "stash with a clean tree is
 printf 'v1\n' > a.txt; "$SIT" stash >/dev/null
 printf 'v2\n' > a.txt; "$SIT" stash >/dev/null
 "$SIT" stash pop >/dev/null; assert_eq "$(cat a.txt)" "v2" "pop restores the newest entry first"
+# 1.6.4: with v2 now sitting uncommitted in the tree, a second pop must refuse
+# rather than silently discard it (it used to). git refuses here too.
+"$SIT" stash pop >/dev/null 2>&1; assert_eq "$?" "1" "pop over uncommitted work refuses"
+assert_eq "$(cat a.txt)" "v2" "the refused pop leaves the uncommitted work alone"
+"$SIT" reset --hard HEAD >/dev/null 2>&1
 "$SIT" stash pop >/dev/null; assert_eq "$(cat a.txt)" "v1" "pop then restores the next one"
 
 # 18d. REACHABILITY: a live stash must survive fsck --prune-now. Pre-1.5.1
@@ -1021,6 +1026,139 @@ if command -v openssl > /dev/null 2>&1; then
 else
   echo "  (skipped 21b-21e: openssl not available)"
 fi
+
+# ── 22. 1.6.4 audit regressions ───────────────────────────────────
+# One scenario per data-loss / escape finding of the 2026-10-19 audit, each
+# asserting the fixed behaviour; every one of these passed silently (and lost
+# or misplaced data) on 1.6.3. See docs/audit/2026-10-19-audit.md.
+hr "1.6.4 audit regressions"
+trap 'rm -rf "$WORK"' EXIT     # section 21 cleared the cleanup trap
+a164() { R="$WORK/a164-$1"; rm -rf "$R"; mkdir -p "$R"; cd "$R"; "$SIT" init >/dev/null; }
+c164() { for f in "$@"; do "$SIT" add "$f" >/dev/null; done; }
+m164() { "$SIT" commit -m "$1" >/dev/null; }
+
+# A1 — cherry-pick refuses to overwrite an uncommitted edit.
+a164 a1; echo a > a.txt; echo b > b.txt; c164 a.txt b.txt; m164 base
+"$SIT" branch side >/dev/null; "$SIT" checkout side >/dev/null; echo side > a.txt; c164 a.txt; m164 side
+"$SIT" checkout main >/dev/null; echo "UNCOMMITTED" > b.txt
+"$SIT" cherry-pick side >/dev/null 2>&1; assert_eq "$?" "1" "A1: cherry-pick over a dirty tree refuses"
+assert_eq "$(cat b.txt)" "UNCOMMITTED" "A1: the uncommitted edit survives"
+
+# A2 — replace vs insert at the same base line conflicts, never drops the insert.
+a164 a2; printf 'a\nb\nc\n' > f.txt; c164 f.txt; m164 base
+"$SIT" branch side >/dev/null; printf 'a\nB\nc\n' > f.txt; c164 f.txt; m164 ours
+"$SIT" checkout side >/dev/null; printf 'a\nx\nb\nc\n' > f.txt; c164 f.txt; m164 theirs
+"$SIT" checkout main >/dev/null; "$SIT" merge side >/dev/null 2>&1
+assert_eq "$?" "1" "A2: replace-vs-insert at one line is a conflict"
+assert_contains "$(cat f.txt)" "x" "A2: theirs' inserted line is still there to resolve"
+
+# A3 — a conflicted merge keeps its clean half through resolve + commit.
+a164 a3; echo c0 > conf.txt; echo "old other" > other.txt; c164 conf.txt other.txt; m164 base
+"$SIT" branch side >/dev/null; echo ours > conf.txt; c164 conf.txt; m164 ours
+"$SIT" checkout side >/dev/null; echo theirs > conf.txt; echo "SIDE EDIT" > other.txt; c164 conf.txt other.txt; m164 theirs
+"$SIT" checkout main >/dev/null; "$SIT" merge side >/dev/null 2>&1
+echo resolved > conf.txt; "$SIT" add conf.txt >/dev/null; "$SIT" commit -m merged >/dev/null 2>&1
+"$SIT" reset --hard HEAD >/dev/null 2>&1
+assert_eq "$(cat other.txt)" "SIDE EDIT" "A3: the cleanly merged file is in the merge commit"
+
+# A4 — an octopus merge does not undo a change HEAD made after a branch forked.
+a164 a4; echo "safe default" > cfg.txt; c164 cfg.txt; m164 R
+"$SIT" branch b1 >/dev/null; echo "DANGEROUS" > cfg.txt; c164 cfg.txt; m164 M1
+"$SIT" branch b2 >/dev/null; echo "safe default" > cfg.txt; c164 cfg.txt; m164 M2
+"$SIT" checkout b1 >/dev/null; echo one > one.txt; c164 one.txt; m164 b1
+"$SIT" checkout b2 >/dev/null; echo two > two.txt; c164 two.txt; m164 b2
+"$SIT" checkout main >/dev/null; "$SIT" merge b1 b2 >/dev/null 2>&1
+assert_eq "$(cat cfg.txt)" "safe default" "A4: octopus keeps HEAD's revert"
+
+# A5 — stash pop after a later commit refuses instead of rolling it back.
+a164 a5; echo a > a.txt; echo b > b.txt; c164 a.txt b.txt; m164 base
+echo stashed > a.txt; "$SIT" stash >/dev/null 2>&1
+echo "committed later" > b.txt; c164 b.txt; m164 later
+"$SIT" stash pop >/dev/null 2>&1; assert_eq "$?" "1" "A5: pop on a moved HEAD refuses"
+assert_eq "$(cat b.txt)" "committed later" "A5: the later commit is untouched"
+assert_contains "$("$SIT" stash list)" "stash@{0}" "A5: and the stash is kept"
+
+# B1 — add normalises ./ and refuses paths that would build a bad tree.
+a164 b1; echo hi > a.txt
+assert_contains "$("$SIT" add ./a.txt)" " a.txt" "B1: add ./a.txt stages a.txt"
+"$SIT" add ../escape >/dev/null 2>&1; assert_eq "$?" "1" "B1: add ../x refuses"
+"$SIT" add .sit/HEAD >/dev/null 2>&1; assert_eq "$?" "1" "B1: add .sit/HEAD refuses"
+
+# B2 — a tracked file replaced by a directory is not "clean".
+a164 b2; echo x > x; c164 x; m164 base; rm x; mkdir x; echo y > x/y
+assert_contains "$("$SIT" status)" "x" "B2: status reports the replaced file"
+
+# B3 / B6 — untracked work in the way refuses, and HEAD does not move.
+a164 b3; echo a > a.txt; c164 a.txt; m164 base
+"$SIT" branch feat >/dev/null; "$SIT" checkout feat >/dev/null; echo theirs > notes.txt; c164 notes.txt; m164 feat
+"$SIT" checkout main >/dev/null; echo "my notes" > notes.txt
+"$SIT" merge feat >/dev/null 2>&1; assert_eq "$?" "1" "B6: fast-forward over an untracked file refuses"
+assert_eq "$(cat notes.txt)" "my notes" "B6: the untracked file survives"
+rm notes.txt; mkdir notes.txt; echo mine > notes.txt/x
+"$SIT" checkout feat >/dev/null 2>&1; assert_eq "$?" "1" "B3: checkout over an untracked dir refuses"
+assert_eq "$(cat .sit/HEAD)" "ref: refs/heads/main" "B3: HEAD unchanged"
+
+# B4 — a directory becomes a file across a checkout.
+a164 b4; mkdir d; echo x > d/x; c164 d/x; m164 base
+"$SIT" branch fb >/dev/null; "$SIT" checkout fb >/dev/null; "$SIT" rm d/x >/dev/null
+assert_eq "$([ -d d ] && echo still || echo gone)" "gone" "B4: rm removes the emptied directory"
+echo file > d; c164 d; m164 fb; "$SIT" checkout main >/dev/null; "$SIT" checkout fb >/dev/null 2>&1
+assert_eq "$(cat d 2>/dev/null)" "file" "B4: dir-to-file checkout lands"
+
+# B5 — a file past the 16 MiB read ceiling is refused at add time.
+a164 b5; head -c 17000000 /dev/zero > big.bin
+"$SIT" add big.bin >/dev/null 2>&1; assert_eq "$?" "1" "B5: add over 16 MiB refuses"
+
+# B8 — nothing is written or removed beyond a symlinked directory.
+a164 b8; echo a > a.txt; c164 a.txt; m164 base
+"$SIT" branch feat >/dev/null; "$SIT" checkout feat >/dev/null; mkdir docs; echo attacker > docs/x; c164 docs/x; m164 feat
+"$SIT" checkout main >/dev/null; mkdir -p "$WORK/b8-outside"; ln -s "$WORK/b8-outside" docs
+"$SIT" merge feat >/dev/null 2>&1; assert_eq "$?" "1" "B8: merge writing beyond a symlink refuses"
+assert_eq "$([ -e "$WORK/b8-outside/x" ] && echo written || echo clean)" "clean" "B8: nothing landed outside the repo"
+
+# D1 — 2 MiB of one byte (compresses past 1000:1) reads back.
+a164 d1; head -c 2097152 /dev/zero > z.bin; c164 z.bin; m164 z; rm z.bin
+assert_contains "$("$SIT" fsck 2>&1)" "0 bad" "D1: a highly compressible blob is readable"
+"$SIT" reset --hard HEAD >/dev/null 2>&1; assert_eq "$(wc -c < z.bin)" "2097152" "D1: and restores"
+
+# D2 — a shallow clone that fetched its history keeps it through prune.
+a164 d2; for i in 1 2 3; do echo v$i > f.txt; c164 f.txt; m164 c$i; done
+cd "$WORK"; rm -rf a164-d2c; "$SIT" clone --depth 1 --force-absolute "$WORK/a164-d2" a164-d2c >/dev/null 2>&1
+cd a164-d2c; "$SIT" fetch origin >/dev/null 2>&1
+assert_contains "$("$SIT" fsck 2>&1)" "0 dangling" "D2: fetched ancestors of a shallow boundary are reachable"
+assert_contains "$("$SIT" fsck --prune-now 2>&1)" "pruned 0" "D2: and survive --prune-now"
+
+# E1 — a ref that is a symlink is replaced, never written through.
+a164 e1; echo a > a.txt; c164 a.txt; m164 one
+echo "user data" > "$WORK/e1-victim"; rm .sit/refs/heads/main; ln -s "$WORK/e1-victim" .sit/refs/heads/main
+echo b > b.txt; c164 b.txt; "$SIT" commit -m two >/dev/null 2>&1
+assert_eq "$(cat "$WORK/e1-victim")" "user data" "E1: the symlink target is untouched"
+
+# E2 — HEAD may only name something under refs/.
+a164 e2; echo a > a.txt; c164 a.txt; m164 one
+printf 'ref: objects.patra\n' > .sit/HEAD; echo b > b.txt; c164 b.txt
+"$SIT" commit -m two >/dev/null 2>&1; assert_eq "$?" "1" "E2: a HEAD naming objects.patra cannot be committed through"
+assert_contains "$("$SIT" fsck 2>&1)" "0 bad" "E2: the object store is intact"
+
+# E3 / E6 — signatures are reported for what they cover.
+a164 e3; "$SIT" key generate >/dev/null 2>&1; echo a > a; c164 a; m164 one
+"$SIT" tag -s v1.0 -m rel >/dev/null 2>&1; cp .sit/refs/tags/v1.0 .sit/refs/tags/v2.1
+"$SIT" verify-tag v2.1 >/dev/null 2>&1; assert_eq "$?" "1" "E3: a tag object found under another name is refused"
+"$SIT" verify-commit v1.0 >/dev/null 2>&1; assert_eq "$?" "1" "E6: verify-commit refuses a tag object"
+
+# E4 — reset --hard to a tree is refused before anything is deleted.
+a164 e4; echo keep > keep.txt; c164 keep.txt; m164 one
+T=$("$SIT" cat-file HEAD | sed -n 's/^tree //p' | head -1)
+"$SIT" reset --hard "$T" >/dev/null 2>&1; assert_eq "$?" "1" "E4: reset --hard to a tree refuses"
+assert_eq "$(cat keep.txt)" "keep" "E4: the worktree is untouched"
+
+# E7 — checkout validates the branch name.
+a164 e7; echo a > a; c164 a; m164 one
+"$SIT" checkout ../tags/x >/dev/null 2>&1; assert_eq "$(cat .sit/HEAD)" "ref: refs/heads/main" "E7: a traversal branch name is refused"
+
+# B12 — -U0 headers apply with patch at the right place.
+a164 b12; seq 1 20 > f.txt; c164 f.txt; m164 base; seq 1 20 | sed '10a NEW' > f.txt
+assert_contains "$("$SIT" diff -U0)" "@@ -10,0 +11 @@" "B12: a pure insert's old start is the line before it"
 
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"

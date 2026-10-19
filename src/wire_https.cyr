@@ -180,13 +180,36 @@ fn tofu_check_pin(host, port, spki_der, der_len) {
 # deliberate: sit's own `sit serve --tls` uses a self-signed certificate, which
 # is the common case for a personal remote, and a CA-verifying default would
 # refuse it out of the box. ADR 0007 records the reasoning.
+#
+# Returns 1 (verify), 0 (TOFU) or -1 for a value that is not a boolean.
+# 1.6.4 (C4): only the exact strings true / 1 / yes turned it on, and every
+# other value — `TRUE`, `True`, `on` — silently meant TOFU, which pins whatever
+# certificate a man in the middle presents on first contact. Booleans are now
+# read the way git reads them (case-insensitive true/yes/on/1, false/no/off/0),
+# and anything else refuses to connect rather than guess the weaker mode.
 fn _https_verify_enabled() {
     var v = config_get("http.sslVerify");
     if (v == 0) { return 0; }
-    if (streq(v, "true") == 1) { return 1; }
-    if (streq(v, "1") == 1) { return 1; }
-    if (streq(v, "yes") == 1) { return 1; }
-    return 0;
+    var n = strlen(v);
+    if (n > 8) { return 0 - 1; }
+    var low[16];
+    var i = 0;
+    while (i < n) {
+        var c = load8(v + i) & 0xFF;
+        if (c >= 65) { if (c <= 90) { c = c + 32; } }
+        store8(&low + i, c);
+        i = i + 1;
+    }
+    store8(&low + n, 0);
+    if (streq(&low, "true") == 1) { return 1; }
+    if (streq(&low, "yes") == 1) { return 1; }
+    if (streq(&low, "on") == 1) { return 1; }
+    if (streq(&low, "1") == 1) { return 1; }
+    if (streq(&low, "false") == 1) { return 0; }
+    if (streq(&low, "no") == 1) { return 0; }
+    if (streq(&low, "off") == 1) { return 0; }
+    if (streq(&low, "0") == 1) { return 0; }
+    return 0 - 1;
 }
 
 # Client certificate for mTLS, or 0. Both halves must be present — a cert with
@@ -208,7 +231,12 @@ fn _https_client_cert_paths(out_key) {
 # Apply the configured trust policy to a fresh client ctx.
 # Returns 0 on success, non-zero to abort the connection.
 fn _https_apply_trust(ctx, host) {
-    if (_https_verify_enabled() == 0) {
+    var mode = _https_verify_enabled();
+    if (mode < 0) {
+        eprintln("sit: http.sslVerify must be true or false — refusing to connect");
+        return 1;
+    }
+    if (mode == 0) {
         # TOFU: accept the chain, then pin the SPKI ourselves below.
         tls_native_set_verify(ctx, TLS_VERIFY_NONE);
         return 0;

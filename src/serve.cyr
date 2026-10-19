@@ -51,6 +51,17 @@ var _serve_token = 0;
 var _serve_tls_ctx = 0;
 fn _serve_set_tls_ctx(ctx) { _serve_tls_ctx = ctx; return 0; }
 
+# Set when a response write on the TLS keep-alive connection fails part-way.
+# The client reads each response by exact Content-Length, so after a partial
+# write the stream is desynchronised: the accept loop must close the connection
+# rather than read the next request off it. Only the --tls path touches this,
+# and that loop is single-threaded (it is why _serve_tls_ctx can be a global).
+var _serve_tls_send_failed = 0;
+
+# Time a --tls client gets to finish the handshake, and then each request and
+# its response: 60 s, sandhi's plain-HTTP request budget (C2, 1.6.4).
+var SERVE_TLS_DEADLINE_NS = 60000000000;
+
 # ── Ref-file reader ───────────────────────────────
 #
 # Read a ref file's content as a 64-char SHA-256 hex string. Strips
@@ -59,6 +70,7 @@ fn _serve_set_tls_ctx(ctx) { _serve_tls_ctx = ctx; return 0; }
 # Returns 0 on any failure (so callers can skip the entry instead of
 # aborting the response).
 
+# Read a ref file for the server: exactly 64 hex after trimming CR/LF, else 0.
 fn serve_read_ref_file(path) {
     var pair = alloc(16);  # [data_ptr, len]
     var rc = read_file_heap(path, pair);
@@ -89,6 +101,7 @@ fn serve_read_ref_file(path) {
 # Pulling `lib/json.cyr` here would buy nothing and add a dep
 # surface inside the hot serve loop.
 
+# JSON body for GET /sit/v1/capabilities.
 fn serve_build_capabilities() {
     var sb = str_builder_new();
     # The "sit" string identifies the wire-protocol release line the server
@@ -129,6 +142,7 @@ fn serve_build_capabilities() {
 # whole response. `sit fsck` is the right tool to surface a broken
 # ref file; `serve` should keep listing what it can.
 
+# Append every valid ref under `dir` to the refs JSON being built.
 fn serve_emit_refs_subtree(sb, prefix, dir, first_ref_cell) {
     if (sf_exists(dir) != 1) { return 0; }
     # dir_walk expects a Str object (it does str_data internally) and pushes
@@ -183,6 +197,7 @@ fn serve_emit_refs_subtree(sb, prefix, dir, first_ref_cell) {
     return 0;
 }
 
+# JSON body for GET /sit/v1/refs (heads and tags).
 fn serve_build_refs() {
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"refs\":[");
@@ -223,7 +238,10 @@ fn _serve_send_status(cfd, code, msg) {
     var pos = _serve_emit_status_line(buf, 0, code, msg);
     memcpy(buf + pos, "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n", 45);
     pos = pos + 45;
-    _wire_io_send(_serve_tls_ctx, cfd, buf, pos);
+    if (_wire_io_send(_serve_tls_ctx, cfd, buf, pos) != 0) {
+        _serve_tls_send_failed = 1;
+        return 0 - 1;
+    }
     return 0;
 }
 
@@ -246,8 +264,14 @@ fn _serve_send_response(cfd, code, msg, ctype, body, body_len, extra) {
     store8(hdr + pos, 13); pos = pos + 1; store8(hdr + pos, 10); pos = pos + 1;
     if (el > 0) { memcpy(hdr + pos, extra, el); pos = pos + el; }   # extra carries its own CRLF
     memcpy(hdr + pos, "Connection: keep-alive\r\n\r\n", 26); pos = pos + 26;
-    _wire_io_send(_serve_tls_ctx, cfd, hdr, pos);
-    if (body_len > 0) { _wire_io_send(_serve_tls_ctx, cfd, body, body_len); }
+    var send_rc = _wire_io_send(_serve_tls_ctx, cfd, hdr, pos);
+    if (send_rc == 0) {
+        if (body_len > 0) { send_rc = _wire_io_send(_serve_tls_ctx, cfd, body, body_len); }
+    }
+    if (send_rc != 0) {
+        _serve_tls_send_failed = 1;
+        return 0 - 1;
+    }
     return 0;
 }
 
@@ -274,6 +298,7 @@ fn _serve_send_response(cfd, code, msg, ctype, body, body_len, extra) {
 var SIT_OBJECT_PATH_PREFIX = "/sit/v1/objects/";
 var SIT_OBJECT_PATH_PREFIX_LEN = 16;
 
+# GET /sit/v1/objects/<hex>: the stored compressed bytes, type in X-Sit-Type.
 fn serve_handle_object(cfd, path) {
     var plen = strlen(path);
     if (plen != SIT_OBJECT_PATH_PREFIX_LEN + 64) {
@@ -310,6 +335,7 @@ fn serve_handle_object(cfd, path) {
         # An object larger than the advertised cap means the repo
         # has accreted state newer than this server promises to
         # serve. Refuse rather than misadvertise.
+        fl_free(compressed);
         _serve_send_status(cfd, 413, "Payload Too Large");
         return 0;
     }
@@ -326,6 +352,10 @@ fn serve_handle_object(cfd, path) {
     store8(hdr + 12 + ty_digits + 2, 0);
     _serve_send_response(cfd, 200, "OK", "application/octet-stream",
       compressed, clen, hdr);
+    # C1 (1.6.4): db_object_read_raw hands back freelist memory; a long-running
+    # server releases it after every response (it grew ~1 MiB of RSS per GET
+    # of a 1 MiB object, from anonymous clients, without bound).
+    fl_free(compressed);
     return 0;
 }
 
@@ -352,6 +382,7 @@ fn serve_handle_object(cfd, path) {
 # lookup. Endianness: native LE on x86_64/aarch64 — load64/store64
 # do the right thing without explicit byteswaps.
 
+# POST /sit/v1/want: batched object fetch (ADR 0006 frame format).
 fn serve_handle_want(cfd, buf, n) {
     var body_off = sandhi_server_body_offset(buf, n);
     if (body_off < 0) {
@@ -430,35 +461,39 @@ fn serve_handle_want(cfd, buf, n) {
             var ty = load64(&raw + 16);
             if (obj_clen > 0) {
                 var frame_len = 64 + 8 + 8 + obj_clen;
-                # Grow response buffer if needed.
-                var grow_done = 0;
-                while (grow_done == 0) {
-                    grow_done = 1;
-                    if (resp_used + frame_len > resp_cap) {
-                        var new_cap = resp_cap * 2;
-                        if (new_cap > SIT_SERVE_MAX_BODY) {
-                            new_cap = SIT_SERVE_MAX_BODY;
-                        }
-                        if (resp_used + frame_len > new_cap) {
-                            # Already at the ceiling and it still
-                            # doesn't fit — refuse rather than
-                            # serve a truncated stream.
-                            fl_free(resp);
-                            _serve_send_status(cfd, 413, "Payload Too Large");
-                            return 0;
-                        }
-                        var new_resp = fl_alloc(new_cap);
-                        if (new_resp == 0) {
-                            fl_free(resp);
-                            _serve_send_status(cfd, 500, "Internal Server Error");
-                            return 0;
-                        }
-                        memcpy(new_resp, resp, resp_used);
-                        fl_free(resp);
-                        resp = new_resp;
-                        resp_cap = new_cap;
-                        if (resp_used + frame_len > resp_cap) { grow_done = 0; }
+                # Grow the response buffer: double until the frame fits or the
+                # body ceiling is reached. 1.6.4 (C8): this refused as soon as
+                # ONE doubling was not enough, so any first frame over ~128 KiB
+                # got 413 (the "grow again" branch was dead) and the client fell
+                # back to per-object GETs for the rest of the fetch.
+                if (resp_used + frame_len > resp_cap) {
+                    var new_cap = resp_cap;
+                    var growing = 1;
+                    while (growing == 1) {
+                        new_cap = new_cap * 2;
+                        if (new_cap >= resp_used + frame_len) { growing = 0; }
+                        if (new_cap >= SIT_SERVE_MAX_BODY) { growing = 0; }
                     }
+                    if (new_cap > SIT_SERVE_MAX_BODY) { new_cap = SIT_SERVE_MAX_BODY; }
+                    if (resp_used + frame_len > new_cap) {
+                        # At the ceiling and it still doesn't fit — refuse
+                        # rather than serve a truncated stream.
+                        fl_free(compressed);
+                        fl_free(resp);
+                        _serve_send_status(cfd, 413, "Payload Too Large");
+                        return 0;
+                    }
+                    var new_resp = fl_alloc(new_cap);
+                    if (new_resp == 0) {
+                        fl_free(compressed);
+                        fl_free(resp);
+                        _serve_send_status(cfd, 500, "Internal Server Error");
+                        return 0;
+                    }
+                    memcpy(new_resp, resp, resp_used);
+                    fl_free(resp);
+                    resp = new_resp;
+                    resp_cap = new_cap;
                 }
                 memcpy(resp + resp_used, hex, 64);
                 store64(resp + resp_used + 64, ty);
@@ -466,6 +501,9 @@ fn serve_handle_want(cfd, buf, n) {
                 memcpy(resp + resp_used + 80, compressed, obj_clen);
                 resp_used = resp_used + frame_len;
             }
+            # C1: the object copy is freelist memory — release it per object
+            # rather than holding every one for the life of the server.
+            fl_free(compressed);
         }
         # else: object missing from this DB — silently omit.
         i = i + 1;
@@ -643,18 +681,30 @@ fn _serve_rehash_and_insert(cfd, hex, claimed_ty, compressed, clen) {
         _serve_send_status(cfd, 400, "Bad Request");
         return 0;
     }
-    var dbuf = load64(&deco);
-    var dlen = load64(&deco + 8);
-    var coff = load64(&deco + 16);
+    var code = _serve_verify_and_insert(hex, claimed_ty, compressed, clen, &deco);
+    # C1 (1.6.4): the inflate buffer (up to 16 MiB) is freed per push.
+    fl_free(load64(&deco));
+    if (code == 200) { _serve_send_status(cfd, 200, "OK"); return 0; }
+    if (code == 201) { _serve_send_status(cfd, 201, "Created"); return 0; }
+    if (code == 500) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
+    _serve_send_status(cfd, 400, "Bad Request");
+    return 0;
+}
+
+# The checks behind _serve_rehash_and_insert, on an already-inflated object:
+# framing type == claimed type, SHA-256 == the requested id, then insert.
+# Returns the HTTP status to answer with (200 already present, 201 stored,
+# 400 rejected, 500 storage error).
+fn _serve_verify_and_insert(hex, claimed_ty, compressed, clen, deco) {
+    var dbuf = load64(deco);
+    var dlen = load64(deco + 8);
+    var coff = load64(deco + 16);
 
     # Verify the decompressed framing's type matches the claimed ty.
     # `coff - 1` is the index of the NUL; the type-string runs from
     # 0 to the first space (which must be at coff - 1 - <digits>).
-    if (coff < 5) { _serve_send_status(cfd, 400, "Bad Request"); return 0; }
-    # Single flag-guarded scan for the type/length separator. This used to run
-    # two passes — one to prove a space existed, a second to recover its index,
-    # because the first clobbered `sp` to force loop exit. Keeping the index in
-    # its own slot does both in one pass over the framing header.
+    if (coff < 5) { return 400; }
+    # Single flag-guarded scan for the type/length separator.
     var sp = 0;
     var found_sp = 0;
     var scan = 0;
@@ -664,33 +714,29 @@ fn _serve_rehash_and_insert(cfd, hex, claimed_ty, compressed, clen) {
         }
         scan = scan + 1;
     }
-    if (found_sp == 0) { _serve_send_status(cfd, 400, "Bad Request"); return 0; }
+    if (found_sp == 0) { return 400; }
     var declared_ty = type_code_of(dbuf, sp);
-    if (declared_ty < 0) { _serve_send_status(cfd, 400, "Bad Request"); return 0; }
-    if (declared_ty != claimed_ty) { _serve_send_status(cfd, 400, "Bad Request"); return 0; }
+    if (declared_ty < 0) { return 400; }
+    if (declared_ty != claimed_ty) { return 400; }
 
     # Recompute the hash over the full framed bytes (type + space +
     # decimal-len + NUL + content) — what write_typed_object uses to
-    # compute the canonical sit hash for any new object. hash_data
-    # returns a heap-owned cstring of 64 lowercase hex chars.
+    # compute the canonical sit hash for any new object.
     var actual_hex = hash_data(dbuf, dlen);
-    if (actual_hex == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
-    if (memeq(actual_hex, hex, 64) == 0) {
-        _serve_send_status(cfd, 400, "Bad Request");
-        return 0;
-    }
+    if (actual_hex == 0) { return 500; }
+    if (memeq(actual_hex, hex, 64) == 0) { return 400; }
 
     # Hash matches. Insert the original compressed bytes. db_object_insert_raw
     # returns 0 on actual insert, 1 on already-present, negative on error.
     var db = get_object_db();
-    if (db == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
+    if (db == 0) { return 500; }
     var rc = db_object_insert_raw(db, hex, claimed_ty, compressed, clen);
-    if (rc < 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
-    if (rc == 1) { _serve_send_status(cfd, 200, "OK"); return 0; }
-    _serve_send_status(cfd, 201, "Created");
-    return 0;
+    if (rc < 0) { return 500; }
+    if (rc == 1) { return 200; }
+    return 201;
 }
 
+# POST /sit/v1/objects/<hex>: validate framing, type and SHA-256, then store.
 fn serve_handle_put_object(cfd, path, buf, n) {
     var plen = strlen(path);
     if (plen != SIT_OBJECT_PATH_PREFIX_LEN + 64) {
@@ -749,6 +795,7 @@ fn serve_handle_put_object(cfd, path, buf, n) {
 var SIT_REF_PUT_PREFIX = "/sit/v1/refs/";
 var SIT_REF_PUT_PREFIX_LEN = 13;
 
+# POST /sit/v1/refs/<name>: validate the ref name and hex, then update the ref.
 fn serve_handle_put_ref(cfd, path, buf, n) {
     var plen = strlen(path);
     if (plen <= SIT_REF_PUT_PREFIX_LEN) {
@@ -925,6 +972,7 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
 # `ctx` is unused in v0.7.3; v0.7.5+ will pass the bearer-token
 # config + auth state through it.
 
+# Route one parsed request to its handler.
 fn serve_handle_request(ctx, cfd, buf, n) {
     var method = sandhi_server_get_method(buf, n);
     var path_with_query = sandhi_server_get_path(buf, n);
@@ -1287,6 +1335,12 @@ fn _serve_run_tls(listen_addr, port, cert, cert_len, key, key_len) {
             sock_set_recv_timeout(cfd, 30, 0);
             var ctx = tls_native_new_server(cert, cert_len, key, key_len);
             if (ctx != 0) {
+                # 1.6.4 (C2): whole-handshake and whole-request DEADLINES, as
+                # sandhi's plain-HTTP loop has (60 s). The 30 s SO_RCVTIMEO above
+                # bounds each read, not the total, so one client trickling a
+                # byte every 10 s — before or after the handshake — held this
+                # single-threaded loop for as long as it liked.
+                tls_native_set_deadline(ctx, clock_now_ns() + SERVE_TLS_DEADLINE_NS);
                 if (tls_native_server_load_creds(ctx) == TLS_OK) {
                     if (tls_native_accept(ctx, cfd) == TLS_OK) {
                         # v0.8.9 keep-alive: serve every request on this TLS
@@ -1296,12 +1350,16 @@ fn _serve_run_tls(listen_addr, port, cert, cert_len, key, key_len) {
                         # stays framed across requests.
                         var alive = 1;
                         while (alive == 1) {
+                            tls_native_set_deadline(ctx, clock_now_ns() + SERVE_TLS_DEADLINE_NS);
                             var n = _serve_tls_recv_request(ctx, reqbuf, SERVE_TLS_REQ_MAX);
                             if (n <= 0) { alive = 0; }
                             else {
+                                _serve_tls_send_failed = 0;
+                                tls_native_set_deadline(ctx, clock_now_ns() + SERVE_TLS_DEADLINE_NS);
                                 _serve_set_tls_ctx(ctx);
                                 serve_handle_request(0, cfd, reqbuf, n);
                                 _serve_set_tls_ctx(0);
+                                if (_serve_tls_send_failed == 1) { alive = 0; }
                             }
                         }
                     }
@@ -1336,6 +1394,7 @@ fn _serve_print_banner(addr, tls_on, auth_on) {
     return 0;
 }
 
+# `sit serve <repo> [--stdio | --listen <addr>:<port>] [--tls] [--require-auth]` — the sit/v1 daemon.
 fn cmd_serve() {
     if (argc() < 3) {
         eprintln("usage: sit serve <repo-path> [--stdio | --listen <addr>:<port>]");

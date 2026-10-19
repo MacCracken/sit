@@ -12,12 +12,6 @@
 # out-params use read_object's 24-byte contract {content_ptr, content_len,
 # content_off}; pack objects carry no loose framing, so content_off is 0.
 
-# One-entry pack-file cache: a sit invocation reads many objects from the same
-# pack, so hold the last-loaded pack in memory rather than re-reading per object.
-var _pack_cache_path = 0;
-var _pack_cache_data = 0;
-var _pack_cache_len = 0;
-
 # Delta-chain recursion guard (git's pack.depth default is 50; 64 is slack).
 var _pack_delta_depth = 0;
 
@@ -33,6 +27,9 @@ var _pack_delta_depth = 0;
 # behaved this way. Kept at 256 MiB as the pre-allocation sanity gate it was
 # written to be; the effective object ceiling is sankoch's 16 MiB.
 var _PACK_MAX_OBJ = 268435456;   # 256 MiB
+# Largest object a delta may reconstruct — the 16 MiB ceiling read_object
+# enforces everywhere else (D5, 1.6.4).
+var _DELTA_MAX_RESULT = 16777216;
 
 # --- big-endian readers ------------------------------------------------------
 fn _be32(p) {
@@ -102,7 +99,7 @@ var _PACK_VARINT_MAX = 10;
 # magic). rawlen is 20 (SHA-1) or 32 (SHA-256).
 fn _git_idx_lookup(idx_path, oid_raw, rawlen) {
     var pr[16];
-    if (read_file_heap(idx_path, &pr) != 0) { return 0 - 1; }
+    if (_git_file_cached(idx_path, &pr) != 0) { return 0 - 1; }
     var d = load64(&pr);
     var len = load64(&pr + 8);
     if (len < 1032) { return 0 - 1; }
@@ -165,27 +162,42 @@ fn _git_idx_lookup(idx_path, oid_raw, rawlen) {
     return _be64(large_table + idx2 * 8);
 }
 
-# --- pack load (cached) ------------------------------------------------------
-fn _git_load_pack(path, out_pair) {
-    if (_pack_cache_path != 0) {
-        if (streq(_pack_cache_path, path) == 1) {
-            store64(out_pair, _pack_cache_data);
-            store64(out_pair + 8, _pack_cache_len);
-            return 0;
-        }
+# --- .idx / .pack load (cached per path) ------------------------------------
+# Every .idx and .pack is read ONCE per process and kept.
+#
+# 1.6.4 (D3): only the most recent pack was cached, and every object lookup
+# re-read every .idx in full. sit's heap is a bump allocator that never frees,
+# so memory grew as (objects read) x (total idx size): sit_repo_status — which
+# reads every tracked blob — peaked at 263 MB on a 3,000-file repo and 4 GB on
+# 12,000 files, and owl / thoth run it in-process. Two packs read alternately
+# re-read both on every switch the same way. Now each file costs its size once.
+var _git_file_cache = 0;
+
+fn _git_file_cached(path, out_pair) {
+    if (_git_file_cache == 0) { _git_file_cache = map_new(); }
+    var hit = map_get(_git_file_cache, path);
+    if (hit != 0) {
+        store64(out_pair, load64(hit));
+        store64(out_pair + 8, load64(hit + 8));
+        return 0;
     }
     var pr[16];
     if (read_file_heap(path, &pr) != 0) { return 0 - 1; }
-    _pack_cache_data = load64(&pr);
-    _pack_cache_len = load64(&pr + 8);
+    var cell = alloc_or_die(16);
+    store64(cell, load64(&pr));
+    store64(cell + 8, load64(&pr + 8));
     var pl = strlen(path);
-    var pc = alloc(pl + 1);
-    memcpy(pc, path, pl);
-    store8(pc + pl, 0);
-    _pack_cache_path = pc;
-    store64(out_pair, _pack_cache_data);
-    store64(out_pair + 8, _pack_cache_len);
+    var key = alloc_or_die(pl + 1);
+    memcpy(key, path, pl);
+    store8(key + pl, 0);
+    map_set(_git_file_cache, key, cell);
+    store64(out_pair, load64(cell));
+    store64(out_pair + 8, load64(cell + 8));
     return 0;
+}
+
+fn _git_load_pack(path, out_pair) {
+    return _git_file_cached(path, out_pair);
 }
 
 # --- varint decoders (cursor is an i64 slot, advanced in place) --------------
@@ -293,10 +305,19 @@ fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
     if (delta_len <= 0) { return 0 - 1; }
     var cur[8];
     store64(&cur, 0);
-    if (_delta_varint(delta, &cur, delta_len) < 0) { return 0 - 1; }   # base-size (sanity field)
+    # 1.6.4 (D10): git's patch_delta rejects a delta whose declared base size is
+    # not the base it is applied to; this read the field and discarded it, so a
+    # delta against the wrong base reconstructed wrong content whenever its
+    # copies happened to fit.
+    var declared_base = _delta_varint(delta, &cur, delta_len);
+    if (declared_base < 0) { return 0 - 1; }
+    if (declared_base != base_len) { return 0 - 1; }
     var result_size = _delta_varint(delta, &cur, delta_len);
     if (result_size <= 0) { return 0 - 1; }
-    if (result_size > _PACK_MAX_OBJ) { return 0 - 1; }
+    # 1.6.4 (D5): held to the same 16 MiB object ceiling as every other read.
+    # The 256 MiB pack-entry cap let a small hostile delta make an in-process
+    # consumer allocate and fill 256 MiB per chain level.
+    if (result_size > _DELTA_MAX_RESULT) { return 0 - 1; }
     var out = alloc(result_size);
     if (out == 0) { return 0 - 2; }
     var op_out = 0;

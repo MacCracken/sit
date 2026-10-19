@@ -17,7 +17,9 @@ var SIT_REBASE_MAX = 100000;
 # The originals stay reachable through the reflog, which is what makes --abort
 # and after-the-fact recovery possible, and is why this waited for 1.1.0.
 
+# State file holding the branch tip saved before a rebase moves anything.
 fn rebase_orig_path() { return ".sit/REBASE_ORIG"; }
+# State file listing the commits a rebase still has to replay.
 fn rebase_todo_path() { return ".sit/rebase-todo"; }
 
 # Commits reachable from `tip` but not from `upstream`, oldest-first, along the
@@ -86,24 +88,72 @@ fn _rebase_write_todo(todo, from_index) {
     return 0;
 }
 
+# The todo list as a vec of 64-hex oids; 0 if the file is present but not
+# exactly a sequence of `<64 hex>\n` records naming readable objects.
+#
+# 1.6.4 (A7): this skipped any record that failed the hex check and stepped a
+# fixed 65 bytes regardless, so one stray byte (a CRLF from an editor, say)
+# misaligned every later record and the rebase "completed" having silently
+# dropped the rest of the branch. A corrupt todo now stops the rebase instead.
 fn _rebase_read_todo() {
     var out = vec_new();
     if (sf_exists(rebase_todo_path()) != 1) { return out; }
     var pair[16];
-    if (read_file_heap(rebase_todo_path(), &pair) != 0) { return out; }
+    if (read_file_heap(rebase_todo_path(), &pair) != 0) { return 0; }
     var buf = load64(&pair);
     var len = load64(&pair + 8);
+    if (len % 65 != 0) { return 0; }
     var pos = 0;
-    while (pos + 64 <= len) {
-        if (hex_prefix_valid(buf + pos, 64) == 1) {
-            var c = alloc(65);
-            memcpy(c, buf + pos, 64);
-            store8(c + 64, 0);
-            vec_push(out, c);
-        }
+    while (pos < len) {
+        if (hex_prefix_valid(buf + pos, 64) == 0) { return 0; }
+        if (load8(buf + pos + 64) != 10) { return 0; }
+        var c = alloc(65);
+        memcpy(c, buf + pos, 64);
+        store8(c + 64, 0);
+        var probe[24];
+        if (read_object(c, &probe) != 0) { return 0; }
+        vec_push(out, c);
         pos = pos + 65;
     }
     return out;
+}
+
+# Read .sit/REBASE_ORIG — `<64 hex>\n` then (since 1.6.4) the branch's ref path
+# and `\n`. Fills `out_hex` (65 bytes); returns the saved ref path (heap
+# cstring), "" for a pre-1.6.4 file without one, or 0 if the state is corrupt.
+#
+# 1.6.4 (A7): --abort trusted any 64 bytes here. NUL bytes or an oid naming a
+# missing object made materialize treat the "commit" as an empty tree, delete
+# every tracked file, write the junk into the branch ref, and report success.
+fn _rebase_read_orig(out_hex) {
+    var pair[16];
+    if (read_file_heap(rebase_orig_path(), &pair) != 0) { return 0; }
+    var b = load64(&pair);
+    var blen = load64(&pair + 8);
+    if (blen < 65) { return 0; }
+    if (hex_prefix_valid(b, 64) == 0) { return 0; }
+    if (load8(b + 64) != 10) { return 0; }
+    memcpy(out_hex, b, 64);
+    store8(out_hex + 64, 0);
+    var probe[24];
+    if (read_object(out_hex, &probe) != 0) { return 0; }
+    var rl = blen - 65;
+    if (rl > 0) { if (load8(b + blen - 1) == 10) { rl = rl - 1; } }
+    var ref = alloc_or_die(rl + 1);
+    memcpy(ref, b + 65, rl);
+    store8(ref + rl, 0);
+    return ref;
+}
+
+# 1 if HEAD is still on the branch a rebase was started on (`saved_ref`, "" for
+# a pre-1.6.4 state file, which carries no branch). 1.6.4 (A6): --abort and
+# --continue wrote whatever branch HEAD named, so `checkout main` mid-rebase
+# followed by --abort reset MAIN to the feature tip.
+fn _rebase_on_saved_branch(saved_ref) {
+    if (strlen(saved_ref) == 0) { return 1; }
+    var cur = read_head_ref_path();
+    if (cur == 0) { return 0; }
+    return streq(cur, saved_ref);
 }
 
 fn _rebase_clear_state() {
@@ -124,7 +174,12 @@ fn _rebase_run(todo, start) {
         # starts AT this commit, and --continue re-applies it after the user
         # resolves.
         if (_apply_one_commit(c, 0, cherry_pick_head_path(), "rebase", 6) != 0) {
-            _rebase_write_todo(todo, i);
+            # A todo that could not be saved would make --continue see an empty
+            # list and announce "rebase complete" with the rest unapplied.
+            if (_rebase_write_todo(todo, i) != 0) {
+                eprintln("sit: cannot save the rebase todo — 'sit rebase --abort' to restore the branch");
+                return 1;
+            }
             syscall(SYS_WRITE, STDERR, "sit: rebase stopped at ", 23);
             syscall(SYS_WRITE, STDERR, c, 12);
             syscall(SYS_WRITE, STDERR, " — resolve, 'sit add', then 'sit rebase --continue'\n", 54);
@@ -137,6 +192,7 @@ fn _rebase_run(todo, start) {
     return 0;
 }
 
+# `sit rebase <upstream> | --continue | --abort` — replay this branch's commits onto <upstream>.
 fn cmd_rebase() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -153,16 +209,17 @@ fn cmd_rebase() {
             eprintln("sit: no rebase in progress");
             return 1;
         }
-        var pair[16];
-        if (read_file_heap(rebase_orig_path(), &pair) != 0) {
-            eprintln("sit: cannot read saved rebase state");
+        var orig = alloc(65);
+        var saved_ref = _rebase_read_orig(orig);
+        if (saved_ref == 0) {
+            eprintln("sit: corrupt rebase state (.sit/REBASE_ORIG) — nothing changed");
             return 1;
         }
-        var b = load64(&pair);
-        if (load64(&pair + 8) < 64) { eprintln("sit: corrupt rebase state"); return 1; }
-        var orig = alloc(65);
-        memcpy(orig, b, 64);
-        store8(orig + 64, 0);
+        if (_rebase_on_saved_branch(saved_ref) == 0) {
+            eprint3("sit: this rebase was started on '", saved_ref, "' — check it out before --abort\n");
+            return 1;
+        }
+        var before_abort = read_head_ref();
         # Materialize before the ref moves — see the note in cmd_merge.
         if (materialize_target(orig) != 0) {
             eprintln("sit: failed to restore the working tree — branch unchanged");
@@ -172,6 +229,7 @@ fn cmd_rebase() {
             eprintln("sit: failed to restore the branch ref");
             return 1;
         }
+        reflog_head_move(before_abort, orig, "rebase: aborted");
         _rebase_clear_state();
         if (sf_exists(".sit/CHERRY_PICK_HEAD") == 1) { sf_unlink(".sit/CHERRY_PICK_HEAD"); }
         stdout_write("rebase aborted; branch restored to ", 35);
@@ -185,8 +243,31 @@ fn cmd_rebase() {
             eprintln("sit: no rebase in progress");
             return 1;
         }
-        if (sf_exists(".sit/CHERRY_PICK_HEAD") == 1) { sf_unlink(".sit/CHERRY_PICK_HEAD"); }
+        var corig = alloc(65);
+        var csaved = _rebase_read_orig(corig);
+        if (csaved == 0) {
+            eprintln("sit: corrupt rebase state (.sit/REBASE_ORIG) — 'sit rebase --abort' cannot help; inspect it");
+            return 1;
+        }
+        if (_rebase_on_saved_branch(csaved) == 0) {
+            eprint3("sit: this rebase was started on '", csaved, "' — check it out before --continue\n");
+            return 1;
+        }
         var todo = _rebase_read_todo();
+        if (todo == 0) {
+            eprintln("sit: corrupt .sit/rebase-todo — 'sit rebase --abort' to restore the branch");
+            return 1;
+        }
+        # The resolution is committed FROM THE INDEX, and the worktree is then
+        # rewritten to match it; an edit that was never `sit add`ed would be
+        # discarded without a word. git refuses here too.
+        if (vec_len(todo) > 0) {
+            if (worktree_differs_from_index() == 1) {
+                eprintln("sit: you have unstaged changes — 'sit add' the resolved files before --continue");
+                return 1;
+            }
+        }
+        if (sf_exists(".sit/CHERRY_PICK_HEAD") == 1) { sf_unlink(".sit/CHERRY_PICK_HEAD"); }
         if (vec_len(todo) == 0) {
             _rebase_clear_state();
             stdout_write("rebase complete\n", 16);
@@ -209,6 +290,7 @@ fn cmd_rebase() {
             return 1;
         }
         if (write_head_ref(new_hex) != 0) { eprintln("sit: failed to update branch ref"); return 1; }
+        reflog_head_move(head_now, new_hex, reflog_msg_subject("rebase (continue): ", msg));
         return _rebase_run(todo, 1);
     }
 
@@ -228,26 +310,40 @@ fn cmd_rebase() {
     }
     var head_hex = read_head_ref();
     if (head_hex == 0) { eprintln("sit: no commits yet"); return 1; }
+    # A1: the branch is about to be rewritten under the worktree.
+    if (is_dirty() == 1) {
+        eprintln("sit: working tree has uncommitted changes — commit or stash them before rebasing");
+        return 1;
+    }
+    var head_ref = read_head_ref_path();
+    if (head_ref == 0) {
+        eprintln("sit: HEAD is detached — check out the branch to rebase");
+        return 1;
+    }
 
     var todo = _rebase_pending(head_hex, &up);
     if (todo == 0) { return 1; }
     if (vec_len(todo) == 0) {
-        stdout_write("already up to date — nothing to rebase\n", 39);
+        stdout_write("already up to date — nothing to rebase\n", 41);
         return 0;
     }
 
     # Save the original tip FIRST: everything after this is recoverable with
     # --abort, and the reflog keeps the original commits reachable regardless.
-    var obuf = alloc(66);
+    # `<tip>\n<branch ref>\n` — the branch is what --abort / --continue check.
+    var hrl = strlen(head_ref);
+    var obuf = alloc(66 + hrl + 1);
     memcpy(obuf, head_hex, 64);
     store8(obuf + 64, 10);
-    if (sf_write_all(rebase_orig_path(), obuf, 65) < 0) {
+    memcpy(obuf + 65, head_ref, hrl);
+    store8(obuf + 65 + hrl, 10);
+    if (sf_write_all(rebase_orig_path(), obuf, 65 + hrl + 1) < 0) {
         eprintln("sit: cannot save rebase state");
         return 1;
     }
 
     # Move the branch to upstream, then replay.
-    if (materialize_target(&up) != 0) {
+    if (materialize_target_safe(&up, 1) != 0) {
         eprintln("sit: failed to check out upstream — branch unchanged");
         _rebase_clear_state();
         return 1;

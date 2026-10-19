@@ -3,15 +3,15 @@
 syscalls
 io
 sankoch
+patra
 string
 str
 fs
-patra
 alloc
 args
 vec
 chrono
+hashmap
 sigil
 freelist
 process
-hashmap

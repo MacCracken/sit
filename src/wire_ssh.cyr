@@ -478,6 +478,7 @@ fn wire_ssh_open(url) {
     #endif
 }
 
+# Close the ssh pipes and reap the ssh child.
 fn wire_ssh_close(h) {
     if (h == 0) { return 0; }
     var wfd = _ssh_handle_write_fd(h);
@@ -527,8 +528,9 @@ fn _wire_ssh_request(h, sub_path, out_body) {
     # detection on the next iteration).
     memcpy(req + pos, " HTTP/1.1\r\nHost: ssh\r\nContent-Length: 0\r\n\r\n", 43);
     pos = pos + 43;
-    var sw_t, sw_v = sock_send(wfd, req, pos);
-    if (is_err_result(sw_t) == 1) {
+    # sock_send_all, not sock_send: a write into the ssh pipe can be short (a
+    # signal mid-write), and a dropped count desynchronises the pipelined stream.
+    if (sock_send_all(wfd, req, pos) != pos) {
         eprintln("sit: write to ssh stdin failed");
         return 0 - 1;
     }
@@ -577,14 +579,12 @@ fn _wire_ssh_post_xhdr(h, sub_path, body, body_len, extra_hdr, out_body) {
     }
     memcpy(hdr + pos, "\r\n", 2); pos = pos + 2;
 
-    var sw1_t, sw1_v = sock_send(wfd, hdr, pos);
-    if (is_err_result(sw1_t) == 1) {
+    if (sock_send_all(wfd, hdr, pos) != pos) {
         eprintln("sit: write to ssh stdin failed");
         return 0 - 1;
     }
     if (body_len > 0) {
-        var sw2_t, sw2_v = sock_send(wfd, body, body_len);
-        if (is_err_result(sw2_t) == 1) {
+        if (sock_send_all(wfd, body, body_len) != body_len) {
             eprintln("sit: write of POST body to ssh stdin failed");
             return 0 - 1;
         }
@@ -856,9 +856,15 @@ fn _wire_ssh_parse_refs(buf, blen, out_pairs) {
         var nl = name_end - name_start;
         var hl = hash_end - hash_start;
         if (hl != 64) { return 0 - 1; }
+        # 1.6.4 (C5): the same gates as the HTTP sibling (_wire_http_parse_refs).
+        # Only the length was checked, so a hostile ssh remote's 64 bytes of
+        # "hash" — newlines, NULs — went straight into refs/remotes, the branch
+        # ref and the reflog on fetch / clone.
+        if (hex_prefix_valid(buf + hash_start, 64) == 0) { return 0 - 1; }
         var name_buf = alloc(nl + 1);
         memcpy(name_buf, buf + name_start, nl);
         store8(name_buf + nl, 0);
+        if (refname_valid(name_buf) == 0) { return 0 - 1; }
         var hash_buf = alloc(hl + 1);
         memcpy(hash_buf, buf + hash_start, hl);
         store8(hash_buf + hl, 0);
@@ -915,7 +921,11 @@ fn ssh_remote_read_raw(h, hex, raw_out) {
     var bbuf = load64(&body);
     var blen = load64(&body + 8);
     var ty = load64(&body + 16);
+    # 1.6.4 (C7): the full sibling gate — a known object type (0..2) and a
+    # non-empty body. `X-Sit-Type: 7` from a hostile remote was stored as-is.
     if (ty < 0) { return 0 - 1; }
+    if (ty > 2) { return 0 - 1; }
+    if (blen <= 0) { return 0 - 1; }
 
     store64(raw_out, bbuf);
     store64(raw_out + 8, blen);

@@ -5,6 +5,7 @@
 # cmd_diff / cmd_show / cmd_status which all consume the same primitives.
 # Also home to is_dirty and the working-tree walker used by status + add.
 
+# 1 if the index or worktree differs from HEAD's tree (guards checkout / merge / pull).
 fn is_dirty() {
     var index_entries = parse_index();
     if (index_entries != 0) {
@@ -24,10 +25,14 @@ fn is_dirty() {
             if (head_ent == 0) { return 1; }
             if (streq(tree_entry_hash(head_ent), idx_hex) == 0) { return 1; }
             if (sf_exists(path) == 1) {
+                # 1.6.4 (B2): a file that cannot be hashed (over the 64 MiB read
+                # cap, or a tracked file replaced by a directory) used to count
+                # as UNCHANGED, so checkout / merge / pull then overwrote it —
+                # a 70 MB uncommitted edit was replaced by the committed 6
+                # bytes. Unknown is dirty.
                 var wh = hash_file_as_blob(path);
-                if (wh != 0) {
-                    if (streq(wh, idx_hex) == 0) { return 1; }
-                }
+                if (wh == 0) { return 1; }
+                if (streq(wh, idx_hex) == 0) { return 1; }
             }
             else { return 1; }
             i = i + 1;
@@ -46,9 +51,28 @@ fn is_dirty() {
     return 0;
 }
 
-# Ensure all parent directories of `path` exist. For "src/lib/foo.cyr",
-# creates "src" and "src/lib".
-# Write "ref: <ref_path>\n" to .sit/HEAD. Returns 0 on success.
+# 1 if any tracked file's worktree content differs from what the index holds
+# for it — modified, missing, or unreadable (B2: unknown is "differs"). Staged
+# changes do not count; this is the "unstaged changes" test.
+fn worktree_differs_from_index() {
+    var index_entries = parse_index();
+    if (index_entries == 0) { return 0; }
+    var n = vec_len(index_entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(index_entries, i);
+        var path = entry_path(e);
+        if (sf_exists(path) != 1) { return 1; }
+        var wh = hash_file_as_blob(path);
+        if (wh == 0) { return 1; }
+        if (streq(wh, hex_encode(entry_hash(e), 32)) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Recursively collect every non-ignored worktree file under `fs_path` into
+# `out` as repo-relative paths (`prefix` + name). Symlinks are leaves.
 fn list_working_walk(prefix, fs_path, out, patterns) {
     var raw = sf_dir_list(str_from(fs_path));
     var n = vec_len(raw);
@@ -79,9 +103,11 @@ fn list_working_walk(prefix, fs_path, out, patterns) {
         var child_is_dir = 0;
         if (skip == 0) {
             # S-25: a symlink is a LEAF, never descended — see the note below.
-            if (is_dir(str_from(child_fs)) == 1) {
-                if (path_is_symlink(child_fs) != 1) { child_is_dir = 1; }
-            }
+            # 1.6.4 (D7): one lstat through the repo-root seam. The listing above
+            # is root-prefixed (sf_dir_list) but these two probes used the raw
+            # cwd-relative path, so `sit_repo_open(<abs>)` from another cwd saw
+            # every subdirectory as a plain file and never descended.
+            if (path_lstat_kind(sit_abs(child_fs)) == 0x4000) { child_is_dir = 1; }
         }
 
         if (skip == 0) {
@@ -158,6 +184,7 @@ fn list_working_walk(prefix, fs_path, out, patterns) {
     return 0;
 }
 
+# Every non-ignored worktree file, as repo-relative paths.
 fn list_working_files() {
     var files = vec_new();
     var patterns = load_sitignore();
@@ -174,6 +201,7 @@ fn push_status_item(vec, label, path) {
     return 0;
 }
 
+# Print a status section of {label, path} items; 0 if the section is empty.
 fn print_labeled_section(title, title_len, items) {
     if (vec_len(items) == 0) { return 0; }
     stdout_write("\n", 1);
@@ -193,6 +221,7 @@ fn print_labeled_section(title, title_len, items) {
     return 1;
 }
 
+# Print a status section of bare path names; 0 if the section is empty.
 fn print_name_section(title, title_len, names) {
     if (vec_len(names) == 0) { return 0; }
     stdout_write("\n", 1);
@@ -209,6 +238,7 @@ fn print_name_section(title, title_len, names) {
     return 1;
 }
 
+# `sit status` — branch, staged / unstaged changes and untracked files.
 fn cmd_status() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -246,8 +276,10 @@ fn cmd_status() {
             if (label != 0) { push_status_item(staged, label, path); }
 
             if (sf_exists(path) == 1) {
+                # A file status cannot hash is reported, never assumed clean (B2).
                 var working_hex = hash_file_as_blob(path);
-                if (working_hex != 0) {
+                if (working_hex == 0) { push_status_item(unstaged, "modified:  ", path); }
+                else {
                     if (streq(working_hex, idx_hash_hex) == 0) {
                         push_status_item(unstaged, "modified:  ", path);
                     }
@@ -312,8 +344,10 @@ fn cmd_status() {
 # ---- diff ------------------------------------------------------------------
 # Line layout (16 bytes): { ptr_into_data, len } — \n excluded.
 fn line_ptr(l) { return load64(l); }
+# Length of a split_lines record ({ptr, len}).
 fn line_len(l) { return load64(l + 8); }
 
+# Split a buffer into {ptr, len} line records (LF-separated, no copy).
 fn split_lines(data, len) {
     var lines = vec_new();
     var pos = 0;
@@ -332,6 +366,7 @@ fn split_lines(data, len) {
     return lines;
 }
 
+# Byte equality of two split_lines records.
 fn lines_equal(a, b) {
     var alen = line_len(a);
     var blen = line_len(b);
@@ -639,10 +674,14 @@ fn lcs_diff(a, b) {
 #   16..24: old_line (1-indexed; 0 if op has no presence in old)
 #   24..32: new_line (1-indexed; 0 if op has no presence in new)
 fn ann_kind(a) { return load64(a); }
+# Line text pointer of an annotated op.
 fn ann_line(a) { return load64(a + 8); }
+# 1-indexed line number in the old file (0 for an insert).
 fn ann_old(a)  { return load64(a + 16); }
+# 1-indexed line number in the new file (0 for a delete).
 fn ann_new(a)  { return load64(a + 24); }
 
+# Attach 1-indexed old / new line numbers to raw diff ops (see the ann_* layout above).
 fn annotate_ops(ops) {
     var out = vec_new();
     var old_line = 0;
@@ -695,6 +734,7 @@ fn annotate_ops(ops) {
 # line count; clamping here covers both callers at one point.
 var DIFF_MAX_CTX = 1000000;
 
+# Group annotated ops into hunks with `ctx_in` context lines, clamped to [0, DIFF_MAX_CTX].
 fn group_hunks(annotated, ctx_in) {
     var ctx = ctx_in;
     if (ctx < 0) { ctx = 0; }
@@ -787,6 +827,13 @@ fn hunk_ranges(hunk, out) {
         }
         i = i + 1;
     }
+    # 1.6.4 (B12): a side with no lines starts at the line BEFORE the change
+    # (GNU diff / git: `@@ -10,0 +11 @@` inserts after old line 10). It stayed
+    # 0, so `-U0` printed `-0,0` / `+0,0` and `patch` applied every pure
+    # insert at line 1. The preceding op in the whole-file annotation carries
+    # that line number; a hunk with no predecessor really does start at 0.
+    if (old_len == 0) { old_start = _hunk_prev_line(hunk, 0); }
+    if (new_len == 0) { new_start = _hunk_prev_line(hunk, 1); }
     store64(out, old_start);
     store64(out + 8, old_len);
     store64(out + 16, new_start);
@@ -794,6 +841,39 @@ fn hunk_ranges(hunk, out) {
     return 0;
 }
 
+# The whole-file annotation print_file_diff is emitting hunks from, and a
+# forward-only scan position into it (hunks arrive in file order).
+var _hunk_ann = 0;
+var _hunk_ann_pos = 0;
+
+# Old (side 0) or new (side 1) line number of the op just before `hunk`'s first
+# op in _hunk_ann — the last line on that side before the change — or 0.
+fn _hunk_prev_line(hunk, side) {
+    if (_hunk_ann == 0) { return 0; }
+    if (vec_len(hunk) == 0) { return 0; }
+    var first = vec_get(hunk, 0);
+    var n = vec_len(_hunk_ann);
+    var i = _hunk_ann_pos;
+    var found = 0 - 1;
+    while (i < n) {
+        if (vec_get(_hunk_ann, i) == first) { found = i; i = n; }
+        else { i = i + 1; }
+    }
+    if (found < 0) { return 0; }
+    _hunk_ann_pos = found;
+    var j = found - 1;
+    var line = 0;
+    while (j >= 0) {
+        var op = vec_get(_hunk_ann, j);
+        var v = ann_old(op);
+        if (side == 1) { v = ann_new(op); }
+        if (v > 0) { line = v; j = 0 - 1; }
+        else { j = j - 1; }
+    }
+    return line;
+}
+
+# Write a non-negative integer to stdout in decimal.
 fn write_unsigned(n) {
     var buf[24];
     var digits = write_decimal(&buf, n);
@@ -801,6 +881,7 @@ fn write_unsigned(n) {
     return 0;
 }
 
+# Print a unified-diff `@@ -a,b +c,d @@` header, omitting `,1` as git does.
 fn print_hunk_header(hunk) {
     var r[32];
     hunk_ranges(hunk, &r);
@@ -836,6 +917,7 @@ fn compute_file_diff(old_buf, old_len, new_buf, new_len) {
     return annotate_ops(ops);
 }
 
+# Print one file's unified diff (---/+++ headers, then hunks); 1 if the diff table is over its cap.
 fn print_file_diff(path, old_buf, old_len, new_buf, new_len, ctx) {
     stdout_write("--- a/", 6);
     stdout_write(path, strlen(path));
@@ -850,6 +932,8 @@ fn print_file_diff(path, old_buf, old_len, new_buf, new_len, ctx) {
     }
 
     var hunks = group_hunks(annotated, ctx);
+    _hunk_ann = annotated;
+    _hunk_ann_pos = 0;
 
     var h = 0;
     var hn = vec_len(hunks);
@@ -926,6 +1010,7 @@ fn read_blob_content(hex, out_pair) {
     return 0;
 }
 
+# `sit diff [--staged|HEAD] [-U<N>]` — unstaged, staged or working-vs-HEAD diffs.
 fn cmd_diff() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");

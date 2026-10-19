@@ -254,6 +254,9 @@ fn _reflog_spec_parse(name, out) {
     }
     if (ok == 0) { return 0; }
     if (ndig == 0) { return 0; }               # "@{}" rejected
+    # 1.6.4 (E13): bounded — `num * 10` wrapped, so HEAD@{18446744073709551617}
+    # resolved to HEAD@{1}. No reflog is a billion entries deep.
+    if (ndig > 9) { return 0; }
     if (j != nlen - 1) { return 0; }           # "}" must be the final byte
     store64(out, name);
     store64(out + 8, at);

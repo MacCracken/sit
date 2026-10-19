@@ -21,6 +21,7 @@ var VAL_REMOTE_URL_MAX = 4096;     # S-04
 # only checks the CHARACTER set so callers can distinguish "too short" from
 # "has bogus characters".
 
+# 1 if the first `len` bytes (1..64) are lowercase hex.
 fn hex_prefix_valid(s, len) {
     if (len == 0) { return 0; }
     if (len > 64) { return 0; }
@@ -65,6 +66,7 @@ fn _ref_is_bad_char(c) {
     return 0;
 }
 
+# 1 if `name` is a safe ref name (git check-ref-format rules, no traversal or control bytes).
 fn refname_valid(name) {
     if (name == 0) { return 0; }
     var len = strlen(name);
@@ -342,6 +344,7 @@ fn _starts_with_dot_hfs(name, len) {
     return 0;
 }
 
+# 1 if a tree entry name cannot escape the worktree or spoof .sit / .git.
 fn tree_entry_name_valid(name) {
     if (name == 0) { return 0; }
     var len = strlen(name);
@@ -389,6 +392,27 @@ fn tree_entry_name_valid(name) {
     # NTFS reserved names
     if (_is_ntfs_reserved(name, len) == 1) { return 0; }
 
+    # 1.6.4 (E12): NTFS 8.3 short names of the guarded dot-directories. On NTFS
+    # `GIT~1` / `SIT~1` resolve to `.git` / `.sit`, so a tree entry spelled that
+    # way writes into repository metadata (CVE-2014-9390 / CVE-2019-1353 class;
+    # git rejects these by default on every platform). Trailing dots and spaces
+    # are already refused above, so the exact five bytes are the whole check.
+    if (len == 5) {
+        if ((load8(name + 3) & 0xFF) == 126) {
+            if ((load8(name + 4) & 0xFF) == 49) {
+                var c0 = load8(name) & 0xDF;       # ASCII upper-case fold
+                var c1 = load8(name + 1) & 0xDF;
+                var c2 = load8(name + 2) & 0xDF;
+                if (c1 == 73) {
+                    if (c2 == 84) {
+                        if (c0 == 71) { return 0; }   # GIT~1
+                        if (c0 == 83) { return 0; }   # SIT~1
+                    }
+                }
+            }
+        }
+    }
+
     return 1;
 }
 
@@ -400,6 +424,7 @@ fn tree_entry_name_valid(name) {
 
 var VAL_TREE_PATH_MAX = 4096;
 
+# 1 if every '/'-separated segment of a relative path passes tree_entry_name_valid.
 fn tree_flat_path_valid(path) {
     if (path == 0) { return 0; }
     var len = strlen(path);
@@ -438,6 +463,7 @@ fn tree_flat_path_valid(path) {
 # executable (100755) — sit doesn't emit those today; accepting them from a
 # remote tree gives an attacker surface we don't need.
 
+# 1 for the two modes sit writes: 100644 (file) and 40000 (tree).
 fn tree_entry_mode_valid(mode) {
     if (mode == 0) { return 0; }
     if (streq(mode, "100644") == 1) { return 1; }
@@ -450,6 +476,7 @@ fn tree_entry_mode_valid(mode) {
 # Reject control chars (includes \n, \r, \0), cap lengths, and for the key
 # require dot-separated tokens that look reasonable.
 
+# 1 if a config value has no NUL, CR or LF and fits VAL_CONFIG_VALUE_MAX.
 fn config_value_valid(v) {
     if (v == 0) { return 0; }
     var len = strlen(v);
@@ -465,6 +492,7 @@ fn config_value_valid(v) {
     return 1;
 }
 
+# 1 if a config key is [A-Za-z0-9._-]+ and fits VAL_CONFIG_KEY_MAX.
 fn config_key_valid(k) {
     if (k == 0) { return 0; }
     var len = strlen(k);
@@ -563,6 +591,7 @@ fn url_authority_path_valid(s, len) {
     return 1;
 }
 
+# 1 if a remote URL is safe to store and hand to a transport (no leading '-', no control bytes).
 fn remote_url_valid(url) {
     if (url == 0) { return 0; }
     var len = strlen(url);
@@ -598,62 +627,4 @@ fn remote_url_valid(url) {
         return url_authority_path_valid(url + 6, len - 6);
     }
     return 0;
-}
-
-# ── Filesystem symlink guard (S-04, S-12) ────────────────────────
-#
-# Calls newfstatat(AT_FDCWD, path, &stat, AT_SYMLINK_NOFOLLOW) and returns:
-#   1 if path exists and is a SYMLINK
-#   0 if path exists and is NOT a symlink (regular file, dir, etc.)
-#  -1 if path does not exist or stat failed
-#
-# struct stat layout on Linux x86_64: st_mode is u32 at offset 24.
-# S_IFMT = 0xF000, S_IFLNK = 0xA000.
-
-var VAL_AT_FDCWD = 0 - 100;
-var VAL_AT_SYMLINK_NOFOLLOW = 256;
-
-fn path_is_symlink(path) {
-    #ifdef CYRIUS_TARGET_AGNOS
-    # agnos's frozen ABI has no lstat / newfstatat (§4.1 exposes only the
-    # symlink-FOLLOWING sys_stat), so a planted symlink resolves to its target
-    # and cannot be flagged here. Report 0 (not-a-symlink) for any path that
-    # exists, -1 if stat fails — preserving the contract while the S-12 guard
-    # degrades to a no-op on agnos (whose single-user capability floor has no
-    # attacker-writable symlink-plant vector today). Accepted degradation,
-    # matching darshini's lstat→stat fallback.
-    var abuf[128];
-    if (sys_stat(path, strlen(path), &abuf) < 0) { return 0 - 1; }
-    return 0;
-    #else
-    var stbuf[144];
-    var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, VAL_AT_SYMLINK_NOFOLLOW);
-    if (rc < 0) { return 0 - 1; }
-    var mode = load32(&stbuf + 24);
-    var fmt = mode & 0xF000;
-    if (fmt == 0xA000) { return 1; }
-    return 0;
-    #endif
-}
-
-# Return the file-type bits (S_IFMT-masked mode) for a path via lstat, or -1
-# if stat failed. Caller compares against 0xA000 (symlink), 0x4000 (dir),
-# 0x8000 (regular), etc. Useful for S-04's "is this a directory" and for
-# S-25's "does target already exist as something other than a dir".
-
-fn path_lstat_kind(path) {
-    #ifdef CYRIUS_TARGET_AGNOS
-    # No lstat on agnos (see path_is_symlink): sys_stat FOLLOWS symlinks, so a
-    # symlink-to-dir reports 0x4000 (dir), not 0xA000 (symlink). Accepted
-    # degradation. STAT_MODE is the agnos struct-stat mode offset (per-target).
-    var abuf[128];
-    if (sys_stat(path, strlen(path), &abuf) < 0) { return 0 - 1; }
-    return load32(&abuf + STAT_MODE) & 0xF000;
-    #else
-    var stbuf[144];
-    var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, VAL_AT_SYMLINK_NOFOLLOW);
-    if (rc < 0) { return 0 - 1; }
-    var mode = load32(&stbuf + 24);
-    return mode & 0xF000;
-    #endif
 }

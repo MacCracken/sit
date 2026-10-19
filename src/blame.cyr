@@ -1,6 +1,8 @@
 # Upper bound on the first-parent walk, mirroring SIT_DESCRIBE_MAX. A cyclic or
 # hostile parent chain reports rather than spinning.
 var SIT_BLAME_MAX_COMMITS = 100000;
+# One warning per run when a diff refuses (A13, 1.6.4).
+var _blame_warned = 0;
 
 # blame.cyr — `sit blame <path>`: per-line last-touch attribution.
 #
@@ -43,6 +45,7 @@ fn _blame_author_of(commit_hex) {
     return ident;
 }
 
+# `sit blame <path>` — the commit that last touched each line of <path>.
 fn cmd_blame() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -127,6 +130,17 @@ fn cmd_blame() {
                         if (have_par == 0) {
                             var ops = compute_file_diff(load64(&par_pair), load64(&par_pair + 8),
                               load64(&cur_pair), load64(&cur_pair + 8));
+                            # 1.6.4 (A13): when the diff gives up (the edit is
+                            # over its cap) every remaining line is credited to
+                            # this commit — say so instead of printing a
+                            # confident, wrong attribution.
+                            if (ops == 0) {
+                                if (_blame_warned == 0) {
+                                    eprintln("sit: blame: a change is too large to diff —");
+                                    eprintln("sit:   lines from before it are credited to it");
+                                    _blame_warned = 1;
+                                }
+                            }
                             if (ops != 0) {
                                 var oi = 0;
                                 var on = vec_len(ops);

@@ -7,6 +7,7 @@
 # `git status`. Not part of the product; lives with the tests.
 include "dist/sit.cyr"
 
+# Status kind → the M / N / D letter the suite asserts on.
 fn kchar(k) {
     if (k == 1) { return "M"; }
     if (k == 2) { return "N"; }
@@ -14,6 +15,7 @@ fn kchar(k) {
     return "?";
 }
 
+# Open the repo in cwd and print BRANCH / STATUS lines from the sit_repo_* API.
 fn main() {
     if (sit_repo_open(".") == 0) { eprintln("PROBE-FAIL-OPEN"); return 1; }
 
