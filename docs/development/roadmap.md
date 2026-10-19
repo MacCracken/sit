@@ -9,7 +9,7 @@
 >
 > A slot is a plan, not a promise. When a release ships, **delete its items** (the CHANGELOG is the record) and re-slot anything that slipped. Do not leave struck-through entries behind. Upstream asks, holds and closed decisions sit at the end, outside the version slots.
 
-**Where we are:** `1.7.2`, on cyrius 6.7.15. The 1.6.x line closed with a P(-1) audit ([`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md); 16 HIGH, all fixed). 1.7.0 bound bearer tokens to remotes ([ADR 0014](../adr/0014-bearer-tokens-bound-to-remotes.md)) and refuses commits of unresolved conflicts. 1.7.1 took patra 1.16.x and makes a refused object insert or commit fail before any ref moves; 1.7.2 finished that sweep (a hole in a source's closure, the legacy index migration, the last unchecked patra statuses) and shipped the audit's small fixes (ssh read deadline, `add` ignore scoping, the no-newline marker, C1 / bidi escaping). **35 commands.** The items below are what that audit still defers, plus the long-standing structural and CLI work.
+**Where we are:** `1.7.3`, on cyrius 6.7.15. The 1.6.x line closed with a P(-1) audit ([`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md); 16 HIGH, all fixed). 1.7.0 bound bearer tokens to remotes ([ADR 0014](../adr/0014-bearer-tokens-bound-to-remotes.md)) and refuses commits of unresolved conflicts. 1.7.1 took patra 1.16.x and makes a refused object insert or commit fail before any ref moves; 1.7.2 finished that sweep (a hole in a source's closure, the legacy index migration, the last unchecked patra statuses) and shipped the audit's small fixes (ssh read deadline, `add` ignore scoping, the no-newline marker, C1 / bidi escaping); 1.7.3 made `rebase` and `describe` walk every parent and `describe` / the tag and branch listings see nested ref names. **35 commands.** The items below are what that audit still defers, plus the long-standing structural and CLI work.
 
 ---
 
@@ -25,12 +25,7 @@ Each item ships under the usual test / fuzz / poison / bench gates.
 
 ## 1.7.x — patch line (no new surface)
 
-Audit ids (A8, D6, …) refer to [`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md).
-
-### 1.7.3 — history walks
-
-- **`rebase` walks first parents only (A8, MEDIUM).** When the merge base is reachable only through a merge's second parent (upstream merged into the feature branch), the pending walk misses it and replays commits upstream already has, down to the root. Needs the "reachable from tip, not from upstream" set over all parents, then a topological replay order.
-- **`describe` is first-parent only, nondeterministic on ties, and ignores nested tags (E14, LOW).** Walk all parents, as git does by default. Break ties by name. Read `refs/tags/` recursively, as `sit tag` listing should too: `release/v1` lists as `release` today.
+Audit ids (C1, D6, …) refer to [`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md).
 
 ### 1.7.4 — resource bounds
 
@@ -47,7 +42,7 @@ Audit ids (A8, D6, …) refer to [`../audit/2026-10-19-audit.md`](../audit/2026-
 New behaviour on existing commands, which is minor-level surface under the tiers above.
 
 - **`stash pop` with a three-way apply (A5 follow-on).** Since 1.6.4, pop refuses once HEAD has moved past the stash's base (it used to roll every later commit back). Applying the stash onto a moved HEAD is cherry-pick of the stash commit without committing: `_apply_one_commit` minus the commit, through `_apply_conflicted_merge` on a conflict.
-- **Honour `sit merge -m <msg>`.** Accepted and ignored since the command existed; CI has passed it since v0.5.x without noticing. git uses it to set the merge commit's message. It changes commit text, so it wants its own tests. The tolerance is pinned at `merge.cyr:724`, `tests/integration/run.sh:797` and `.github/workflows/ci.yml:561`.
+- **Honour `sit merge -m <msg>`.** Accepted and ignored since the command existed; CI has passed it since v0.5.x without noticing. git uses it to set the merge commit's message. It changes commit text, so it wants its own tests. The tolerance is pinned at `merge.cyr:729`, `tests/integration/run.sh:797` and `.github/workflows/ci.yml:561`.
 - **Reflog `expire` / `delete` and the `@{<date>}` selector.**
   - Reflog entries are unbounded, so `fsck --prune` reclaims reflog-protected objects only via `--prune-now`; expiry closes that.
   - `expire` / `delete` are new subcommands, and `@{<date>}` is new selector syntax.
@@ -106,11 +101,11 @@ Re-checked 2026-10-19 against **cmdit 1.4.0** (latest tag; its own pin is cyrius
   | `add -f` | `index.cyr:17` |
   | `rm --cached` | `index.cyr:738` |
   | `reset --hard` | `index.cyr:637` |
-  | `checkout -b` | `refs.cyr:654` |
-  | `branch -d` | `refs.cyr:540` |
-  | `tag -d` / `-a` / `-s` | `refs.cyr:349,390,392` |
-  | `merge --abort` / `-S` | `merge.cyr:746,774` |
-  | `rebase --abort` / `--continue` | `rebase.cyr:207,242` |
+  | `checkout -b` | `refs.cyr:693` |
+  | `branch -d` | `refs.cyr:576` |
+  | `tag -d` / `-a` / `-s` | `refs.cyr:397,439,441` |
+  | `merge --abort` / `-S` | `merge.cyr:751,779` |
+  | `rebase --abort` / `--continue` | `rebase.cyr:257,292` |
   | `config --global` | `config.cyr:302` |
 - **Scanning loops:**
 
@@ -180,12 +175,13 @@ Re-checked 2026-10-19 against **cmdit 1.4.0** (latest tag; its own pin is cyrius
   modules = ["dist/cmdit.cyr"]
   ```
 - **Tests:** `tests/sit.tcyr` / `tests/sit.fcyr` don't touch CLI parsing. The bar is `tests/integration/run.sh` plus CI's smoke steps (and `scripts/benchmark.sh`'s invocations), with stdout / stderr byte-identical.
-- **argv safety:** `lib/args.cyr` (cyrius 6.7.15, `args_init` at `:167-173`) reads the command line into a heap buffer, so `cmdit_argv`'s stored pointers are safe. The old stack-buffer hazard ([architecture 001](../architecture/001-args-stack-buffer-lifetime.md), and the octopus comment at `merge.cyr:1356`) no longer applies.
+- **argv safety:** `lib/args.cyr` (cyrius 6.7.15, `args_init` at `:167-173`) reads the command line into a heap buffer, so `cmdit_argv`'s stored pointers are safe. The old stack-buffer hazard ([architecture 001](../architecture/001-args-stack-buffer-lifetime.md), and the octopus comment at `merge.cyr:1361`) no longer applies.
 
 ## 1.x — unscheduled
 
 Wanted, not yet committed to a release. Each earns its own minor when its time comes.
 
+- **A commit-parent cache (commit-graph).** Every history walk reads each commit object afresh, about 75 µs apiece. That makes whole-ancestry walks cost about 150 ms per 2,000 commits: `find_merge_base` on every merge, `rebase`'s pending set, and `describe` when a merge lies between the commit and its nearest tag (1.7.3). git keeps a commit-graph file for the same reason. A parent table in `objects.patra`, filled on write and backfilled once, would cut the walks to table reads. Measure `merge-base` / `describe` / `rebase` on a 100k-commit fixture first.
 - **Hooks** (`pre-commit`, `pre-push`, …), if a consumer asks.
 
 ---
@@ -209,4 +205,4 @@ Closed by measurement. The reasoning lives where cited; they are listed here onl
 
 ---
 
-*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/), latest [`2026-10-19-v1.7.2.md`](../benchmarks/2026-10-19-v1.7.2.md). Security audit reports are in [`../audit/`](../audit/), latest [`2026-10-19-audit.md`](../audit/2026-10-19-audit.md).*
+*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/), latest [`2026-10-19-v1.7.3.md`](../benchmarks/2026-10-19-v1.7.3.md). Security audit reports are in [`../audit/`](../audit/), latest [`2026-10-19-audit.md`](../audit/2026-10-19-audit.md).*

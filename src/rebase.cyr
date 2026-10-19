@@ -22,46 +22,96 @@ fn rebase_orig_path() { return ".sit/REBASE_ORIG"; }
 # State file listing the commits a rebase still has to replay.
 fn rebase_todo_path() { return ".sit/rebase-todo"; }
 
-# Commits reachable from `tip` but not from `upstream`, oldest-first, along the
-# first-parent chain. That is the set a rebase replays.
+# A heap copy of a 64-hex commit id.
+fn _rebase_hex_dup(h) {
+    var c = alloc_or_die(65);
+    memcpy(c, h, 64);
+    store8(c + 64, 0);
+    return c;
+}
+
+# The commits a rebase replays: reachable from `tip` over every parent, not
+# reachable from `upstream`, merge commits left out, oldest-first in
+# topological order (each commit after all of its parents). That is git's
+# default `upstream..tip`, linearized.
+#
+# 1.7.3 (A8): this used to follow first parents from `tip` down to the merge
+# base. When upstream had been merged INTO the branch, the base was reachable
+# only through that merge's second parent, the walk never met it, and rebase
+# replayed everything down to the root, upstream's own commits included.
+# Merges are dropped as git drops them: the branch-only commits they brought
+# in are in the set themselves, and what they brought from upstream is
+# already on upstream.
 fn _rebase_pending(tip, upstream) {
-    var base = find_merge_base(tip, upstream);
-    var newest_first = vec_new();
-    var cur = tip;
-    var guard = 0;
-    var walking = 1;
-    while (walking == 1) {
-        if (cur == 0) { walking = 0; }
-        else {
-            var at_base = 0;
-            if (base != 0) {
-                if (streq(cur, base) == 1) { at_base = 1; }
-            }
-            if (at_base == 1) { walking = 0; }
-            else {
-                guard = guard + 1;
-                if (guard > SIT_REBASE_MAX) {
-                    eprintln("sit: rebase range too long");
-                    return 0;
-                }
-                var c = alloc(65);
-                memcpy(c, cur, 64);
-                store8(c + 64, 0);
-                vec_push(newest_first, c);
-                var parents = commit_parents_of(cur);
-                cur = 0;
-                if (parents != 0) {
-                    if (vec_len(parents) > 0) { cur = vec_get(parents, 0); }
+    # Phase 1: everything upstream already has (the same full-DAG walk
+    # find_merge_base makes of one side).
+    var have = map_new();
+    var q = vec_new();
+    vec_push(q, _rebase_hex_dup(upstream));
+    while (vec_len(q) > 0) {
+        var cur = vec_get(q, vec_len(q) - 1);
+        vec_pop(q);
+        if (map_has(have, cur) == 0) {
+            map_set(have, cur, 1);
+            var pv = commit_parents_of(cur);
+            if (pv != 0) {
+                var pi = 0;
+                while (pi < vec_len(pv)) {
+                    vec_push(q, vec_get(pv, pi));
+                    pi = pi + 1;
                 }
             }
         }
     }
-    # Collected newest-first; replay oldest-first.
+
+    # Phase 2: iterative post-order DFS from `tip`, pruned at `have`. A commit
+    # is emitted once every parent has been, so the list comes out
+    # oldest-first; parents are taken in order, so a first-parent line stays
+    # together. Three parallel stacks: the commit, its parents, the next
+    # parent to visit.
     var out = vec_new();
-    var i = vec_len(newest_first);
-    while (i > 0) {
-        i = i - 1;
-        vec_push(out, vec_get(newest_first, i));
+    var seen = map_new();
+    var st_c = vec_new();
+    var st_p = vec_new();
+    var st_k = vec_new();
+    var t = _rebase_hex_dup(tip);
+    if (map_has(have, t) == 0) {
+        map_set(seen, t, 1);
+        vec_push(st_c, t);
+        vec_push(st_p, commit_parents_of(t));
+        vec_push(st_k, 0);
+    }
+    while (vec_len(st_c) > 0) {
+        var top = vec_len(st_c) - 1;
+        var c = vec_get(st_c, top);
+        var parents = vec_get(st_p, top);
+        var k = vec_get(st_k, top);
+        var np = 0;
+        if (parents != 0) { np = vec_len(parents); }
+        if (k < np) {
+            vec_set(st_k, top, k + 1);
+            var p = vec_get(parents, k);
+            if (map_has(have, p) == 0) {
+                if (map_has(seen, p) == 0) {
+                    map_set(seen, p, 1);
+                    vec_push(st_c, p);
+                    vec_push(st_p, commit_parents_of(p));
+                    vec_push(st_k, 0);
+                }
+            }
+        }
+        else {
+            vec_pop(st_c);
+            vec_pop(st_p);
+            vec_pop(st_k);
+            if (np <= 1) {
+                vec_push(out, c);
+                if (vec_len(out) > SIT_REBASE_MAX) {
+                    eprintln("sit: rebase range too long");
+                    return 0;
+                }
+            }
+        }
     }
     return out;
 }

@@ -4,6 +4,57 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.3] — 2026-10-19 — rebase and describe walk every parent; nested ref names
+
+The 1.7.3 slot: the two history-walk findings the 2026-10-19 audit ([`docs/audit/2026-10-19-audit.md`](docs/audit/2026-10-19-audit.md)) deferred, A8 and E14. There is no new surface, and the toolchain stays at cyrius 6.7.15.
+
+### Fixed — `rebase` replays `upstream..branch` over every parent (audit A8, MEDIUM)
+
+`_rebase_pending` followed first parents from the branch tip until it met the merge base. When upstream had been merged into the branch, that base was reachable only through the merge's second parent. The walk never met it, and the rebase replayed everything down to the root: upstream's own commits, the merges, and the root commit.
+
+The set is now git's default `upstream..HEAD`:
+- every commit reachable from the tip, over all parents, that upstream does not already have
+- merge commits dropped, as git drops them: the branch-only commits they brought in are in the set themselves, and what they brought from upstream is already on upstream
+- replayed oldest-first in topological order, each commit after all of its parents, with a first-parent line kept together
+
+Repro: a branch that merged upstream, then merged a topic branch, while upstream later edited a file one of its earlier commits created.
+
+| | 1.7.2 | 1.7.3 |
+|---|---|---|
+| commits queued | 6 (the root and both merges among them) | 4 |
+| outcome | stops on a `u.txt` conflict, replaying upstream's own change against its newer one | completes; history `F3 T1 F2 F1 U2 U1 B`, every file at its final content |
+
+The walk no longer calls `find_merge_base`. It collects upstream's ancestry once (the same full-DAG walk `find_merge_base` made of one side), so the cost is unchanged: 154 → 151 ms for a 3-commit branch on a 2,000-commit history.
+
+### Fixed — `describe` counts every parent, breaks ties the same way every run, and sees nested tags (audit E14)
+
+- **The count is git's documented one.** The number is the commits in `<tag>..<commit>`, and the tag with the fewest wins. `describe` used to take the first tag on the first-parent chain and count first-parent steps. A merge's second parent was invisible: its commits went uncounted, and a tag reachable only through it was never found.
+  - The rule is computed exactly. One walk collects the commit's ancestry. One topological pass then propagates a bit per candidate tag (the nearest 62) to its ancestors, so each tag's count is that ancestry minus the tag's own.
+  - On six shapes the result equals `git describe --tags` once commits carry distinct timestamps. git's implementation approximates the rule with a commit-date-ordered walk: with every commit in the same second it prints `zz-near-9` where its own `git rev-list --count release/v3..HEAD` is 4. sit prints `release/v3-4`, and does not depend on timestamps.
+- **Ties are fixed.** Two tags on one commit used to resolve by directory-listing order. Now an annotated tag wins over a lightweight one (git's preference), then the smaller name.
+- **Nested tags count.** Tag names come from the whole `refs/tags` tree. `release/v1` was a directory `describe` skipped.
+- **The common case stays as cheap as before.** Along a chain of single-parent commits, the first tagged commit wins outright, since everything past it is its own ancestry, so `describe` reads only the commits up to it: 2 ms in 1.7.2, 1 ms in 1.7.3, on a 2,000-commit linear history.
+  - Through a merge, the exact count needs the whole ancestry: 151 ms on 2,000 commits. 1.7.2 answered in 2 ms but undercounted, `near-11` for the true `near-12`.
+  - The per-commit cost is the object read every history walk pays (`find_merge_base` too). A commit-parent cache is now on the roadmap.
+
+### Fixed — nested ref names list in full and delete cleanly
+
+`sit tag` and `sit branch` listed one directory level, so `release/v1` listed as `release` and `feature/x` as `feature`.
+- **Listings recurse.** A shared `ref_names_under` reads the whole `refs/tags` / `refs/heads` tree, sorted, by full name. `describe` uses it too. `fsck`'s root walk always recursed, so nested refs were never at risk of being pruned.
+- **Deletes prune.** `tag -d` and `branch -d` remove the directories a nested ref leaves empty, including the branch's reflog directory, and never remove `refs/heads` / `refs/tags` themselves. An empty `feature/` used to block a later branch named `feature`, as it does in git.
+
+### Tests
+
+- **Integration, 310 → 324.** Section 26 covers:
+  - the A8 rebase
+  - six `describe` shapes: linear, a merge's second parent, a tag only a second parent reaches, annotated over lightweight, nested, and fewest-commits over nearer-looking
+  - nested listing and deletion
+
+  13 of its 14 assertions fail on the 1.7.2 build. The linear-history control passes on both, as it should.
+- **Unit:** 464, unchanged. The walks read the object store, so they are tested end to end.
+
+**Benchmarks** ([`docs/benchmarks/2026-10-19-v1.7.3.md`](docs/benchmarks/2026-10-19-v1.7.3.md)): `describe` and `rebase` as above. Every micro and head-to-head row is flat against 1.7.2: `log-100commits` 9.30 → 9.35 ms, `clone-100commits` 60.60 → 61.58 ms, `lcs-diff-1000x1000` 30.84 → 31.02 ms.
+
 ## [1.7.2] — 2026-10-19 — holes in a source's closure refused; ssh read deadline; add ignore scoping; no-newline marker; C1 / bidi escaping
 
 The 1.7.2 slot. It finishes 1.7.1's storage sweep and fixes four LOW findings the 2026-10-19 audit ([`docs/audit/2026-10-19-audit.md`](docs/audit/2026-10-19-audit.md)) deferred: C10, B13, B14 and E10. There is no new surface, and the toolchain stays at cyrius 6.7.15.
@@ -108,7 +159,8 @@ Ref names are not refused, because git allows non-ASCII names. They are stored a
 | copy-objects-100 | 162.02 µs | 162.30 µs |
 
 The diff win comes from the line-record encoding above. `log` absorbs the UTF-8-aware sanitizer at no measurable cost. Everything else is flat.
- — 2026-10-19 — cyrius 6.7.15; a refused object write never moves a ref
+
+## [1.7.1] — 2026-10-19 — cyrius 6.7.15; a refused object write never moves a ref
 
 A toolchain patch. It folds patra 1.16.1–1.16.5, which 1.7.0 flagged as worth taking for their row-loss and fdatasync fixes. Taking them changed what a failed `patra_commit` means, and sit was ignoring that status, so this release also fixes the write paths that relied on it.
 

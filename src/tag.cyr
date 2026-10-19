@@ -28,10 +28,14 @@ var OBJ_TY_TAG = 3;
 # _WIRE_MAX_DEPTH in the tree walk.
 var TAG_PEEL_MAX = 16;
 
-# Upper bound on the first-parent walk in `describe`. A repository with more
-# history than this simply reports no tag rather than walking indefinitely on a
-# cyclic or hostile parent chain.
+# Upper bound on the commits `describe` walks (the described commit's whole
+# ancestry since 1.7.3). A larger history is refused rather than walked
+# without end on a hostile parent graph.
 var SIT_DESCRIBE_MAX = 100000;
+
+# Tags that compete for `describe`, nearest first: one bit each in an i64
+# (git's default is 10).
+var SIT_DESCRIBE_CANDIDATES = 62;
 
 # Build an annotated tag object body. `seed` non-zero also signs it.
 # Returns the heap body with its length at *out_len, or 0 on failure.
@@ -402,26 +406,25 @@ fn cmd_describe() {
     }
 
     # commit-oid -> tag-name, built once. Annotated tags are peeled so both
-    # kinds land on the commit they describe.
+    # kinds land on the commit they describe. 1.7.3 (E14): names come from the
+    # whole refs/tags tree (release/v1 was invisible), and two tags on one
+    # commit resolve the same way every run: annotated over lightweight (as
+    # git prefers), then the smaller name (the listing is sorted).
     if (sf_exists(".sit/refs/tags") != 1) {
         eprintln("sit: no tags found to describe");
         return 1;
     }
-    var raw = sf_dir_list(str_from(".sit/refs/tags"));
+    var names = ref_names_under(".sit/refs/tags");
     var tagmap = map_new();
-    var tn = vec_len(raw);
+    var tag_ann = map_new();
     var ti = 0;
-    while (ti < tn) {
-        var s = vec_get(raw, ti);
-        var slen = str_len(s);
-        var nm = alloc(slen + 1);
-        memcpy(nm, str_data(s), slen);
-        store8(nm + slen, 0);
-
-        var tpath = alloc(15 + slen + 1);
+    while (ti < vec_len(names)) {
+        var nm = vec_get(names, ti);
+        var nl = strlen(nm);
+        var tpath = alloc(15 + nl + 1);
         memcpy(tpath, ".sit/refs/tags/", 15);
-        memcpy(tpath + 15, nm, slen);
-        store8(tpath + 15 + slen, 0);
+        memcpy(tpath + 15, nm, nl);
+        store8(tpath + 15 + nl, 0);
         var pair[16];
         if (read_file_heap(tpath, &pair) == 0) {
             var rb = load64(&pair);
@@ -433,9 +436,20 @@ fn cmd_describe() {
                     store8(oid + 64, 0);
                     var peeled = peel_tag(oid);
                     if (peeled != 0) {
-                        # First tag wins for a given commit — deterministic
-                        # because sf_dir_list is sorted below.
-                        if (map_has(tagmap, peeled) == 0) { map_set(tagmap, peeled, nm); }
+                        var annotated = 0;
+                        if (streq(peeled, oid) == 0) { annotated = 1; }
+                        if (map_has(tagmap, peeled) == 0) {
+                            map_set(tagmap, peeled, nm);
+                            map_set(tag_ann, peeled, annotated);
+                        }
+                        else {
+                            if (annotated == 1) {
+                                if (map_get(tag_ann, peeled) == 0) {
+                                    map_set(tagmap, peeled, nm);
+                                    map_set(tag_ann, peeled, 1);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -443,46 +457,173 @@ fn cmd_describe() {
         ti = ti + 1;
     }
 
-    # Walk back from `start`, counting distance. First-parent order matches
-    # git's default `describe` behaviour on merge-bearing history.
-    var cur = start;
-    var depth = 0;
-    var walking = 1;
-    var found = 0;
-    while (walking == 1) {
-        if (map_has(tagmap, cur) == 1) { found = 1; walking = 0; }
-        else {
-            var parents = commit_parents_of(cur);
-            if (parents == 0) { walking = 0; }
-            else {
-                if (vec_len(parents) == 0) { walking = 0; }
-                else {
-                    cur = vec_get(parents, 0);
-                    depth = depth + 1;
-                    if (depth > SIT_DESCRIBE_MAX) {
-                        eprintln("sit: describe walked too far without finding a tag");
-                        return 1;
-                    }
+    var parents_of = map_new();
+
+    # Fast path, exact: along a chain of single-parent commits from `start`,
+    # the first tagged commit T wins outright. Everything past T is T's own
+    # ancestry, so every other tag's `tag..start` strictly contains T's. That
+    # is the common linear case, and it costs only the distance to T (the full
+    # walk below costs the whole history: 1 ms vs 152 ms at 2,000 commits).
+    var fc = start;
+    var fd = 0;
+    var linear = 1;
+    while (linear == 1) {
+        if (map_has(tagmap, fc) == 1) {
+            var hit = map_get(tagmap, fc);
+            write_sanitized(STDOUT, hit, strlen(hit));   # E8: a ref filename
+            if (fd > 0) {
+                stdout_write("-", 1);
+                var fbuf[24];
+                var fdl = write_decimal(&fbuf, fd);
+                stdout_write(&fbuf, fdl);
+                stdout_write("-g", 2);
+                stdout_write(start, 12);
+            }
+            stdout_write("\n", 1);
+            return 0;
+        }
+        var fpv = commit_parents_of(fc);
+        map_set(parents_of, fc, fpv);
+        linear = 0;
+        if (fpv != 0) {
+            if (vec_len(fpv) == 1) {
+                fc = vec_get(fpv, 0);
+                fd = fd + 1;
+                linear = 1;
+                if (fd > SIT_DESCRIBE_MAX) {
+                    eprintln("sit: describe: history too long to walk");
+                    return 1;
                 }
             }
         }
     }
 
-    if (found == 0) {
+    # 1.7.3 (E14): every parent, as git's describe walks by default. The first
+    # tag on the first-parent chain used to win, with its first-parent
+    # distance. git's count is the number of commits in `<tag>..<commit>`, and
+    # it names the candidate with the smallest count; so does this.
+    #
+    # Phase 1: the commit's whole ancestry S, in BFS order, with each commit's
+    # parents (reusing the fast path's reads) and its number of children in S.
+    var kids = map_new();
+    var order = vec_new();
+    var seen = map_new();
+    map_set(seen, start, 1);
+    vec_push(order, start);
+    var head = 0;
+    while (head < vec_len(order)) {
+        var c = vec_get(order, head);
+        head = head + 1;
+        var pv = 0;
+        if (map_has(parents_of, c) == 1) { pv = map_get(parents_of, c); }
+        else {
+            pv = commit_parents_of(c);
+            map_set(parents_of, c, pv);
+        }
+        if (pv != 0) {
+            var pi = 0;
+            while (pi < vec_len(pv)) {
+                var p = vec_get(pv, pi);
+                map_set(kids, p, map_get(kids, p) + 1);
+                if (map_has(seen, p) == 0) {
+                    map_set(seen, p, 1);
+                    vec_push(order, p);
+                    if (vec_len(order) > SIT_DESCRIBE_MAX) {
+                        eprintln("sit: describe: history too long to walk");
+                        return 1;
+                    }
+                }
+                pi = pi + 1;
+            }
+        }
+    }
+
+    # The nearest tagged commits (BFS order) are the candidates, one bit each.
+    var cand = vec_new();
+    var bit_of = map_new();
+    var oi = 0;
+    while (oi < vec_len(order)) {
+        var oc = vec_get(order, oi);
+        if (map_has(tagmap, oc) == 1) {
+            if (vec_len(cand) < SIT_DESCRIBE_CANDIDATES) {
+                map_set(bit_of, oc, 1 << vec_len(cand));
+                vec_push(cand, oc);
+            }
+        }
+        oi = oi + 1;
+    }
+    if (vec_len(cand) == 0) {
         eprintln("sit: no tag found describing this commit");
         return 1;
     }
 
-    var tagname = map_get(tagmap, cur);
-    write_sanitized(STDOUT, tagname, strlen(tagname));   # E8: a ref filename
-    if (depth > 0) {
-        stdout_write("-", 1);
-        var nbuf[24];
-        var d = write_decimal(&nbuf, depth);
-        stdout_write(&nbuf, d);
-        stdout_write("-g", 2);
-        stdout_write(start, 12);
+    # Phase 2: children before parents (Kahn's order from `start`), so a
+    # candidate's bit reaches every one of its ancestors. A commit carrying a
+    # candidate's bit is reachable from that tag; the rest of S is `tag..start`.
+    var flags = map_new();
+    var ready = vec_new();
+    vec_push(ready, start);
+    var rh = 0;
+    var within = alloc(8 * SIT_DESCRIBE_CANDIDATES);
+    memset(within, 0, 8 * SIT_DESCRIBE_CANDIDATES);
+    var nc = vec_len(cand);
+    while (rh < vec_len(ready)) {
+        var c2 = vec_get(ready, rh);
+        rh = rh + 1;
+        var f = map_get(flags, c2) | map_get(bit_of, c2);
+        var b = 0;
+        while (b < nc) {
+            if ((f & (1 << b)) != 0) { store64(within + b * 8, load64(within + b * 8) + 1); }
+            b = b + 1;
+        }
+        var pv2 = map_get(parents_of, c2);
+        if (pv2 != 0) {
+            var pj = 0;
+            while (pj < vec_len(pv2)) {
+                var p2 = vec_get(pv2, pj);
+                map_set(flags, p2, map_get(flags, p2) | f);
+                var left = map_get(kids, p2) - 1;
+                map_set(kids, p2, left);
+                if (left == 0) { vec_push(ready, p2); }
+                pj = pj + 1;
+            }
+        }
     }
+
+    # Smallest count wins; a tie goes to an annotated tag, then the smaller name.
+    var total = vec_len(order);
+    var best = 0 - 1;
+    var best_n = 0;
+    var k = 0;
+    while (k < nc) {
+        var n_k = total - load64(within + k * 8);
+        var take = 0;
+        if (best < 0) { take = 1; }
+        else {
+            if (n_k < best_n) { take = 1; }
+            if (n_k == best_n) {
+                var ck = vec_get(cand, k);
+                var cb = vec_get(cand, best);
+                var ak = map_get(tag_ann, ck);
+                var ab = map_get(tag_ann, cb);
+                if (ak > ab) { take = 1; }
+                if (ak == ab) {
+                    if (strcmp_cstr(map_get(tagmap, ck), map_get(tagmap, cb)) < 0) { take = 1; }
+                }
+            }
+        }
+        if (take == 1) { best = k; best_n = n_k; }
+        k = k + 1;
+    }
+
+    var tagname = map_get(tagmap, vec_get(cand, best));
+    write_sanitized(STDOUT, tagname, strlen(tagname));   # E8: a ref filename
+    stdout_write("-", 1);
+    var nbuf[24];
+    var d = write_decimal(&nbuf, best_n);
+    stdout_write(&nbuf, d);
+    stdout_write("-g", 2);
+    stdout_write(start, 12);
     stdout_write("\n", 1);
     return 0;
 }

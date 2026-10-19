@@ -1420,6 +1420,55 @@ if [ -n "$GIT_PROBE" ]; then
   assert_contains "$("$GIT_PROBE" 2>/dev/null)" "BRANCH evil?name" "25h: sit_repo_branch returns the name made safe"
 fi
 
+# ── 26. 1.7.3: history walks over every parent ─────────────────────
+hr "1.7.3 history walks"
+c173() { echo "$2" > "$1"; c164 "$1"; m164 "$3"; }
+
+# 26a. rebase replays `upstream..branch` over all parents (A8). With upstream
+# merged INTO the branch, the old first-parent walk missed the merge base,
+# replayed upstream's own commits and the merges, and stopped on a conflict.
+a164 r173; c173 b.txt base B
+"$SIT" branch feature >/dev/null; c173 u.txt u1 U1
+"$SIT" checkout feature >/dev/null; c173 f1.txt f1 F1; "$SIT" merge main >/dev/null 2>&1
+"$SIT" branch topic >/dev/null; "$SIT" checkout topic >/dev/null; c173 t.txt t1 T1
+"$SIT" checkout feature >/dev/null; c173 f2.txt f2 F2; "$SIT" merge topic >/dev/null 2>&1; c173 f3.txt f3 F3
+"$SIT" checkout main >/dev/null; c173 u.txt u2 U2
+"$SIT" checkout feature >/dev/null
+ROUT=$("$SIT" rebase main 2>&1); RRC=$?
+assert_eq "$RRC" "0" "26a: rebase over a merged-in upstream completes"
+assert_contains "$ROUT" "rebasing 4 commit(s)" "26a: only the branch's own commits, merges dropped"
+assert_eq "$("$SIT" log --oneline | sed 's/^[0-9a-f]* //' | tr '\n' ' ')" "F3 T1 F2 F1 U2 U1 B " "26a: linear history, each commit after its parents"
+assert_eq "$(cat u.txt)$(cat f1.txt)$(cat t.txt)$(cat f2.txt)$(cat f3.txt)" "u2f1t1f2f3" "26a: every file at its final content"
+
+# 26b. describe counts `<tag>..<commit>` over every parent and names the tag
+# with the fewest (E14), as git documents it; ties go to an annotated tag.
+dsc() { "$SIT" describe 2>&1 | sed 's/-g[0-9a-f]*$//'; }
+a164 d173; c173 a.txt 1 B; "$SIT" tag v1 >/dev/null; c173 a.txt 2 C; c173 a.txt 3 D
+assert_eq "$(dsc)" "v1-2" "26b: linear history"
+"$SIT" branch feature >/dev/null; "$SIT" checkout feature >/dev/null
+c173 f.txt 1 F1; c173 f.txt 2 F2; c173 f.txt 3 F3
+"$SIT" checkout main >/dev/null; c173 m.txt 1 X; "$SIT" merge feature >/dev/null 2>&1
+assert_eq "$(dsc)" "v1-7" "26b: a merge counts the commits its second parent brings"
+"$SIT" checkout feature >/dev/null; c173 f.txt 4 F4; "$SIT" tag ft >/dev/null
+"$SIT" checkout main >/dev/null; c173 a.txt 4 E; "$SIT" merge feature >/dev/null 2>&1
+assert_eq "$(dsc)" "ft-4" "26b: a tag reachable only through a second parent is found"
+c173 a.txt 5 G; "$SIT" tag -a v2 -m ann >/dev/null; "$SIT" tag aaa >/dev/null
+assert_eq "$(dsc)" "v2" "26b: annotated beats lightweight on the same commit"
+c173 a.txt 6 H; "$SIT" tag release/v3 >/dev/null; c173 a.txt 7 I
+assert_eq "$(dsc)" "release/v3-1" "26b: a nested tag describes"
+"$SIT" checkout feature >/dev/null; c173 f.txt 9 F9; "$SIT" tag zz-near >/dev/null
+"$SIT" checkout main >/dev/null; c173 a.txt 8 J; "$SIT" merge feature >/dev/null 2>&1
+assert_eq "$(dsc)" "release/v3-4" "26b: the fewest-commits tag wins over the nearer-looking one"
+
+# 26c. Nested ref names list in full and delete cleanly (E14's listing half).
+a164 n173; c173 a a one
+"$SIT" tag release/2026/v1 >/dev/null; "$SIT" tag v0 >/dev/null; "$SIT" branch feature/x >/dev/null
+assert_eq "$("$SIT" tag | tr '\n' ' ')" "release/2026/v1 v0 " "26c: sit tag lists a nested tag by its full name"
+assert_contains "$("$SIT" branch)" "feature/x" "26c: sit branch lists a nested branch by its full name"
+"$SIT" branch -d feature/x >/dev/null; "$SIT" tag -d release/2026/v1 >/dev/null
+assert_eq "$(find .sit/refs -mindepth 2 -type d | wc -l | tr -d ' ')" "0" "26c: deleting a nested ref removes its empty directories"
+"$SIT" branch feature >/dev/null 2>&1; assert_eq "$?" "0" "26c: so a ref named after the old directory can be made"
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

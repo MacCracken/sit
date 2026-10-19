@@ -5,6 +5,11 @@
 # builders, cmd_merge (including --abort).
 
 # Turn a diff op stream into {base_start, base_end, inserts} hunks for the three-way line merge.
+# A hunk groups consecutive non-keep ops (deletes and/or inserts) and records the base line
+# range it covers along with the replacement lines from the other side. Layout (24 bytes):
+#   [0..8)   base_start (inclusive base line index)
+#   [8..16)  base_end   (exclusive base line index)
+#   [16..24) replacement lines vec (each element is a line-tuple pointer)
 fn extract_hunks(ops) {
     var hunks = vec_new();
     var n = vec_len(ops);

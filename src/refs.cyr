@@ -301,14 +301,75 @@ fn set_head_ref(ref_path) {
     return 0;
 }
 
-# Extract hunks from an LCS op-script. A hunk groups consecutive
-# non-keep ops (deletes and/or inserts) and records the base line range
-# it covers along with the replacement lines from the other side.
-#
-# Hunk layout (24 bytes):
-#   [0..8)   base_start (inclusive base line index)
-#   [8..16)  base_end   (exclusive base line index)
-#   [16..24) replacement lines vec (each element is a line-tuple pointer)
+# Every ref under `dir` (".sit/refs/tags", ".sit/refs/heads"), named by its
+# path relative to it ("release/v1"), sorted. 1.7.3 (E14): the tag and branch
+# listings, and describe, read one level, so a nested name listed as its
+# directory ("release") and describe never saw the ref. fsck's root walk
+# (dir_walk) always recursed.
+fn ref_names_under(dir) {
+    var names = vec_new();
+    if (sf_exists(dir) != 1) { return names; }
+    _ref_names_walk(dir, "", names, 0);
+    sort_cstrings(names);
+    return names;
+}
+
+# Recursive half of ref_names_under. Only a real directory is descended (a
+# symlinked one is a leaf, as in the worktree walk), 64 levels at most.
+fn _ref_names_walk(fs_dir, prefix, names, depth) {
+    if (depth > 64) { return 0; }
+    var raw = sf_dir_list(str_from(fs_dir));
+    var dl = strlen(fs_dir);
+    var pl = strlen(prefix);
+    var i = 0;
+    while (i < vec_len(raw)) {
+        var s = vec_get(raw, i);
+        var sl = str_len(s);
+        var child = alloc(dl + 1 + sl + 1);
+        memcpy(child, fs_dir, dl);
+        store8(child + dl, 47);
+        memcpy(child + dl + 1, str_data(s), sl);
+        store8(child + dl + 1 + sl, 0);
+        var name = alloc(pl + sl + 2);
+        memcpy(name, prefix, pl);
+        memcpy(name + pl, str_data(s), sl);
+        store8(name + pl + sl, 0);
+        if (path_lstat_kind(sit_abs(child)) == 0x4000) {
+            store8(name + pl + sl, 47);                  # "<prefix><dir>/"
+            store8(name + pl + sl + 1, 0);
+            _ref_names_walk(child, name, names, depth + 1);
+        }
+        else { vec_push(names, name); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Remove the directories a nested ref's deletion left empty between `path` and
+# its root (the first `root_len` bytes, e.g. ".sit/refs/heads"), deepest first;
+# the root itself always stays. An empty `feature/` would otherwise block a
+# later ref named `feature`, as it does in git.
+fn _ref_prune_empty_dirs(path, root_len) {
+    var len = strlen(path);
+    var buf = alloc(len + 1);
+    memcpy(buf, path, len);
+    store8(buf + len, 0);
+    var i = len - 1;
+    var go = 1;
+    while (go == 1) {
+        if (i <= root_len) { go = 0; }
+        else {
+            if (load8(buf + i) == 47) {
+                store8(buf + i, 0);
+                if (sf_rmdir(buf) != 0) { go = 0; }
+            }
+            i = i - 1;
+        }
+    }
+    return 0;
+}
+
+# `sit tag [-a|-s] [-d <name> | <name> [-m <msg>] [<commit>]]` — list, create or delete tags.
 fn cmd_tag() {
     if (sf_exists(".sit/HEAD") != 1) {
         eprintln("sit: not a sit repository (run 'sit init')");
@@ -317,22 +378,9 @@ fn cmd_tag() {
 
     if (argc() < 3) {
         if (sf_exists(".sit/refs/tags") != 1) { return 0; }
-        var raw = sf_dir_list(str_from(".sit/refs/tags"));
-        var names = vec_new();
-        var n = vec_len(raw);
-        var i = 0;
-        while (i < n) {
-            var s = vec_get(raw, i);
-            var slen = str_len(s);
-            var nm = alloc(slen + 1);
-            memcpy(nm, str_data(s), slen);
-            store8(nm + slen, 0);
-            vec_push(names, nm);
-            i = i + 1;
-        }
-        sort_cstrings(names);
+        var names = ref_names_under(".sit/refs/tags");
         var m = vec_len(names);
-        i = 0;
+        var i = 0;
         while (i < m) {
             var nm = vec_get(names, i);
             # 1.6.4 (E8): names come from the directory listing, not from
@@ -374,6 +422,7 @@ fn cmd_tag() {
             eprintln("sit: failed to remove tag ref");
             return 1;
         }
+        _ref_prune_empty_dirs(dpath, 14);                # ".sit/refs/tags"
         stdout_write("deleted tag '", 13);
         stdout_write(dname, dnlen);
         stdout_write("'\n", 2);
@@ -504,22 +553,9 @@ fn cmd_branch() {
 
     if (argc() < 3) {
         if (sf_exists(".sit/refs/heads") != 1) { return 0; }
-        var raw = sf_dir_list(str_from(".sit/refs/heads"));
-        var names = vec_new();
-        var n = vec_len(raw);
-        var i = 0;
-        while (i < n) {
-            var s = vec_get(raw, i);
-            var slen = str_len(s);
-            var nm = alloc(slen + 1);
-            memcpy(nm, str_data(s), slen);
-            store8(nm + slen, 0);
-            vec_push(names, nm);
-            i = i + 1;
-        }
-        sort_cstrings(names);
+        var names = ref_names_under(".sit/refs/heads");
         var curr = current_branch_name();
-        i = 0;
+        var i = 0;
         var m = vec_len(names);
         while (i < m) {
             var nm = vec_get(names, i);
@@ -581,7 +617,10 @@ fn cmd_branch() {
         memcpy(dlref, "refs/heads/", 11);
         memcpy(dlref + 11, dname, dnlen);
         store8(dlref + 11 + dnlen, 0);
-        sf_unlink(reflog_log_path(dlref));
+        var dlog = reflog_log_path(dlref);
+        sf_unlink(dlog);
+        _ref_prune_empty_dirs(dpath, 15);                # ".sit/refs/heads"
+        _ref_prune_empty_dirs(dlog, strlen(dlog) - dnlen - 1);   # ".../logs/refs/heads"
         stdout_write("deleted branch '", 16);
         stdout_write(dname, dnlen);
         stdout_write("'\n", 2);
