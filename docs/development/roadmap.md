@@ -4,7 +4,7 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.6.4` — the last 1.6.x patch: a P(-1) audit closed the line (16 HIGH, all fixed; see [`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md)). The `1.3.x` line went almost entirely to audit work
+**Where we are**: `1.7.0` — cyrius 6.7.9; bearer tokens bound to remotes ([ADR 0014](../adr/0014-bearer-tokens-bound-to-remotes.md)) and unresolved conflicts refused at commit, the two follow-ons of the 2026-10-19 audit that closed 1.6.x ([`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md)).
 (two security audits, see [`../audit/`](../audit/)) and `1.4.x` to correctness
 and growth curves — `status` is no longer superlinear (4.98× git at 1,000 files,
 was 26.64×), the last four unfuzzed parsers have harnesses, every deferral
@@ -43,16 +43,9 @@ Nothing below blocks anything else; ordering within a section is a recommendatio
 Confirmed by the P(-1) audit that closed 1.6.x
 ([`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md)), and left open
 on purpose. Every CRITICAL / HIGH was fixed in 1.6.4; these are design work or
-lower-severity items. Each names the finding id it came from.
+lower-severity items. Each names the finding id it came from. C3 (token binding)
+and the unresolved-conflict guard shipped in 1.7.0.
 
-- **Bearer token is not bound to a remote (C3, MEDIUM).** `~/.sit/serve.token`
-  — the credential that guards the user's own `sit serve --require-auth` — goes
-  to any http(s) remote that advertises `"auth":["bearer"]`, and to every ssh
-  remote's POSTs. Pushing to a third-party server hands it that credential, and
-  plain `http://` accepts any IPv4 literal, so it can travel in cleartext. Needs
-  a per-remote credential (e.g. `remote.<name>.tokenFile`) and a refusal to send
-  one over plain http to a non-loopback host — new config surface, so it wants
-  its own release rather than riding a patch.
 - **`rebase` walks first parents only (A8, MEDIUM).** When the merge base is
   reachable only through a merge's second parent (upstream merged into the
   feature branch), the pending walk misses it and replays commits upstream
@@ -76,11 +69,6 @@ lower-severity items. Each names the finding id it came from.
   refuse once HEAD has moved past the stash's base (it used to roll every
   later commit back). Applying the stash onto a moved HEAD is cherry-pick of
   the stash commit without committing — `_apply_one_commit` minus the commit.
-- **`sit commit` accepts unresolved conflict markers.** After a conflicted
-  merge / cherry-pick / rebase stop, nothing stops a commit (or `rebase
-  --continue`) of a file still containing `<<<<<<<` once it is `sit add`ed.
-  git tracks unmerged index stages; the cheap version records the conflicted
-  paths in a state file and refuses until each one's content changed.
 - **ssh transport has no read timeout (C10, LOW).** Plain http gained the 30 s
   bound in 1.6.4; the ssh pipe needs a poll()-based deadline in
   `_wire_ssh_recv_response`.

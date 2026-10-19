@@ -1160,6 +1160,79 @@ a164 e7; echo a > a; c164 a; m164 one
 a164 b12; seq 1 20 > f.txt; c164 f.txt; m164 base; seq 1 20 | sed '10a NEW' > f.txt
 assert_contains "$("$SIT" diff -U0)" "@@ -10,0 +11 @@" "B12: a pure insert's old start is the line before it"
 
+# ── 23. 1.7.0: bearer tokens bound to remotes; unresolved conflicts ─
+hr "1.7.0 token binding + conflict refusal"
+
+# 23a. Conflicts: a commit is refused until every conflicted path is resolved
+# AND staged; merge --abort clears the record.
+a164 c170; echo c0 > conf.txt; echo other > o.txt; c164 conf.txt o.txt; m164 base
+"$SIT" branch side >/dev/null; echo ours > conf.txt; c164 conf.txt; m164 ours
+"$SIT" checkout side >/dev/null; echo theirs > conf.txt; echo side-o > o.txt; c164 conf.txt o.txt; m164 theirs
+"$SIT" checkout main >/dev/null; "$SIT" merge side >/dev/null 2>&1
+assert_contains "$("$SIT" status)" "Unmerged paths" "23a: status lists the unmerged path"
+"$SIT" commit -m nothing-resolved >/dev/null 2>&1; assert_eq "$?" "1" "23a: commit with nothing resolved refuses"
+"$SIT" add conf.txt >/dev/null
+"$SIT" commit -m markers-staged >/dev/null 2>&1; assert_eq "$?" "1" "23a: commit with markers staged refuses"
+echo resolved > conf.txt
+"$SIT" commit -m not-staged >/dev/null 2>&1; assert_eq "$?" "1" "23a: a resolution that was not 'sit add'ed refuses"
+"$SIT" add conf.txt >/dev/null
+"$SIT" commit -m merged >/dev/null 2>&1; assert_eq "$?" "0" "23a: resolved + staged commits"
+assert_eq "$([ -e .sit/CONFLICTS ] && echo left || echo cleared)" "cleared" "23a: the commit clears the record"
+assert_eq "$(cat o.txt)" "side-o" "23a: the clean half came along"
+"$SIT" branch side2 >/dev/null; echo m3 > conf.txt; c164 conf.txt; m164 m3
+"$SIT" checkout side2 >/dev/null; echo s3 > conf.txt; c164 conf.txt; m164 s3
+"$SIT" checkout main >/dev/null; "$SIT" merge side2 >/dev/null 2>&1; "$SIT" merge --abort >/dev/null 2>&1
+assert_eq "$([ -e .sit/CONFLICTS ] && echo left || echo cleared)" "cleared" "23a: merge --abort clears the record"
+
+# 23b. rebase --continue refuses an unresolved stop.
+a164 r170; echo base > f.txt; c164 f.txt; m164 base
+"$SIT" branch feat >/dev/null; echo main > f.txt; c164 f.txt; m164 main
+"$SIT" checkout feat >/dev/null; echo feat > f.txt; c164 f.txt; m164 feat
+"$SIT" rebase main >/dev/null 2>&1
+"$SIT" rebase --continue >/dev/null 2>&1; assert_eq "$?" "1" "23b: rebase --continue with markers refuses"
+echo resolved > f.txt; "$SIT" add f.txt >/dev/null
+"$SIT" rebase --continue >/dev/null 2>&1; assert_eq "$?" "0" "23b: and continues once resolved and staged"
+
+# 23c. Bearer tokens go only to bound remotes (ADR 0014). A spy server that
+# demands bearer auth records every Authorization header it is sent.
+if command -v python3 >/dev/null 2>&1; then
+  a164 t170; echo a > a; c164 a; m164 one
+  echo "SERVE-TOKEN-0123456789abcdef" > "$HOME/.sit/serve.token" 2>/dev/null || { mkdir -p "$HOME/.sit"; echo "SERVE-TOKEN-0123456789abcdef" > "$HOME/.sit/serve.token"; }
+  chmod 600 "$HOME/.sit/serve.token"
+  echo "BOUND-TOKEN-fedcba9876543210" > "$WORK/bound.tok"; chmod 600 "$WORK/bound.tok"
+  SPYLOG="$WORK/spy.log"; : > "$SPYLOG"
+  python3 -I "$ROOT/tests/integration/bearer_spy.py" 0.0.0.0 18791 "$SPYLOG" & SPY=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do (echo > /dev/tcp/127.0.0.1/18791) >/dev/null 2>&1 && break; sleep 0.3; done
+
+  "$SIT" remote add loop http://127.0.0.1:18791 >/dev/null
+  "$SIT" push loop >/dev/null 2>&1
+  assert_contains "$(cat "$SPYLOG")" "Bearer SERVE-TOKEN" "23c: an unbound LOOPBACK remote gets ~/.sit/serve.token"
+  : > "$SPYLOG"
+  "$SIT" config remote.loop.tokenFile "$WORK/bound.tok"
+  "$SIT" push loop >/dev/null 2>&1
+  assert_contains "$(cat "$SPYLOG")" "Bearer BOUND-TOKEN" "23c: a bound remote gets ITS token"
+  assert_eq "$(grep -c SERVE-TOKEN "$SPYLOG")" "0" "23c: and never the serve token"
+  chmod 644 "$WORK/bound.tok"
+  "$SIT" push loop >/dev/null 2>&1; assert_eq "$?" "1" "23c: a token file that is not 0600 is an error"
+  chmod 600 "$WORK/bound.tok"
+
+  # A non-loopback address of this machine stands in for "someone else's server".
+  LAN=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+  if [ -n "$LAN" ] && [ "${LAN#127.}" = "$LAN" ]; then
+    : > "$SPYLOG"
+    "$SIT" remote add far "http://$LAN:18791" >/dev/null
+    assert_contains "$("$SIT" push far 2>&1)" "remote.far.tokenFile" "23c: an unbound non-loopback remote is refused, naming the key"
+    "$SIT" config remote.far.tokenFile "$WORK/bound.tok"
+    assert_contains "$("$SIT" push far 2>&1)" "plain http" "23c: a bound token is never sent over plain http off-host"
+    assert_eq "$(grep -c 'Bearer' "$SPYLOG")" "0" "23c: the off-host server saw no token at all"
+  else
+    echo "  (skipped 23c off-host cases: no non-loopback address)"
+  fi
+  kill $SPY 2>/dev/null || true
+else
+  echo "  (skipped 23c: python3 not available)"
+fi
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

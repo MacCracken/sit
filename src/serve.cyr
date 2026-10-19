@@ -38,7 +38,6 @@ var SIT_WANT_MAX_COUNT = 512;
 # consult both before doing any DB work; GET endpoints stay
 # anonymous (the per-ADR-0007 deployment surface assumes loopback
 # anyway, so anonymous read is a feature, not a vulnerability).
-var SIT_TOKEN_MIN_LEN = 16;
 var _serve_require_auth = 0;
 var _serve_token = 0;
 
@@ -529,81 +528,7 @@ fn serve_handle_want(cfd, buf, n) {
 # has no legitimate group/world-readable use, so any wider mode is
 # a configuration mistake worth refusing.
 fn _serve_load_token(path) {
-    if (path_is_symlink(path) == 1) {
-        eprintln("sit: refusing to follow symlink for serve token");
-        return 0;
-    }
-    #ifdef CYRIUS_TARGET_AGNOS
-    # agnos: length-carrying sys_stat; mode at STAT_MODE (per-target offset).
-    # agnos's file_open ignores the create mode (the frozen floor chooses it),
-    # so a token file may not read back as exactly 0600 — the strict check then
-    # fails closed below, matching this loader's "strictly enforced or absent,
-    # never a silent no-auth" posture (cmd_serve refuses to start). agnos
-    # `sit serve` auth stays unavailable until the ABI grows settable modes.
-    var stbuf[128];
-    if (sys_stat(path, strlen(path), &stbuf) < 0) {
-        eprintln("sit: cannot stat serve token");
-        return 0;
-    }
-    var mode = load32(&stbuf + STAT_MODE);
-    #else
-    var stbuf[144];
-    var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, 0);
-    if (rc < 0) {
-        eprintln("sit: cannot stat serve token");
-        return 0;
-    }
-    var mode = load32(&stbuf + 24);
-    #endif
-    var perm = mode & 0xFFF;
-    if (perm != 384) {        # 0600 octal = 384 decimal
-        eprintln("sit: serve token file must be mode 0600");
-        return 0;
-    }
-    var pair[16];
-    if (read_file_heap(path, &pair) != 0) {
-        eprintln("sit: failed to read serve token");
-        return 0;
-    }
-    var data = load64(&pair);
-    var len = load64(&pair + 8);
-    # Strip trailing whitespace (trailing newline from `echo` is the
-    # canonical form). Flag-driven loop because Cyrius's `break` in
-    # while-with-var is unreliable per CLAUDE.md.
-    var stripping = 1;
-    while (stripping == 1) {
-        stripping = 0;
-        if (len > 0) {
-            var lc = load8(data + len - 1) & 0xFF;
-            if (lc == 10) { len = len - 1; stripping = 1; }
-            if (lc == 13) { len = len - 1; stripping = 1; }
-            if (lc == 32) { len = len - 1; stripping = 1; }
-            if (lc == 9)  { len = len - 1; stripping = 1; }
-        }
-    }
-
-    if (len < SIT_TOKEN_MIN_LEN) {
-        eprintln("sit: serve token shorter than 16 chars — generate a stronger one");
-        return 0;
-    }
-    # Reject control bytes / NUL inside the token; tokens travel via
-    # an HTTP header so CR/LF would smuggle headers.
-    var i = 0;
-    while (i < len) {
-        var c = load8(data + i) & 0xFF;
-        if (c == 0)  { eprintln("sit: serve token contains NUL"); return 0; }
-        if (c == 10) { eprintln("sit: serve token contains LF"); return 0; }
-        if (c == 13) { eprintln("sit: serve token contains CR"); return 0; }
-        if (c == 32) { eprintln("sit: serve token contains space"); return 0; }
-        if (c == 9)  { eprintln("sit: serve token contains TAB"); return 0; }
-        if (c < 32)  { eprintln("sit: serve token contains control byte"); return 0; }
-        if (c == 127) { eprintln("sit: serve token contains DEL"); return 0; }
-        i = i + 1;
-    }
-    var tok = alloc(len + 1);
-    memcpy(tok, data, len);
-    store8(tok + len, 0);
-    return tok;
+    return token_file_load(path, "serve token");
 }
 
 # Returns 1 if the request carries a valid `Authorization: Bearer <token>`

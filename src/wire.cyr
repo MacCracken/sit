@@ -1614,6 +1614,68 @@ fn cmd_push() {
     return 0;
 }
 
+# `~/...` → `$HOME/...` for a path read from config; anything else unchanged.
+# Returns 0 when it starts with `~/` and HOME is unset.
+fn _expand_home_path(p) {
+    if (load8(p) != 126) { return p; }                 # '~'
+    if (load8(p + 1) != 47) { return p; }              # '/'
+    var home = getenv("HOME");
+    if (home == 0) { return 0; }
+    var hl = strlen(home);
+    var rl = strlen(p) - 1;
+    var out = alloc_or_die(hl + rl + 1);
+    memcpy(out, home, hl);
+    memcpy(out + hl, p + 1, rl);
+    store8(out + hl + rl, 0);
+    return out;
+}
+
+# The bearer token to present to remote `name`, or 0 for none (ADR 0014, 1.7.0).
+#
+#   remote.<name>.tokenFile set   → that file, loaded by token_file_load. A
+#     configured file that does not load is an ERROR (*out_err = 1), never a
+#     quiet "no token".
+#   unset, and `loopback` == 1    → ~/.sit/serve.token when it exists: the
+#     remote is this machine, and that file guards this machine's own server.
+#   unset otherwise               → none.
+#
+# Through 1.6.4 ~/.sit/serve.token went to ANY http(s) remote that advertised
+# bearer auth and to every ssh remote's POSTs — pushing to someone else's
+# server handed it the credential that guards your own (audit C3).
+fn remote_bearer_token(name, loopback, out_err) {
+    store64(out_err, 0);
+    var nl = strlen(name);
+    var key = alloc_or_die(nl + 18);
+    memcpy(key, "remote.", 7);
+    memcpy(key + 7, name, nl);
+    memcpy(key + 7 + nl, ".tokenFile", 10);
+    store8(key + 7 + nl + 10, 0);
+    var cfg = config_get(key);
+    if (cfg != 0) {
+        var path = _expand_home_path(cfg);
+        if (path == 0) {
+            eprintln("sit: remote tokenFile uses ~/ but HOME is unset");
+            store64(out_err, 1);
+            return 0;
+        }
+        var tok = token_file_load(path, "remote token file");
+        if (tok == 0) { store64(out_err, 1); }
+        return tok;
+    }
+    if (loopback != 1) { return 0; }
+    var home = getenv("HOME");
+    if (home == 0) { return 0; }
+    var hl = strlen(home);
+    var dp = alloc_or_die(hl + 18);
+    memcpy(dp, home, hl);
+    memcpy(dp + hl, "/.sit/serve.token", 17);
+    store8(dp + hl + 17, 0);
+    if (file_exists(dp) != 1) { return 0; }
+    var dtok = token_file_load(dp, "serve token");
+    if (dtok == 0) { store64(out_err, 1); }
+    return dtok;
+}
+
 # v0.7.6 push over http. Walks reachable objects from local_tip,
 # POSTs each to /sit/v1/objects/<hex> (server rehashes — trust
 # boundary), then POSTs the new tip to /sit/v1/refs/<refname>.
@@ -1630,11 +1692,24 @@ fn _do_push_http(name, branch, url, src_db, local_tip) {
     # accidentally short-circuit auth loading.
     http_remote_check_batch(http);
     if (_http_remote_requires_auth(http) == 1) {
-        var tok = _wire_http_load_client_token();
+        var loop = _http_remote_is_loopback(http);
+        var terr[8];
+        var tok = remote_bearer_token(name, loop, &terr);
+        if (load64(&terr) == 1) { wire_http_close(http); return 1; }
         if (tok == 0) {
             wire_http_close(http);
-            eprintln("sit: server requires bearer auth but ~/.sit/serve.token is missing or unreadable");
+            eprint3("sit: server requires bearer auth — set remote.", name,
+              ".tokenFile to its token file (an unbound remote never gets ~/.sit/serve.token)\n");
             return 1;
+        }
+        # A bearer token is never sent in cleartext off this machine: plain
+        # http to a non-loopback host is refused even with an explicit binding.
+        if (_http_remote_is_tls(http) == 0) {
+            if (loop == 0) {
+                wire_http_close(http);
+                eprintln("sit: refusing to send a bearer token over plain http off this host — use https:// or ssh://");
+                return 1;
+            }
         }
         _http_remote_set_token(http, tok);
     }
@@ -1767,6 +1842,13 @@ fn _print_push_summary(branch, name, local_tip, copied) {
 fn _do_push_ssh(name, branch, url, src_db, local_tip) {
     var sh = wire_ssh_open(url);
     if (sh == 0) { return 1; }
+    # 1.7.0 (C3): ssh carries a bearer token only when this remote is bound to
+    # one (remote.<name>.tokenFile). An ssh remote is another host by
+    # definition, so there is no implicit ~/.sit/serve.token here.
+    var serr[8];
+    var stok = remote_bearer_token(name, 0, &serr);
+    if (load64(&serr) == 1) { wire_ssh_close(sh); return 1; }
+    _ssh_set_auth_token(sh, stok);
 
     # FF preflight via /sit/v1/refs over the same SSH pipe.
     # resolve_branch returns 0 if the branch doesn't exist on the

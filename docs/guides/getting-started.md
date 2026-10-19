@@ -281,7 +281,16 @@ HTTPS trust is **TOFU / pinned** (like SSH host keys): the first clone records t
 sit clone ssh://user@host/srv/repos/demo my-demo
 ```
 
-Bearer-token auth (`--require-auth`, `~/.sit/serve.token`) gates writes over HTTP/HTTPS; reads stay anonymous. Pushing to a remote's currently-checked-out branch is refused (`denyCurrentBranch`), matching git.
+Bearer-token auth (`--require-auth`, `~/.sit/serve.token`) gates writes over HTTP/HTTPS and ssh; reads stay anonymous. Pushing to a remote's currently-checked-out branch is refused (`denyCurrentBranch`), matching git.
+
+On the client, a token goes only to a remote it is bound to (1.7.0, [ADR 0014](../adr/0014-bearer-tokens-bound-to-remotes.md)):
+
+```sh
+# the token file must be mode 0600
+sit config remote.origin.tokenFile ~/.sit/origin.token
+```
+
+A loopback http(s) remote (`127.0.0.1`) with no `tokenFile` uses `~/.sit/serve.token`, which is your own server's token. Any other unbound remote gets no token, and a token is never sent over plain `http://` to a non-loopback host.
 
 ## View history
 

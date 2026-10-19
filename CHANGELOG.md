@@ -4,6 +4,98 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-10-19 — cyrius 6.7.9; bearer tokens bound to remotes; unresolved conflicts refused at commit
+
+The first 1.7.x minor carries the two follow-ons the 2026-10-19 audit ([`docs/audit/2026-10-19-audit.md`](docs/audit/2026-10-19-audit.md)) left as design work, plus the toolchain bump.
+
+### Security — a bearer token goes only to a remote it is bound to (audit C3, [ADR 0014](docs/adr/0014-bearer-tokens-bound-to-remotes.md))
+
+Through 1.6.4 the client sent `~/.sit/serve.token` (the token that guards your *own* `sit serve --require-auth`) to any http(s) remote that advertised bearer auth, and on every POST to any ssh remote. Pushing to a third-party or compromised server handed it that credential, and plain `http://` let it travel in cleartext to another host. Now:
+
+- **`remote.<name>.tokenFile`** binds a token file to one remote (`~/` expands to `$HOME`). A configured file that fails to load is an error, never a silent "no token".
+- **An unbound loopback http(s) remote** (127.0.0.0/8) still gets `~/.sit/serve.token`: it is this machine's own server. The single-machine workflow, and CI's push smoke, are unchanged.
+- **Any other unbound remote gets no token.** The push is refused with a message naming the key to set.
+- **No token travels over plain `http://` off this host**, bound or not.
+- **ssh** carries a token only when the remote is bound.
+- **Client and server share one loader, `token_file_load`.** It requires a regular file (no symlink), mode exactly 0600, and 16+ printable bytes. The client used to skip the mode and symlink checks.
+
+**Migration:** to push with bearer auth to a non-loopback https remote or an ssh remote, bind it once. Loopback pushes need nothing.
+
+```sh
+sit config remote.<name>.tokenFile ~/.sit/serve.token
+```
+
+### Added — unresolved conflicts cannot be committed
+
+A merge, cherry-pick, revert or rebase that stops on a conflict now records its conflicted paths in `.sit/CONFLICTS`.
+
+- **The refusal.** `sit commit` and `sit rebase --continue` refuse while any recorded path:
+  - still has a `<<<<<<< ` / `>>>>>>> ` line in the worktree or in the staged copy;
+  - has a worktree resolution that was never `sit add`ed;
+  - is deleted but still staged.
+
+  Each offender is named with the command that fixes it.
+- **Status.** `sit status` lists the paths under *Unmerged paths*.
+- **Clearing.** A successful commit, `merge --abort`, `rebase --abort` / `--continue` and `reset --hard` clear the record.
+- **The bare `=======` separator is not treated as a marker,** because setext headings legitimately use it.
+
+Through 1.6.4 nothing stopped a commit of a file still holding markers once it was `sit add`ed. A commit with nothing resolved also silently kept HEAD's side of every conflict. 1.6.4 had already made the clean half of a conflicted merge survive (A3); this closes the other half.
+
+### Changed — cyrius pin 6.6.20 → **6.7.9**
+
+| fold | 6.6.20 | 6.7.9 |
+|---|---|---|
+| patra | 1.15.2 | **1.16.0** |
+| sigil | 3.13.10 | 3.13.11 |
+| sankoch | 2.8.1 | 2.8.3 |
+| sandhi | 1.10.8 | 1.10.9 |
+| sakshi | 2.5.7 | 2.5.8 |
+| bayan | 1.5.12 | 1.5.13 |
+
+**patra 1.16.0 is a minor bump in the storage layer, so the on-disk format was A/B-tested.** A repo written by the 1.6.4 build was read and extended by the 6.7.9 build, and the reverse, 27/27 each, covering:
+- a 2.2 MB random blob and a >1 MiB compressible file
+- a signed commit and an annotated tag
+- `reset --hard` byte-identity, `fsck`, `verify-commit` and a `file://` clone
+
+No format change.
+
+Changes in the range that touch sit:
+- **patra 1.16.0:**
+  - WAL recovery now runs before every statement, so a crashed writer's journal is no longer truncated by the next `patra_begin`.
+  - Five silent wrong answers now fail. None is on sit's path: `LIMIT 0`, `SUM` / `MIN` / `MAX` on non-INT, identifiers over 31 bytes, and `ORDER BY` on an unknown or BYTES column.
+- **sigil 3.13.11:** `sha256` / `sha384` one-shots and `pem_decode_privkey` wipe their secrets.
+- **The ssh transport's exec children** now start with default SIGPIPE / SIGXFSZ.
+- **`tls_native_set_client_cert`** sizes its PEM decode by the input (sit's mTLS client uses PEM).
+
+No source change was needed for the build. Unit, integration, fuzz, the poison A/B and `cyrius audit` all pass on the first try.
+
+⚠ **Not in 6.7.9:** patra 1.16.1 / 1.16.2 fix three ways to lose acknowledged rows, and fdatasync failures being read as success. They fold at cyrius 6.7.11 and are worth taking with the next pin.
+
+**Benchmarks** (best of two runs, 1.6.4 vs 1.7.0, [`docs/benchmarks/2026-10-19-v1.7.0.md`](docs/benchmarks/2026-10-19-v1.7.0.md)):
+
+| bench | 1.6.4 | 1.7.0 |
+|---|---:|---:|
+| patra-open-close | 24.40 µs | 26.14 µs (+7.1%) |
+| sha256-64B | 727 ns | 769 ns (+5.8%) |
+| sha256-1024B | 3.52 µs | 3.41 µs |
+| clone-100commits (head-to-head) | 64.89 ms | 66.61 ms (+2.6%) |
+
+- The first two are the folds' own costs: patra's per-statement WAL probe, and sigil's context wipe, which is gone by 1 KiB.
+- Everything else is within noise.
+
+### Fixed
+
+- **The server's token-file mode check read `st_uid` on aarch64.** `_serve_load_token` loaded `st_mode` at x86_64's hardcoded offset 24. That is the B11 class 1.6.4 fixed in the lstat guards and missed here: on arm64 every token failed the 0600 check, so `sit serve --require-auth` could not start. The shared `token_file_load` reads `STAT_MODE`.
+
+### Verified
+
+- **Unit:** **425 / 425** (was 413).
+- **Integration:** **261 / 261** (was 244). Section 23 runs the token cases against a spy server that records every `Authorization` header, using a non-loopback address of the host for the off-host cases (skipped where none exists), plus the conflict-refusal flows. Against the 1.6.4 binary **9 of its assertions fail**, including "the off-host server saw no token at all".
+- **Fuzz** is clean, and so is the **poison A/B** run on the bumped toolchain. The whole integration suite also passes against a poison-built binary, which covers both new features. `cyrius audit` is clean.
+- **On arm64 under qemu:** the 1.6.4 build refuses a correct 0600 serve token ("must be mode 0600 … refusing to start"); 1.7.0 serves.
+- **CI smoke steps,** run locally: all pass except ssh, which needs sshd and wasn't run.
+- **Bundles:** both compile into a consumer probe. The new `_ssh_set_auth_token` call stays off every consumer-reachable path (architecture 006).
+
 ## [1.6.4] — 2026-10-19 — closing 1.6.x: short writes, and a P(-1) audit that found sixteen ways to lose data
 
 The last 1.6.x patch. It carries the short-write fix and a full P(-1) hardening pass over everything changed since the 2026-08-18 audit, 1.4.0 → 1.6.3. Five area auditors found 66 issues, each reproduced, re-verified and red/green-tested:

@@ -841,29 +841,52 @@ fn http_remote_check_batch(h) {
     return 0;
 }
 
-# Load a serve.token from disk in the same format the server's
-# `_serve_load_token` accepts (16+ chars, no control bytes,
-# trailing-whitespace stripped). Used by cmd_push when the server's
-# capabilities advertise `"auth":["bearer"]`. Path is
-# `~/.sit/serve.token` by convention; clients can override with
-# `--token` on cmd_push (plumbed through wire_http_open variants
-# in a follow-on patch — v0.7.6 ships the default-path-only shape).
+# Read a bearer-token file — the ONE loader, for the server's `--require-auth`
+# token and every client-side token (1.7.0). Returns the heap cstring, or 0
+# after saying why (`what` names the file in the message).
 #
-# Returns the heap-owned cstring on success, 0 on any failure.
-# Callers must error out on 0 if the server requires bearer; sit
-# never silently sends an empty Authorization header.
-
-fn _wire_http_load_client_token() {
-    var home = getenv("HOME");
-    if (home == 0) { return 0; }
-    var hl = strlen(home);
-    var p = alloc(hl + 18);
-    memcpy(p, home, hl);
-    memcpy(p + hl, "/.sit/serve.token", 17);
-    store8(p + hl + 17, 0);
-    if (file_exists(p) != 1) { return 0; }
+# The file must be a regular file (never followed through a symlink), mode
+# exactly 0600, and hold 16+ printable bytes after trailing whitespace is
+# stripped — tokens travel in an HTTP header, so CR / LF / control bytes would
+# smuggle headers. Through 1.6.4 the client loaded ~/.sit/serve.token with
+# only the content checks; it now gets the server's mode and symlink checks.
+fn token_file_load(path, what) {
+    if (path_is_symlink(path) == 1) {
+        eprint3("sit: refusing to follow a symlink for the ", what, "\n");
+        return 0;
+    }
+    #ifdef CYRIUS_TARGET_AGNOS
+    # agnos: length-carrying sys_stat; mode at STAT_MODE (per-target offset).
+    # agnos's file_open ignores the create mode (the frozen floor chooses it),
+    # so a token file may not read back as exactly 0600 — the strict check then
+    # fails closed below ("strictly enforced or absent, never a silent no-auth").
+    var stbuf[128];
+    if (sys_stat(path, strlen(path), &stbuf) < 0) {
+        eprint3("sit: cannot stat the ", what, "\n");
+        return 0;
+    }
+    var mode = load32(&stbuf + STAT_MODE);
+    #else
+    var stbuf[144];
+    var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, 0);
+    if (rc < 0) {
+        eprint3("sit: cannot stat the ", what, "\n");
+        return 0;
+    }
+    # STAT_MODE, not 24: 24 is x86_64's offset; on aarch64 it read st_uid, so
+    # every token failed the 0600 check there (the B11 class, missed in 1.6.4).
+    var mode = load32(&stbuf + STAT_MODE);
+    #endif
+    var perm = mode & 0xFFF;
+    if (perm != 384) {        # 0600 octal = 384 decimal
+        eprint3("sit: the ", what, " must be mode 0600\n");
+        return 0;
+    }
     var pair[16];
-    if (read_file_heap(p, &pair) != 0) { return 0; }
+    if (read_file_heap(path, &pair) != 0) {
+        eprint3("sit: cannot read the ", what, "\n");
+        return 0;
+    }
     var data = load64(&pair);
     var len = load64(&pair + 8);
     var stripping = 1;
@@ -877,18 +900,37 @@ fn _wire_http_load_client_token() {
             if (lc == 9)  { len = len - 1; stripping = 1; }
         }
     }
-    if (len < 16) { return 0; }
+    if (len < SIT_TOKEN_MIN_LEN) {
+        eprint3("sit: the ", what, " is shorter than 16 chars — generate a stronger one\n");
+        return 0;
+    }
     var i = 0;
     while (i < len) {
         var c = load8(data + i) & 0xFF;
-        if (c < 33)   { return 0; }   # control + space → reject
-        if (c == 127) { return 0; }
+        if (c < 33) {             # NUL, CR, LF, TAB, space, other control
+            eprint3("sit: the ", what, " contains whitespace or a control byte\n");
+            return 0;
+        }
+        if (c == 127) {
+            eprint3("sit: the ", what, " contains DEL\n");
+            return 0;
+        }
         i = i + 1;
     }
     var tok = alloc(len + 1);
     memcpy(tok, data, len);
     store8(tok + len, 0);
     return tok;
+}
+
+# Shortest bearer token either side accepts.
+var SIT_TOKEN_MIN_LEN = 16;
+
+# 1 if an http(s) remote handle points at loopback (127.0.0.0/8). The packed
+# address is network order, so the first octet is the low byte.
+fn _http_remote_is_loopback(h) {
+    if ((_http_remote_addr(h) & 0xFF) == 127) { return 1; }
+    return 0;
 }
 
 # ── /sit/v1/want batched object fetch (v0.7.4) ─────────────────────

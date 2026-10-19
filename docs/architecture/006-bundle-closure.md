@@ -26,7 +26,7 @@ The read profile was unaffected: it carries neither `wire_http` nor `serve`.
 
 | bundle | unresolved | why it is unreachable |
 |---|---|---|
-| `dist/sit.cyr` | `wire_ssh_open` / `wire_ssh_close`, `ssh_remote_*`, `_wire_https_connect`, `_url_is_http_family` | reached only from the client side: `wire.cyr`'s clone / fetch / push dispatch and `wire_http.cyr`'s request functions, which no address-taken root reaches |
+| `dist/sit.cyr` | `wire_ssh_open` / `wire_ssh_close`, `ssh_remote_*`, `_ssh_set_auth_token` (1.7.0), `_wire_https_connect`, `_url_is_http_family` | reached only from the client side: `wire.cyr`'s clone / fetch / push dispatch and `wire_http.cyr`'s request functions, which no address-taken root reaches |
 | `dist/sit-read.cyr` | `load_signing_seed`, `sign_commit_body`, `verify_commit_body` | reached only from commit's signing path, which the read API never calls |
 
 These names print as `warning: undefined function` in a consumer build. That is expected. A `(reachable call site)` suffix is not: it means a new root or a moved call has pulled a transport or signing path into the bundle.

@@ -230,6 +230,7 @@ fn cmd_rebase() {
             return 1;
         }
         reflog_head_move(before_abort, orig, "rebase: aborted");
+        conflicts_clear();
         _rebase_clear_state();
         if (sf_exists(".sit/CHERRY_PICK_HEAD") == 1) { sf_unlink(".sit/CHERRY_PICK_HEAD"); }
         stdout_write("rebase aborted; branch restored to ", 35);
@@ -262,6 +263,10 @@ fn cmd_rebase() {
         # rewritten to match it; an edit that was never `sit add`ed would be
         # discarded without a word. git refuses here too.
         if (vec_len(todo) > 0) {
+            if (conflicts_check_resolved() != 0) {
+                eprintln("sit: rebase --continue refused — resolve and 'sit add' the conflicted files first");
+                return 1;
+            }
             if (worktree_differs_from_index() == 1) {
                 eprintln("sit: you have unstaged changes — 'sit add' the resolved files before --continue");
                 return 1;
@@ -291,6 +296,7 @@ fn cmd_rebase() {
         }
         if (write_head_ref(new_hex) != 0) { eprintln("sit: failed to update branch ref"); return 1; }
         reflog_head_move(head_now, new_hex, reflog_msg_subject("rebase (continue): ", msg));
+        conflicts_clear();
         return _rebase_run(todo, 1);
     }
 

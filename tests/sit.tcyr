@@ -1327,6 +1327,34 @@ fn test_audit_164_pure() {
     return 0;
 }
 
+# 1.7.0: the pure pieces of token binding and conflict tracking.
+fn test_170_pure() {
+    test_group("1.7.0 — loopback detection, ~/ expansion, conflict markers");
+
+    # Only 127.0.0.0/8 counts as "this machine" for the implicit serve.token.
+    assert_eq(_http_remote_is_loopback(wire_http_open("http://127.0.0.1:9/")), 1, "127.0.0.1 is loopback");
+    assert_eq(_http_remote_is_loopback(wire_http_open("http://127.5.6.7:9/")), 1, "127.5.6.7 is loopback");
+    assert_eq(_http_remote_is_loopback(wire_http_open("http://10.1.2.3:9/")), 0, "10.1.2.3 is not loopback");
+    assert_eq(_http_remote_is_loopback(wire_http_open("http://192.168.1.9:9/")), 0, "192.168.1.9 is not loopback");
+
+    # ~/ expansion for tokenFile, and nothing else touched.
+    assert_eq(streq(_expand_home_path("/abs/tok"), "/abs/tok"), 1, "absolute path unchanged");
+    assert_eq(streq(_expand_home_path("rel/tok"), "rel/tok"), 1, "relative path unchanged");
+    var home = getenv("HOME");
+    if (home != 0) {
+        var ex = _expand_home_path("~/x.tok");
+        assert_eq(memeq(ex, home, strlen(home)), 1, "~/ expands to $HOME");
+    }
+
+    # Conflict markers: either fence at a line start counts, "=======" alone does not.
+    assert_eq(_has_conflict_marker("a\n<<<<<<< HEAD\nb\n", 18), 1, "<<<<<<< fence detected");
+    assert_eq(_has_conflict_marker("a\n>>>>>>> side\n", 15), 1, ">>>>>>> fence detected");
+    assert_eq(_has_conflict_marker("Title\n=======\ntext\n", 19), 0, "a bare ======= line is text");
+    assert_eq(_has_conflict_marker("x <<<<<<< mid-line\n", 19), 0, "a fence mid-line is not a marker");
+    assert_eq(_has_conflict_marker("<<<<<<<\n", 8), 0, "a fence without its trailing space is not one");
+    return 0;
+}
+
 # _wire_io_send must return 0 only when every byte went out. Through 1.6.3 the
 # plain-socket path made ONE sock_send and returned 0 regardless of the count,
 # so a short write became a silently truncated request or response. A
@@ -1411,6 +1439,7 @@ fn main() {
     test_wire_io_send_short_write();
     test_parse_tree_order();
     test_audit_164_pure();
+    test_170_pure();
     return assert_summary();
 }
 

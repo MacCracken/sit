@@ -609,6 +609,7 @@ fn cmd_reset() {
             return 1;
         }
         reflog_head_move(rl_old, &hex, reflog_msg_subject("reset: moving to ", target));
+        conflicts_clear();      # the conflict it recorded is gone with the worktree
         stdout_write("HEAD reset --hard to ", 21);
         stdout_write(&hex, 12);
         stdout_write("\n", 1);

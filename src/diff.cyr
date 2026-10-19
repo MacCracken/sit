@@ -331,6 +331,11 @@ fn cmd_status() {
     }
 
     var any = 0;
+    # 1.7.0: paths a conflict stop recorded and a commit will refuse.
+    var unmerged = conflicts_list();
+    if (unmerged != 0) {
+        if (print_name_section("Unmerged paths (resolve, then 'sit add'):", 41, unmerged) == 1) { any = 1; }
+    }
     if (print_labeled_section("Staged for commit:", 18, staged) == 1)   { any = 1; }
     if (print_labeled_section("Unstaged changes:", 17, unstaged) == 1)   { any = 1; }
     if (print_name_section("Untracked files:", 16, untracked) == 1)      { any = 1; }

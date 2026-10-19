@@ -458,10 +458,10 @@ fn wire_ssh_open(url) {
     _ssh_set_read_fd(h, out_read);
     _ssh_set_batch_known(h, 0);
     _ssh_set_carry(h, 0);
-    # Reuses the HTTP loader, so the token format and its validation (16+
-    # chars, no control bytes) are defined in exactly one place. Absent file
-    # -> 0 -> no header, which is the pre-1.6.0 behaviour.
-    _ssh_set_auth_token(h, _wire_http_load_client_token());
+    # No token by default (1.7.0, C3): the push path binds one per remote via
+    # remote_bearer_token. Opening a session used to load ~/.sit/serve.token
+    # for EVERY ssh remote and send it on every POST.
+    _ssh_set_auth_token(h, 0);
 
     # Probe capabilities so the early "ssh user@host: command not
     # found" / auth failures surface here as a clean error rather than

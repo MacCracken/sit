@@ -1150,6 +1150,11 @@ fn cmd_commit() {
         }
     }
 
+    # 1.7.0: an unresolved conflict cannot be committed (see conflicts_*).
+    if (conflicts_check_resolved() != 0) {
+        eprintln("sit: commit refused — the last merge / cherry-pick / revert / rebase stop is unresolved");
+        return 1;
+    }
     var entries = parse_index();
     if (entries == 0) {
         eprintln("sit: nothing to commit (empty or missing index)");
@@ -1201,6 +1206,8 @@ fn cmd_commit() {
     if (merge_parent != 0) { rl_prefix = "commit (merge): "; }
     else { if (parent_hex == 0) { rl_prefix = "commit (initial): "; } }
     reflog_head_move(parent_hex, commit_hex, reflog_msg_subject(rl_prefix, message));
+
+    conflicts_clear();
 
     # 1.6.4 (A15): a commit is what resolves a conflicted cherry-pick or revert,
     # so it clears their state files the way it clears MERGE_HEAD. They used to
