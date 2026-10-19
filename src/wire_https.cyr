@@ -328,56 +328,6 @@ fn _wire_https_connect(host, port, fd) {
     return ctx;
 }
 
-# Transport-uniform send. `tls` == 0 → plain socket; else TLS, fragmenting into
-# <= TLS_RECORD_MAX_PLAINTEXT records. Returns 0 on success, -1 on error.
-fn _wire_io_send(tls, fd, buf, len) {
-    if (tls == 0) {
-        sock_send(fd, buf, len);
-        return 0;
-    }
-    var off = 0;
-    var rc = 0;
-    while (off < len) {
-        if (rc != 0) { off = len; }
-        else {
-            var chunk = len - off;
-            if (chunk > TLS_RECORD_MAX_PLAINTEXT) { chunk = TLS_RECORD_MAX_PLAINTEXT; }
-            if (tls_native_write(tls, buf + off, chunk) < 0) { rc = 0 - 1; }
-            else { off = off + chunk; }
-        }
-    }
-    return rc;
-}
-
-# Transport-uniform recv into `buf` (up to `max`). Returns bytes read (>0), or 0
-# to signal end-of-stream (EOF / alert / error — the caller stops and parses what
-# it has, matching the plain-socket EOF contract). For TLS, transparently skips
-# post-handshake records (NewSessionTicket / KeyUpdate, which read as 0) up to a
-# small bound so a legit record stream isn't truncated.
-fn _wire_io_recv(tls, fd, buf, max) {
-    if (tls == 0) {
-        var r_t, r_v = sock_recv(fd, buf, max);
-        if (is_err_result(r_t) == 1) { return 0; }
-        var pn = r_v;
-        if (pn < 0) { return 0; }
-        return pn;
-    }
-    var tries = 0;
-    var out = 0 - 2;          # sentinel: keep looping
-    while (out == 0 - 2) {
-        var n = tls_native_read(tls, buf, max);
-        if (n > 0) { out = n; }
-        else {
-            if (n < 0) { out = 0; }            # alert / EOF (TCP FIN) / error → end-of-stream
-            else {
-                tries = tries + 1;             # n == 0: post-handshake record; bounded retry
-                if (tries >= 8) { out = 0; }
-            }
-        }
-    }
-    return out;
-}
-
 # True (1) if the scheme is HTTP or HTTPS — the wire_http transport family.
 fn _url_is_http_family(s) {
     if (s == URL_SCHEME_HTTP)  { return 1; }

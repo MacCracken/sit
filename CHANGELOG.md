@@ -4,6 +4,76 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.3] — 2026-10-19 — cyrius 6.6.20; the full bundle compiles into consumers again
+
+### Changed — cyrius pin 6.6.2 → **6.6.20**
+
+The pin selects every dependency sit has ([ADR 0012](docs/adr/0012-deps-pinned-through-the-toolchain.md)), so this is also the dependency refresh:
+
+| fold | 6.6.2 | 6.6.20 |
+|---|---|---|
+| sigil | 3.12.16 | **3.13.10** |
+| sankoch | 2.7.14 | **2.8.1** |
+| patra | 1.14.1 | **1.15.2** |
+| sandhi | 1.9.16 | **1.10.8** |
+| sakshi | 2.5.1 | 2.5.7 |
+| bayan | 1.5.5 | 1.5.12 |
+
+These are minor bumps in the hashing, compression and storage layers, so the on-disk format was **A/B-tested rather than skimmed**. A repo written by the 6.6.2 build was read and extended by the 6.6.20 build, and the reverse. Coverage: a 2.2 MB random blob and a >1 MiB compressible file, which crosses sankoch's block boundary, plus nested paths, a signed commit, an annotated tag, `fsck`, `verify-commit`, `reset --hard` byte-identity and a `file://` clone. **27/27 in each direction.** No storage-format change.
+
+Upstream fixes sit picks up without source changes:
+
+- **io**: `file_write_all` no longer reports a short write as success, and `file_read_all` returns a negative errno instead of a prefix of the file on a read error. Every sit caller already rejects a short or negative read.
+- **net / tls**: server writes use `MSG_NOSIGNAL`, so a peer that disconnects mid-response can no longer kill `sit serve` with SIGPIPE. Native TLS no longer spins on an unbounded ChangeCipherSpec loop.
+- **patra**: the CSPRNG-failure fallback for database ids and WAL salts no longer collides for two processes started in the same second. The WAL's `O_NOFOLLOW` now holds on aarch64.
+- **compiler**: several silent miscompiles fixed (a nested `continue` bound to the wrong loop, narrow-store widths, per-call slots that were shared across threads).
+
+Contract changes in the range were checked against sit's call sites, and none apply. sit never spawns SSH under a deadline, so the new `setsid` behaviour doesn't reach it. The TLS accept loop already expects the now-uniform blocking sockets, and no code walks a hashmap while inserting.
+
+**`ed25519-sign` is ~2× slower, on purpose.** sigil 3.13 re-derives the public key from the seed on every sign and compares it in constant time against the stored half. That closes the "double public key" signing oracle, where signing with a mismatched public half leaks the private key. sit derives `sk` from the seed one line before signing, so the new `-1` mismatch return cannot fire at its call site. Verify is unchanged.
+
+| bench (`tests/sit.bcyr`) | 6.6.2 | 6.6.20 |
+|---|---:|---:|
+| ed25519-sign | 885 µs | **1.727 ms** |
+| ed25519-verify | 5.050 ms | 5.116 ms |
+| sha256-65536B | 181.4 µs | 183.7 µs |
+| zlib-compress-65536B | 1.019 ms | 1.002 ms |
+| zlib-decompress-65536B | 330.3 µs | 331.5 µs |
+| blob-hash-1048576B | 4.516 ms | 4.574 ms |
+| lcs-diff-4000x4000 | 488.2 ms | 492.4 ms |
+
+The sign row reproduced across three runs per toolchain (877–885 µs vs 1.725–1.735 ms). All 25 benchmarks were compared; everything outside the sign row is within ±7%, except `tree_flat_path_valid` at −12% (faster).
+
+**`cyrius distlib` output changed shape.** Each bundle now opens with a compile-verified `include "lib/…"` requires block, and the `.deps` sidecar holds only the leaves that verify derives: `dist/sit.deps` 39 → 19, `dist/sit-read.deps` 18 → 15. This is generated output, with no change to either module list.
+
+### Fixed
+
+- ⛔ **`dist/sit.cyr` did not compile into any consumer on 6.6.20.** `serve.cyr` passes `&serve_handle_request` to the server loop. An address-taken function is a reachability root, so `serve_handle_request` → `_serve_send_status` → `_wire_io_send` is live in **every** program that includes the full bundle, including one that never serves. `_wire_io_send` / `_wire_io_recv` were defined in `wire_https.cyr`, which is deliberately in neither `[lib]` profile.
+
+  Through 6.6.8 the compiler let that through: an earlier reference from an unreachable function masked the reachable one, leaving a binary that would trap if the path ever ran. 6.6.9 closed that hole, so every consumer build now ends in `refusing to emit binary with 1 reachable undefined function(s)`.
+
+  The two helpers are plain-or-TLS socket I/O shared by the HTTP client and the server. They now live in `wire_http.cyr`. The TLS handshake (`_wire_https_connect`) and the TOFU pin store stay in `wire_https.cyr`, outside the bundles. The read profile (thoth) carries neither `wire_http` nor `serve` and was unaffected. The constraint is written up as [architecture 006](docs/architecture/006-bundle-closure.md).
+
+- **The integration suite reported a bundle that would not compile as a skip.** If `cyrius` was on `PATH` but `tests/integration/git_probe.cyr` failed to build against `dist/sit.cyr`, `run.sh` printed `SKIP: library-API probe unavailable (cyrius toolchain not found)`. CI would have passed the broken bundle above with that message. A build failure with a toolchain present is now a **FAIL** that prints the compiler's refusal. Red/green verified: against the 1.6.2 bundle it fails, 203 passed / 1 failed; against this one it passes, 207 / 0.
+
+### Changed — `cyrius.cyml` is a manifest again
+
+The manifest had accumulated ~100 lines of rationale and release history in comments: why the folded deps are not git blocks, what the read profile keeps and drops, which cyrius release fixed which `mutex_*` duplicate, and the folded versions as of 6.5.24. It now holds keys and values only. The durable reasoning moved to where the docs tree says it belongs:
+
+- [ADR 0012](docs/adr/0012-deps-pinned-through-the-toolchain.md): why first-party deps are pinned through the toolchain, and why every reachable stdlib module is declared explicitly.
+- [ADR 0013](docs/adr/0013-dist-bundle-profiles.md): the two bundle profiles, their membership rules and their deliberately unresolved symbols.
+- [architecture 006](docs/architecture/006-bundle-closure.md): the reachability constraint above.
+
+History stays here in the CHANGELOG, and versions in `state.md`. `CLAUDE.md` gains the rule, and the CI comment that pointed at the old manifest note now points at ADR 0012. `cyrius deps` resolves an identical `cyrius.lock` from the stripped manifest.
+
+### Verified
+
+- `cyrius build` **x86_64**, `CYRIUS_DCE=1`, and **`--aarch64`**: all `OK`.
+- Unit **383 / 383**. Integration **207 / 207**, up from 203 + 1 silent skip on 6.6.20 before the fix.
+- Fuzz: 15 harnesses, no crashes (`want_frame_decoder` 10M rounds).
+- Lint: 0 warnings across all 28 `src/*.cyr`.
+- `dist/sit.cyr` and `dist/sit-read.cyr` regenerated; each compiles into a consumer probe. cmdit 1.3.0 and 1.4.0 dists also compile on 6.6.20 (roadmap CLI item).
+
 ## [1.6.2] — 2026-08-23 — arm64 builds again: two legacy syscall constants that do not exist on aarch64
 
 ### Changed — cyrius pin 6.5.31 → **6.6.2**

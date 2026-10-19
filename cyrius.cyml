@@ -5,22 +5,13 @@ description = "Sovereign version control — a Cyrius-native git replacement"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sit"
 language = "cyrius"
-cyrius = "6.6.2"
+cyrius = "6.6.20"
 
 [build]
 entry = "src/main.cyr"
 test = "tests/sit.tcyr"
 output = "sit"
 
-# `[lib]` drives `cyrius distlib` — concatenates the listed modules in
-# order into `dist/sit.cyr` for downstream Cyrius consumers. Single-pass
-# compiler: each module may only reference symbols defined in earlier
-# modules. Order mirrors src/lib.cyr's include chain (primitives →
-# storage → refs / objects / commands → public API last).
-#
-# Public surface lives in src/api.cyr (last module); everything else is
-# internal and `_`-prefixed (or callable only via cmd_*). See ADR 0009
-# for the public-API contract.
 [lib]
 modules = [
     "src/version.cyr",
@@ -49,23 +40,6 @@ modules = [
     "src/api.cyr",
 ]
 
-# `read` profile — `cyrius distlib read` → dist/sit-read.cyr. A LEAN, read-only
-# subset for consumers that only REPORT on a repo (branch / status / diff) and never
-# write or sync: owl's gutter markers, thoth's status bar. It drops the SIGNING module
-# (sign) and the whole NETWORK stack (wire / wire_http / serve) — the parts the
-# read-only sit_repo_* API never executes. It KEEPS reflog / index / commit / merge:
-# those ARE on the read path (status honours .gitignore + the index; reading HEAD parses
-# its commit object → tree; ref resolution touches the reflog), so dropping them would
-# silently break status/diff. The win for read consumers: no dead-code stdlib-global
-# refs (serve's HSV_REQ_BUF_SIZE, TLS's TLS_OK) and no unresolved wire_ssh transport
-# symbols — so the bundle compiles into a consumer with no shims and no wire warnings.
-# (Three sign symbols — load_signing_seed / sign_commit_body / verify_commit_body — stay
-# unresolved as dead-path placeholders, referenced only by commit's signing path which
-# the read API never calls; same shape as the full bundle leaving wire_ssh unresolved.)
-# Same public API (sit_repo_open / _branch / _status / _diff_path + ann_* / sit_status_*),
-# same module ORDER as [lib] (single-pass: each module references only earlier ones). See
-# ADR 0009 (public-API contract) + the consumers table in docs/development/state.md. Keep
-# the module list a subset of [lib], minus {sign, wire, wire_http, serve}.
 [lib.read]
 modules = [
     "src/util.cyr",
@@ -85,71 +59,7 @@ modules = [
     "src/api.cyr",
 ]
 
-# No libgit2, no C, no FFI. Each layer is first-party Cyrius, benchmarked
-# against its C incumbent.
-#   sankoch — LZ4/DEFLATE/zlib/gzip (git's pack-file compression layer)
-#   sigil   — hashing + trust verification (git's SHA layer)
-#   patra   — B+ tree / WAL object store (git's .git/objects layer)
-#   sakshi  — structured logging (reached transitively via patra / sandhi)
-#
-# As of 1.3.6 all four are stdlib leaves, not git deps — the `cyrius` pin in
-# [package] selects their versions. See the note in [deps].stdlib below.
 [deps]
-# Transitive stdlib resolution (cyrius v5.10.x SLOT 19) doesn't follow
-# through enum / constant references — sandhi pulls TLS_EARLY_DATA_*,
-# fdlopen_*, base64 (via tls/ws shim transitives), sigil pulls
-# u256_* / ct_eq_bytes_lens / _keccak_* / shake256 (via its crypto
-# primitives), and patra pulls `sync` (the cross-handle / cross-process
-# tail-page cache guard added in 1.12.7). All explicit until the cyrius
-# transitive arc closes those follow-through gaps. `bayan` is the cyrius
-# 6.x omnibus bundle that folded the old base64 / json / bigint stdlib
-# modules into one.
-#
-# `sync` + `thread` USED to both export mutex_* on Linux, which emitted
-# three benign `duplicate fn 'mutex_*' (last definition wins)` warnings.
-# As of cyrius 6.5.4 `lib/thread.cyr` no longer defines them — `sync` is
-# the sole owner (6 defs) — so the build is warning-free on that front.
-# `thread` still can NOT be dropped: sigil references `thread_join`
-# (parallel-hash path) and sandhi references the channel machinery
-# (`chan_new` / `chan_send`).
-#
-# `thread_local` is declared explicitly as of 1.3.5 even though 6.5.4 resolves
-# it transitively. Both sigil (>= 3.12.1, crypto-bank slot) and patra (1.12.12,
-# which moved its five TLS slots off hardcoded indices) now call
-# `thread_local_alloc` / `_get` / `_set` on hot paths. An undeclared module of
-# this class is a RUNTIME failure, not a build error — exactly how the missing
-# `random` module made `sit key generate` SIGILL at v1.0.2 — so it is declared
-# rather than left to the transitive arc.
-#
-# ── sakshi / sankoch / sigil / patra live HERE as of 1.3.6 ──────────────
-# All four are folded into the cyrius stdlib snapshot (`lib/<name>.cyr` ships
-# in `lib sync --full`), so they are stdlib leaves, not git deps. They were
-# `[deps.<name>]` git blocks through 1.3.5; that shape was actively wrong for
-# a project that publishes a bundle, in two ways:
-#
-#   1. A git pin OVERRIDES the folded module for everything downstream of it.
-#      The pin does not merely select a version for sit — `cyrius deps` overlays
-#      a git dep's resolution ON TOP of the snapshot on every build, recursing
-#      through sibling manifests, so a stale pin pushes the older file onto any
-#      consumer that reaches sit transitively. The only signal is an unnamed
-#      "N bundled lib(s) differ" shadow warning, and `deps --verify` cannot
-#      catch it because the lock is written FROM DISK — it records the hash of
-#      the downgraded file. patra hit this four levels deep (1.13.0) and sigil
-#      independently (3.12.7); both dropped their pins for exactly this reason.
-#
-#   2. On a bundle-publishing project a git dep makes `cyrius distlib`
-#      reclassify the module out of the stdlib leaves, so it is DROPPED from
-#      the `dist/sit.deps` sidecar. Measured at 1.3.5's shape: `dist/sit.cyr`
-#      referenced 27 symbols across sigil / sankoch / patra (patra_*, zlib_*,
-#      hash_data, hex_*, ed25519_*, pem_decode_certs) while the sidecar listed
-#      only the 34 stdlib leaves and none of the three modules defining them —
-#      so a consumer building from bundle + sidecar could not resolve them and
-#      had to hand-declare the deps. kavach hit the same reclassification.
-#
-# ⚠ Do NOT re-add these as `[deps.<name>]` git blocks. Pinning a version here
-# means pinning the toolchain — that is the correct and only lever, and the
-# `cyrius` pin in [package] is where it lives. Versions folded by 6.5.24:
-# sakshi 2.4.10, sankoch 2.7.7, sigil 3.12.9, patra 1.13.0.
 stdlib = [
     "slice",
     "string",
@@ -190,4 +100,3 @@ stdlib = [
     "sigil",
     "patra",
 ]
-

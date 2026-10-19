@@ -19,10 +19,15 @@ WORK=$(mktemp -d -t sit-itest.XXXXXX)
 # Build the .git/ read-mode library probe (against the shipped dist/sit.cyr
 # bundle) BEFORE HOME is isolated below — cyrius needs the real HOME to find
 # its toolchain. Empty if the toolchain isn't on this runner (binary-only CI).
+# A toolchain that is present but cannot compile the bundle is a FAILURE, not a
+# skip — that is exactly the consumer breakage this probe exists to catch.
 GIT_PROBE=""
+GIT_PROBE_BROKEN=0
 if command -v cyrius >/dev/null 2>&1; then
-  if ( cd "$ROOT" && cyrius build tests/integration/git_probe.cyr "$WORK/git_probe" ) >/dev/null 2>&1; then
+  if ( cd "$ROOT" && cyrius build tests/integration/git_probe.cyr "$WORK/git_probe" ) >"$WORK/git_probe.log" 2>&1; then
     GIT_PROBE="$WORK/git_probe"
+  else
+    GIT_PROBE_BROKEN=1
   fi
 fi
 
@@ -317,6 +322,9 @@ if command -v git >/dev/null 2>&1; then
     assert_contains "$APIOUT" "STATUS M tracked.txt"  "probe: sit_repo_status reports modified"
     assert_contains "$APIOUT" "STATUS D gone.txt"     "probe: sit_repo_status reports deleted"
     assert_contains "$APIOUT" "STATUS N fresh.txt"    "probe: sit_repo_status reports new"
+  elif [ "$GIT_PROBE_BROKEN" = 1 ]; then
+    bad "probe: dist/sit.cyr does not compile into a consumer"
+    grep -E 'error|reachable call site' "$WORK/git_probe.log" | sed 's/^/    /'
   else
     printf '  SKIP: library-API probe unavailable (cyrius toolchain not found)\n'
   fi

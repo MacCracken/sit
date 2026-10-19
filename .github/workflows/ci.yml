@@ -37,7 +37,7 @@ jobs:
         # Stdlib-only resolution as of v1.3.6. Every module sit consumes —
         # including sakshi / sankoch / sigil / patra — is a `[deps].stdlib`
         # leaf folded into the toolchain snapshot; there are no `[deps.X]`
-        # git crates left (see cyrius.cyml's note on why a git pin on a
+        # git crates left (see docs/adr/0012 on why a git pin on a
         # folded module downgrades consumers and drops it from the
         # dist/sit.deps sidecar).
         #

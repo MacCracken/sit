@@ -4,7 +4,7 @@
 
 > **How this file is organized.** Backlog items are grouped by **what kind of work they are**, not by a version number, because version-keyed headings go stale the moment a release ships. Only the *themed minor line* carries version numbers, because those are deliberate scope commitments. When an item ships, **delete it** — the CHANGELOG is the record. Do not leave struck-through entries behind.
 
-**Where we are**: `1.6.2`. The `1.3.x` line went almost entirely to audit work
+**Where we are**: `1.6.3`. The `1.3.x` line went almost entirely to audit work
 (two security audits, see [`../audit/`](../audit/)) and `1.4.x` to correctness
 and growth curves — `status` is no longer superlinear (4.98× git at 1,000 files,
 was 26.64×), the last four unfuzzed parsers have harnesses, every deferral
@@ -263,9 +263,9 @@ completions and uniform errors, in two independent steps.
 **Placement constraint.** Every `cmd_*` is in a `[lib]` module and ships in `dist/sit.cyr` (40
 `fn cmd_`) and `dist/sit-read.cyr` (22). `cmdit_*` calls must stay out of `[lib]`/`[lib.read]` —
 in `src/main.cyr` or a new `src/cli.cyr` neither profile lists — or owl and thoth inherit an
-unresolved dependency. That is also why a `[deps.cmdit]` git block is safe despite the
-`cyrius.cyml:149` warning: the warning covers the four stdlib-folded modules, cmdit is not
-folded, and `distlib` leaving it out of `dist/sit.deps` is harmless when no bundled module calls
+unresolved dependency. That is also why a `[deps.cmdit]` git block is safe despite
+[ADR 0012](../adr/0012-deps-pinned-through-the-toolchain.md): the ADR covers the stdlib-folded
+modules, cmdit is not folded, and `distlib` leaving it out of `dist/sit.deps` is harmless when no bundled module calls
 it.
 
 **Step 1 — top level only (no `cmd_*` or dist change)**
@@ -303,8 +303,9 @@ it.
 
 **cyrius.cyml, tests, identity**
 
-- [ ] No stdlib `flags` to drop; `args` + `io` already in `[deps] stdlib`. No pin bump (cmdit's
-  dist compiles on 6.6.2). 1.3.0 is untagged as of 2026-10-14; 1.2.6 is the same API.
+- [ ] No stdlib `flags` to drop; `args` + `io` already in `[deps] stdlib`. No pin bump: cmdit's
+  dist compiles on 6.6.20 (1.3.0 and 1.4.0 both checked 2026-10-19). cmdit is tagged through
+  1.4.0 as of 2026-10-19.
   ```
   [deps.cmdit]
   git = "https://github.com/MacCracken/cmdit.git"
@@ -315,7 +316,7 @@ it.
   `tests/integration/run.sh` + the CI smoke steps in `.github/workflows/ci.yml` (and
   `scripts/benchmark.sh`'s invocations), stdout/stderr byte-identical.
 - [ ] `docs/architecture/001` and `merge.cyr:1079-1088` describe `args_init` reading into a stack
-  buffer; the 6.6.2 stdlib heap-allocates it (`lib/args.cyr:132-143`), so `cmdit_argv`'s stored
+  buffer; the 6.6.20 stdlib heap-allocates it (`lib/args.cyr:138-149`), so `cmdit_argv`'s stored
   pointers are safe. Update both notes when this lands.
 
 References: cmdit `README.md` and `docs/adr/0002-verb-dispatch.md` (identify-and-return,
