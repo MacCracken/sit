@@ -650,24 +650,90 @@ fn ident_sanitized(s) {
     return out;
 }
 
-# Write bytes to `fd` with control bytes (except tab) and DEL replaced by '?'.
+# Classify the run starting at `p` (`n` bytes left) for display: returns
+# -len for a run to keep as is, +len for a run to replace with one '?'.
+#
+# 1.7.2 (E10): bytes >= 0x80 used to pass untouched, so a UTF-8 C1 control
+# (U+009B is CSI) or a bidi override in a ref name or commit message reached
+# the terminal. git allows non-ASCII ref names, so the bytes are escaped on
+# output, not refused on input. UTF-8 is decoded rather than byte-matched:
+# 0x80-0x9F are also ordinary continuation bytes ("é" is C3 A9).
+fn _text_run(p, n) {
+    var c = load8(p) & 0xFF;
+    if (c < 32) {
+        if (c == 9) { return 0 - 1; }                 # tab stays
+        return 1;                                     # C0 control
+    }
+    if (c == 127) { return 1; }                       # DEL
+    if (c < 128) { return 0 - 1; }
+    # One UTF-8 sequence. A malformed one is unsafe byte by byte: an 8-bit
+    # terminal reads a lone 0x9B as CSI.
+    var need = 0;
+    var cp = 0;
+    if (c >= 0xC2) { if (c <= 0xDF) { need = 1; cp = c & 0x1F; } }
+    if (c >= 0xE0) { if (c <= 0xEF) { need = 2; cp = c & 0x0F; } }
+    if (c >= 0xF0) { if (c <= 0xF4) { need = 3; cp = c & 0x07; } }
+    if (need == 0) { return 1; }                      # continuation or bad lead
+    if (need >= n) { return 1; }                      # truncated
+    var k = 1;
+    while (k <= need) {
+        var cc = load8(p + k) & 0xFF;
+        if ((cc & 0xC0) != 0x80) { return 1; }
+        cp = (cp << 6) | (cc & 0x3F);
+        k = k + 1;
+    }
+    if (need == 2) {
+        if (cp < 0x800) { return 1; }                 # overlong
+        if (cp >= 0xD800) { if (cp <= 0xDFFF) { return 1; } }   # surrogate
+    }
+    if (need == 3) {
+        if (cp < 0x10000) { return 1; }               # overlong
+        if (cp > 0x10FFFF) { return 1; }
+    }
+    var run = need + 1;
+    if (cp <= 0x9F) { return run; }                   # C1 control (U+0080-U+009F)
+    # Bidi controls (Trojan Source, CVE-2021-42574): ALM, LRM / RLM,
+    # LRE / RLE / PDF / LRO / RLO, LRI / RLI / FSI / PDI.
+    if (cp == 0x061C) { return run; }
+    if (cp == 0x200E) { return run; }
+    if (cp == 0x200F) { return run; }
+    if (cp >= 0x202A) { if (cp <= 0x202E) { return run; } }
+    if (cp >= 0x2066) { if (cp <= 0x2069) { return run; } }
+    return 0 - run;
+}
+
+# A display-safe copy of bytes[0, len): each C0 control (except tab), DEL, C1
+# control, bidi control and malformed UTF-8 byte becomes one '?'. Returns a
+# fresh cstring and writes its length to `out_len`; never longer than `len`.
+fn text_sanitized(bytes, len, out_len) {
+    var out = alloc_or_die(len + 1);
+    var i = 0;
+    var o = 0;
+    while (i < len) {
+        var r = _text_run(bytes + i, len - i);
+        if (r > 0) {
+            store8(out + o, 63);                      # '?'
+            o = o + 1;
+            i = i + r;
+        }
+        else {
+            memcpy(out + o, bytes + i, 0 - r);
+            o = o + (0 - r);
+            i = i + (0 - r);
+        }
+    }
+    store8(out + o, 0);
+    store64(out_len, o);
+    return out;
+}
+
+# Write bytes to `fd` made display-safe by text_sanitized.
 fn write_sanitized(fd, bytes, len) {
     if (len <= 0) { return 0; }
-    var out = alloc_or_die(len);
-    var i = 0;
-    while (i < len) {
-        var c = load8(bytes + i) & 0xFF;
-        var emit = c;
-        if (c < 32) {
-            if (c == 9) { }              # allow tab
-            else { emit = 63; }           # '?'
-        }
-        if (c == 127) { emit = 63; }
-        store8(out + i, emit);
-        i = i + 1;
-    }
-    if (fd == STDOUT) { stdout_write(out, len); }
-    else { syscall(SYS_WRITE, fd, out, len); }
+    var olen[8];
+    var out = text_sanitized(bytes, len, &olen);
+    if (fd == STDOUT) { stdout_write(out, load64(&olen)); }
+    else { syscall(SYS_WRITE, fd, out, load64(&olen)); }
     return 0;
 }
 

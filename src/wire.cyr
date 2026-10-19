@@ -75,7 +75,7 @@ fn remote_objects_path(repo_path) {
 # Blocks the CVE-2023-22490 shape where a malicious remote's .sit points at
 # /etc/shadow or similar.
 fn remote_objects_open(repo_path) {
-    patra_init();
+    if (patra_init() != PATRA_OK) { return 0; }       # 1.7.2: see object_db_open
     var rl = strlen(repo_path);
     var sit_dir = alloc(rl + 6);
     memcpy(sit_dir, repo_path, rl);
@@ -688,8 +688,9 @@ fn walk_reachable_tree_batched(src, tree_hex, out, seen, raw_cache) {
 }
 
 # Copy every hex in `hashes` that isn't already present in `dst_db` from
-# `src` (an obj_src). Returns the count of objects newly written, or -1 when
-# the batch did not land (callers must not move a ref).
+# `src` (an obj_src). Returns the count of objects newly written, or -1 (cause
+# already printed) when the destination does not end up holding every object
+# in `hashes`: callers must not move a ref.
 fn copy_objects(src, dst_db, hashes, raw_cache) {
     var n = vec_len(hashes);
     var i = 0;
@@ -739,6 +740,18 @@ fn copy_objects(src, dst_db, hashes, raw_cache) {
         if (got == 0) {
             if (obj_src_read_raw(src, hex, &raw) == 0) { got = 1; }
         }
+        if (got == 0) {
+            # 1.7.2: a read miss used to be skipped, so fetch / push moved the
+            # ref onto an incomplete closure. It is a hole unless the
+            # destination already holds the object; then nothing is missing.
+            if (db_object_has(dst_db, hex) == 0) {
+                if (in_txn == 1) { patra_rollback(dst_db); }
+                eprint("sit: the source cannot produce object ", 38);
+                eprint(hex, 64);
+                eprintln("");
+                return 0 - 1;
+            }
+        }
         if (got == 1) {
             var compressed = load64(&raw);
             var clen = load64(&raw + 8);
@@ -746,6 +759,9 @@ fn copy_objects(src, dst_db, hashes, raw_cache) {
             var ins = db_object_insert_raw(dst_db, hex, ty, compressed, clen);
             if (ins < 0) {
                 if (in_txn == 1) { patra_rollback(dst_db); }
+                eprint("sit: failed to store object ", 28);
+                eprint(hex, 64);
+                eprintln("");
                 return 0 - 1;
             }
             if (ins == 0) { copied = copied + 1; }
@@ -753,7 +769,10 @@ fn copy_objects(src, dst_db, hashes, raw_cache) {
         i = i + 1;
     }
     if (in_txn == 1) {
-        if (patra_commit(dst_db) != PATRA_OK) { return 0 - 1; }
+        if (patra_commit(dst_db) != PATRA_OK) {
+            eprintln("sit: failed to commit the copied objects");
+            return 0 - 1;
+        }
     }
     return copied;
 }
@@ -1149,7 +1168,7 @@ fn do_fetch(name, branch) {
     if (ssh_handle != 0)   { wire_ssh_close(ssh_handle); }
 
     if (copied < 0) {
-        eprintln("sit: failed to store fetched objects; remote-tracking ref not updated");
+        eprintln("sit: fetch incomplete; remote-tracking ref not updated");
         return 0;
     }
 
@@ -1623,7 +1642,7 @@ fn cmd_push() {
     patra_close(dst_db);
 
     if (copied < 0) {
-        eprintln("sit: failed to store objects in the remote; remote ref not updated");
+        eprintln("sit: push incomplete; remote ref not updated");
         return 1;
     }
 

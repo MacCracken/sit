@@ -55,8 +55,7 @@ fn cmd_add() {
     }
 
     if (forced == 0) {
-        var patterns = load_sitignore();
-        if (is_ignored(path, patterns) == 1) {
+        if (is_ignored_scoped(path) == 1) {
             syscall(SYS_WRITE, STDERR, "sit: '", 6);
             syscall(SYS_WRITE, STDERR, path, path_len);
             syscall(SYS_WRITE, STDERR, "' matches a .sitignore pattern (use -f to override)\n", 52);
@@ -138,7 +137,7 @@ fn _ensure_entries_index(db) {
 
 # Open (creating if needed) .sit/index.patra with its entries table and path index.
 fn index_db_open() {
-    patra_init();
+    if (patra_init() != PATRA_OK) { return 0; }       # 1.7.2: see object_db_open
     var db = sf_patra_open(".sit/index.patra");
     if (db == 0) { return 0; }
     # Idempotent — second call returns "already exists", which we ignore.
@@ -150,28 +149,58 @@ fn index_db_open() {
 # v0.6.4: process-wide cache for .sit/index.patra. Same pattern as
 # get_object_db (object_db.cyr). Lazy-open + lazy-migrate-from-plaintext.
 var _index_db_cached = 0;
+var _index_db_failed = 0;
 
 # Process-cached index DB handle; migrates a v0.1 plaintext index on first open.
+# 0 when the index cannot be opened or a pending migration did not finish.
 fn get_index_db() {
     if (_index_db_cached != 0) { return _index_db_cached; }
-    _index_db_cached = index_db_open();
-    if (_index_db_cached == 0) { return 0; }
+    if (_index_db_failed == 1) { return 0; }
+    var db = index_db_open();
+    if (db == 0) { return 0; }
     # v0.6.10 — see get_object_db (object_db.cyr) for the BATCH-mode revert
     # rationale. Same shape: cache never closes, so BATCH-pending writes
     # would be lost on power loss before the every-64-writes auto-flush.
-    index_migrate_from_plaintext(_index_db_cached);
+    #
+    # 1.7.2: an unfinished migration withholds the handle. A table missing
+    # the legacy rows would let `commit` record their files as deleted.
+    if (index_migrate_from_plaintext(db) != 0) {
+        patra_close(db);
+        _index_db_failed = 1;
+        return 0;
+    }
+    _index_db_cached = db;
     return _index_db_cached;
+}
+
+# 1 when a staging index exists on disk (patra or the v0.1 plaintext file).
+fn index_files_present() {
+    if (sf_exists(".sit/index.patra") == 1) { return 1; }
+    if (sf_exists(".sit/index") == 1) { return 1; }
+    return 0;
 }
 
 # Migrate legacy plaintext .sit/index (v0.1 format) into the patra table.
 # No-op if the plaintext file is absent. Deletes it on successful migration.
+# Returns 0 when there was nothing to do or every row landed, and -1 with
+# `.sit/index` kept when the file could not be read or a row was refused.
 fn index_migrate_from_plaintext(db) {
     if (sf_exists(".sit/index") != 1) { return 0; }
     var pair[16];
-    if (read_file_heap(".sit/index", &pair) != 0) { return 0; }
+    if (read_file_heap(".sit/index", &pair) != 0) { return 0 - 1; }
     var data = load64(&pair);
     var len = load64(&pair + 8);
 
+    # 1.7.2: all or nothing. A refused insert used to be dropped and the file
+    # deleted anyway, losing those staged entries. The rows now share one
+    # transaction; any refusal rolls it back and keeps `.sit/index` for the
+    # next open. Or-ignore (`entries(path)` is indexed by now) stops a retry
+    # after a refused BEGIN from duplicating paths, and lets an entry staged
+    # since then win over the legacy row.
+    var in_txn = 0;
+    if (patra_begin(db) == PATRA_OK) { in_txn = 1; }
+    var landed = 1;
+    var dropped = 0;
     var pos = 0;
     while (pos < len) {
         if (pos + 65 > len) { pos = len; }
@@ -190,33 +219,61 @@ fn index_migrate_from_plaintext(db) {
                 # for deep nested cases without paying for a malicious blob.
                 if (plen > 4096) { pos = len; }
                 else {
+                    # A row no current index can hold (a path over the 255-byte
+                    # column, an empty path, a non-hex id) would be refused on
+                    # every retry and wedge the migration. Drop it, counted.
+                    var holdable = 1;
+                    if (plen > 255) { holdable = 0; }
+                    if (plen == 0) { holdable = 0; }
+                    if (hex_prefix_valid(data + pos, 64) == 0) { holdable = 0; }
+                    if (holdable == 0) { dropped = dropped + 1; }
+                    else {
+                        var hash_copy = alloc(65);
+                        memcpy(hash_copy, data + pos, 64);
+                        store8(hash_copy + 64, 0);
+                        var path_copy = alloc(plen + 1);
+                        memcpy(path_copy, data + pos + 65, plen);
+                        store8(path_copy + plen, 0);
 
-                    var hash_copy = alloc(65);
-                    memcpy(hash_copy, data + pos, 64);
-                    store8(hash_copy + 64, 0);
-                    var path_copy = alloc(plen + 1);
-                    memcpy(path_copy, data + pos + 65, plen);
-                    store8(path_copy + plen, 0);
-
-                    var types[16];
-                    store64(&types + 0, 1);
-                    store64(&types + 8, 1);
-                    var ivals[16];
-                    var sptrs[16];
-                    store64(&sptrs + 0, path_copy);
-                    store64(&sptrs + 8, hash_copy);
-                    var slens[16];
-                    store64(&slens + 0, plen);
-                    store64(&slens + 8, 64);
-                    var bptrs[16];
-                    var blens[16];
-                    patra_insert_row(db, "entries", 7, 2,
-                      &types, &ivals, &sptrs, &slens, &bptrs, &blens);
-
-                    pos = nl + 1;
+                        var types[16];
+                        store64(&types + 0, 1);
+                        store64(&types + 8, 1);
+                        var ivals[16];
+                        var sptrs[16];
+                        store64(&sptrs + 0, path_copy);
+                        store64(&sptrs + 8, hash_copy);
+                        var slens[16];
+                        store64(&slens + 0, plen);
+                        store64(&slens + 8, 64);
+                        var bptrs[16];
+                        var blens[16];
+                        if (patra_insert_row_or_ignore(db, "entries", 7, 2,
+                            &types, &ivals, &sptrs, &slens, &bptrs, &blens) != PATRA_OK) {
+                            landed = 0;
+                        }
+                    }
+                    if (landed == 1) { pos = nl + 1; }
+                    else { pos = len; }
                 }
             }
         }
+    }
+    if (in_txn == 1) {
+        if (landed == 1) {
+            if (patra_commit(db) != PATRA_OK) { landed = 0; }
+        }
+        else { patra_rollback(db); }
+    }
+    if (landed == 0) {
+        eprintln("sit: could not migrate the legacy .sit/index; it is kept for the next run");
+        return 0 - 1;
+    }
+    if (dropped > 0) {
+        var nbuf[24];
+        var nlen = write_decimal(&nbuf, dropped);
+        eprint("sit: dropped ", 13);
+        eprint(&nbuf, nlen);
+        eprintln(" legacy index entries no index can hold (path over 255 bytes, or a bad id)");
     }
     sf_unlink(".sit/index");
     return 0;
@@ -1054,6 +1111,51 @@ fn is_ignored(path, patterns) {
     return is_ignored_kind(path, patterns, 0);
 }
 
+# 1 if the file `path` (repo-relative) is ignored exactly as the working-tree
+# walk (list_working_walk) would ignore it. 1.7.2 (B13): `add` used to test only
+# the root rules, with no kind, so `sit add build/foo.o` succeeded under a
+# `build/` rule, and a nested ignore file was never read. Each ancestor
+# directory is now tested AS a directory with the rules inherited from above
+# it (an ignored directory hides everything below), and then contributes its
+# own ignore file, scoped to it.
+fn is_ignored_scoped(path) {
+    var patterns = load_sitignore();
+    var ig_name = _ignore_filename();
+    var ig_nlen = strlen(ig_name);
+    var plen = strlen(path);
+    var i = 0;
+    while (i < plen) {
+        if (load8(path + i) == 47) {
+            var dir = alloc(i + ig_nlen + 2);
+            memcpy(dir, path, i);
+            store8(dir + i, 0);
+            if (is_ignored_kind(dir, patterns, 1) == 1) { return 1; }
+            # `dir` grows into "<dir>/<ignore file>" in place; the scope is
+            # "<dir>/", the same prefix the walk passes.
+            store8(dir + i, 47);
+            memcpy(dir + i + 1, ig_name, ig_nlen);
+            store8(dir + i + 1 + ig_nlen, 0);
+            if (sf_exists(dir) == 1) {
+                var scoped = vec_new();
+                if (patterns != 0) {
+                    var k = 0;
+                    while (k < vec_len(patterns)) {
+                        vec_push(scoped, vec_get(patterns, k));
+                        k = k + 1;
+                    }
+                }
+                var scope = alloc(i + 2);
+                memcpy(scope, path, i + 1);
+                store8(scope + i + 1, 0);
+                _parse_ignore_file(dir, scoped, scope);
+                patterns = scoped;
+            }
+        }
+        i = i + 1;
+    }
+    return is_ignored_kind(path, patterns, 0);
+}
+
 # 1 if `path` is ignored by `patterns`; last matching rule wins, dir-only rules need path_is_dir.
 fn is_ignored_kind(path, patterns, path_is_dir) {
     if (patterns == 0) { return 0; }
@@ -1226,7 +1328,7 @@ fn _parse_ignore_file(fname, patterns, scope) {
 # is parsed first and the top-level ignore file second — a `.gitignore` rule
 # (including a `!` re-include) overrides info/exclude, which is git's ordering.
 # Global/core.excludesFile is still not consulted; nested ignore files are
-# handled by load_ignore_for_dir.
+# added per directory by list_working_walk (diff.cyr) and is_ignored_scoped.
 fn load_sitignore() {
     var patterns = vec_new();
 

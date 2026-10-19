@@ -459,7 +459,8 @@ fn _ensure_object_index(db) {
 
 # Open (creating if needed) .sit/objects.patra with its objects table and hash index.
 fn object_db_open() {
-    patra_init();
+    # 1.7.2: patra_init reports a refused allocation since patra 1.16.1.
+    if (patra_init() != PATRA_OK) { return 0; }
     var db = sf_patra_open(".sit/objects.patra");
     if (db == 0) { return 0; }
     patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
@@ -1231,6 +1232,18 @@ fn cmd_fsck() {
     # hasn't been committed yet would look dangling. (Mirrors git's
     # implicit-keep of `git ls-files` blobs during fsck.)
     var idx_entries = parse_index();
+    # 1.7.2: an index on disk that will not open (an unfinished v0.1
+    # migration, a corrupt index.patra) reads as "nothing staged" here, so
+    # every blob only it references would look dangling.
+    var idx_unreadable = 0;
+    if (idx_entries == 0) {
+        if (index_files_present() == 1) {
+            if (get_index_db() == 0) { idx_unreadable = 1; }
+        }
+    }
+    if (idx_unreadable == 1) {
+        eprintln("sit: warning: the staging index cannot be read; blobs it stages count as dangling");
+    }
     if (idx_entries != 0) {
         var ii = 0;
         while (ii < vec_len(idx_entries)) {
@@ -1336,6 +1349,10 @@ fn cmd_fsck() {
             eprintln("sit:   their objects cannot be proven reachable and would be deleted while still referenced");
             return 1;
         }
+        if (idx_unreadable == 1) {
+            eprintln("sit: refusing --prune — the staging index cannot be read (see above)");
+            return 1;
+        }
         # If EVERY object is unreachable, the roots are almost certainly broken
         # (corrupt / missing HEAD or refs), not the objects. Pruning would wipe
         # the whole store. Refuse.
@@ -1394,7 +1411,9 @@ fn cmd_fsck() {
             }
             pi = pi + 1;
         }
-        patra_flush(db);
+        # 1.7.2: since patra 1.16.2 a failed fdatasync is reported, and it
+        # sticks to the handle, so this one flush answers for every DELETE.
+        var flush_rc = patra_flush(db);
         stdout_write("pruned ", 7);
         write_unsigned(pruned);
         stdout_write(" objects", 8);
@@ -1404,6 +1423,10 @@ fn cmd_fsck() {
             stdout_write(" within grace", 13);
         }
         stdout_write("\n", 1);
+        if (flush_rc != PATRA_OK) {
+            eprintln("sit: the object store could not be synced; the pruning may not be durable");
+            return 1;
+        }
     }
 
     if (bad > 0) { return 1; }

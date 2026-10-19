@@ -409,9 +409,11 @@ As of v0.8.10 the matcher is git-parity:
 - **Anchoring**: a pattern with a leading or middle `/` (`/foo`, `a/b`) is matched from the repo root; a pattern with no `/` (`build`, `*.log`) matches at any level.
 - **Negation**: `!pattern` re-includes a previously-excluded match — patterns are evaluated in order, last match wins.
 - **Directory exclusion**: a matched directory excludes its contents (`build` also ignores `build/foo.o`).
-- `sit add <ignored>` errors out — like git, override with `-f`. `.sitignore` itself is trackable.
+- **Directory-only rules**: a trailing `/` (`build/`) matches directories, not a file of the same name.
+- **Nested ignore files**: a `.sitignore` in a subdirectory applies below it, after the rules inherited from above (so its `!` re-includes win), as git's nested `.gitignore` does.
+- `sit add <ignored>` errors out — like git, override with `-f`. `add` applies exactly the rules `status` does (since 1.7.2). `.sitignore` itself is trackable.
 
-Simplifications vs git (documented in `src/index.cyr`): a non-segment `**` (e.g. `a**b`) still crosses `/`; a trailing `/` (`build/`) is allowed but not enforced as directories-only.
+Simplification vs git (documented in `src/index.cyr`): a non-segment `**` (e.g. `a**b`) still crosses `/`.
 
 **Note**: unlike older sit versions, dotfiles aren't hidden by default anymore — only `.sit/` is hardcoded-skipped. To keep `.git/` out of your sit repo when both coexist, list `.git` in your `.sitignore`. (Separately, since 1.2.0 sit can *read* an existing `.git/` repo read-only — see ["read an existing git repository"](#what-works-today) below — so a `.git/` directory isn't merely clutter.)
 
@@ -469,11 +471,8 @@ Simplifications vs git (documented in `src/index.cyr`): a non-segment `**` (e.g.
 
 ## What doesn't yet
 
-- Rebase; cherry-pick; stash (the reflog + its `fsck --prune` grace period landed in 1.1.0, making these safe to add next)
 - Reflog entry expiry (`reflog expire` / `delete`) — entries are currently unbounded, so reflog-protected objects stay until the log is cleared manually; the `@{<date>}` time-selector (only the integer `@{N}` ordinal ships in 1.1.0)
-- Octopus (3+ parent) merges — `merge-base` resolves them correctly, but `sit merge` is 2-way, so 3-parent commits can't be created yet
 - Pack bundles / delta compression for object transfer (objects copy one-at-a-time)
 - HTTPS over public CA certs / mTLS — HTTPS today is TOFU-pinned (CA-chain + hostname verification is a post-v1 opt-in; the **1.7.0** transport-trust minor)
-- `.sitignore` directory-only (`build/`) enforcement
 
 Track progress in [`../development/roadmap.md`](../development/roadmap.md). Design notes live in [`../architecture/`](../architecture/); decisions in [`../adr/`](../adr/).

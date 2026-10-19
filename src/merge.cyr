@@ -109,8 +109,8 @@ fn any_hunk_overlap(hunks_a, hunks_b) {
 # reaches an unmapped page. The bound makes any such miscount fail closed (the
 # merge degrades to a conflict) instead of corrupting the heap.
 fn append_line_to_buf(buf, pos, line_tup, cap) {
-    var lp = load64(line_tup);
-    var ll = load64(line_tup + 8);
+    var lp = line_ptr(line_tup);
+    var ll = line_len(line_tup);                # without diff.cyr's LINE_NO_EOL flag
     if (ll < 0) { return 0 - 1; }
     if (pos < 0) { return 0 - 1; }
     if (pos + ll + 1 > cap) { return 0 - 1; }

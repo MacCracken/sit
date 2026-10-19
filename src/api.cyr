@@ -126,8 +126,14 @@ fn sit_diff_path(repo, path) {
 # .sit/HEAD or .git/HEAD through the storage seam (roadmap 1.2.0), so it works
 # on both sit-native and existing git repositories. Caller owns the cstring.
 # New public surface (ADR 0009): additive, SemVer-minor.
+#
+# 1.7.2 (E10): the name is display-safe (text_sanitized): a C1 or bidi control
+# in it comes back as '?', since consumers put it straight on screen.
 fn sit_repo_branch(repo) {
-    return current_branch_name();
+    var name = current_branch_name();
+    if (name == 0) { return 0; }
+    var n[8];
+    return text_sanitized(name, strlen(name), &n);
 }
 
 # A status record is a 16-byte {path_ptr, kind} pair. Internal builder.

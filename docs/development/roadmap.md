@@ -9,7 +9,7 @@
 >
 > A slot is a plan, not a promise. When a release ships, **delete its items** (the CHANGELOG is the record) and re-slot anything that slipped. Do not leave struck-through entries behind. Upstream asks, holds and closed decisions sit at the end, outside the version slots.
 
-**Where we are:** `1.7.1`, on cyrius 6.7.15. The 1.6.x line closed with a P(-1) audit ([`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md); 16 HIGH, all fixed). 1.7.0 bound bearer tokens to remotes ([ADR 0014](../adr/0014-bearer-tokens-bound-to-remotes.md)) and refuses commits of unresolved conflicts. 1.7.1 took patra 1.16.x and makes a refused object insert or commit fail before any ref moves. **35 commands.** The items below are what that audit deferred, the rest of 1.7.1's patra-status sweep, and the long-standing structural and CLI work.
+**Where we are:** `1.7.2`, on cyrius 6.7.15. The 1.6.x line closed with a P(-1) audit ([`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md); 16 HIGH, all fixed). 1.7.0 bound bearer tokens to remotes ([ADR 0014](../adr/0014-bearer-tokens-bound-to-remotes.md)) and refuses commits of unresolved conflicts. 1.7.1 took patra 1.16.x and makes a refused object insert or commit fail before any ref moves; 1.7.2 finished that sweep (a hole in a source's closure, the legacy index migration, the last unchecked patra statuses) and shipped the audit's small fixes (ssh read deadline, `add` ignore scoping, the no-newline marker, C1 / bidi escaping). **35 commands.** The items below are what that audit still defers, plus the long-standing structural and CLI work.
 
 ---
 
@@ -25,17 +25,7 @@ Each item ships under the usual test / fuzz / poison / bench gates.
 
 ## 1.7.x — patch line (no new surface)
 
-Audit ids (A8, C10, …) refer to [`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md).
-
-### 1.7.2 — small correctness fixes
-
-- **ssh transport has no read timeout (C10, LOW).** Plain http gained the 30 s bound in 1.6.4. The ssh pipe needs a poll()-based deadline in `_wire_ssh_recv_response`; cyrius 6.7.9 added `sys_ppoll` on every target.
-- **`sit add` ignores directory-only and nested ignore rules (B13, LOW).** `status` has honoured both since 1.4.9 / 1.5.2. `add` still matches only the root `.sitignore` and `info/exclude`, with `kind = 0`, so `sit add build/foo.o` succeeds under a `build/` rule. Route `add` through the same scoped check `list_working_walk` uses.
-- **No `\ No newline at end of file` marker (B14, LOW).** A change that only adds a trailing newline prints headers and no hunk, and patches across a file with no final newline do not round-trip. `split_lines` has to keep the final-newline state.
-- **Bytes ≥ 0x80 pass `refname_valid` and `write_sanitized` (E10, LOW).** UTF-8 C1 controls (U+009B CSI) and bidi overrides reach terminals and API consumers. git allows non-ASCII ref names, so the fix is escaping the C1 / bidi ranges on output, not rejecting them.
-- **`copy_objects` skips an object the source cannot produce, and the ref still moves (MEDIUM).** 1.7.1 made a refused insert or commit fatal. A read miss (`obj_src_read_raw` fails on a corrupt source, or an HTTP GET fails after the batch prefetch) still drops that object silently, so fetch / push can point a ref at an incomplete closure. git refuses with "missing object". sit stores no gitlinks, and `clone --depth` trims the walk rather than the copy, so a miss is always an error. Make it one, with a source-side corruption test.
-- **The v0.1 plaintext-index migration drops refused rows and deletes `.sit/index` anyway (LOW).** `index_migrate_from_plaintext` ignores each `patra_insert_row`, the same pattern 1.7.1 fixed in the loose-object migration. Only staged state is at risk; the blobs and the worktree survive. Unlink only when every row landed, and insert with or-ignore so a retry does not duplicate paths already migrated.
-- **The remaining unchecked patra statuses (LOW).** `patra_init` returns `PATRA_ERR_IO` since patra 1.16.1 and is ignored at `object_db.cyr:462`, `wire.cyr:78` and `index.cyr:141`. `fsck --prune`'s closing `patra_flush` (`object_db.cyr:1397`) is ignored, though since 1.16.2 a failed fdatasync is sticky on the handle. Report both.
+Audit ids (A8, D6, …) refer to [`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md).
 
 ### 1.7.3 — history walks
 
@@ -114,8 +104,8 @@ Re-checked 2026-10-19 against **cmdit 1.4.0** (latest tag; its own pin is cyrius
   | flag | location |
   |---|---|
   | `add -f` | `index.cyr:17` |
-  | `rm --cached` | `index.cyr:681` |
-  | `reset --hard` | `index.cyr:580` |
+  | `rm --cached` | `index.cyr:738` |
+  | `reset --hard` | `index.cyr:637` |
   | `checkout -b` | `refs.cyr:654` |
   | `branch -d` | `refs.cyr:540` |
   | `tag -d` / `-a` / `-s` | `refs.cyr:349,390,392` |
@@ -129,14 +119,14 @@ Re-checked 2026-10-19 against **cmdit 1.4.0** (latest tag; its own pin is cyrius
   | `log` | `cmd_log`, `commit.cyr:949` | |
   | `commit -S` / `-m` | `cmd_commit`, `commit.cyr:1104` | |
   | `reflog -n` | `cmd_reflog`, `reflog.cyr:379` | a missing value is ignored |
-  | `fsck --prune` / `--prune-now` | `cmd_fsck`, `object_db.cyr:1099` | everything else is ignored |
-  | `clone` | `cmd_clone`, `wire.cyr:1290` | |
+  | `fsck --prune` / `--prune-now` | `cmd_fsck`, `object_db.cyr:1106` | everything else is ignored |
+  | `clone` | `cmd_clone`, `wire.cyr:1326` | |
   | `serve` | `cmd_serve`, `serve.cyr:1323` | `<repo>` fixed at `argv(2)` |
-  | `diff` / `show` | `diff.cyr:1019,1289` | |
+  | `diff` / `show` | `diff.cyr:1029,1299` | |
 - **Sub-commands:**
   - `stash push | list | pop | drop` (default push): `cmd_stash`, `history.cyr:472`.
   - `key generate | show`: `cmd_key`, `sign.cyr:293`.
-  - `remote add | list | remove` (default list): `cmd_remote`, `wire.cyr:1028`.
+  - `remote add | list | remove` (default list): `cmd_remote`, `wire.cyr:1059`.
 - **Silent tolerance is load-bearing.** `merge <branch> -m <msg>` ignores `-m` (1.8.0 above), and both the integration suite and CI pass it.
   - The `getenv` reads (`SIT_AUTHOR_*`, `SIT_OWL`, `HOME`, …) are not flag fallbacks and stay.
 
@@ -170,14 +160,14 @@ Re-checked 2026-10-19 against **cmdit 1.4.0** (latest tag; its own pin is cyrius
   - Keep diff/show hand-rolled, or strip `-U*` before `cmdit_parse_verb`.
   - This is concrete demand for cmdit's v2-backlog "attached short value" as an opt-in per-flag modifier.
 - **Caller-side rules (not gaps):**
-  - serve's `--stdio` / `--listen` and `--tls` / `--stdio` exclusions, and `--tls` needing `--cert` / `--key` (`serve.cyr:1386-1388`)
+  - serve's `--stdio` / `--listen` and `--tls` / `--stdio` exclusions, and `--tls` needing `--cert` / `--key` (`serve.cyr:1414-1459`)
   - `merge` registering `-m` and keeping "any flag → single-branch path"
   - config's `--list` / `--unset` / `<key>` exclusivity
 - **Decide, don't drift:**
   - Dash-leading paths and messages will need `--`.
   - `atoi` junk (`-n x`) becomes an int error.
   - Arguments ignored today (fsck, reflog, extras) become errors.
-- **`sit serve <repo> --stdio` is a cross-version contract.** The SSH client builds exactly that remote command line (`wire_ssh.cyr:407`), so it must keep parsing byte for byte.
+- **`sit serve <repo> --stdio` is a cross-version contract.** The SSH client builds exactly that remote command line (`wire_ssh.cyr:410`), so it must keep parsing byte for byte.
 
 **cyrius.cyml, tests, identity**
 
@@ -190,7 +180,7 @@ Re-checked 2026-10-19 against **cmdit 1.4.0** (latest tag; its own pin is cyrius
   modules = ["dist/cmdit.cyr"]
   ```
 - **Tests:** `tests/sit.tcyr` / `tests/sit.fcyr` don't touch CLI parsing. The bar is `tests/integration/run.sh` plus CI's smoke steps (and `scripts/benchmark.sh`'s invocations), with stdout / stderr byte-identical.
-- **argv safety:** `lib/args.cyr` (cyrius 6.7.15, `args_init` at `:167-173`) reads the command line into a heap buffer, so `cmdit_argv`'s stored pointers are safe. The old stack-buffer hazard ([architecture 001](../architecture/001-args-stack-buffer-lifetime.md), and the octopus comment at `merge.cyr:1359`) no longer applies.
+- **argv safety:** `lib/args.cyr` (cyrius 6.7.15, `args_init` at `:167-173`) reads the command line into a heap buffer, so `cmdit_argv`'s stored pointers are safe. The old stack-buffer hazard ([architecture 001](../architecture/001-args-stack-buffer-lifetime.md), and the octopus comment at `merge.cyr:1356`) no longer applies.
 
 ## 1.x — unscheduled
 
@@ -219,4 +209,4 @@ Closed by measurement. The reasoning lives where cited; they are listed here onl
 
 ---
 
-*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/), latest [`2026-10-19-v1.7.1.md`](../benchmarks/2026-10-19-v1.7.1.md). Security audit reports are in [`../audit/`](../audit/), latest [`2026-10-19-audit.md`](../audit/2026-10-19-audit.md).*
+*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/), latest [`2026-10-19-v1.7.2.md`](../benchmarks/2026-10-19-v1.7.2.md). Security audit reports are in [`../audit/`](../audit/), latest [`2026-10-19-audit.md`](../audit/2026-10-19-audit.md).*

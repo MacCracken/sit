@@ -440,7 +440,7 @@ fn print_indented_message(body, msg_start, body_len) {
             mnl = mnl + 1;
         }
         stdout_write("    ", 4);
-        stdout_write(body + msg_start + mp, mnl - mp);
+        write_sanitized(STDOUT, body + msg_start + mp, mnl - mp);   # E10
         stdout_write("\n", 1);
         mp = mnl + 1;
     }
@@ -626,7 +626,7 @@ fn print_commit_oneline(commit_hex, body, body_len, msg_start) {
         }
         var subj_len = first_nl - msg_start;
         if (subj_len > 0) {
-            stdout_write(body + msg_start, subj_len);
+            write_sanitized(STDOUT, body + msg_start, subj_len);    # E10
         }
     }
     stdout_write("\n", 1);

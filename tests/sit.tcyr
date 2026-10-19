@@ -1404,6 +1404,117 @@ fn test_wire_io_send_short_write() {
     return 0;
 }
 
+# 1.7.2 (C10): _wire_ssh_recv_response bounds each read from the ssh pipe.
+# Through 1.7.1 a remote that stalled after a request hung sit forever. The
+# deadline is lowered to 200 ms here so the silent case costs no real wait.
+fn test_wire_ssh_recv_deadline() {
+    test_group("wire_ssh.cyr — read deadline on the ssh pipe (v1.7.2)");
+    var fds[8];
+    store64(&fds, 0);
+    var rc = sys_pipe(&fds);
+    assert_eq(rc, 0, "pipe");
+    if (rc != 0) { return 0; }
+    var rfd = load64(&fds) & 0xFFFFFFFF;
+    var wfd = (load64(&fds) >> 32) & 0xFFFFFFFF;
+    var out[24];
+
+    # A complete response still reads normally.
+    var resp = "HTTP/1.0 200 OK\r\nContent-Length: 5\r\nX-Sit-Type: 2\r\n\r\nhello";
+    sys_write(wfd, resp, strlen(resp));
+    assert_eq(_wire_ssh_recv_response(rfd, &out), 200, "a complete response returns its status");
+    assert_eq(load64(&out + 8), 5, "and its body length");
+    assert_eq(memeq(load64(&out), "hello", 5), 1, "and its body");
+    assert_eq(load64(&out + 16), 2, "and its X-Sit-Type");
+
+    var saved = WIRE_SSH_READ_TIMEOUT_MS;
+    WIRE_SSH_READ_TIMEOUT_MS = 200;
+    # A peer that sends nothing gives up at the deadline instead of hanging.
+    var t0 = clock_now_ms();
+    assert_eq(_wire_ssh_recv_response(rfd, &out), 0 - 1, "a silent peer fails with -1");
+    var waited = clock_now_ms() - t0;
+    assert(waited >= 150, "after waiting about the deadline");
+    assert(waited < 5000, "and not much longer");
+    # A peer that stalls mid-response is bounded the same way.
+    var part = "HTTP/1.0 200 OK\r\nContent-Length: 50\r\n\r\nshort";
+    sys_write(wfd, part, strlen(part));
+    assert_eq(_wire_ssh_recv_response(rfd, &out), 0 - 1, "a response stalled mid-body fails with -1");
+    # A peer that hangs up fails at once, not at the deadline.
+    sys_close(wfd);
+    WIRE_SSH_READ_TIMEOUT_MS = 60000;
+    t0 = clock_now_ms();
+    assert_eq(_wire_ssh_recv_response(rfd, &out), 0 - 1, "a hung-up peer fails with -1");
+    assert(clock_now_ms() - t0 < 5000, "without waiting for the deadline");
+    WIRE_SSH_READ_TIMEOUT_MS = saved;
+    sys_close(rfd);
+    return 0;
+}
+
+# 1.7.2 (B14): split_lines keeps the final-newline state, and a last line
+# without one is not equal to the same text with one (git's model).
+fn test_split_lines_final_newline() {
+    test_group("diff.cyr — final-newline state (v1.7.2)");
+    var a = split_lines("a\nb", 3);
+    var b = split_lines("a\nb\n", 4);
+    assert_eq(vec_len(a), 2, "a\\nb splits into 2 lines");
+    assert_eq(vec_len(b), 2, "a\\nb\\n splits into 2 lines");
+    assert_eq(line_no_eol(vec_get(a, 1)), 1, "an unterminated last line is marked");
+    assert_eq(line_no_eol(vec_get(b, 1)), 0, "a terminated last line is not");
+    assert_eq(line_no_eol(vec_get(a, 0)), 0, "an inner line is never marked");
+    assert_eq(lines_equal(vec_get(a, 0), vec_get(b, 0)), 1, "equal inner lines compare equal");
+    assert_eq(lines_equal(vec_get(a, 1), vec_get(b, 1)), 0, "b and b+newline differ");
+    var ann = compute_file_diff("a\nb", 3, "a\nb\n", 4);
+    var changed = 0;
+    var i = 0;
+    while (i < vec_len(ann)) {
+        if (ann_kind(vec_get(ann, i)) != 0) { changed = changed + 1; }
+        i = i + 1;
+    }
+    assert_eq(changed, 2, "adding only the final newline is one deletion + one insertion");
+    assert_eq(vec_len(split_lines("", 0)), 0, "an empty buffer has no lines");
+    return 0;
+}
+
+# One text_sanitized case, input and expected output as hex.
+fn _san_case(in_hex, want_hex, label) {
+    var il = strlen(in_hex) / 2;
+    var wl = strlen(want_hex) / 2;
+    var inb = hex_decode(in_hex, strlen(in_hex));
+    var want = hex_decode(want_hex, strlen(want_hex));
+    var n[8];
+    var got = text_sanitized(inb, il, &n);
+    var ok = 0;
+    if (load64(&n) == wl) { if (memeq(got, want, wl) == 1) { ok = 1; } }
+    assert_eq(ok, 1, label);
+    return 0;
+}
+
+# 1.7.2 (E10): text_sanitized / write_sanitized escape C1 and bidi controls and
+# malformed UTF-8, and leave well-formed text (including its 0x80-0x9F
+# continuation bytes) alone. '?' is 3f.
+fn test_text_sanitized() {
+    test_group("util.cyr — text_sanitized C1 / bidi / UTF-8 (v1.7.2)");
+    _san_case("706c61696e", "706c61696e", "plain ASCII is unchanged");
+    _san_case("611b5b33316d62", "613f5b33316d62", "ESC (C0) becomes ?");
+    _san_case("746162096f6b", "746162096f6b", "tab is kept");
+    _san_case("7f", "3f", "DEL becomes ?");
+    _san_case("c29b33316d", "3f33316d", "UTF-8 CSI (U+009B) becomes one ?");
+    _san_case("c280", "3f", "U+0080, the first C1, is escaped");
+    _san_case("c2a0", "c2a0", "U+00A0, just past C1, is kept");
+    _san_case("636166c3a9", "636166c3a9", "e-acute is kept");
+    _san_case("e282ac", "e282ac", "the euro sign (continuation 0x82) is kept");
+    _san_case("f09f9880", "f09f9880", "a 4-byte emoji is kept");
+    _san_case("78e280ae79", "783f79", "RLO (U+202E) becomes one ?");
+    _san_case("e281a6", "3f", "LRI (U+2066) is escaped");
+    _san_case("e2808e", "3f", "LRM (U+200E) is escaped");
+    _san_case("d89c", "3f", "ALM (U+061C) is escaped");
+    _san_case("9b", "3f", "a lone 0x9B (8-bit CSI) is escaped");
+    _san_case("e282", "3f3f", "a truncated sequence is escaped byte by byte");
+    _san_case("c0af", "3f3f", "an overlong encoding is escaped");
+    _san_case("eda080", "3f3f3f", "a UTF-16 surrogate is escaped");
+    _san_case("f4908080", "3f3f3f3f", "a code point past U+10FFFF is escaped");
+    return 0;
+}
+
 # Run every test group; exit status is the failure count.
 fn main() {
     alloc_init();
@@ -1437,6 +1548,9 @@ fn main() {
     test_ignore_dir_only();
     test_delta_roundtrip();
     test_wire_io_send_short_write();
+    test_wire_ssh_recv_deadline();
+    test_split_lines_final_newline();
+    test_text_sanitized();
     test_parse_tree_order();
     test_audit_164_pure();
     test_170_pure();

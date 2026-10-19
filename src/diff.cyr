@@ -319,7 +319,7 @@ fn cmd_status() {
 
     var branch = current_branch_name();
     stdout_write("On branch ", 10);
-    if (branch != 0) { stdout_write(branch, strlen(branch)); }
+    if (branch != 0) { write_sanitized(STDOUT, branch, strlen(branch)); }   # E10
     else             { stdout_write("(detached)", 10); }
     stdout_write("\n", 1);
     if (read_head_ref() == 0) {
@@ -347,12 +347,32 @@ fn cmd_status() {
 }
 
 # ---- diff ------------------------------------------------------------------
-# Line layout (16 bytes): { ptr_into_data, len } — \n excluded.
+# Line layout (16 bytes): { ptr_into_data, len_word } — \n excluded. Read it
+# through line_ptr / line_len / line_no_eol (the ADR 0009 contract), never raw.
+#
+# 1.7.2 (B14): the length word carries LINE_NO_EOL on a file's last line when
+# the file does not end in \n. Keeping the flag in the word rather than a third
+# field lets lines_equal check length AND final-newline state with the single
+# compare it already made: a 24-byte record with a separate flag cost the LCS
+# inner loop 10-13% (lcs-diff-1000x1000 34.2 -> 38.7 ms).
+enum DiffLine {
+    LINE_NO_EOL = 0x4000000000000000;
+    LINE_LEN_MASK = 0x3FFFFFFFFFFFFFFF;
+}
+# Pointer to a split_lines record's first byte.
 fn line_ptr(l) { return load64(l); }
-# Length of a split_lines record ({ptr, len}).
-fn line_len(l) { return load64(l + 8); }
+# Length of a split_lines record, without the LINE_NO_EOL flag.
+fn line_len(l) { return load64(l + 8) & LINE_LEN_MASK; }
+# 1 for a file's last line when the file does not end in \n.
+fn line_no_eol(l) {
+    if ((load64(l + 8) & LINE_NO_EOL) != 0) { return 1; }
+    return 0;
+}
 
-# Split a buffer into {ptr, len} line records (LF-separated, no copy).
+# Split a buffer into line records (LF-separated, no copy). `a\nb` and
+# `a\nb\n` used to split identically, so a change that only added the trailing
+# newline printed headers and no hunk, and a patch across such a file did not
+# round-trip.
 fn split_lines(data, len) {
     var lines = vec_new();
     var pos = 0;
@@ -364,19 +384,22 @@ fn split_lines(data, len) {
         }
         var line = alloc(16);
         store64(line, data + start);
-        store64(line + 8, pos - start);
+        var word = pos - start;
+        if (pos == len) { word = word | LINE_NO_EOL; }  # ran off the end: no \n
+        store64(line + 8, word);
         vec_push(lines, line);
         if (pos < len) { pos = pos + 1; }
     }
     return lines;
 }
 
-# Byte equality of two split_lines records.
+# Equality of two split_lines records: the same bytes AND the same
+# final-newline state, so `b` and `b\n` differ as they do in git. Comparing the
+# raw length words checks both at once.
 fn lines_equal(a, b) {
-    var alen = line_len(a);
-    var blen = line_len(b);
-    if (alen != blen) { return 0; }
-    return memeq(line_ptr(a), line_ptr(b), alen);
+    var aw = load64(a + 8);
+    if (aw != load64(b + 8)) { return 0; }
+    return memeq(line_ptr(a), line_ptr(b), aw & LINE_LEN_MASK);
 }
 
 # Read trace slice for depth `d` at diagonal `kp` (P-14). The slice holds the
@@ -957,6 +980,7 @@ fn print_file_diff(path, old_buf, old_len, new_buf, new_len, ctx) {
             if (kind == 2) { stdout_write("+", 1); }
             stdout_write(line_ptr(l), line_len(l));
             stdout_write("\n", 1);
+            if (line_no_eol(l) == 1) { stdout_write("\\ No newline at end of file\n", 28); }
             ni = ni + 1;
         }
         h = h + 1;

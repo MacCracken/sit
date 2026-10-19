@@ -35,6 +35,9 @@
 
 var WIRE_SSH_RECV_INITIAL = 4096;
 var WIRE_SSH_RECV_MAX = 16777216;  # 16 MiB — match WIRE_HTTP_MAX_BODY
+# 1.7.2 (C10): idle bound on each read from the ssh pipe, the 30 s plain http
+# has had since 1.6.4. A variable so the unit tests can shorten it.
+var WIRE_SSH_READ_TIMEOUT_MS = 30000;
 
 fn _ssh_handle_pid(h)         { return load64(h); }
 fn _ssh_handle_write_fd(h)    { return load64(h + 8); }
@@ -631,6 +634,20 @@ fn _wire_ssh_recv_response(rfd, out_body) {
             fl_free(buf);
             buf = new_buf;
             cap = new_cap;
+        }
+        # A stalled remote used to hang sit for good. Wait for data (or the
+        # child's hang-up) at most WIRE_SSH_READ_TIMEOUT_MS; a signal restarts
+        # the wait. Where the host has no poll (-38, agnos) the read blocks.
+        var waiting = 1;
+        while (waiting == 1) {
+            var w = fd_wait_ready(rfd, 0, WIRE_SSH_READ_TIMEOUT_MS);
+            if (w == 0 - 4) { continue; }                 # EINTR
+            waiting = 0;
+            if (w == 0) {
+                fl_free(buf);
+                eprintln("sit: ssh remote sent nothing for 30 s; giving up");
+                return 0 - 1;
+            }
         }
         var rd_t, rd_v = sock_recv(rfd, buf + used, cap - used);
         if (is_err_result(rd_t) == 1) {

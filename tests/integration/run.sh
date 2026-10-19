@@ -1297,6 +1297,129 @@ else
   echo "  (skipped 24e: python3 not available)"
 fi
 
+# ── 25. 1.7.2: small correctness fixes ─────────────────────────────
+hr "1.7.2 correctness fixes"
+
+# 25a. A source whose closure has a hole (commit + tree, no blobs) must not
+# produce a ref: the copy used to skip what it could not read.
+if command -v python3 >/dev/null 2>&1; then
+  a164 h172x; echo keep > k; echo gone > g; c164 k g; m164 one; H172X="$R"
+  HC=$(cat .sit/refs/heads/main); HT=$("$SIT" cat-file "$HC" | sed -n 's/^tree //p')
+  a164 h172y; H172Y="$R"
+  python3 -I "$ROOT/tests/integration/plant_loose.py" "$SIT" "$H172X" "$H172Y" "commit:$HC" "tree:$HT"
+  echo "$HC" > .sit/refs/heads/main
+  assert_contains "$("$SIT" fsck 2>&1)" "missing" "25a: the planted source really is missing its blobs"
+  a164 h172d; "$SIT" remote add origin "$H172Y" >/dev/null
+  assert_contains "$("$SIT" fetch origin main 2>&1)" "cannot produce object" "25a: a fetch from a holed source names the missing object"
+  "$SIT" fetch origin main >/dev/null 2>&1; assert_eq "$?" "1" "25a: and fails"
+  assert_eq "$([ -e .sit/refs/remotes/origin/main ] && echo moved || echo untouched)" "untouched" "25a: and origin/main is not written"
+  # 25b. ...unless the destination already holds what the source lacks.
+  a164 h172e; echo keep > k; echo gone > g; c164 k g; "$SIT" remote add origin "$H172Y" >/dev/null
+  "$SIT" fetch origin main >/dev/null 2>&1; assert_eq "$?" "0" "25b: a miss the destination already holds is not a hole"
+  assert_contains "$("$SIT" fsck 2>&1)" " 0 bad" "25b: and the result is complete"
+  # 25c. push from a holed repo is refused the same way.
+  a164 h172r; echo r > r; c164 r; m164 base; H172R="$R"
+  # HEAD moves by hand: checkout cannot materialize a tree whose blobs are gone.
+  cd "$H172Y"; echo "$HC" > .sit/refs/heads/feat; echo "ref: refs/heads/feat" > .sit/HEAD
+  "$SIT" remote add target "$H172R" >/dev/null
+  assert_contains "$("$SIT" push target 2>&1)" "cannot produce object" "25c: a push from a holed repo names the missing object"
+  "$SIT" push target >/dev/null 2>&1; assert_eq "$?" "1" "25c: a push of an incomplete closure fails"
+  assert_eq "$([ -e "$H172R/.sit/refs/heads/feat" ] && echo moved || echo untouched)" "untouched" "25c: and the remote ref is not created"
+else
+  echo "  (skipped 25a-c: python3 not available)"
+fi
+
+# 25d. A v0.1 plaintext index migrates; rows no index can hold (a path over
+# 255 bytes, a non-hex id) are dropped with a count rather than wedging it.
+if command -v python3 >/dev/null 2>&1; then
+  blobid() { python3 -I -c 'import hashlib,sys; b=sys.stdin.buffer.read(); print(hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest())'; }
+  a164 i172d; echo x > f; c164 f; HX=$(printf 'x\n' | blobid)
+  rm -f .sit/index.patra .sit/index.indexed
+  LONGP=$(python3 -I -c 'print("L" * 300)')
+  printf '%s\tf\n%s\tg\n%s\t%s\n%s\th\n' "$HX" "$HX" "$HX" "$LONGP" "ZZZZ${HX:4}" > .sit/index
+  ST=$("$SIT" status 2>&1)
+  assert_contains "$ST" "dropped 2 legacy index entries" "25d: unholdable legacy rows are dropped, counted"
+  assert_eq "$(echo "$ST" | grep -c 'new file:')" "2" "25d: the two holdable rows migrate"
+  assert_eq "$([ -e .sit/index ] && echo kept || echo removed)" "removed" "25d: and the plaintext index is removed"
+
+  # 25e. A migration that cannot finish (writes fail past a 256 KiB file-size
+  # limit) keeps .sit/index, serves no partial index, and completes later.
+  lim256() { ( trap '' XFSZ; ulimit -f 256; "$@" ); }
+  a164 i172e; echo x > f; c164 f; m164 base; echo y > g; c164 g; HY=$(printf 'y\n' | blobid)
+  rm -f .sit/index.patra .sit/index.indexed
+  python3 -I -c '
+import sys
+with open(".sit/index", "w") as f:
+    for i in range(3000):
+        f.write("%s\td/%05d-%s\n" % (sys.argv[1], i, "p" * 180))' "$HY"
+  lim256 "$SIT" status >/dev/null 2>&1
+  assert_eq "$([ -e .sit/index ] && echo kept || echo removed)" "kept" "25e: an unfinished migration keeps .sit/index"
+  lim256 "$SIT" commit -m partial >/dev/null 2>&1; assert_eq "$?" "1" "25e: commit refuses a partial index"
+  assert_contains "$(lim256 "$SIT" fsck --prune 2>&1)" "refusing --prune" "25e: prune refuses while the index cannot be read"
+  assert_eq "$("$SIT" status 2>/dev/null | grep -c 'new file:  d/')" "3000" "25e: the next open migrates every row"
+  assert_eq "$([ -e .sit/index ] && echo kept || echo removed)" "removed" "25e: and then removes the plaintext index"
+else
+  echo "  (skipped 25d-e: python3 not available)"
+fi
+
+# 25f. `add` applies the same ignore rules as `status` (B13): dir-only rules,
+# nested ignore files and their `!` re-includes. It used to read only the root
+# rules, with no notion of a directory.
+a164 i172f
+printf 'build/\n*.log\n' > .sitignore
+mkdir -p build sub deep/er
+echo x > build/foo.o; echo x > sub/keep.log; echo x > sub/a.txt; echo x > deep/er/b.txt
+printf '!keep.log\n*.txt\n' > sub/.sitignore; printf '*.txt\n' > deep/.sitignore
+"$SIT" add build/foo.o >/dev/null 2>&1; assert_eq "$?" "1" "25f: add refuses a file under a dir-only rule"
+"$SIT" add sub/a.txt >/dev/null 2>&1; assert_eq "$?" "1" "25f: add honours a nested ignore file"
+"$SIT" add deep/er/b.txt >/dev/null 2>&1; assert_eq "$?" "1" "25f: and its rules reach every level below it"
+UNTR=$("$SIT" status 2>&1)
+assert_eq "$(echo "$UNTR" | grep -c 'sub/keep.log')" "1" "25f: status lists the nested re-include as untracked"
+"$SIT" add sub/keep.log >/dev/null 2>&1; assert_eq "$?" "0" "25f: and add accepts it"
+"$SIT" add -f build/foo.o >/dev/null 2>&1; assert_eq "$?" "0" "25f: -f still overrides"
+
+# 25g. `\ No newline at end of file` (B14): a change at a final line without a
+# newline shows as git shows it, and the patch applies back exactly.
+if command -v git >/dev/null 2>&1; then
+  eolcase() {   # <old> <new> <label>
+    a164 "e172-$3"; printf "$1" > f; c164 f; m164 o
+    printf "$1" > old; printf "$2" > f
+    "$SIT" diff > p.diff 2>&1
+    assert_eq "$(sed -n '/^@@/,$p' p.diff)" "$(git diff --no-index old f | sed -n '/^@@/,$p')" "25g: $3 matches git"
+    cp f want; cp old f
+    if git apply p.diff 2>/dev/null; then
+      assert_eq "$(cmp -s f want && echo same || echo differs)" "same" "25g: $3 round-trips through git apply"
+    else
+      bad "25g: $3: git apply refused sit's patch"
+    fi
+  }
+  eolcase 'a\nb' 'a\nb\n' add-eol
+  eolcase 'a\nb\n' 'a\nb' drop-eol
+  eolcase 'a\nb' 'a\nB' edit-no-eol
+  eolcase 'a\nb\nc' 'A\nb\nc' context-no-eol
+else
+  echo "  (skipped 25g: git not installed)"
+fi
+
+# 25h. C1 and bidi controls are escaped on output (E10). git allows non-ASCII
+# ref names, so the name is stored as given and shown made safe.
+RLO=$(printf '\342\200\256')    # U+202E RIGHT-TO-LEFT OVERRIDE
+CSI=$(printf '\302\233')        # U+009B, the C1 CSI
+EACUTE=$(printf '\303\251')     # an ordinary é, which must survive
+a164 b172h; echo a > a; c164 a; "$SIT" commit -m "msg ${CSI}31m red caf${EACUTE}" >/dev/null
+"$SIT" checkout -b "evil${RLO}name" >/dev/null 2>&1
+SHOWN=$("$SIT" status 2>&1; "$SIT" branch 2>&1; "$SIT" log 2>&1)
+assert_contains "$SHOWN" "On branch evil?name" "25h: status escapes a bidi override in the branch name"
+assert_eq "$(printf '%s' "$SHOWN" | grep -c "$RLO")" "0" "25h: no raw RLO reaches the terminal"
+assert_contains "$SHOWN" "msg ?31m red caf${EACUTE}" "25h: log escapes a C1 CSI and keeps ordinary UTF-8"
+assert_eq "$(printf '%s' "$SHOWN" | grep -c "$CSI")" "0" "25h: no raw CSI reaches the terminal"
+if [ -n "$GIT_PROBE" ]; then
+  R="$WORK/gitapi-bidi"; mkdir -p "$R"; cd "$R"; git init -q
+  git -c user.email=i@t -c user.name=t commit -q --allow-empty -m base >/dev/null 2>&1
+  git checkout -q -b "evil${RLO}name"
+  assert_contains "$("$GIT_PROBE" 2>/dev/null)" "BRANCH evil?name" "25h: sit_repo_branch returns the name made safe"
+fi
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

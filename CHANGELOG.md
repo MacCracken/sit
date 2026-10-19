@@ -4,7 +4,111 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.7.1] — 2026-10-19 — cyrius 6.7.15; a refused object write never moves a ref
+## [1.7.2] — 2026-10-19 — holes in a source's closure refused; ssh read deadline; add ignore scoping; no-newline marker; C1 / bidi escaping
+
+The 1.7.2 slot. It finishes 1.7.1's storage sweep and fixes four LOW findings the 2026-10-19 audit ([`docs/audit/2026-10-19-audit.md`](docs/audit/2026-10-19-audit.md)) deferred: C10, B13, B14 and E10. There is no new surface, and the toolchain stays at cyrius 6.7.15.
+
+### Fixed — fetch / push refuse a source whose closure has a hole (data integrity)
+
+1.7.1 made a refused insert or commit fatal. A read miss was still skipped. When the source could not produce an object (a corrupt source repo, or an HTTP / ssh GET that failed after the batch prefetch), `copy_objects` dropped it, and fetch / push moved the ref onto an incomplete closure.
+
+Now the copy stops and names the object (`sit: the source cannot produce object <id>`), and no ref moves. The one exception is an object the destination already holds: then nothing is missing, and the fetch succeeds. Fetch and push then say `fetch incomplete; remote-tracking ref not updated` / `push incomplete; remote ref not updated`; the line before names the cause.
+
+Repro: a source holding a commit and its tree but not their blobs. New `tests/integration/plant_loose.py` copies chosen objects between repos as loose files, because nothing in the CLI can build such a repo. 1.7.1 reports "2 new objects" and writes `origin/main`; 1.7.2 refuses, and the same holds for a push from that repo.
+
+### Fixed — the v0.1 plaintext-index migration is all or nothing
+
+`index_migrate_from_plaintext` ignored each `patra_insert_row` and deleted `.sit/index` anyway, so a refused row lost that staged entry. Now:
+
+- **The rows share one transaction.** Any refusal rolls it back and keeps `.sit/index` for the next open. Rows are inserted with or-ignore, so a retry does not duplicate paths, and an entry staged since then wins over the legacy row.
+- **An unfinished migration withholds the index.** `commit` refuses instead of recording the unmigrated files as deleted.
+- **`fsck --prune` refuses while an index on disk cannot be opened.** It used to read that as "nothing staged" and delete every blob only the index referenced. This is a new tripwire beside the corrupt-roots ones, and it covers a corrupt `index.patra` too. Plain `fsck` warns.
+- **Rows no index can hold are dropped with a count:** a path over the 255-byte column, an empty path, or a non-hex id. They would otherwise be refused on every retry and wedge the migration.
+
+Repro: 3,000 legacy entries under a 256 KiB file-size limit.
+
+| | 1.7.1 | 1.7.2 |
+|---|---|---|
+| `.sit/index` after the limited open | deleted | kept |
+| `commit` while limited | succeeds with 182 of the 3,000 entries | refused |
+| `fsck --prune` while limited | runs | refused |
+| next unlimited open | 182 entries | all 3,000 |
+
+### Fixed — the last unchecked patra statuses
+
+- **`patra_init`** reports a refused allocation since patra 1.16.1. All three openers (`object_db_open`, `index_db_open`, `remote_objects_open`) now fail instead of carrying on.
+- **`fsck --prune`'s closing `patra_flush`** is checked. Since patra 1.16.2 a failed fdatasync is reported and sticks to the handle, so this one flush answers for every DELETE. A failure now exits 1 with "the pruning may not be durable".
+
+Neither is exercised by a test: they need a refused allocation or a failing fdatasync.
+
+### Fixed — the ssh transport has a read deadline (audit C10)
+
+Each read from the ssh pipe now waits at most 30 s for data or the child's hang-up (`fd_wait_ready`), the bound plain http has had since 1.6.4. A stalled remote used to hang sit for good.
+- A signal restarts the wait.
+- On agnos, which has no poll, the read blocks as before.
+
+The unit test lowers the deadline to 200 ms. Against the 1.7.1 reader the suite hangs until killed (120 s); with 1.7.2 it finishes in 3 s.
+
+### Fixed — `sit add` applies the same ignore rules as `status` (audit B13)
+
+`add` read only the root `.sitignore` and `info/exclude`, and never knew a path's parents were directories. `is_ignored_scoped` now applies the working-tree walk's rules along the path. Each ancestor is tested as a directory against the rules inherited from above it, then adds its own ignore file, scoped to it.
+
+| under these rules | `sit add` path | 1.7.1 | 1.7.2 |
+|---|---|---|---|
+| `build/` | `build/foo.o` | added | refused |
+| `sub/.sitignore`: `*.txt` | `sub/a.txt` | added | refused |
+| `deep/.sitignore`: `*.txt` | `deep/er/b.txt` | added | refused |
+| root `*.log`, `sub/.sitignore`: `!keep.log` | `sub/keep.log` | refused | added |
+
+`-f` still overrides.
+
+### Fixed — `\ No newline at end of file` (audit B14)
+
+`a\nb` and `a\nb\n` used to split into identical lines. A change that only added or dropped the final newline printed headers and no hunk, and a patch across a file with no final newline did not round-trip.
+- **Line records keep the final-newline state.** `split_lines` sets a flag bit in the last line's length word when the file does not end in `\n`, and a last line without a newline no longer equals the same text with one. Consumers keep reading records through `line_ptr` / `line_len`, the accessors ADR 0009 binds, which return what they always did. Only a raw read of the length word would now see the flag. `line_no_eol` stays internal. A first cut used a separate third field and cost the LCS inner loop 10–13%. With the flag in the length word, `lines_equal` checks both with one compare (see Benchmarks).
+- **`diff` and `show` print the marker.** Output matches `git diff` byte for byte on five shapes (add, drop, an edit to an unterminated last line, an append to one, one kept as context), and the patch applies back exactly with `git apply`.
+- **Merge and blame see the same.** A change that only adds or drops the final newline is a change to the last line, as in git. Merge output still ends every line in `\n`, as before.
+
+### Security — C1 and bidi controls are escaped on output (audit E10)
+
+Bytes ≥ 0x80 passed `write_sanitized` untouched. A UTF-8 C1 control (U+009B is CSI) or a bidi override in a ref name or commit message therefore reached the terminal and library consumers. This is the [CVE-2021-42574](https://nvd.nist.gov/vuln/detail/CVE-2021-42574) "Trojan Source" shape.
+
+New `text_sanitized` decodes UTF-8 and replaces each of these with one `?`:
+- a C0 control (except tab), or DEL
+- a C1 control, U+0080–U+009F
+- a bidi control: U+061C, U+200E / U+200F, U+202A–U+202E, U+2066–U+2069
+- a malformed byte (an 8-bit terminal reads a lone 0x9B as CSI)
+
+Well-formed text is kept, including its 0x80–0x9F continuation bytes (`é`, `€`).
+
+Where it applies:
+- **`write_sanitized` is built on it,** so every path that already sanitized gets it: ref listings, `config`, idents, `log --graph`.
+- **Newly sanitized:** `status`'s "On branch" line, and the message in plain `log` / `show` / `log --oneline`. Those were raw until now.
+- **`sit_repo_branch`** (library API) returns the name made safe, since consumers put it straight on screen. A branch name holding these bytes comes back with `?` in their place.
+
+Ref names are not refused, because git allows non-ASCII names. They are stored as given and shown made safe.
+
+### Tests
+
+- **Unit, 425 → 464.**
+  - the ssh read deadline: complete, silent, stalled mid-body and hung-up peers
+  - final-newline state
+  - 19 `text_sanitized` byte cases, at the C1 boundaries and with overlong, surrogate and truncated sequences
+- **Fuzz:** `text_sanitized` (100,000 rounds; half drawn from an alphabet of UTF-8 fragments). It checks that the output never grows, holds no unsafe run, and is idempotent. That makes 16 harnesses.
+- **Integration, 274 → 310.** Section 25 holds one scenario per fix and is A/B-checked against the 1.7.1 build.
+
+**Benchmarks** (1.7.1 vs 1.7.2, quiet host, [`docs/benchmarks/2026-10-19-v1.7.2.md`](docs/benchmarks/2026-10-19-v1.7.2.md)):
+
+| bench | 1.7.1 | 1.7.2 |
+|---|---:|---:|
+| lcs-diff-1000x1000 | 34.020 ms | 31.022 ms (−8.8%) |
+| lcs-diff-4000x4000 | 485.017 ms | 430.797 ms (−11.2%) |
+| `diff-edit` vs git | 11.93 ms | 11.31 ms (−5.2%) |
+| `log-100commits` vs git | 9.31 ms | 9.39 ms |
+| copy-objects-100 | 162.02 µs | 162.30 µs |
+
+The diff win comes from the line-record encoding above. `log` absorbs the UTF-8-aware sanitizer at no measurable cost. Everything else is flat.
+ — 2026-10-19 — cyrius 6.7.15; a refused object write never moves a ref
 
 A toolchain patch. It folds patra 1.16.1–1.16.5, which 1.7.0 flagged as worth taking for their row-loss and fdatasync fixes. Taking them changed what a failed `patra_commit` means, and sit was ignoring that status, so this release also fixes the write paths that relied on it.
 
