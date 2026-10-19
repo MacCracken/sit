@@ -1469,6 +1469,86 @@ assert_contains "$("$SIT" branch)" "feature/x" "26c: sit branch lists a nested b
 assert_eq "$(find .sit/refs -mindepth 2 -type d | wc -l | tr -d ' ')" "0" "26c: deleting a nested ref removes its empty directories"
 "$SIT" branch feature >/dev/null 2>&1; assert_eq "$?" "0" "26c: so a ref named after the old directory can be made"
 
+# ── 27. 1.7.4 serve memory bounds (C1) ─────────────────────────────
+# `sit serve` runs until killed, on a heap with no free. On this load 1.7.3
+# grows by ~15 MB (about 5 KB kept per GET /refs) and by ~23 MB over 300 TLS
+# connections (about 77 KB each). 1.7.4 builds each request in an arena it
+# rewinds and each TLS connection in another. The bounds are a small fraction
+# of the old growth and well above RSS noise.
+hr "1.7.4 serve memory bounds"
+if command -v python3 >/dev/null 2>&1; then
+  R="$WORK/srv174"; mkdir -p "$R"; cd "$R"
+  "$SIT" init >/dev/null
+  printf 'x\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c1 >/dev/null
+  "$SIT" branch feature/a >/dev/null; "$SIT" tag v1 >/dev/null
+  waitport() {
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if (echo > /dev/tcp/127.0.0.1/"$1") >/dev/null 2>&1; then return 0; fi
+      sleep 0.5
+    done
+    return 1
+  }
+  LOAD="$ROOT/tests/integration/serve_load.py"
+
+  # 27a. Plain HTTP: 3000 GET /refs.
+  PORT=18750
+  "$SIT" serve "$R" --listen 127.0.0.1:$PORT > /dev/null 2>&1 & SP=$!
+  waitport $PORT
+  read -r G ST _ <<< "$(python3 -I "$LOAD" $SP http $PORT /sit/v1/refs 3000)"
+  assert_eq "${ST:-none}" "200" "27a: GET /refs answers 200 under load"
+  [ "${G:-99999}" -lt 2048 ] 2>/dev/null && ok || bad "27a: 3000 GET /refs grew RSS by ${G:-?} KB (bound 2048; 1.7.3 ~15000)"
+
+  # 27b. A FIFO under refs/, or a symlink to one, is skipped. 1.7.3 opened it
+  # and the single-threaded server blocked until a writer appeared.
+  mkfifo .sit/refs/heads/fifo
+  read -r G ST _ <<< "$(timeout 30 python3 -I "$LOAD" $SP http $PORT /sit/v1/refs 1)"
+  assert_eq "${ST:-hung}" "200" "27b: a FIFO under refs/heads does not block GET /refs"
+  rm -f .sit/refs/heads/fifo
+  mkfifo .sit/pipe; ln -s ../../pipe .sit/refs/heads/via-link
+  read -r G ST _ <<< "$(timeout 30 python3 -I "$LOAD" $SP http $PORT /sit/v1/refs 1)"
+  assert_eq "${ST:-hung}" "200" "27b: nor does a symlink to a FIFO"
+  rm -f .sit/pipe .sit/refs/heads/via-link
+  kill $SP 2>/dev/null; wait $SP 2>/dev/null
+
+  # 27c. TLS: 300 connections, a full handshake each.
+  if command -v openssl >/dev/null 2>&1; then
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+      -keyout k.pem -out c.pem -days 2 -nodes -subj "/CN=localhost" > /dev/null 2>&1
+    PORT=18751
+    "$SIT" serve "$R" --tls --cert c.pem --key k.pem --listen 127.0.0.1:$PORT > /dev/null 2>&1 & SP=$!
+    waitport $PORT
+    read -r G ST _ <<< "$(python3 -I "$LOAD" $SP https $PORT /sit/v1/capabilities 300)"
+    assert_eq "${ST:-none}" "200" "27c: capabilities over TLS answers 200 under load"
+    [ "${G:-99999}" -lt 4096 ] 2>/dev/null && ok || bad "27c: 300 TLS connections grew RSS by ${G:-?} KB (bound 4096; 1.7.3 ~23000)"
+    kill $SP 2>/dev/null; wait $SP 2>/dev/null
+  else
+    echo "  (skipped 27c: openssl not available)"
+  fi
+else
+  echo "  (skipped 27: python3 not available)"
+fi
+
+# ── 28. 1.7.4 git read-mode: deep delta chains, packs past 64 MiB (D6) ──
+# 1.7.3 stopped delta chains at 64 and read each .idx / .pack through a 64 MiB
+# cap, so those objects read as missing (sit_repo_status then called a clean
+# file modified). The corpus builds chains of 100, 4095 and 4096 (refused, past
+# git's ceiling), REF_DELTA chains across two packs, a REF cycle, a 75 MiB pack,
+# and a real `git repack --depth=300` repo checked against `git cat-file`.
+# 9 of its 11 cases fail on 1.7.3; the two refusals pass on both.
+hr "1.7.4 git read-mode depth and size"
+if command -v python3 >/dev/null 2>&1; then
+  if python3 -I "$ROOT/tests/integration/deep_pack.py" "$SIT" "$WORK/deep" >"$WORK/deep.log" 2>&1; then
+    N=$(grep -c '^  PASS' "$WORK/deep.log")
+    i=0; while [ "$i" -lt "$N" ]; do ok; i=$((i+1)); done
+  else
+    bad "deep-pack corpus (see below)"
+    sed 's/^/    /' "$WORK/deep.log"
+  fi
+  rm -rf "$WORK/deep"
+else
+  printf '  SKIP: python3 not installed — deep-pack corpus skipped\n'
+fi
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -743,6 +743,160 @@ fn fuzz_text_sanitized(rounds) {
     return 0;
 }
 
+# 1.7.4 (C1): `sit serve` parses Content-Length itself, over the request arena,
+# because sandhi_server_content_length allocates on the global heap. The two must
+# agree on every request: a disagreement is a framing difference between the
+# server's recv loop and its handlers, which is how request smuggling starts.
+# Values draw from digits (most), spaces, tabs, commas, signs, letters and CR, up
+# to 26 bytes (past the 0x7FFFFFFF bound and the i64 wrap), under three
+# spellings of the header name, sometimes twice.
+fn fuzz_serve_content_length(rounds) {
+    var req = alloc(512);
+    var rnd = alloc(64);
+    var alpha = "01234567890123456789012345678901234567890123456789  \t\t,+-xA\r";
+    var an = strlen(alpha);
+    var names = vec_new();
+    vec_push(names, "Content-Length:");
+    vec_push(names, "content-length:");
+    vec_push(names, "CONTENT-LENGTH: ");
+    var a = _serve_req_alloc();
+    var seed = 0x51715174;
+    var i = 0;
+    while (i < rounds) {
+        reset_via(a);
+        fill_pseudo_random(rnd, 64, seed);
+        var n = 0;
+        var head = "POST /sit/v1/want HTTP/1.1\r\nHost: x\r\n";
+        memcpy(req, head, strlen(head));
+        n = strlen(head);
+        var copies = 1;
+        if (((load8(rnd) & 0xFF) % 8) == 0) { copies = 2; }
+        var c = 0;
+        while (c < copies) {
+            var nm = vec_get(names, (load8(rnd + 1 + c) & 0xFF) % 3);
+            memcpy(req + n, nm, strlen(nm));
+            n = n + strlen(nm);
+            var vlen = (load8(rnd + 3 + c) & 0xFF) % 27;
+            var j = 0;
+            while (j < vlen) {
+                store8(req + n, load8(alpha + ((load8(rnd + 8 + c * 28 + j) & 0xFF) % an)));
+                n = n + 1;
+                j = j + 1;
+            }
+            memcpy(req + n, "\r\n", 2);
+            n = n + 2;
+            c = c + 1;
+        }
+        memcpy(req + n, "\r\n", 2);
+        n = n + 2;
+        store8(req + n, 0);
+        var mine = _serve_content_length(a, req, n);
+        var theirs = sandhi_server_content_length(req, n);
+        if (mine != theirs) {
+            println("fuzz: _serve_content_length disagrees with sandhi_server_content_length");
+            return 1;
+        }
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+    return 0;
+}
+
+# 1.7.4 (D6): the iterative delta resolver. Each round builds a real pack — a
+# blob, then a chain of 0..90 OFS_DELTAs (past 1.7.3's 64), each copying its base
+# — and reads the chain's tip. Unmutated, it must reconstruct the blob exactly.
+# Three rounds in four then flip a few bytes past the header, which reaches the
+# header, varint, back-reference, inflate and delta-instruction failures, and,
+# where a type bit flips to REF_DELTA, a lookup by a random id. The repo root is
+# pointed at a directory that does not exist, so that lookup finds nothing. A
+# read that succeeds anyway is held to the 16 MiB ceiling.
+
+# Write git's biased big-endian OFS_DELTA back-offset; returns its length.
+fn _fz_ofs_put(buf, n) {
+    var tmp[16];
+    store8(&tmp, n & 0x7F);
+    var k = 1;
+    n = n / 128;
+    while (n > 0) {
+        n = n - 1;
+        store8(&tmp + k, 0x80 | (n & 0x7F));
+        k = k + 1;
+        n = n / 128;
+    }
+    var i = 0;
+    while (i < k) { store8(buf + i, load8(&tmp + k - 1 - i)); i = i + 1; }
+    return k;
+}
+
+fn fuzz_pack_obj(rounds) {
+    var cap = 8192;
+    var pack = alloc(cap);
+    var zbase = alloc(64);
+    var zbl = zlib_compress("abcdefgh", 8, zbase, 64);
+    var delta = alloc(8);
+    store8(delta, 8);                              # base size 8
+    store8(delta + 1, 8);                          # result size 8
+    store8(delta + 2, 0x90);                       # COPY, one size byte, offset 0
+    store8(delta + 3, 8);                          # 8 bytes
+    var zdelta = alloc(64);
+    var zdl = zlib_compress(delta, 4, zdelta, 64);
+    if (zbl <= 0) { println("fuzz: pack_obj could not build its base"); return 1; }
+    if (zdl <= 0) { println("fuzz: pack_obj could not build its delta"); return 1; }
+    sit_set_repo_root("/nonexistent/sit-fuzz-pack");
+    _fz_set_backend(1);                            # git, SHA-1 ids
+    var seed = 0xD6D6D6;
+    var i = 0;
+    while (i < rounds) {
+        memcpy(pack, "PACK", 4);
+        store64(pack + 4, 0);
+        var pos = 12;
+        store8(pack + pos, 0x38);                  # blob, size 8
+        pos = pos + 1;
+        memcpy(pack + pos, zbase, zbl);
+        pos = pos + zbl;
+        var prev = 12;
+        var depth = (seed & 0xFFFF) % 91;
+        var d = 0;
+        while (d < depth) {
+            var here = pos;
+            store8(pack + pos, 0x64);              # OFS_DELTA, size 4
+            pos = pos + 1;
+            pos = pos + _fz_ofs_put(pack + pos, here - prev);
+            memcpy(pack + pos, zdelta, zdl);
+            pos = pos + zdl;
+            prev = here;
+            d = d + 1;
+        }
+        var mutated = 0;
+        if ((i & 3) != 0) {
+            var flips = 1 + ((seed >> 16) & 3);
+            var f = 0;
+            while (f < flips) {
+                var at = 12 + ((seed >> (f * 7)) & 0x7FFFFFFF) % (pos - 12);
+                store8(pack + at, load8(pack + at) ^ (1 + ((seed >> (f * 5 + 3)) & 0x7F)));
+                f = f + 1;
+            }
+            mutated = 1;
+        }
+        var out[24];
+        var r = _git_pack_obj(pack, pos, prev, &out);
+        if (mutated == 0) {
+            if (r != 0) { println("fuzz: pack_obj failed on a valid chain"); return 1; }
+            if (load64(&out + 8) != 8) { println("fuzz: pack_obj rebuilt the wrong length"); return 1; }
+            if (memeq(load64(&out), "abcdefgh", 8) == 0) { println("fuzz: pack_obj rebuilt the wrong bytes"); return 1; }
+        }
+        if (r == 0) {
+            if (load64(&out + 8) > 16777216) { println("fuzz: pack_obj passed the 16 MiB ceiling"); return 1; }
+            fl_free(load64(&out));
+        }
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+    sit_set_repo_root(0);
+    _fz_set_backend(0);
+    return 0;
+}
+
 # Run every bounded fuzz harness; nonzero on the first crash or invariant break.
 fn main() {
     alloc_init();
@@ -778,6 +932,10 @@ fn main() {
     if (fuzz_parse_tag_body(200000) != 0) { return 1; }
     println("fuzz: text_sanitized (100000 rounds)");
     if (fuzz_text_sanitized(100000) != 0) { return 1; }
+    println("fuzz: serve_content_length (200000 rounds)");
+    if (fuzz_serve_content_length(200000) != 0) { return 1; }
+    println("fuzz: pack_obj (50000 rounds)");
+    if (fuzz_pack_obj(50000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

@@ -1515,6 +1515,229 @@ fn test_text_sanitized() {
     return 0;
 }
 
+# ── sit serve request arena (v1.7.4, C1) ───────────────────────────────────
+#
+# Each request allocates in an arena serve_handle_request rewinds, so serving
+# leaves nothing on the global heap. Through 1.7.3 a GET /refs kept 3.5 KB and
+# the smallest request 192 bytes.
+
+var _srv_root = "/tmp/sit-tcyr-serve";
+var _srv_hex = "9fcf402c5bfd0604647dd2aa5c3aac4f7490788b46bdbe17306d987fcc876769";
+
+# Write `len` bytes of `data` to `<_srv_root>/<rel>`.
+fn _srv_put(rel, data, len) {
+    var p = alloc(strlen(_srv_root) + strlen(rel) + 2);
+    var rl = strlen(_srv_root);
+    memcpy(p, _srv_root, rl);
+    store8(p + rl, 47);
+    memcpy(p + rl + 1, rel, strlen(rel));
+    store8(p + rl + 1 + strlen(rel), 0);
+    sys_unlink(p);
+    file_write_all(p, data, len);
+    return p;
+}
+
+# The fixture's ref file `rel` holding `n` copies of `tail` after the 64 hex.
+fn _srv_ref_with(rel, tail, n) {
+    var buf = alloc(64 + n * strlen(tail) + 1);
+    memcpy(buf, _srv_hex, 64);
+    var len = 64;
+    var i = 0;
+    while (i < n) {
+        memcpy(buf + len, tail, strlen(tail));
+        len = len + strlen(tail);
+        i = i + 1;
+    }
+    return _srv_put(rel, buf, len);
+}
+
+# One request, dispatched straight to the handler (cfd -1: the reply is
+# refused, which costs the same allocations as one sent).
+fn _srv_dispatch(req, len) {
+    var buf = alloc(len + 1);
+    memcpy(buf, req, len);
+    store8(buf + len, 0);
+    serve_handle_request(0, 0 - 1, buf, len);
+    return 0;
+}
+
+# A "POST /" request whose Content-Length header carries `v` (0 = no header).
+fn _srv_cl_request(v) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "POST / HTTP/1.1\r\nHost: x\r\n");
+    if (v != 0) {
+        str_builder_add_cstr(sb, "Content-Length: ");
+        str_builder_add_cstr(sb, v);
+        str_builder_add_cstr(sb, "\r\n");
+    }
+    str_builder_add_cstr(sb, "\r\n");
+    return str_data(str_builder_build(sb));
+}
+
+fn _srv_cl_case(v, label) {
+    var req = _srv_cl_request(v);
+    var n = strlen(req);
+    assert_eq(_serve_content_length(_serve_req_alloc(), req, n),
+      sandhi_server_content_length(req, n), label);
+    return 0;
+}
+
+fn test_serve_request_arena() {
+    test_group("serve.cyr — request arena, refs walk, Content-Length (v1.7.4)");
+
+    # sit's arena-backed Content-Length parse agrees with sandhi's.
+    _srv_cl_case(0, "no Content-Length header");
+    _srv_cl_case("", "an empty value");
+    _srv_cl_case("0", "0");
+    _srv_cl_case("72", "72");
+    _srv_cl_case(" 72 ", "spaces around the digits");
+    _srv_cl_case("\t72\t", "tabs around the digits");
+    _srv_cl_case("0072", "leading zeros");
+    _srv_cl_case("10, 20", "a list (CL.CL smuggling shape)");
+    _srv_cl_case("7 2", "a space inside the digits");
+    _srv_cl_case("72x", "trailing junk");
+    _srv_cl_case("-1", "a sign");
+    _srv_cl_case("+5", "a plus sign");
+    _srv_cl_case("abc", "no digits");
+    _srv_cl_case("2147483647", "0x7FFFFFFF, the largest representable");
+    _srv_cl_case("2147483648", "one past it");
+    _srv_cl_case("99999999999999999999999", "far past it (the i64 wrap)");
+    assert_eq(_serve_content_length(_serve_req_alloc(), _srv_cl_request("2147483648"),
+      strlen(_srv_cl_request("2147483648"))), 0 - 1, "past 0x7FFFFFFF reads as -1");
+
+    # Fixture repo: two heads (one nested), a tag, and refs that must be skipped.
+    sit_mkdir(_srv_root, 493);
+    var d = alloc(256);
+    var dirs = vec_new();
+    vec_push(dirs, "/.sit");
+    vec_push(dirs, "/.sit/refs");
+    vec_push(dirs, "/.sit/refs/heads");
+    vec_push(dirs, "/.sit/refs/heads/feature");
+    vec_push(dirs, "/.sit/refs/tags");
+    var di = 0;
+    while (di < vec_len(dirs)) {
+        var rl = strlen(_srv_root);
+        memcpy(d, _srv_root, rl);
+        memcpy(d + rl, vec_get(dirs, di), strlen(vec_get(dirs, di)) + 1);
+        sit_mkdir(d, 493);
+        di = di + 1;
+    }
+    _srv_put(".sit/HEAD", "ref: refs/heads/main\n", 21);
+    _srv_ref_with(".sit/refs/heads/main", "\n", 1);
+    _srv_ref_with(".sit/refs/heads/feature/x", "\r\n", 1);
+    _srv_ref_with(".sit/refs/tags/v1", "", 0);
+    _srv_put(".sit/refs/heads/bad", "not a hash\n", 11);
+    _srv_put(".sit/refs/tags/BAD.lock", _srv_hex, 64);   # file name fails refname_valid
+    # A symlink to a ref file is listed, as dir_walk listed it; one to a
+    # directory is not a ref.
+    var lk = _srv_put(".sit/refs/heads/alias", "", 0);
+    sys_unlink(lk);
+    xsymlink("main", lk);
+    var lk2 = _srv_put(".sit/refs/heads/dirlink", "", 0);
+    sys_unlink(lk2);
+    xsymlink("feature", lk2);
+    sit_set_repo_root(_srv_root);
+    var a = _serve_req_alloc();
+
+    # serve_read_ref_file: 64 hex, then only CR/LF, within 128 bytes.
+    assert(serve_read_ref_file(a, _srv_ref_with("rr", "", 0)) != 0, "64 hex, no newline");
+    assert(serve_read_ref_file(a, _srv_ref_with("rr", "\n", 1)) != 0, "64 hex + LF");
+    assert(serve_read_ref_file(a, _srv_ref_with("rr", "\r\n", 3)) != 0, "64 hex + CRLF CRLF CRLF");
+    assert(serve_read_ref_file(a, _srv_ref_with("rr", "\n", 64)) != 0, "64 hex + 64 LF (128 bytes)");
+    assert_eq(serve_read_ref_file(a, _srv_ref_with("rr", "\n", 65)), 0, "129 bytes is not a ref");
+    assert_eq(serve_read_ref_file(a, _srv_ref_with("rr", "0", 1)), 0, "65 hex is not a ref");
+    assert_eq(serve_read_ref_file(a, _srv_put("rr", _srv_hex, 63)), 0, "63 hex is not a ref");
+    assert_eq(serve_read_ref_file(a, _srv_put("rr", "9FCF402C5BFD0604647DD2AA5C3AAC4F7490788B46BDBE17306D987FCC876769", 64)), 0,
+      "uppercase hex is not a ref");
+    assert_eq(serve_read_ref_file(a, "/tmp/sit-tcyr-serve/missing"), 0, "a missing file");
+    var got = serve_read_ref_file(a, _srv_ref_with("rr", "\n", 1));
+    assert_eq(memeq(got, _srv_hex, 64), 1, "the 64 hex come back");
+    assert_eq(load8(got + 64), 0, "NUL-terminated");
+
+    # The refs walk: nested names in full, the bad ones left out.
+    var body = serve_build_refs(a);
+    assert(body != 0, "refs body built");
+    assert(strstr(body, "{\"name\":\"refs/heads/main\",\"hash\":\"9fcf") >= 0, "main listed");
+    assert(strstr(body, "\"refs/heads/feature/x\"") >= 0, "a nested head listed in full");
+    assert(strstr(body, "\"refs/tags/v1\"") >= 0, "a tag listed");
+    assert(strstr(body, "\"refs/heads/alias\"") >= 0, "a symlink to a ref file is listed");
+    assert_eq(strstr(body, "dirlink"), 0 - 1, "a symlink to a directory is not");
+    assert_eq(strstr(body, "bad"), 0 - 1, "a ref file without a hash is left out");
+    assert_eq(strstr(body, "BAD"), 0 - 1, "an invalid ref name is left out");
+    assert_eq(memeq(body, "{\"refs\":[{", 10), 1, "the body opens the list");
+    assert_eq(memeq(body + strlen(body) - 3, "}]}", 3), 1, "and closes it");
+    assert(strstr(body, "},{") >= 0, "entries are comma-separated");
+
+    # Bounded: after one warm-up (the arena, the object-store handle), more
+    # requests leave the global heap exactly where it was.
+    var want = alloc(256);
+    var wh = "POST /sit/v1/want HTTP/1.1\r\nHost: x\r\nContent-Length: 72\r\n\r\n";
+    var whl = strlen(wh);
+    memcpy(want, wh, whl);
+    store64(want + whl, 1);
+    memcpy(want + whl + 8, _srv_hex, 64);
+    var reqs = vec_new();
+    vec_push(reqs, "GET /sit/v1/capabilities HTTP/1.1\r\nHost: x\r\n\r\n");
+    vec_push(reqs, "GET /sit/v1/refs HTTP/1.1\r\nHost: x\r\n\r\n");
+    vec_push(reqs, "GET /sit/v1/objects/9fcf402c5bfd0604647dd2aa5c3aac4f7490788b46bdbe17306d987fcc876769 HTTP/1.1\r\nHost: x\r\n\r\n");
+    vec_push(reqs, "GET /nope?x=1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    vec_push(reqs, "DELETE /sit/v1/refs HTTP/1.1\r\nHost: x\r\n\r\n");
+    var ri = 0;
+    while (ri < vec_len(reqs)) { _srv_dispatch(vec_get(reqs, ri), strlen(vec_get(reqs, ri))); ri = ri + 1; }
+    _srv_dispatch(want, whl + 72);
+    var u0 = alloc_used();
+    var round = 0;
+    while (round < 25) {
+        ri = 0;
+        while (ri < vec_len(reqs)) { _srv_dispatch(vec_get(reqs, ri), strlen(vec_get(reqs, ri))); ri = ri + 1; }
+        _srv_dispatch(want, whl + 72);
+        round = round + 1;
+    }
+    # The dispatch copies above are the test's own; the handlers' share is 0.
+    var copies = 0;
+    ri = 0;
+    while (ri < vec_len(reqs)) { copies = copies + ((strlen(vec_get(reqs, ri)) + 1 + 7) & (0 - 8)); ri = ri + 1; }
+    copies = copies + ((whl + 72 + 1 + 7) & (0 - 8));
+    assert_eq(alloc_used() - u0, copies * 25, "150 requests leave nothing on the global heap");
+
+    sit_set_repo_root(0);
+    return 0;
+}
+
+# 1.7.4 (D6): the delta core writes into a caller's buffer, so a chain reuses
+# two buffers for every step; the allocating wrapper is unchanged to its callers.
+fn test_apply_delta_into() {
+    test_group("git_pack.cyr — delta apply into a caller's buffer (v1.7.4)");
+    var base = "the quick brown fox";
+    var bl = strlen(base);
+    # "the quick red fox": COPY 10 (offset 0), literal "red", COPY 4 from 15.
+    var d = alloc(32);
+    var n = 0;
+    store8(d + n, bl); n = n + 1;
+    store8(d + n, 17); n = n + 1;
+    store8(d + n, 0x90); n = n + 1; store8(d + n, 10); n = n + 1;
+    store8(d + n, 3); n = n + 1; memcpy(d + n, "red", 3); n = n + 3;
+    store8(d + n, 0x91); n = n + 1; store8(d + n, 15); n = n + 1; store8(d + n, 4); n = n + 1;
+    var out = alloc(64);
+    assert_eq(_git_apply_delta_into(base, bl, d, n, out, 64), 17, "the result length comes back");
+    assert_eq(memeq(out, "the quick red fox", 17), 1, "and the result bytes");
+    assert_eq(_git_apply_delta_into(base, bl, d, n, out, 17), 17, "a buffer of exactly the size is enough");
+    assert_eq(_git_apply_delta_into(base, bl, d, n, out, 16), 0 - 2, "one byte short is refused");
+    assert_eq(_git_apply_delta_into(base, bl - 1, d, n, out, 64), 0 - 1, "a base of the wrong size is refused");
+    assert_eq(_git_apply_delta_into(base, bl, d, n, 0, 64), 0 - 2, "no buffer is refused");
+    var o24[24];
+    assert_eq(_git_apply_delta(base, bl, d, n, &o24), 0, "the allocating form still works");
+    assert_eq(load64(&o24 + 8), 17, "with the same length");
+    assert_eq(memeq(load64(&o24), "the quick red fox", 17), 1, "and bytes");
+    fl_free(load64(&o24));
+    var raw = alloc(4);
+    store8(raw, 0x00); store8(raw + 1, 0x9f); store8(raw + 2, 0xa0); store8(raw + 3, 0xff);
+    var hx[16];
+    _hex_into(raw, 4, &hx);
+    assert_eq(memeq(&hx, "009fa0ff", 9), 1, "_hex_into writes lowercase hex and a NUL");
+    return 0;
+}
+
 # Run every test group; exit status is the failure count.
 fn main() {
     alloc_init();
@@ -1554,6 +1777,8 @@ fn main() {
     test_parse_tree_order();
     test_audit_164_pure();
     test_170_pure();
+    test_serve_request_arena();
+    test_apply_delta_into();
     return assert_summary();
 }
 

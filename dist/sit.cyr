@@ -11,15 +11,16 @@ include "lib/patra.cyr"
 include "lib/tls.cyr"
 include "lib/sandhi.cyr"
 include "lib/string.cyr"
+include "lib/alloc.cyr"
 include "lib/str.cyr"
 include "lib/fs.cyr"
-include "lib/alloc.cyr"
 include "lib/args.cyr"
 include "lib/vec.cyr"
 include "lib/chrono.cyr"
+include "lib/mmap.cyr"
 include "lib/hashmap.cyr"
-include "lib/sigil.cyr"
 include "lib/freelist.cyr"
+include "lib/sigil.cyr"
 include "lib/process.cyr"
 include "lib/net.cyr"
 include "lib/result.cyr"
@@ -80,6 +81,14 @@ fn sit_set_repo_root(root) {
 # On Linux and for already-absolute paths this is a no-op, so the whole
 # change is behavior-preserving there.
 fn sit_abs(rel) {
+    return sit_abs_a(0, rel);
+}
+
+# sit_abs with the joined path drawn from allocator `a`: `sit serve` passes its
+# request arena, so a path built for one request is reclaimed with it (C1,
+# 1.7.4). `a` == 0 is sit_abs itself: the global heap, dying on OOM. Otherwise
+# 0 comes back when `a` cannot serve the bytes.
+fn sit_abs_a(a, rel) {
     if (rel == 0) { return rel; }
     if (load8(rel) == 47) { return rel; }            # '/'
     if (_repo_root == 0) { return rel; }
@@ -90,7 +99,12 @@ fn sit_abs(rel) {
     var rlen = strlen(_repo_root);
     var plen = strlen(rel);
     # "<root>" + "/" + "<rel>" + NUL
-    var out = alloc_or_die(rlen + 1 + plen + 1);
+    var out = 0;
+    if (a == 0) { out = alloc_or_die(rlen + 1 + plen + 1); }
+    else {
+        out = alloc_via(a, rlen + 1 + plen + 1);
+        if (out == 0) { return 0; }
+    }
     memcpy(out, _repo_root, rlen);
     store8(out + rlen, 47);                          # '/'
     memcpy(out + rlen + 1, rel, plen);
@@ -2724,8 +2738,14 @@ fn _git_resolve_ref_name(name, out_buf) {
 # out-params use read_object's 24-byte contract {content_ptr, content_len,
 # content_off}; pack objects carry no loose framing, so content_off is 0.
 
-# Delta-chain recursion guard (git's pack.depth default is 50; 64 is slack).
-var _pack_delta_depth = 0;
+# Deepest delta chain a read follows: git's own ceiling (pack.depth is capped at
+# 4095). 1.7.3 resolved chains by recursion and stopped at 64, so the deeper
+# objects of a repo repacked with `--depth=250` (git gc --aggressive's old
+# default, and still common advice) read as missing (D6, 1.7.4).
+var _PACK_DELTA_MAX_DEPTH = 4095;
+# One link of a chain being resolved: the delta object's pack {data, len}, where
+# its zlib payload starts, and its declared (inflated) size.
+var _PACK_LINK = 32;
 
 # Reject an absurd object size from a hostile pack header before allocating.
 #
@@ -2883,7 +2903,31 @@ fn _git_idx_lookup(idx_path, oid_raw, rawlen) {
 # reads every tracked blob — peaked at 263 MB on a 3,000-file repo and 4 GB on
 # 12,000 files, and owl / thoth run it in-process. Two packs read alternately
 # re-read both on every switch the same way. Now each file costs its size once.
+#
+# 1.7.4 (D6): each file is mapped read-only rather than copied onto the heap.
+# read_file_heap refuses anything over 64 MiB (S-06), so a larger pack — or the
+# .idx of a repo with a few million objects — read as absent, and every object in
+# it as missing: sit_repo_status then called a clean file modified or untracked.
+# A mapping costs no heap at any size; the kernel pages it in as objects are read.
+# Where mmap is unavailable (agnos), or refused, the file is read as before.
+# Like git, which maps its packs too, this assumes a pack is never truncated in
+# place (git writes a new one and renames it); reading past a truncation faults.
 var _git_file_cache = 0;
+
+# Map `path` read-only into out_pair {addr, len}. 0, or -1 when it cannot be
+# opened, is empty, or mmap refuses.
+fn _git_file_map(path, out_pair) {
+    var fd = file_open(sit_abs(path), 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
+    if (size <= 0) { file_close(fd); return 0 - 1; }
+    var addr = mmap_file_ro(fd, size);
+    file_close(fd);                                # the mapping outlives the fd
+    if (addr == 0) { return 0 - 1; }
+    store64(out_pair, addr);
+    store64(out_pair + 8, size);
+    return 0;
+}
 
 fn _git_file_cached(path, out_pair) {
     if (_git_file_cache == 0) { _git_file_cache = map_new(); }
@@ -2894,7 +2938,9 @@ fn _git_file_cached(path, out_pair) {
         return 0;
     }
     var pr[16];
-    if (read_file_heap(path, &pr) != 0) { return 0 - 1; }
+    if (_git_file_map(path, &pr) != 0) {
+        if (read_file_heap(path, &pr) != 0) { return 0 - 1; }
+    }
     var cell = alloc_or_die(16);
     store64(cell, load64(&pr));
     store64(cell + 8, load64(&pr + 8));
@@ -3007,31 +3053,59 @@ fn _delta_varint(data, curptr, limit) {
 }
 
 # --- delta apply -------------------------------------------------------------
-# Reconstruct a target object from base + delta instruction stream. Writes the
-# read_object contract into out24 (content_off 0). Returns 0 or negative.
-fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
-    # S-24: `base` / `delta` are both attacker-controlled in a hostile repo, so
-    # validate the pair before touching either.
-    if (base == 0) { return 0 - 1; }
+# The result size a delta declares, once its header checks out against the base
+# it is applied to; -1 otherwise. `cur` (an i64 slot) is left at the first
+# instruction.
+fn _git_delta_header(base_len, delta, delta_len, cur) {
+    store64(cur, 0);
     if (base_len < 0) { return 0 - 1; }
     if (delta_len <= 0) { return 0 - 1; }
-    var cur[8];
-    store64(&cur, 0);
     # 1.6.4 (D10): git's patch_delta rejects a delta whose declared base size is
     # not the base it is applied to; this read the field and discarded it, so a
     # delta against the wrong base reconstructed wrong content whenever its
     # copies happened to fit.
-    var declared_base = _delta_varint(delta, &cur, delta_len);
+    var declared_base = _delta_varint(delta, cur, delta_len);
     if (declared_base < 0) { return 0 - 1; }
     if (declared_base != base_len) { return 0 - 1; }
-    var result_size = _delta_varint(delta, &cur, delta_len);
+    var result_size = _delta_varint(delta, cur, delta_len);
     if (result_size <= 0) { return 0 - 1; }
     # 1.6.4 (D5): held to the same 16 MiB object ceiling as every other read.
     # The 256 MiB pack-entry cap let a small hostile delta make an in-process
     # consumer allocate and fill 256 MiB per chain level.
     if (result_size > _DELTA_MAX_RESULT) { return 0 - 1; }
-    var out = alloc(result_size);
+    return result_size;
+}
+
+# Reconstruct a target object from base + delta instruction stream. Writes the
+# read_object contract into out24 (content_off 0), in a freelist buffer the
+# caller owns. Returns 0 or negative.
+fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
+    var cur[8];
+    var result_size = _git_delta_header(base_len, delta, delta_len, &cur);
+    if (result_size < 0) { return 0 - 1; }
+    var out = fl_alloc(result_size);
     if (out == 0) { return 0 - 2; }
+    var r = _git_apply_delta_into(base, base_len, delta, delta_len, out, result_size);
+    if (r < 0) { fl_free(out); return r; }
+    store64(out24, out);
+    store64(out24 + 8, r);
+    store64(out24 + 16, 0);
+    return 0;
+}
+
+# _git_apply_delta into a caller's buffer of `out_cap` bytes. Returns the result
+# length, or negative: -1 a bad header, -2 `out_cap` below the declared size,
+# -3..-9 a bad instruction. 1.7.4 (D6): split out so a delta chain reuses two
+# buffers for all its steps rather than allocating one per step.
+fn _git_apply_delta_into(base, base_len, delta, delta_len, out, out_cap) {
+    # S-24: `base` / `delta` are both attacker-controlled in a hostile repo, so
+    # validate the pair before touching either.
+    if (base == 0) { return 0 - 1; }
+    var cur[8];
+    var result_size = _git_delta_header(base_len, delta, delta_len, &cur);
+    if (result_size < 0) { return 0 - 1; }
+    if (out == 0) { return 0 - 2; }
+    if (out_cap < result_size) { return 0 - 2; }
     var op_out = 0;
     var err = 0;
     while (load64(&cur) < delta_len) {
@@ -3090,108 +3164,264 @@ fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
     }
     if (err != 0) { return err; }
     if (op_out != result_size) { return 0 - 7; }
-    store64(out24, out);
-    store64(out24 + 8, result_size);
+    return result_size;
+}
+
+# --- pack object reconstruct -------------------------------------------------
+# Reconstruct the object at `offset` in the in-memory pack {pdata,plen}. Writes
+# read_object contract into out24 (content_off 0).
+#
+# 1.7.4 (D6): iterative. The chain is walked down to its base first, recording
+# each delta it passes (an OFS_DELTA steps back in the same pack; a REF_DELTA
+# names its base by id, which may be loose or in another pack). Then the deltas
+# are applied from the base upward. Every intermediate base and delta buffer is
+# freed once the next step has used it, so a read keeps only its result: the
+# recursion this replaces kept every level of every chain on the bump heap, which
+# owl and thoth pay in-process for each blob sit_repo_status reads.
+#
+# The chain is bounded at _PACK_DELTA_MAX_DEPTH links. An OFS_DELTA chain cannot
+# loop (each base lies strictly before its delta); a REF_DELTA cycle stops there.
+# Each step's result is held to 16 MiB (D5), so the worst a hostile chain costs is
+# 4095 such steps, the bound git itself accepts.
+
+# Write `n` raw bytes as lowercase hex into `out` (2n bytes + NUL).
+fn _hex_into(raw, n, out) {
+    var digits = "0123456789abcdef";
+    var i = 0;
+    while (i < n) {
+        var b = load8(raw + i) & 0xFF;
+        store8(out + i * 2, load8(digits + b / 16));
+        store8(out + i * 2 + 1, load8(digits + (b & 15)));
+        i = i + 1;
+    }
+    store8(out + n * 2, 0);
+    return 0;
+}
+
+# Inflate `size` declared bytes at `body` of {pdata,plen} into a fresh freelist
+# buffer. Returns the buffer and stores the inflated length at `out_len`, or 0.
+fn _pack_inflate(pdata, plen, body, size, out_len) {
+    # S-24: a header that consumed the whole buffer leaves body == plen, making
+    # `plen - body` zero or negative — never hand that to the decompressor.
+    if (body >= plen) { return 0; }
+    var buf = fl_alloc(size + 16);
+    if (buf == 0) { return 0; }
+    var got = zlib_decompress_with_ratio_cap(pdata + body, plen - body,
+      buf, size + 16, SIT_MAX_INFLATE_RATIO);
+    if (got <= 0) { fl_free(buf); return 0; }
+    store64(out_len, got);
+    return buf;
+}
+
+fn _git_pack_obj(pdata, plen, offset, out24) {
+    var links_cap = 16;
+    var links = fl_alloc(links_cap * _PACK_LINK);
+    if (links == 0) { return 0 - 11; }
+    var nlinks = 0;
+    var cp = pdata;
+    var cl = plen;
+    var co = offset;
+    var base = 0;            # the base's bytes once found
+    var base_len = 0;
+    var base_owned = 0;      # 1 when `base` is a freelist buffer this read made
+    var rc = 0;
+    var walking = 1;
+    while (walking == 1) {
+        # S-24: `co` comes from the .idx offset table (attacker-supplied, up to
+        # 2^63 via the large-offset table) or an OFS_DELTA back-reference. The
+        # pack v2 header is 12 bytes, so any real object starts at >= 12.
+        if (cp == 0) { rc = 0 - 10; }
+        if (rc == 0) { if (co < 12) { rc = 0 - 10; } }
+        if (rc == 0) { if (co >= cl) { rc = 0 - 10; } }
+        var cur[8];
+        var type_slot[8];
+        var size = 0;
+        var type = 0;
+        if (rc == 0) {
+            store64(&cur, co);
+            store64(&type_slot, 0);
+            size = _pack_obj_header(cp, &cur, &type_slot, cl);
+            if (size < 0) { rc = 0 - 10; }
+            if (size > _PACK_MAX_OBJ) { rc = 0 - 10; }
+            type = load64(&type_slot);
+        }
+        if (rc == 0) {
+            if (type >= 1) {
+                if (type <= 4) {
+                    var got[8];
+                    base = _pack_inflate(cp, cl, load64(&cur), size, &got);
+                    if (base == 0) { rc = 0 - 12; }
+                    else { base_len = load64(&got); base_owned = 1; }
+                    walking = 0;
+                }
+            }
+        }
+        if (rc == 0) {
+            if (walking == 1) {
+                if (type != 6) { if (type != 7) { rc = 0 - 21; } }
+                if (rc == 0) { if (nlinks >= _PACK_DELTA_MAX_DEPTH) { rc = 0 - 13; } }
+            }
+        }
+        if (rc == 0) {
+            if (walking == 1) {
+                if (nlinks >= links_cap) {
+                    var grown = fl_alloc(links_cap * 2 * _PACK_LINK);
+                    if (grown == 0) { rc = 0 - 11; }
+                    else {
+                        memcpy(grown, links, nlinks * _PACK_LINK);
+                        fl_free(links);
+                        links = grown;
+                        links_cap = links_cap * 2;
+                    }
+                }
+            }
+        }
+        if (rc == 0) {
+            if (walking == 1) {
+                if (type == 6) {
+                    var ofs = _ofs_varint(cp, &cur, cl);
+                    # S-24: a zero-distance back-reference would make the object its
+                    # own base.
+                    if (ofs <= 0) { rc = 0 - 14; }
+                    if (rc == 0) { if (co - ofs < 0) { rc = 0 - 14; } }
+                    if (rc == 0) {
+                        var lk = links + nlinks * _PACK_LINK;
+                        store64(lk, cp);
+                        store64(lk + 8, cl);
+                        store64(lk + 16, load64(&cur));
+                        store64(lk + 24, size);
+                        nlinks = nlinks + 1;
+                        co = co - ofs;
+                    }
+                }
+                else {
+                    # REF_DELTA: the base id is `rawlen` raw bytes at the cursor.
+                    var rawlen = _id_rawlen();
+                    # S-24: bound the whole run before it is read.
+                    if (load64(&cur) + rawlen > cl) { rc = 0 - 18; }
+                    var base_hex[72];
+                    if (rc == 0) {
+                        _hex_into(cp + load64(&cur), rawlen, &base_hex);
+                        var lk2 = links + nlinks * _PACK_LINK;
+                        store64(lk2, cp);
+                        store64(lk2 + 8, cl);
+                        store64(lk2 + 16, load64(&cur) + rawlen);
+                        store64(lk2 + 24, size);
+                        nlinks = nlinks + 1;
+                        var loose24[24];
+                        if (_git_read_loose(&base_hex, &loose24) == 0) {
+                            # A loose base carries its framing; step past it. It
+                            # is the loose reader's buffer, not this read's.
+                            base = load64(&loose24) + load64(&loose24 + 16);
+                            base_len = load64(&loose24 + 8) - load64(&loose24 + 16);
+                            if (base_len < 0) { rc = 0 - 18; }
+                            walking = 0;
+                        }
+                        else {
+                            var loc[24];
+                            if (_git_pack_locate(&base_hex, &loc) != 0) { rc = 0 - 18; }
+                            else {
+                                cp = load64(&loc);
+                                cl = load64(&loc + 8);
+                                co = load64(&loc + 16);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (rc != 0) { walking = 0; }
+    }
+    # Apply the deltas from the base upward: the last link recorded is the one
+    # nearest the base. Two result buffers take turns as each step's base and
+    # output, and one holds the inflated delta. Each is replaced only when a step
+    # needs more room, so a chain costs a few allocations however deep it is:
+    # one per step measured 28% slower, every buffer over 4 KiB being its own
+    # mapping.
+    var base_cap = base_len;           # an inflated base's buffer is reusable
+    var other = 0;
+    var other_cap = 0;
+    var dbuf = 0;
+    var dcap = 0;
+    var li = nlinks - 1;
+    while (li >= 0) {
+        if (rc == 0) {
+            var l = links + li * _PACK_LINK;
+            var lp = load64(l);
+            var lplen = load64(l + 8);
+            var body = load64(l + 16);
+            var need = load64(l + 24) + 16;
+            if (body >= lplen) { rc = 0 - 17; }  # S-24: never a non-positive inflate length
+            if (rc == 0) {
+                if (dcap < need) {
+                    if (dbuf != 0) { fl_free(dbuf); }
+                    dbuf = fl_alloc(need);
+                    dcap = need;
+                    if (dbuf == 0) { dcap = 0; rc = 0 - 17; }
+                }
+            }
+            var dlen = 0;
+            if (rc == 0) {
+                dlen = zlib_decompress_with_ratio_cap(lp + body, lplen - body, dbuf, need,
+                  SIT_MAX_INFLATE_RATIO);
+                if (dlen <= 0) { rc = 0 - 17; }
+            }
+            var hcur[8];
+            var rsize = 0;
+            if (rc == 0) {
+                rsize = _git_delta_header(base_len, dbuf, dlen, &hcur);
+                if (rsize < 0) { rc = 0 - 1; }
+            }
+            if (rc == 0) {
+                if (other_cap < rsize) {
+                    if (other != 0) { fl_free(other); }
+                    other = fl_alloc(rsize);
+                    other_cap = rsize;
+                    if (other == 0) { other_cap = 0; rc = 0 - 2; }
+                }
+            }
+            if (rc == 0) {
+                var ar = _git_apply_delta_into(base, base_len, dbuf, dlen, other, other_cap);
+                if (ar < 0) { rc = ar; }
+                else {
+                    # The output becomes the next base; the old base's buffer, if
+                    # it is this read's, becomes the next output.
+                    var prev = base;
+                    var prev_cap = base_cap;
+                    var prev_owned = base_owned;
+                    base = other;
+                    base_len = ar;
+                    base_cap = other_cap;
+                    base_owned = 1;
+                    other = 0;
+                    other_cap = 0;
+                    if (prev_owned == 1) { other = prev; other_cap = prev_cap; }
+                }
+            }
+        }
+        li = li - 1;
+    }
+    if (dbuf != 0) { fl_free(dbuf); }
+    if (other != 0) { fl_free(other); }
+    fl_free(links);
+    if (rc != 0) {
+        if (base_owned == 1) { fl_free(base); }
+        return rc;
+    }
+    # The result is the caller's. (A loose base is only reached through a link,
+    # so by now at least one delta has been applied and `base` is this read's.)
+    store64(out24, base);
+    store64(out24 + 8, base_len);
     store64(out24 + 16, 0);
     return 0;
 }
 
-# --- pack object reconstruct (recursive for deltas) --------------------------
-# Reconstruct the object at `offset` in the in-memory pack {pdata,plen}. Writes
-# read_object contract into out24 (content_off 0). Recurses through delta bases.
-fn _git_pack_obj(pdata, plen, offset, out24) {
-    # S-24: `offset` comes from the .idx offset table, which is attacker-supplied
-    # in a hostile repo (and can reach 2^63 via the large-offset table). Reject
-    # it before it becomes a load address. The pack v2 header is 12 bytes, so any
-    # real object starts at >= 12.
-    if (pdata == 0) { return 0 - 10; }
-    if (offset < 12) { return 0 - 10; }
-    if (offset >= plen) { return 0 - 10; }
-    var cur[8];
-    store64(&cur, offset);
-    var type_slot[8];
-    store64(&type_slot, 0);
-    var size = _pack_obj_header(pdata, &cur, &type_slot, plen);
-    if (size < 0) { return 0 - 10; }
-    var type = load64(&type_slot);
-    if (size > _PACK_MAX_OBJ) { return 0 - 10; }
-
-    if (type >= 1) {
-        if (type <= 4) {
-            var body = load64(&cur);
-            # S-24: a header that consumed the whole buffer leaves body == plen,
-            # making `plen - body` zero or negative — never hand that to the
-            # decompressor as a length.
-            if (body >= plen) { return 0 - 11; }
-            var content = alloc(size + 16);
-            if (content == 0) { return 0 - 11; }
-            var got = zlib_decompress_with_ratio_cap(pdata + body, plen - body,
-              content, size + 16, SIT_MAX_INFLATE_RATIO);
-            if (got <= 0) { return 0 - 12; }
-            store64(out24, content);
-            store64(out24 + 8, got);
-            store64(out24 + 16, 0);
-            return 0;
-        }
-    }
-
-    if (_pack_delta_depth >= 64) { return 0 - 13; }
-
-    if (type == 6) {
-        var ofs = _ofs_varint(pdata, &cur, plen);
-        if (ofs < 0) { return 0 - 14; }
-        var base_off = offset - ofs;
-        if (base_off < 0) { return 0 - 14; }
-        # S-24: a zero-distance back-reference makes the object its own delta
-        # base — infinite recursion the depth cap only bounds at 64 frames.
-        if (ofs == 0) { return 0 - 14; }
-        var base24[24];
-        _pack_delta_depth = _pack_delta_depth + 1;
-        var br = _git_pack_obj(pdata, plen, base_off, &base24);
-        _pack_delta_depth = _pack_delta_depth - 1;
-        if (br != 0) { return 0 - 15; }
-        var dbody = load64(&cur);
-        if (dbody >= plen) { return 0 - 16; }
-        var delta = alloc(size + 16);
-        if (delta == 0) { return 0 - 16; }
-        var dgot = zlib_decompress_with_ratio_cap(pdata + dbody, plen - dbody, delta, size + 16, SIT_MAX_INFLATE_RATIO);
-        if (dgot <= 0) { return 0 - 17; }
-        return _git_apply_delta(load64(&base24), load64(&base24 + 8), delta, dgot, out24);
-    }
-
-    if (type == 7) {
-        var rawlen = _id_rawlen();
-        # S-24: the base oid is `rawlen` raw bytes at the cursor — bound the
-        # whole run before hex_encode reads it.
-        if (load64(&cur) + rawlen > plen) { return 0 - 18; }
-        var base_hex = hex_encode(pdata + load64(&cur), rawlen);
-        store64(&cur, load64(&cur) + rawlen);
-        var base24[24];
-        _pack_delta_depth = _pack_delta_depth + 1;
-        var br = _git_read_any(base_hex, &base24);
-        _pack_delta_depth = _pack_delta_depth - 1;
-        if (br != 0) { return 0 - 18; }
-        # normalize base to raw content (loose base carries framing at +16)
-        var bbuf = load64(&base24) + load64(&base24 + 16);
-        var blen = load64(&base24 + 8) - load64(&base24 + 16);
-        if (blen < 0) { return 0 - 18; }
-        var dbody = load64(&cur);
-        if (dbody >= plen) { return 0 - 19; }
-        var delta = alloc(size + 16);
-        if (delta == 0) { return 0 - 19; }
-        var dgot = zlib_decompress_with_ratio_cap(pdata + dbody, plen - dbody, delta, size + 16, SIT_MAX_INFLATE_RATIO);
-        if (dgot <= 0) { return 0 - 20; }
-        return _git_apply_delta(bbuf, blen, delta, dgot, out24);
-    }
-
-    return 0 - 21;
-}
-
 # --- top-level packfile read -------------------------------------------------
-# Look up `hex` across every .git/objects/pack/*.idx; on a hit, reconstruct the
-# object from the matching .pack. Writes read_object contract to out24. Returns
-# 0 on success, negative if not found in any pack (or no pack dir).
-fn _git_read_pack(hex, out24) {
+# Find `hex` across every .git/objects/pack/*.idx. On a hit, writes the matching
+# pack's {data, len} and the object's offset to out24 and returns 0; negative
+# when there is no pack directory (-1), `hex` is not an id (-2), or no pack
+# holds it (-3).
+fn _git_pack_locate(hex, out24) {
     var packdir = ".git/objects/pack";
     # S-26: route through the sit_abs seam like every other repo path. A raw
     # `is_dir(str_from(packdir))` is cwd-relative, so on agnos — which has no
@@ -3232,7 +3462,10 @@ fn _git_read_pack(hex, out24) {
                         store8(ppath + dlen + 1 + nb + 5, 0);
                         var pkp[16];
                         if (_git_load_pack(ppath, &pkp) == 0) {
-                            rc = _git_pack_obj(load64(&pkp), load64(&pkp + 8), offset, out24);
+                            store64(out24, load64(&pkp));
+                            store64(out24 + 8, load64(&pkp + 8));
+                            store64(out24 + 16, offset);
+                            rc = 0;
                             done = 1;
                         }
                     }
@@ -3242,6 +3475,16 @@ fn _git_read_pack(hex, out24) {
         i = i + 1;
     }
     return rc;
+}
+
+# Look up `hex` across every .git/objects/pack/*.idx; on a hit, reconstruct the
+# object from the matching .pack. Writes read_object contract to out24. Returns
+# 0 on success, negative if not found in any pack (or no pack dir).
+fn _git_read_pack(hex, out24) {
+    var loc[24];
+    var lr = _git_pack_locate(hex, &loc);
+    if (lr != 0) { return lr; }
+    return _git_pack_obj(load64(&loc), load64(&loc + 8), load64(&loc + 16), out24);
 }
 
 # Loose-first, then packfile: the git-mode object read used by read_object and
@@ -14215,12 +14458,16 @@ fn remote_objects_open(repo_path) {
 
 # Return 1 if `hex` exists in the given opened object DB, else 0.
 fn db_object_has(db, hex) {
-    var sql = alloc(128);
+    # 1.7.4 (C1): freelist, as db_object_read_raw does — `sit serve` asks this
+    # on every ref push, and copy_objects once per object.
+    var sql = fl_alloc(128);
+    if (sql == 0) { return 0; }
     memcpy(sql, "SELECT hash FROM objects WHERE hash = '", 39);
     memcpy(sql + 39, hex, 64);
     memcpy(sql + 39 + 64, "'", 1);
     store8(sql + 39 + 64 + 1, 0);
     var rs = patra_query(db, sql);
+    fl_free(sql);
     if (rs == 0) { return 0; }
     var cnt = patra_result_count(rs);
     patra_result_free(rs);
@@ -17650,6 +17897,77 @@ var _serve_tls_send_failed = 0;
 # its response: 60 s, sandhi's plain-HTTP request budget (C2, 1.6.4).
 var SERVE_TLS_DEADLINE_NS = 60000000000;
 
+# ── Request arena (C1, 1.7.4) ─────────────────────
+#
+# The global heap is a bump allocator with no free, and `sit serve` runs until
+# it is killed, so anything a request allocates there is kept for good. 1.6.4
+# moved the large per-request buffers (object bytes, inflate, /want streams) to
+# the freelist; what was left was about 3 KB per request of small allocations,
+# and more per ref on GET /refs.
+#
+# Everything a request allocates now comes from this arena: the parsed method,
+# path and headers, the response head, the JSON bodies, the refs walk, the paths
+# the push handlers build. serve_handle_request rewinds it before routing, so
+# the server settles at its largest request and stops growing. It also covers
+# what the stdio and TLS loops allocate while framing a request, since that is
+# done before the dispatch that rewinds it.
+#
+# ⚠ Nothing allocated here may outlive the request. A cached value (the object
+# DB handle, the bearer token, TLS credentials) stays on the global heap.
+#
+# A growable arena: a request that outgrows the first chunk chains another, and
+# the chain is kept across rewinds, so a large /refs costs its memory once.
+var SERVE_REQ_ARENA_CHUNK = 65536;
+var _serve_req_al = 0;
+
+# The request arena, created on first use. The serve loops are single-threaded
+# (sandhi_server_run, the --tls loop, --stdio), which is why one is enough.
+fn _serve_req_alloc() {
+    if (_serve_req_al == 0) {
+        _serve_req_al = arena_allocator_growable(SERVE_REQ_ARENA_CHUNK);
+        if (_serve_req_al == 0) {
+            eprintln("sit: cannot allocate the serve request arena");
+            syscall(SYS_EXIT, 1);
+        }
+    }
+    return _serve_req_al;
+}
+
+# Content-Length of the request in buf, with the header value taken from `a`.
+# sandhi_server_content_length reads it into the global heap on every call, and
+# sandhi has no allocator-taking form, so this is the same parse over
+# sandhi_server_find_header_a: 0 when absent or malformed, 0 - 1 when the
+# digits exceed 0x7FFFFFFF, else the value. Surrounding spaces and tabs are
+# allowed; anything else is malformed (RFC 7230 §3.3.2, no "10, 20"). The unit
+# and fuzz suites compare the two parsers byte for byte.
+var SERVE_CL_MAX = 2147483647;
+
+fn _serve_content_length(a, buf, n) {
+    var v = sandhi_server_find_header_a(a, buf, n, "Content-Length");
+    if (v == 0) { return 0; }
+    var vlen = strlen(v);
+    var i = skip_ws(v, 0, vlen);
+    if (i >= vlen) { return 0; }
+    var val = 0;
+    var seen = 0;
+    var digits = 1;
+    while (digits == 1) {
+        var c = load8(v + i);
+        if (c < 48) { digits = 0; }
+        if (c > 57) { digits = 0; }
+        if (digits == 1) {
+            val = val * 10 + (c - 48);
+            if (val > SERVE_CL_MAX) { return 0 - 1; }
+            seen = 1;
+            i = i + 1;
+        }
+    }
+    if (seen == 0) { return 0; }
+    i = skip_ws(v, i, vlen);
+    if (i < vlen) { return 0; }
+    return val;
+}
+
 # ── Ref-file reader ───────────────────────────────
 #
 # Read a ref file's content as a 64-char SHA-256 hex string. Strips
@@ -17657,25 +17975,48 @@ var SERVE_TLS_DEADLINE_NS = 60000000000;
 # and friends; rejects anything that doesn't pass `hex_prefix_valid`.
 # Returns 0 on any failure (so callers can skip the entry instead of
 # aborting the response).
+#
+# 1.7.4: the file is read into a stack buffer, not the global heap, and only the
+# 64 hex are copied out, into `a`. `path` is opened as given: the refs walk
+# passes it already resolved. A ref file is 65 bytes, so the read stops past
+# SERVE_REF_READ_MAX and a longer file is not a ref. (Through 1.7.3 the whole
+# file was read, up to read_file_heap's 64 MiB, to the same verdict.)
+var SERVE_REF_READ_MAX = 128;
 
 # Read a ref file for the server: exactly 64 hex after trimming CR/LF, else 0.
-fn serve_read_ref_file(path) {
-    var pair = alloc(16);  # [data_ptr, len]
-    var rc = read_file_heap(path, pair);
-    if (rc < 0) { return 0; }
-    var data = load64(pair);
-    var len = load64(pair + 8);
-    while (len > 0) {
-        var lc = load8(data + len - 1) & 0xFF;
-        if (lc != 10) {
-            if (lc != 13) { break; }
+fn serve_read_ref_file(a, path) {
+    var fd = file_open(path, 0, 0);
+    if (fd < 0) { return 0; }
+    var rb[136];                                   # SERVE_REF_READ_MAX + 1 bytes are read at most
+    var len = 0;
+    var reading = 1;
+    while (reading == 1) {
+        var got = file_read(fd, &rb + len, SERVE_REF_READ_MAX + 1 - len);
+        if (got <= 0) { reading = 0; }
+        else {
+            len = len + got;
+            if (len > SERVE_REF_READ_MAX) { reading = 0; }
         }
-        len = len - 1;
+    }
+    file_close(fd);
+    if (len > SERVE_REF_READ_MAX) { return 0; }
+    var trimming = 1;
+    while (trimming == 1) {
+        if (len == 0) { trimming = 0; }
+        else {
+            var lc = load8(&rb + len - 1) & 0xFF;
+            if (lc == 10) { len = len - 1; }
+            else {
+                if (lc == 13) { len = len - 1; }
+                else { trimming = 0; }
+            }
+        }
     }
     if (len != 64) { return 0; }
-    if (hex_prefix_valid(data, 64) == 0) { return 0; }
-    var out = alloc(65);
-    memcpy(out, data, 64);
+    if (hex_prefix_valid(&rb, 64) == 0) { return 0; }
+    var out = alloc_via(a, 65);
+    if (out == 0) { return 0; }
+    memcpy(out, &rb, 64);
     store8(out + 64, 0);
     return out;
 }
@@ -17689,9 +18030,15 @@ fn serve_read_ref_file(path) {
 # Pulling `lib/json.cyr` here would buy nothing and add a dep
 # surface inside the hot serve loop.
 
-# JSON body for GET /sit/v1/capabilities.
-fn serve_build_capabilities() {
-    var sb = str_builder_new();
+# Each builder allocates in `a` (the request arena) and returns the body, or 0
+# when `a` refused a grow: the `_a` appends then leave the builder unchanged, and
+# a refs list short of a ref is worse than a 500.
+
+# JSON body for GET /sit/v1/capabilities, or 0.
+fn serve_build_capabilities(a) {
+    var sb = str_builder_new_a(a);
+    if (sb == 0) { return 0; }
+    var bad = 0;
     # The "sit" string identifies the wire-protocol release line the server
     # promises. v1.4.8: it now comes from `sit_version_string()` in the
     # GENERATED src/version.cyr, so it tracks VERSION by construction rather
@@ -17699,84 +18046,129 @@ fn serve_build_capabilities() {
     # twice in that span — stuck at 0.8.10 through v1.0.3, and missed again at
     # 1.4.6 — each time caught only by the CI gate that exists to catch it.
     # Regenerate with scripts/gen-version.sh; CI diffs it like dist/ sync.
-    str_builder_add_cstr(sb, "{\"sit\":\"");
-    str_builder_add_cstr(sb, sit_version_string());
-    str_builder_add_cstr(sb, "\",\"max_body\":");
-    str_builder_add_int(sb, SIT_SERVE_MAX_BODY);
-    str_builder_add_cstr(sb, ",\"auth\":[");
+    bad = bad | str_builder_add_cstr_a(a, sb, "{\"sit\":\"");
+    bad = bad | str_builder_add_cstr_a(a, sb, sit_version_string());
+    bad = bad | str_builder_add_cstr_a(a, sb, "\",\"max_body\":");
+    bad = bad | str_builder_add_int_a(a, sb, SIT_SERVE_MAX_BODY);
+    bad = bad | str_builder_add_cstr_a(a, sb, ",\"auth\":[");
     if (_serve_require_auth == 1) {
-        str_builder_add_cstr(sb, "\"bearer\"");
+        bad = bad | str_builder_add_cstr_a(a, sb, "\"bearer\"");
     }
     else {
-        str_builder_add_cstr(sb, "\"none\"");
+        bad = bad | str_builder_add_cstr_a(a, sb, "\"none\"");
     }
-    str_builder_add_cstr(sb, "],\"objects\":true,\"batch\":true,\"batch_max\":");
-    str_builder_add_int(sb, SIT_WANT_MAX_COUNT);
-    str_builder_add_cstr(sb, ",\"push\":true}");
-    return str_data(str_builder_build(sb));
+    bad = bad | str_builder_add_cstr_a(a, sb, "],\"objects\":true,\"batch\":true,\"batch_max\":");
+    bad = bad | str_builder_add_int_a(a, sb, SIT_WANT_MAX_COUNT);
+    bad = bad | str_builder_add_cstr_a(a, sb, ",\"push\":true}");
+    if (bad != 0) { return 0; }
+    var built = str_builder_build_a(a, sb);
+    if (built == 0) { return 0; }
+    return str_data(built);
 }
 
 # Recursively walk one refs subtree (`.sit/refs/heads` or
 # `.sit/refs/tags`) appending one JSON object per ref to `sb`.
 # `prefix` is the ref namespace ("refs/heads/" / "refs/tags/");
 # `dir` is the on-disk path to the corresponding directory;
-# `first_ref_cell` is a heap-allocated i64 used as a shared "is
-# this the first entry across BOTH subtrees?" flag — toggled to
-# 0 after the first emission so subsequent entries get a leading
-# comma.
+# `st` is the walk's 16-byte state, shared across BOTH subtrees:
+#   +0  1 until the first ref is emitted (later ones get a leading comma)
+#   +8  set when `a` refused a grow (the body is then dropped for a 500)
 #
 # Errors (missing dir, malformed ref content, refnames that fail
 # `refname_valid`) silently omit the entry rather than fail the
 # whole response. `sit fsck` is the right tool to surface a broken
 # ref file; `serve` should keep listing what it can.
+#
+# 1.7.4 (C1): the walk allocates only in `a`. It used dir_walk, which builds a
+# Str, a vec slot and a joined path per entry on the global heap, and those were
+# kept for the life of the server: 3.5 KB per GET /refs with two refs, more per
+# ref. It now lists each directory with dir_list_into, into buffers taken from
+# `a`, and visits entries in the same order dir_walk did (directory order,
+# depth-first), so the body is byte-identical.
+
+# dir_list_into's buffers for one directory: the getdents batch, the packed
+# names and the offset table. A directory that does not fit is listed again with
+# the names and offsets doubled, up to SERVE_DIRLIST_TRIES listings.
+var SERVE_DIRLIST_SCRATCH = 4096;
+var SERVE_DIRLIST_NAMES = 8192;
+var SERVE_DIRLIST_ENTRIES = 256;
+var SERVE_DIRLIST_TRIES = 16;
+# dir_walk's depth bound (DIR_WALK_MAX_DEPTH), kept from the walk this replaces.
+var SERVE_REFS_MAX_DEPTH = 64;
 
 # Append every valid ref under `dir` to the refs JSON being built.
-fn serve_emit_refs_subtree(sb, prefix, dir, first_ref_cell) {
-    if (sf_exists(dir) != 1) { return 0; }
-    # dir_walk expects a Str object (it does str_data internally) and pushes
-    # Str objects into the results vec. Convert at the boundary. Walk the
-    # repo-root-ABSOLUTE dir (sit_abs): dir_walk is cwd-relative, so when
-    # `serve`'s cwd isn't the repo — e.g. over SSH, where the session cwd is
-    # $HOME, not the served repo — a raw ".sit/refs/heads" walk sees nothing
-    # and `serve` advertises zero refs ("remote has no such branch" on the
-    # client). sf_exists above is repo-root-relative, which masked this (the
-    # guard passed while the walk came up empty). dlen tracks the abs prefix.
-    var adir = sit_abs(dir);
-    var files = vec_new();
-    dir_walk(str_from(adir), files);
-    var i = 0;
-    var dlen = strlen(adir);
-    var plen = strlen(prefix);
-    while (i < vec_len(files)) {
-        var fp_str = vec_get(files, i);
-        var fp_len = str_len(fp_str);
-        var fp_data = str_data(fp_str);
-        # Strip the dir prefix + leading '/' to get the in-namespace name.
-        var rel_offset = dlen;
-        if (rel_offset < fp_len) {
-            if (load8(fp_data + rel_offset) == 47) { rel_offset = rel_offset + 1; }
+fn serve_emit_refs_subtree(a, sb, prefix, dir, st) {
+    # Walk the repo-root-ABSOLUTE dir: the walk is cwd-relative, and over SSH
+    # the session cwd is $HOME, not the served repo, so a raw ".sit/refs/heads"
+    # walk saw nothing and `serve` advertised zero refs (1.3.2).
+    var adir = sit_abs_a(a, dir);
+    if (adir == 0) { store64(st + 8, 1); return 0; }
+    if (file_exists(adir) != 1) { return 0; }
+    return _serve_emit_refs_dir(a, sb, prefix, adir, 0, st);
+}
+
+# One directory of the walk: `adir` is its resolved path and `prefix` its ref
+# name with the trailing '/'. A real directory is descended. A regular file, or a
+# symlink to one, is read as a ref, as dir_walk listed both. Anything else is
+# skipped: through 1.7.3 a FIFO (or a symlink to one) was opened for reading,
+# which blocked the single-threaded server until a writer appeared.
+fn _serve_emit_refs_dir(a, sb, prefix, adir, depth, st) {
+    if (depth > SERVE_REFS_MAX_DEPTH) { return 0; }
+    var path_str = str_from_a(a, adir);
+    var scratch = alloc_via(a, SERVE_DIRLIST_SCRATCH);
+    if (path_str == 0) { store64(st + 8, 1); return 0; }
+    if (scratch == 0) { store64(st + 8, 1); return 0; }
+    var names_cap = SERVE_DIRLIST_NAMES;
+    var max_entries = SERVE_DIRLIST_ENTRIES;
+    var names = 0;
+    var offs = 0;
+    var count = 0;
+    var tries = 0;
+    var listing = 1;
+    while (listing == 1) {
+        names = alloc_via(a, names_cap);
+        offs = alloc_via(a, max_entries * 8);
+        if (names == 0) { store64(st + 8, 1); return 0; }
+        if (offs == 0) { store64(st + 8, 1); return 0; }
+        count = dir_list_into(path_str, scratch, SERVE_DIRLIST_SCRATCH,
+          names, names_cap, offs, max_entries);
+        listing = 0;
+        tries = tries + 1;
+        if (tries < SERVE_DIRLIST_TRIES) {
+            if (count == 0 - 3) { names_cap = names_cap * 2; listing = 1; }
+            if (count == 0 - 4) { max_entries = max_entries * 2; listing = 1; }
         }
-        var rel_len = fp_len - rel_offset;
-        if (rel_len > 0) {
-            var name = alloc(plen + rel_len + 1);
-            memcpy(name, prefix, plen);
-            memcpy(name + plen, fp_data + rel_offset, rel_len);
-            store8(name + plen + rel_len, 0);
-            var ok_name = refname_valid(name);
-            if (ok_name == 1) {
-                # serve_read_ref_file is cstring-based; materialize the Str.
-                var fs_cstr = alloc(fp_len + 1);
-                memcpy(fs_cstr, fp_data, fp_len);
-                store8(fs_cstr + fp_len, 0);
-                var hex = serve_read_ref_file(fs_cstr);
-                if (hex != 0) {
-                    if (load64(first_ref_cell) == 0) { str_builder_add_cstr(sb, ","); }
-                    str_builder_add_cstr(sb, "{\"name\":\"");
-                    str_builder_add_cstr(sb, name);
-                    str_builder_add_cstr(sb, "\",\"hash\":\"");
-                    str_builder_add_cstr(sb, hex);
-                    str_builder_add_cstr(sb, "\"}");
-                    store64(first_ref_cell, 0);
+    }
+    if (count < 0) { return 0; }                   # unreadable: omitted, as dir_walk did
+    var plen = strlen(prefix);
+    var dlen = strlen(adir);
+    var i = 0;
+    while (i < count) {
+        var nm = names + load64(offs + i * 8);
+        var nl = strlen(nm);
+        var child = alloc_via(a, dlen + 1 + nl + 1);
+        var rname = alloc_via(a, plen + nl + 2);
+        if (child == 0) { store64(st + 8, 1); return 0; }
+        if (rname == 0) { store64(st + 8, 1); return 0; }
+        memcpy(child, adir, dlen);
+        store8(child + dlen, 47);                  # '/'
+        memcpy(child + dlen + 1, nm, nl);
+        store8(child + dlen + 1 + nl, 0);
+        memcpy(rname, prefix, plen);
+        memcpy(rname + plen, nm, nl);
+        store8(rname + plen + nl, 0);
+        var kind = path_lstat_kind(child);
+        if (kind == 0x4000) {
+            store8(rname + plen + nl, 47);         # "<prefix><dir>/"
+            store8(rname + plen + nl + 1, 0);
+            _serve_emit_refs_dir(a, sb, rname, child, depth + 1, st);
+        }
+        if (kind == 0x8000) { _serve_emit_ref(a, sb, rname, child, st); }
+        if (kind == 0xA000) {
+            var tst[256];                          # stat follows the link
+            if (xstat(child, &tst) == 0) {
+                if ((load32(&tst + STAT_MODE) & 0xF000) == 0x8000) {
+                    _serve_emit_ref(a, sb, rname, child, st);
                 }
             }
         }
@@ -17785,16 +18177,39 @@ fn serve_emit_refs_subtree(sb, prefix, dir, first_ref_cell) {
     return 0;
 }
 
-# JSON body for GET /sit/v1/refs (heads and tags).
-fn serve_build_refs() {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "{\"refs\":[");
-    var first_cell = alloc(8);
-    store64(first_cell, 1);
-    serve_emit_refs_subtree(sb, "refs/heads/", ".sit/refs/heads", first_cell);
-    serve_emit_refs_subtree(sb, "refs/tags/",  ".sit/refs/tags",  first_cell);
-    str_builder_add_cstr(sb, "]}");
-    return str_data(str_builder_build(sb));
+# Append `{"name":…,"hash":…}` for the ref file at `path`, if the name is a valid
+# ref name and the file holds one.
+fn _serve_emit_ref(a, sb, rname, path, st) {
+    if (refname_valid(rname) == 0) { return 0; }
+    var hex = serve_read_ref_file(a, path);
+    if (hex == 0) { return 0; }
+    var bad = 0;
+    if (load64(st) == 0) { bad = bad | str_builder_add_cstr_a(a, sb, ","); }
+    bad = bad | str_builder_add_cstr_a(a, sb, "{\"name\":\"");
+    bad = bad | str_builder_add_cstr_a(a, sb, rname);
+    bad = bad | str_builder_add_cstr_a(a, sb, "\",\"hash\":\"");
+    bad = bad | str_builder_add_cstr_a(a, sb, hex);
+    bad = bad | str_builder_add_cstr_a(a, sb, "\"}");
+    if (bad != 0) { store64(st + 8, 1); }
+    store64(st, 0);
+    return 0;
+}
+
+# JSON body for GET /sit/v1/refs (heads and tags), or 0.
+fn serve_build_refs(a) {
+    var sb = str_builder_new_a(a);
+    if (sb == 0) { return 0; }
+    var st[16];
+    store64(&st, 1);
+    store64(&st + 8, 0);
+    if (str_builder_add_cstr_a(a, sb, "{\"refs\":[") != 0) { return 0; }
+    serve_emit_refs_subtree(a, sb, "refs/heads/", ".sit/refs/heads", &st);
+    serve_emit_refs_subtree(a, sb, "refs/tags/",  ".sit/refs/tags",  &st);
+    if (str_builder_add_cstr_a(a, sb, "]}") != 0) { return 0; }
+    if (load64(&st + 8) != 0) { return 0; }
+    var built = str_builder_build_a(a, sb);
+    if (built == 0) { return 0; }
+    return str_data(built);
 }
 
 # ── TLS-aware response senders (bite 3) ──
@@ -17819,10 +18234,16 @@ fn _serve_emit_status_line(buf, pos, code, msg) {
     return pos;
 }
 
+# Both senders build the response head in the request arena (C1, 1.7.4).
 fn _serve_send_status(cfd, code, msg) {
-    if (_serve_tls_ctx == 0) { return sandhi_server_send_status(cfd, code, msg); }
+    var a = _serve_req_alloc();
+    if (_serve_tls_ctx == 0) { return sandhi_server_send_status_a(a, cfd, code, msg); }
     var ml = strlen(msg);
-    var buf = alloc(64 + ml);
+    var buf = alloc_via(a, 64 + ml);
+    if (buf == 0) {
+        _serve_tls_send_failed = 1;                # no response: close, don't leave the client waiting
+        return 0 - 1;
+    }
     var pos = _serve_emit_status_line(buf, 0, code, msg);
     memcpy(buf + pos, "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n", 45);
     pos = pos + 45;
@@ -17834,15 +18255,20 @@ fn _serve_send_status(cfd, code, msg) {
 }
 
 fn _serve_send_response(cfd, code, msg, ctype, body, body_len, extra) {
+    var a = _serve_req_alloc();
     if (_serve_tls_ctx == 0) {
-        return sandhi_server_send_response(cfd, code, msg, ctype, body, body_len, extra);
+        return sandhi_server_send_response_a(a, cfd, code, msg, ctype, body, body_len, extra);
     }
     var ctl = strlen(ctype);
     var el = 0;
     if (extra != 0) { el = strlen(extra); }
     var clen_buf[24];
     var clen_digits = write_decimal(&clen_buf, body_len);
-    var hdr = alloc(96 + ctl + el + clen_digits);
+    var hdr = alloc_via(a, 96 + ctl + el + clen_digits);
+    if (hdr == 0) {
+        _serve_tls_send_failed = 1;
+        return 0 - 1;
+    }
     var pos = _serve_emit_status_line(hdr, 0, code, msg);
     memcpy(hdr + pos, "Content-Type: ", 14); pos = pos + 14;
     memcpy(hdr + pos, ctype, ctl); pos = pos + ctl;
@@ -17932,7 +18358,12 @@ fn serve_handle_object(cfd, path) {
     var ty_buf[24];
     var ty_digits = write_decimal(&ty_buf, ty);
     var hdr_len = 13 + ty_digits + 2;
-    var hdr = alloc(hdr_len + 1);
+    var hdr = alloc_via(_serve_req_alloc(), hdr_len + 1);
+    if (hdr == 0) {
+        fl_free(compressed);
+        _serve_send_status(cfd, 500, "Internal Server Error");
+        return 0;
+    }
     memcpy(hdr, "X-Sit-Type: ", 12);
     memcpy(hdr + 12, &ty_buf, ty_digits);
     store8(hdr + 12 + ty_digits, 13);
@@ -17983,7 +18414,7 @@ fn serve_handle_want(cfd, buf, n) {
     # that case anyway; this makes it structural rather than incidental, and
     # matches the ordering already used by serve_handle_put_object.)
     var clen = content_length_sane(
-      sandhi_server_content_length(buf, n), SIT_SERVE_MAX_BODY);
+      _serve_content_length(_serve_req_alloc(), buf, n), SIT_SERVE_MAX_BODY);
     if (clen <= 0) {
         _serve_send_status(cfd, 411, "Length Required");
         return 0;
@@ -18128,7 +18559,7 @@ fn _serve_load_token(path) {
 fn _serve_auth_ok(buf, n) {
     if (_serve_require_auth == 0) { return 1; }
     if (_serve_token == 0) { return 0; }
-    var hdr = sandhi_server_find_header(buf, n, "Authorization");
+    var hdr = sandhi_server_find_header_a(_serve_req_alloc(), buf, n, "Authorization");
     if (hdr == 0) { return 0; }
     # Expect literal "Bearer " prefix (case-sensitive, matching git's
     # http.extraHeader convention). Eight bytes including the space.
@@ -18236,9 +18667,15 @@ fn _serve_verify_and_insert(hex, claimed_ty, compressed, clen, deco) {
     # Recompute the hash over the full framed bytes (type + space +
     # decimal-len + NUL + content) — what write_typed_object uses to
     # compute the canonical sit hash for any new object.
-    var actual_hex = hash_data(dbuf, dlen);
-    if (actual_hex == 0) { return 500; }
-    if (memeq(actual_hex, hex, 64) == 0) { return 400; }
+    #
+    # 1.7.4 (C1): compared as raw digests on the stack. hash_data returns its
+    # hex on the global heap, kept for every pushed object. `hex` is lowercase
+    # hex (the handler checked it), so decoding it compares the same values.
+    var actual[32];
+    var wanted[32];
+    sha256(dbuf, dlen, &actual);
+    if (hex_decode_into(hex, 64, &wanted) == 0) { return 400; }
+    if (memeq(&actual, &wanted, 32) == 0) { return 400; }
 
     # Hash matches. Insert the original compressed bytes. db_object_insert_raw
     # returns 0 on actual insert, 1 on already-present, negative on error.
@@ -18262,7 +18699,7 @@ fn serve_handle_put_object(cfd, path, buf, n) {
         _serve_send_status(cfd, 400, "Bad Request");
         return 0;
     }
-    var ty_hdr = sandhi_server_find_header(buf, n, "X-Sit-Type");
+    var ty_hdr = sandhi_server_find_header_a(_serve_req_alloc(), buf, n, "X-Sit-Type");
     if (ty_hdr == 0) {
         _serve_send_status(cfd, 400, "Bad Request");
         return 0;
@@ -18277,7 +18714,7 @@ fn serve_handle_put_object(cfd, path, buf, n) {
 
     var body_off = sandhi_server_body_offset(buf, n);
     if (body_off < 0) { _serve_send_status(cfd, 400, "Bad Request"); return 0; }
-    var clen = sandhi_server_content_length(buf, n);
+    var clen = _serve_content_length(_serve_req_alloc(), buf, n);
     if (clen <= 0) { _serve_send_status(cfd, 411, "Length Required"); return 0; }
     if (clen > SIT_SERVE_MAX_BODY) { _serve_send_status(cfd, 413, "Payload Too Large"); return 0; }
     if (body_off + clen > n) { _serve_send_status(cfd, 400, "Bad Request"); return 0; }
@@ -18318,8 +18755,11 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
     }
     var rname_start = path + SIT_REF_PUT_PREFIX_LEN;
     var rname_len = plen - SIT_REF_PUT_PREFIX_LEN;
-    # Materialize as a cstring for refname_valid.
-    var rname = alloc(rname_len + 1);
+    # Materialize as a cstring for refname_valid. Every buffer this handler
+    # builds comes from the request arena (C1, 1.7.4).
+    var a = _serve_req_alloc();
+    var rname = alloc_via(a, rname_len + 1);
+    if (rname == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
     memcpy(rname, rname_start, rname_len);
     store8(rname + rname_len, 0);
     if (refname_valid(rname) == 0) {
@@ -18367,20 +18807,25 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
     # Initial pushes to empty remotes: if the target ref file doesn't
     # exist yet, allow — matches git's denyCurrentBranch behavior.
     # First push to a fresh remote is the canonical way to bootstrap.
-    # The existence check happens against the on-disk ref path which we
-    # compute below; mirror that compute here so the bypass is precise.
+    # The existence check happens against the same on-disk ref path the FF
+    # check below uses.
+    #
+    # The on-disk path: ".sit/<rname>". rname already passed refname_valid so
+    # no traversal possible. `adisk` is it resolved against the repo root.
+    var disk_path = alloc_via(a, rname_len + 6);
+    if (disk_path == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
+    memcpy(disk_path, ".sit/", 5);
+    memcpy(disk_path + 5, rname, rname_len);
+    store8(disk_path + 5 + rname_len, 0);
+    var adisk = sit_abs_a(a, disk_path);
+    if (adisk == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
     if (is_head == 1) {
         var server_head = read_head_ref_path();
         if (server_head != 0) {
             if (streq(server_head, rname) == 1) {
-                # Probe the on-disk ref to gate the bypass. Same path
-                # shape used by the FF check below; ensure_parent_dirs
+                # Probe the on-disk ref to gate the bypass; ensure_parent_dirs
                 # happens at write time so this read is safe pre-write.
-                var probe_path = alloc(rname_len + 6);
-                memcpy(probe_path, ".sit/", 5);
-                memcpy(probe_path + 5, rname, rname_len);
-                store8(probe_path + 5 + rname_len, 0);
-                if (sf_exists(probe_path) == 1) {
+                if (file_exists(adisk) == 1) {
                     var msg = "refusing to update checked-out branch (denyCurrentBranch)\n";
                     _serve_send_response(cfd, 423, "Locked", "text/plain",
                       msg, strlen(msg), 0);
@@ -18392,7 +18837,7 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
 
     var body_off = sandhi_server_body_offset(buf, n);
     if (body_off < 0) { _serve_send_status(cfd, 400, "Bad Request"); return 0; }
-    var clen = sandhi_server_content_length(buf, n);
+    var clen = _serve_content_length(_serve_req_alloc(), buf, n);
     # Body must be exactly 64 hex chars, optionally followed by '\n'.
     if (clen != 64) {
         if (clen != 65) {
@@ -18412,7 +18857,8 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
             return 0;
         }
     }
-    var new_hex = alloc(65);
+    var new_hex = alloc_via(a, 65);
+    if (new_hex == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
     memcpy(new_hex, body, 64);
     store8(new_hex + 64, 0);
 
@@ -18426,26 +18872,23 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
         return 0;
     }
 
-    # Build the on-disk path: ".sit/<rname>". rname already
-    # passed refname_valid so no traversal possible.
-    var disk_path = alloc(rname_len + 6);
-    memcpy(disk_path, ".sit/", 5);
-    memcpy(disk_path + 5, rname, rname_len);
-    store8(disk_path + 5 + rname_len, 0);
-
     # Existing tip? FF check via is_ancestor_in_db.
-    if (sf_exists(disk_path) == 1) {
-        # Refuse to follow a symlink on the ref file itself (S-04).
-        if (path_is_symlink(disk_path) == 1) {
+    if (file_exists(adisk) == 1) {
+        # Refuse to follow a symlink on the ref file itself (S-04). 1.7.4: on
+        # the resolved path. It was handed the repo-relative one, so with the
+        # served repo anywhere but the cwd the guard looked at the wrong file
+        # (sf_write_all below refuses to write through a symlink regardless).
+        if (path_is_symlink(adisk) == 1) {
             _serve_send_status(cfd, 500, "Internal Server Error");
             return 0;
         }
-        var rbuf = alloc(128);
-        var nr = sf_read_all(disk_path, rbuf, 128);
+        var rbuf[128];
+        var nr = file_read_all(adisk, &rbuf, 128);
         if (nr < 64) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
-        if (hex_prefix_valid(rbuf, 64) == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
-        var cur = alloc(65);
-        memcpy(cur, rbuf, 64);
+        if (hex_prefix_valid(&rbuf, 64) == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
+        var cur = alloc_via(a, 65);
+        if (cur == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
+        memcpy(cur, &rbuf, 64);
         store8(cur + 64, 0);
         if (memeq(cur, new_hex, 64) == 1) {
             # No-op update — tip already at the new hex.
@@ -18468,11 +18911,11 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
     # Write atomically (write to .tmp then rename). file_write_all
     # already does a single write call — for sit's ref file size
     # (65 bytes) that's atomic on every Linux fs the workflow targets.
-    var wbuf = alloc(66);
-    memcpy(wbuf, new_hex, 64);
-    store8(wbuf + 64, 10);
+    var wbuf[72];
+    memcpy(&wbuf, new_hex, 64);
+    store8(&wbuf + 64, 10);
     ensure_parent_dirs(disk_path);
-    if (sf_write_all(disk_path, wbuf, 65) < 0) {
+    if (sf_write_all(disk_path, &wbuf, 65) < 0) {
         _serve_send_status(cfd, 500, "Internal Server Error");
         return 0;
     }
@@ -18487,20 +18930,32 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
 # config + auth state through it.
 
 # Route one parsed request to its handler.
+#
+# C1 (1.7.4): the request arena is rewound first, which reclaims the previous
+# request and whatever its loop allocated framing this one. Nothing in it is
+# read after the rewind: every handler has sent its response by the time it
+# returns, and the loops keep only integers (lengths, offsets) across it.
 fn serve_handle_request(ctx, cfd, buf, n) {
-    var method = sandhi_server_get_method(buf, n);
-    var path_with_query = sandhi_server_get_path(buf, n);
-    var path = sandhi_server_path_only(path_with_query);
+    var a = _serve_req_alloc();
+    reset_via(a);
+    var method = sandhi_server_get_method_a(a, buf, n);
+    var path_with_query = sandhi_server_get_path_a(a, buf, n);
+    var path = 0;
+    if (path_with_query != 0) { path = sandhi_server_path_only_a(a, path_with_query); }
+    if (method == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
+    if (path == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
 
     if (streq(method, "GET") == 1) {
         if (streq(path, "/sit/v1/capabilities") == 1) {
-            var b1 = serve_build_capabilities();
+            var b1 = serve_build_capabilities(a);
+            if (b1 == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
             _serve_send_response(cfd, 200, "OK", "application/json",
               b1, strlen(b1), 0);
             return 0;
         }
         if (streq(path, "/sit/v1/refs") == 1) {
-            var b2 = serve_build_refs();
+            var b2 = serve_build_refs(a);
+            if (b2 == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
             _serve_send_response(cfd, 200, "OK", "application/json",
               b2, strlen(b2), 0);
             return 0;
@@ -18650,7 +19105,7 @@ fn _stdio_recv_request(buf, max, start_have) {
         store8(buf + have, 0);
         var bo0 = sandhi_server_body_offset(buf, have);
         if (bo0 >= 0) {
-            var clen0 = sandhi_server_content_length(buf, have);
+            var clen0 = _serve_content_length(_serve_req_alloc(), buf, have);
             need_body = bo0 + clen0;
             if (have >= need_body) { return have; }
         }
@@ -18670,7 +19125,7 @@ fn _stdio_recv_request(buf, max, start_have) {
             store8(buf + have, 0);
             var bo = sandhi_server_body_offset(buf, have);
             if (bo >= 0) {
-                var clen = sandhi_server_content_length(buf, have);
+                var clen = _serve_content_length(_serve_req_alloc(), buf, have);
                 need_body = bo + clen;
             }
         }
@@ -18722,7 +19177,7 @@ fn _serve_run_stdio() {
         # handed that claimed length (up to 16 MiB) to `zlib_decompress` over a
         # 64 KiB buffer, reading out of bounds.
         var clen = content_length_sane(
-          sandhi_server_content_length(buf, n), SIT_SERVE_MAX_BODY);
+          _serve_content_length(_serve_req_alloc(), buf, n), SIT_SERVE_MAX_BODY);
         if (clen < 0) {
             _serve_send_status(STDOUT_FILENO, 400, "Bad Request");
             stdout_flush();
@@ -18771,6 +19226,7 @@ fn _serve_run_stdio() {
 # reach here.
 
 var SERVE_TLS_REQ_MAX = 65536;   # 64 KiB request buffer (matches sandhi's HSV cap)
+var SERVE_TLS_CONN_ARENA_CHUNK = 131072;   # one handshake's state fits; more chains a chunk
 
 # Load a certificate file as DER. Accepts PEM (decoded via pem_decode_certs) or
 # raw DER. Writes [der_ptr, der_len] to out_pair (16 bytes). Returns 0 on
@@ -18810,7 +19266,7 @@ fn _serve_tls_recv_request(ctx, buf, max) {
                 if (headers_end < 0) {
                     headers_end = sandhi_server_body_offset(buf, used);
                     if (headers_end > 0) {
-                        content_len = sandhi_server_content_length(buf, used);
+                        content_len = _serve_content_length(_serve_req_alloc(), buf, used);
                     }
                 }
                 if (headers_end > 0) {
@@ -18839,6 +19295,13 @@ fn _serve_run_tls(listen_addr, port, cert, cert_len, key, key_len) {
         eprintln("sit: listen failed"); return 1;
     }
     var reqbuf = alloc(SERVE_TLS_REQ_MAX);
+    # C1 (1.7.4): each connection's TLS state — the ctx, the handshake, the
+    # transcript and key schedule, the record buffers — is built in this arena
+    # and reclaimed when the connection closes. tls_native_new_server builds it
+    # on the global heap, where it stayed: about 74 KB per connection, so 1,000
+    # handshakes kept 74 MB.
+    var conn_al = arena_allocator_growable(SERVE_TLS_CONN_ARENA_CHUNK);
+    if (conn_al == 0) { eprintln("sit: cannot allocate the TLS connection arena"); return 1; }
     while (1 == 1) {
         var cr_t, cr_v = sock_accept(sfd);
         if (is_err_result(cr_t) == 0) {
@@ -18847,7 +19310,10 @@ fn _serve_run_tls(listen_addr, port, cert, cert_len, key, key_len) {
             # handshake + request read (v0.8.9 hardening; mirrors what
             # sandhi_server_run_opts does for the plain-http path).
             sock_set_recv_timeout(cfd, 30, 0);
-            var ctx = tls_native_new_server(cert, cert_len, key, key_len);
+            # The previous connection's ctx was closed before its socket, so
+            # nothing in the arena is live here.
+            reset_via(conn_al);
+            var ctx = tls_native_new_server_in(conn_al, cert, cert_len, key, key_len);
             if (ctx != 0) {
                 # 1.6.4 (C2): whole-handshake and whole-request DEADLINES, as
                 # sandhi's plain-HTTP loop has (60 s). The 30 s SO_RCVTIMEO above

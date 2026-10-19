@@ -10,15 +10,16 @@ include "lib/io.cyr"
 include "lib/sankoch.cyr"
 include "lib/patra.cyr"
 include "lib/string.cyr"
+include "lib/alloc.cyr"
 include "lib/str.cyr"
 include "lib/fs.cyr"
-include "lib/alloc.cyr"
 include "lib/args.cyr"
 include "lib/vec.cyr"
 include "lib/chrono.cyr"
+include "lib/mmap.cyr"
 include "lib/hashmap.cyr"
-include "lib/sigil.cyr"
 include "lib/freelist.cyr"
+include "lib/sigil.cyr"
 include "lib/process.cyr"
 
 # --- util.cyr ---
@@ -62,6 +63,14 @@ fn sit_set_repo_root(root) {
 # On Linux and for already-absolute paths this is a no-op, so the whole
 # change is behavior-preserving there.
 fn sit_abs(rel) {
+    return sit_abs_a(0, rel);
+}
+
+# sit_abs with the joined path drawn from allocator `a`: `sit serve` passes its
+# request arena, so a path built for one request is reclaimed with it (C1,
+# 1.7.4). `a` == 0 is sit_abs itself: the global heap, dying on OOM. Otherwise
+# 0 comes back when `a` cannot serve the bytes.
+fn sit_abs_a(a, rel) {
     if (rel == 0) { return rel; }
     if (load8(rel) == 47) { return rel; }            # '/'
     if (_repo_root == 0) { return rel; }
@@ -72,7 +81,12 @@ fn sit_abs(rel) {
     var rlen = strlen(_repo_root);
     var plen = strlen(rel);
     # "<root>" + "/" + "<rel>" + NUL
-    var out = alloc_or_die(rlen + 1 + plen + 1);
+    var out = 0;
+    if (a == 0) { out = alloc_or_die(rlen + 1 + plen + 1); }
+    else {
+        out = alloc_via(a, rlen + 1 + plen + 1);
+        if (out == 0) { return 0; }
+    }
     memcpy(out, _repo_root, rlen);
     store8(out + rlen, 47);                          # '/'
     memcpy(out + rlen + 1, rel, plen);
@@ -2706,8 +2720,14 @@ fn _git_resolve_ref_name(name, out_buf) {
 # out-params use read_object's 24-byte contract {content_ptr, content_len,
 # content_off}; pack objects carry no loose framing, so content_off is 0.
 
-# Delta-chain recursion guard (git's pack.depth default is 50; 64 is slack).
-var _pack_delta_depth = 0;
+# Deepest delta chain a read follows: git's own ceiling (pack.depth is capped at
+# 4095). 1.7.3 resolved chains by recursion and stopped at 64, so the deeper
+# objects of a repo repacked with `--depth=250` (git gc --aggressive's old
+# default, and still common advice) read as missing (D6, 1.7.4).
+var _PACK_DELTA_MAX_DEPTH = 4095;
+# One link of a chain being resolved: the delta object's pack {data, len}, where
+# its zlib payload starts, and its declared (inflated) size.
+var _PACK_LINK = 32;
 
 # Reject an absurd object size from a hostile pack header before allocating.
 #
@@ -2865,7 +2885,31 @@ fn _git_idx_lookup(idx_path, oid_raw, rawlen) {
 # reads every tracked blob — peaked at 263 MB on a 3,000-file repo and 4 GB on
 # 12,000 files, and owl / thoth run it in-process. Two packs read alternately
 # re-read both on every switch the same way. Now each file costs its size once.
+#
+# 1.7.4 (D6): each file is mapped read-only rather than copied onto the heap.
+# read_file_heap refuses anything over 64 MiB (S-06), so a larger pack — or the
+# .idx of a repo with a few million objects — read as absent, and every object in
+# it as missing: sit_repo_status then called a clean file modified or untracked.
+# A mapping costs no heap at any size; the kernel pages it in as objects are read.
+# Where mmap is unavailable (agnos), or refused, the file is read as before.
+# Like git, which maps its packs too, this assumes a pack is never truncated in
+# place (git writes a new one and renames it); reading past a truncation faults.
 var _git_file_cache = 0;
+
+# Map `path` read-only into out_pair {addr, len}. 0, or -1 when it cannot be
+# opened, is empty, or mmap refuses.
+fn _git_file_map(path, out_pair) {
+    var fd = file_open(sit_abs(path), 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
+    if (size <= 0) { file_close(fd); return 0 - 1; }
+    var addr = mmap_file_ro(fd, size);
+    file_close(fd);                                # the mapping outlives the fd
+    if (addr == 0) { return 0 - 1; }
+    store64(out_pair, addr);
+    store64(out_pair + 8, size);
+    return 0;
+}
 
 fn _git_file_cached(path, out_pair) {
     if (_git_file_cache == 0) { _git_file_cache = map_new(); }
@@ -2876,7 +2920,9 @@ fn _git_file_cached(path, out_pair) {
         return 0;
     }
     var pr[16];
-    if (read_file_heap(path, &pr) != 0) { return 0 - 1; }
+    if (_git_file_map(path, &pr) != 0) {
+        if (read_file_heap(path, &pr) != 0) { return 0 - 1; }
+    }
     var cell = alloc_or_die(16);
     store64(cell, load64(&pr));
     store64(cell + 8, load64(&pr + 8));
@@ -2989,31 +3035,59 @@ fn _delta_varint(data, curptr, limit) {
 }
 
 # --- delta apply -------------------------------------------------------------
-# Reconstruct a target object from base + delta instruction stream. Writes the
-# read_object contract into out24 (content_off 0). Returns 0 or negative.
-fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
-    # S-24: `base` / `delta` are both attacker-controlled in a hostile repo, so
-    # validate the pair before touching either.
-    if (base == 0) { return 0 - 1; }
+# The result size a delta declares, once its header checks out against the base
+# it is applied to; -1 otherwise. `cur` (an i64 slot) is left at the first
+# instruction.
+fn _git_delta_header(base_len, delta, delta_len, cur) {
+    store64(cur, 0);
     if (base_len < 0) { return 0 - 1; }
     if (delta_len <= 0) { return 0 - 1; }
-    var cur[8];
-    store64(&cur, 0);
     # 1.6.4 (D10): git's patch_delta rejects a delta whose declared base size is
     # not the base it is applied to; this read the field and discarded it, so a
     # delta against the wrong base reconstructed wrong content whenever its
     # copies happened to fit.
-    var declared_base = _delta_varint(delta, &cur, delta_len);
+    var declared_base = _delta_varint(delta, cur, delta_len);
     if (declared_base < 0) { return 0 - 1; }
     if (declared_base != base_len) { return 0 - 1; }
-    var result_size = _delta_varint(delta, &cur, delta_len);
+    var result_size = _delta_varint(delta, cur, delta_len);
     if (result_size <= 0) { return 0 - 1; }
     # 1.6.4 (D5): held to the same 16 MiB object ceiling as every other read.
     # The 256 MiB pack-entry cap let a small hostile delta make an in-process
     # consumer allocate and fill 256 MiB per chain level.
     if (result_size > _DELTA_MAX_RESULT) { return 0 - 1; }
-    var out = alloc(result_size);
+    return result_size;
+}
+
+# Reconstruct a target object from base + delta instruction stream. Writes the
+# read_object contract into out24 (content_off 0), in a freelist buffer the
+# caller owns. Returns 0 or negative.
+fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
+    var cur[8];
+    var result_size = _git_delta_header(base_len, delta, delta_len, &cur);
+    if (result_size < 0) { return 0 - 1; }
+    var out = fl_alloc(result_size);
     if (out == 0) { return 0 - 2; }
+    var r = _git_apply_delta_into(base, base_len, delta, delta_len, out, result_size);
+    if (r < 0) { fl_free(out); return r; }
+    store64(out24, out);
+    store64(out24 + 8, r);
+    store64(out24 + 16, 0);
+    return 0;
+}
+
+# _git_apply_delta into a caller's buffer of `out_cap` bytes. Returns the result
+# length, or negative: -1 a bad header, -2 `out_cap` below the declared size,
+# -3..-9 a bad instruction. 1.7.4 (D6): split out so a delta chain reuses two
+# buffers for all its steps rather than allocating one per step.
+fn _git_apply_delta_into(base, base_len, delta, delta_len, out, out_cap) {
+    # S-24: `base` / `delta` are both attacker-controlled in a hostile repo, so
+    # validate the pair before touching either.
+    if (base == 0) { return 0 - 1; }
+    var cur[8];
+    var result_size = _git_delta_header(base_len, delta, delta_len, &cur);
+    if (result_size < 0) { return 0 - 1; }
+    if (out == 0) { return 0 - 2; }
+    if (out_cap < result_size) { return 0 - 2; }
     var op_out = 0;
     var err = 0;
     while (load64(&cur) < delta_len) {
@@ -3072,108 +3146,264 @@ fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
     }
     if (err != 0) { return err; }
     if (op_out != result_size) { return 0 - 7; }
-    store64(out24, out);
-    store64(out24 + 8, result_size);
+    return result_size;
+}
+
+# --- pack object reconstruct -------------------------------------------------
+# Reconstruct the object at `offset` in the in-memory pack {pdata,plen}. Writes
+# read_object contract into out24 (content_off 0).
+#
+# 1.7.4 (D6): iterative. The chain is walked down to its base first, recording
+# each delta it passes (an OFS_DELTA steps back in the same pack; a REF_DELTA
+# names its base by id, which may be loose or in another pack). Then the deltas
+# are applied from the base upward. Every intermediate base and delta buffer is
+# freed once the next step has used it, so a read keeps only its result: the
+# recursion this replaces kept every level of every chain on the bump heap, which
+# owl and thoth pay in-process for each blob sit_repo_status reads.
+#
+# The chain is bounded at _PACK_DELTA_MAX_DEPTH links. An OFS_DELTA chain cannot
+# loop (each base lies strictly before its delta); a REF_DELTA cycle stops there.
+# Each step's result is held to 16 MiB (D5), so the worst a hostile chain costs is
+# 4095 such steps, the bound git itself accepts.
+
+# Write `n` raw bytes as lowercase hex into `out` (2n bytes + NUL).
+fn _hex_into(raw, n, out) {
+    var digits = "0123456789abcdef";
+    var i = 0;
+    while (i < n) {
+        var b = load8(raw + i) & 0xFF;
+        store8(out + i * 2, load8(digits + b / 16));
+        store8(out + i * 2 + 1, load8(digits + (b & 15)));
+        i = i + 1;
+    }
+    store8(out + n * 2, 0);
+    return 0;
+}
+
+# Inflate `size` declared bytes at `body` of {pdata,plen} into a fresh freelist
+# buffer. Returns the buffer and stores the inflated length at `out_len`, or 0.
+fn _pack_inflate(pdata, plen, body, size, out_len) {
+    # S-24: a header that consumed the whole buffer leaves body == plen, making
+    # `plen - body` zero or negative — never hand that to the decompressor.
+    if (body >= plen) { return 0; }
+    var buf = fl_alloc(size + 16);
+    if (buf == 0) { return 0; }
+    var got = zlib_decompress_with_ratio_cap(pdata + body, plen - body,
+      buf, size + 16, SIT_MAX_INFLATE_RATIO);
+    if (got <= 0) { fl_free(buf); return 0; }
+    store64(out_len, got);
+    return buf;
+}
+
+fn _git_pack_obj(pdata, plen, offset, out24) {
+    var links_cap = 16;
+    var links = fl_alloc(links_cap * _PACK_LINK);
+    if (links == 0) { return 0 - 11; }
+    var nlinks = 0;
+    var cp = pdata;
+    var cl = plen;
+    var co = offset;
+    var base = 0;            # the base's bytes once found
+    var base_len = 0;
+    var base_owned = 0;      # 1 when `base` is a freelist buffer this read made
+    var rc = 0;
+    var walking = 1;
+    while (walking == 1) {
+        # S-24: `co` comes from the .idx offset table (attacker-supplied, up to
+        # 2^63 via the large-offset table) or an OFS_DELTA back-reference. The
+        # pack v2 header is 12 bytes, so any real object starts at >= 12.
+        if (cp == 0) { rc = 0 - 10; }
+        if (rc == 0) { if (co < 12) { rc = 0 - 10; } }
+        if (rc == 0) { if (co >= cl) { rc = 0 - 10; } }
+        var cur[8];
+        var type_slot[8];
+        var size = 0;
+        var type = 0;
+        if (rc == 0) {
+            store64(&cur, co);
+            store64(&type_slot, 0);
+            size = _pack_obj_header(cp, &cur, &type_slot, cl);
+            if (size < 0) { rc = 0 - 10; }
+            if (size > _PACK_MAX_OBJ) { rc = 0 - 10; }
+            type = load64(&type_slot);
+        }
+        if (rc == 0) {
+            if (type >= 1) {
+                if (type <= 4) {
+                    var got[8];
+                    base = _pack_inflate(cp, cl, load64(&cur), size, &got);
+                    if (base == 0) { rc = 0 - 12; }
+                    else { base_len = load64(&got); base_owned = 1; }
+                    walking = 0;
+                }
+            }
+        }
+        if (rc == 0) {
+            if (walking == 1) {
+                if (type != 6) { if (type != 7) { rc = 0 - 21; } }
+                if (rc == 0) { if (nlinks >= _PACK_DELTA_MAX_DEPTH) { rc = 0 - 13; } }
+            }
+        }
+        if (rc == 0) {
+            if (walking == 1) {
+                if (nlinks >= links_cap) {
+                    var grown = fl_alloc(links_cap * 2 * _PACK_LINK);
+                    if (grown == 0) { rc = 0 - 11; }
+                    else {
+                        memcpy(grown, links, nlinks * _PACK_LINK);
+                        fl_free(links);
+                        links = grown;
+                        links_cap = links_cap * 2;
+                    }
+                }
+            }
+        }
+        if (rc == 0) {
+            if (walking == 1) {
+                if (type == 6) {
+                    var ofs = _ofs_varint(cp, &cur, cl);
+                    # S-24: a zero-distance back-reference would make the object its
+                    # own base.
+                    if (ofs <= 0) { rc = 0 - 14; }
+                    if (rc == 0) { if (co - ofs < 0) { rc = 0 - 14; } }
+                    if (rc == 0) {
+                        var lk = links + nlinks * _PACK_LINK;
+                        store64(lk, cp);
+                        store64(lk + 8, cl);
+                        store64(lk + 16, load64(&cur));
+                        store64(lk + 24, size);
+                        nlinks = nlinks + 1;
+                        co = co - ofs;
+                    }
+                }
+                else {
+                    # REF_DELTA: the base id is `rawlen` raw bytes at the cursor.
+                    var rawlen = _id_rawlen();
+                    # S-24: bound the whole run before it is read.
+                    if (load64(&cur) + rawlen > cl) { rc = 0 - 18; }
+                    var base_hex[72];
+                    if (rc == 0) {
+                        _hex_into(cp + load64(&cur), rawlen, &base_hex);
+                        var lk2 = links + nlinks * _PACK_LINK;
+                        store64(lk2, cp);
+                        store64(lk2 + 8, cl);
+                        store64(lk2 + 16, load64(&cur) + rawlen);
+                        store64(lk2 + 24, size);
+                        nlinks = nlinks + 1;
+                        var loose24[24];
+                        if (_git_read_loose(&base_hex, &loose24) == 0) {
+                            # A loose base carries its framing; step past it. It
+                            # is the loose reader's buffer, not this read's.
+                            base = load64(&loose24) + load64(&loose24 + 16);
+                            base_len = load64(&loose24 + 8) - load64(&loose24 + 16);
+                            if (base_len < 0) { rc = 0 - 18; }
+                            walking = 0;
+                        }
+                        else {
+                            var loc[24];
+                            if (_git_pack_locate(&base_hex, &loc) != 0) { rc = 0 - 18; }
+                            else {
+                                cp = load64(&loc);
+                                cl = load64(&loc + 8);
+                                co = load64(&loc + 16);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (rc != 0) { walking = 0; }
+    }
+    # Apply the deltas from the base upward: the last link recorded is the one
+    # nearest the base. Two result buffers take turns as each step's base and
+    # output, and one holds the inflated delta. Each is replaced only when a step
+    # needs more room, so a chain costs a few allocations however deep it is:
+    # one per step measured 28% slower, every buffer over 4 KiB being its own
+    # mapping.
+    var base_cap = base_len;           # an inflated base's buffer is reusable
+    var other = 0;
+    var other_cap = 0;
+    var dbuf = 0;
+    var dcap = 0;
+    var li = nlinks - 1;
+    while (li >= 0) {
+        if (rc == 0) {
+            var l = links + li * _PACK_LINK;
+            var lp = load64(l);
+            var lplen = load64(l + 8);
+            var body = load64(l + 16);
+            var need = load64(l + 24) + 16;
+            if (body >= lplen) { rc = 0 - 17; }  # S-24: never a non-positive inflate length
+            if (rc == 0) {
+                if (dcap < need) {
+                    if (dbuf != 0) { fl_free(dbuf); }
+                    dbuf = fl_alloc(need);
+                    dcap = need;
+                    if (dbuf == 0) { dcap = 0; rc = 0 - 17; }
+                }
+            }
+            var dlen = 0;
+            if (rc == 0) {
+                dlen = zlib_decompress_with_ratio_cap(lp + body, lplen - body, dbuf, need,
+                  SIT_MAX_INFLATE_RATIO);
+                if (dlen <= 0) { rc = 0 - 17; }
+            }
+            var hcur[8];
+            var rsize = 0;
+            if (rc == 0) {
+                rsize = _git_delta_header(base_len, dbuf, dlen, &hcur);
+                if (rsize < 0) { rc = 0 - 1; }
+            }
+            if (rc == 0) {
+                if (other_cap < rsize) {
+                    if (other != 0) { fl_free(other); }
+                    other = fl_alloc(rsize);
+                    other_cap = rsize;
+                    if (other == 0) { other_cap = 0; rc = 0 - 2; }
+                }
+            }
+            if (rc == 0) {
+                var ar = _git_apply_delta_into(base, base_len, dbuf, dlen, other, other_cap);
+                if (ar < 0) { rc = ar; }
+                else {
+                    # The output becomes the next base; the old base's buffer, if
+                    # it is this read's, becomes the next output.
+                    var prev = base;
+                    var prev_cap = base_cap;
+                    var prev_owned = base_owned;
+                    base = other;
+                    base_len = ar;
+                    base_cap = other_cap;
+                    base_owned = 1;
+                    other = 0;
+                    other_cap = 0;
+                    if (prev_owned == 1) { other = prev; other_cap = prev_cap; }
+                }
+            }
+        }
+        li = li - 1;
+    }
+    if (dbuf != 0) { fl_free(dbuf); }
+    if (other != 0) { fl_free(other); }
+    fl_free(links);
+    if (rc != 0) {
+        if (base_owned == 1) { fl_free(base); }
+        return rc;
+    }
+    # The result is the caller's. (A loose base is only reached through a link,
+    # so by now at least one delta has been applied and `base` is this read's.)
+    store64(out24, base);
+    store64(out24 + 8, base_len);
     store64(out24 + 16, 0);
     return 0;
 }
 
-# --- pack object reconstruct (recursive for deltas) --------------------------
-# Reconstruct the object at `offset` in the in-memory pack {pdata,plen}. Writes
-# read_object contract into out24 (content_off 0). Recurses through delta bases.
-fn _git_pack_obj(pdata, plen, offset, out24) {
-    # S-24: `offset` comes from the .idx offset table, which is attacker-supplied
-    # in a hostile repo (and can reach 2^63 via the large-offset table). Reject
-    # it before it becomes a load address. The pack v2 header is 12 bytes, so any
-    # real object starts at >= 12.
-    if (pdata == 0) { return 0 - 10; }
-    if (offset < 12) { return 0 - 10; }
-    if (offset >= plen) { return 0 - 10; }
-    var cur[8];
-    store64(&cur, offset);
-    var type_slot[8];
-    store64(&type_slot, 0);
-    var size = _pack_obj_header(pdata, &cur, &type_slot, plen);
-    if (size < 0) { return 0 - 10; }
-    var type = load64(&type_slot);
-    if (size > _PACK_MAX_OBJ) { return 0 - 10; }
-
-    if (type >= 1) {
-        if (type <= 4) {
-            var body = load64(&cur);
-            # S-24: a header that consumed the whole buffer leaves body == plen,
-            # making `plen - body` zero or negative — never hand that to the
-            # decompressor as a length.
-            if (body >= plen) { return 0 - 11; }
-            var content = alloc(size + 16);
-            if (content == 0) { return 0 - 11; }
-            var got = zlib_decompress_with_ratio_cap(pdata + body, plen - body,
-              content, size + 16, SIT_MAX_INFLATE_RATIO);
-            if (got <= 0) { return 0 - 12; }
-            store64(out24, content);
-            store64(out24 + 8, got);
-            store64(out24 + 16, 0);
-            return 0;
-        }
-    }
-
-    if (_pack_delta_depth >= 64) { return 0 - 13; }
-
-    if (type == 6) {
-        var ofs = _ofs_varint(pdata, &cur, plen);
-        if (ofs < 0) { return 0 - 14; }
-        var base_off = offset - ofs;
-        if (base_off < 0) { return 0 - 14; }
-        # S-24: a zero-distance back-reference makes the object its own delta
-        # base — infinite recursion the depth cap only bounds at 64 frames.
-        if (ofs == 0) { return 0 - 14; }
-        var base24[24];
-        _pack_delta_depth = _pack_delta_depth + 1;
-        var br = _git_pack_obj(pdata, plen, base_off, &base24);
-        _pack_delta_depth = _pack_delta_depth - 1;
-        if (br != 0) { return 0 - 15; }
-        var dbody = load64(&cur);
-        if (dbody >= plen) { return 0 - 16; }
-        var delta = alloc(size + 16);
-        if (delta == 0) { return 0 - 16; }
-        var dgot = zlib_decompress_with_ratio_cap(pdata + dbody, plen - dbody, delta, size + 16, SIT_MAX_INFLATE_RATIO);
-        if (dgot <= 0) { return 0 - 17; }
-        return _git_apply_delta(load64(&base24), load64(&base24 + 8), delta, dgot, out24);
-    }
-
-    if (type == 7) {
-        var rawlen = _id_rawlen();
-        # S-24: the base oid is `rawlen` raw bytes at the cursor — bound the
-        # whole run before hex_encode reads it.
-        if (load64(&cur) + rawlen > plen) { return 0 - 18; }
-        var base_hex = hex_encode(pdata + load64(&cur), rawlen);
-        store64(&cur, load64(&cur) + rawlen);
-        var base24[24];
-        _pack_delta_depth = _pack_delta_depth + 1;
-        var br = _git_read_any(base_hex, &base24);
-        _pack_delta_depth = _pack_delta_depth - 1;
-        if (br != 0) { return 0 - 18; }
-        # normalize base to raw content (loose base carries framing at +16)
-        var bbuf = load64(&base24) + load64(&base24 + 16);
-        var blen = load64(&base24 + 8) - load64(&base24 + 16);
-        if (blen < 0) { return 0 - 18; }
-        var dbody = load64(&cur);
-        if (dbody >= plen) { return 0 - 19; }
-        var delta = alloc(size + 16);
-        if (delta == 0) { return 0 - 19; }
-        var dgot = zlib_decompress_with_ratio_cap(pdata + dbody, plen - dbody, delta, size + 16, SIT_MAX_INFLATE_RATIO);
-        if (dgot <= 0) { return 0 - 20; }
-        return _git_apply_delta(bbuf, blen, delta, dgot, out24);
-    }
-
-    return 0 - 21;
-}
-
 # --- top-level packfile read -------------------------------------------------
-# Look up `hex` across every .git/objects/pack/*.idx; on a hit, reconstruct the
-# object from the matching .pack. Writes read_object contract to out24. Returns
-# 0 on success, negative if not found in any pack (or no pack dir).
-fn _git_read_pack(hex, out24) {
+# Find `hex` across every .git/objects/pack/*.idx. On a hit, writes the matching
+# pack's {data, len} and the object's offset to out24 and returns 0; negative
+# when there is no pack directory (-1), `hex` is not an id (-2), or no pack
+# holds it (-3).
+fn _git_pack_locate(hex, out24) {
     var packdir = ".git/objects/pack";
     # S-26: route through the sit_abs seam like every other repo path. A raw
     # `is_dir(str_from(packdir))` is cwd-relative, so on agnos — which has no
@@ -3214,7 +3444,10 @@ fn _git_read_pack(hex, out24) {
                         store8(ppath + dlen + 1 + nb + 5, 0);
                         var pkp[16];
                         if (_git_load_pack(ppath, &pkp) == 0) {
-                            rc = _git_pack_obj(load64(&pkp), load64(&pkp + 8), offset, out24);
+                            store64(out24, load64(&pkp));
+                            store64(out24 + 8, load64(&pkp + 8));
+                            store64(out24 + 16, offset);
+                            rc = 0;
                             done = 1;
                         }
                     }
@@ -3224,6 +3457,16 @@ fn _git_read_pack(hex, out24) {
         i = i + 1;
     }
     return rc;
+}
+
+# Look up `hex` across every .git/objects/pack/*.idx; on a hit, reconstruct the
+# object from the matching .pack. Writes read_object contract to out24. Returns
+# 0 on success, negative if not found in any pack (or no pack dir).
+fn _git_read_pack(hex, out24) {
+    var loc[24];
+    var lr = _git_pack_locate(hex, &loc);
+    if (lr != 0) { return lr; }
+    return _git_pack_obj(load64(&loc), load64(&loc + 8), load64(&loc + 16), out24);
 }
 
 # Loose-first, then packfile: the git-mode object read used by read_object and

@@ -37,6 +37,14 @@ fn sit_set_repo_root(root) {
 # On Linux and for already-absolute paths this is a no-op, so the whole
 # change is behavior-preserving there.
 fn sit_abs(rel) {
+    return sit_abs_a(0, rel);
+}
+
+# sit_abs with the joined path drawn from allocator `a`: `sit serve` passes its
+# request arena, so a path built for one request is reclaimed with it (C1,
+# 1.7.4). `a` == 0 is sit_abs itself: the global heap, dying on OOM. Otherwise
+# 0 comes back when `a` cannot serve the bytes.
+fn sit_abs_a(a, rel) {
     if (rel == 0) { return rel; }
     if (load8(rel) == 47) { return rel; }            # '/'
     if (_repo_root == 0) { return rel; }
@@ -47,7 +55,12 @@ fn sit_abs(rel) {
     var rlen = strlen(_repo_root);
     var plen = strlen(rel);
     # "<root>" + "/" + "<rel>" + NUL
-    var out = alloc_or_die(rlen + 1 + plen + 1);
+    var out = 0;
+    if (a == 0) { out = alloc_or_die(rlen + 1 + plen + 1); }
+    else {
+        out = alloc_via(a, rlen + 1 + plen + 1);
+        if (out == 0) { return 0; }
+    }
     memcpy(out, _repo_root, rlen);
     store8(out + rlen, 47);                          # '/'
     memcpy(out + rlen + 1, rel, plen);

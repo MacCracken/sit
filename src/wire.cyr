@@ -113,12 +113,16 @@ fn remote_objects_open(repo_path) {
 
 # Return 1 if `hex` exists in the given opened object DB, else 0.
 fn db_object_has(db, hex) {
-    var sql = alloc(128);
+    # 1.7.4 (C1): freelist, as db_object_read_raw does — `sit serve` asks this
+    # on every ref push, and copy_objects once per object.
+    var sql = fl_alloc(128);
+    if (sql == 0) { return 0; }
     memcpy(sql, "SELECT hash FROM objects WHERE hash = '", 39);
     memcpy(sql + 39, hex, 64);
     memcpy(sql + 39 + 64, "'", 1);
     store8(sql + 39 + 64 + 1, 0);
     var rs = patra_query(db, sql);
+    fl_free(sql);
     if (rs == 0) { return 0; }
     var cnt = patra_result_count(rs);
     patra_result_free(rs);
