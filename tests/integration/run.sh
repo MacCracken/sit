@@ -1233,6 +1233,70 @@ else
   echo "  (skipped 23c: python3 not available)"
 fi
 
+# ── 24. 1.7.1: a refused object write never moves a ref ────────────
+hr "1.7.1 refused object writes"
+
+# A 1 MiB file-size limit (SIGXFSZ ignored, so writes fail with EFBIG) stops
+# objects.patra growing to hold a 2 MiB incompressible blob. patra 1.16.2
+# rolls the whole batch back; sit used to count it as copied anyway.
+lim() { ( trap '' XFSZ; ulimit -f 1024; "$@" ); }
+
+# 24a. push: the remote's commit fails, so its ref must not move.
+a164 p171r; echo r > r; c164 r; m164 base; P171R="$R"
+a164 p171; echo a > f; c164 f; m164 one; "$SIT" checkout -b feat >/dev/null 2>&1
+head -c 2097152 /dev/urandom > big; c164 big; m164 big
+"$SIT" remote add origin "$P171R" >/dev/null
+lim "$SIT" push origin >/dev/null 2>&1; assert_eq "$?" "1" "24a: a push whose objects did not land fails"
+assert_eq "$([ -e "$P171R/.sit/refs/heads/feat" ] && echo moved || echo untouched)" "untouched" "24a: and the remote ref is not created"
+assert_contains "$(cd "$P171R" && "$SIT" fsck 2>&1)" " 0 bad" "24a: the remote stays fsck-clean"
+"$SIT" push origin >/dev/null 2>&1; assert_eq "$?" "0" "24a: the same push succeeds without the limit"
+assert_contains "$(cd "$P171R" && "$SIT" fsck 2>&1)" " 0 bad" "24a: and lands whole"
+
+# 24b. BEGIN refused (a read-only .sit/ leaves no room for the WAL): the copy
+# falls back to autocommit inserts, each still checked, and the push lands.
+if [ "$(id -u)" != "0" ]; then
+  a164 b171r; echo r > r; c164 r; m164 base; B171R="$R"
+  a164 b171; echo a > f; c164 f; m164 one; "$SIT" checkout -b feat >/dev/null 2>&1
+  echo b > f; c164 f; m164 two
+  "$SIT" remote add origin "$B171R" >/dev/null
+  chmod 555 "$B171R/.sit"
+  "$SIT" push origin >/dev/null 2>&1; assert_eq "$?" "0" "24b: a push with BEGIN refused still lands"
+  chmod 755 "$B171R/.sit"
+  assert_contains "$(cd "$B171R" && "$SIT" fsck 2>&1)" " 0 bad" "24b: whole"
+else
+  echo "  (skipped 24b: root ignores directory modes)"
+fi
+
+# 24c. fetch: the local commit fails, so origin/<branch> must not move.
+a164 f171s; echo a > f; c164 f; m164 one; head -c 2097152 /dev/urandom > big; c164 big; m164 big; F171S="$R"
+a164 f171; "$SIT" remote add origin "$F171S" >/dev/null
+lim "$SIT" fetch origin main >/dev/null 2>&1; assert_eq "$?" "1" "24c: a fetch whose objects did not land fails"
+assert_eq "$([ -e .sit/refs/remotes/origin/main ] && echo moved || echo untouched)" "untouched" "24c: and origin/main is not written"
+
+# 24d. add: a refused insert is an error, not a staged id.
+head -c 2097152 /dev/urandom > big2
+lim "$SIT" add big2 >/dev/null 2>&1; assert_eq "$?" "1" "24d: add of an object that could not be stored fails"
+assert_contains "$("$SIT" status)" "Untracked files" "24d: and nothing is staged"
+
+# 24e. loose-object migration: a refused insert keeps the loose file, and the
+# next open migrates it.
+if command -v python3 >/dev/null 2>&1; then
+  a164 m171; echo a > f; c164 f; m164 one
+  HEX=$(python3 -I -c '
+import hashlib, os, zlib
+body = os.urandom(2 * 1024 * 1024)
+framed = b"blob %d\0" % len(body) + body
+h = hashlib.sha256(framed).hexdigest()
+os.makedirs(".sit/objects/" + h[:2], exist_ok=True)
+open(".sit/objects/" + h[:2] + "/" + h[2:], "wb").write(zlib.compress(framed))
+print(h)')
+  lim "$SIT" fsck >/dev/null 2>&1
+  assert_eq "$([ -e ".sit/objects/${HEX:0:2}/${HEX:2}" ] && echo kept || echo lost)" "kept" "24e: a refused migration keeps the loose object"
+  "$SIT" cat-file "$HEX" >/dev/null 2>&1; assert_eq "$?" "0" "24e: the next open migrates it"
+else
+  echo "  (skipped 24e: python3 not available)"
+fi
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

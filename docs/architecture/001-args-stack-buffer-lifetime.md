@@ -1,6 +1,6 @@
 # 001 — `args.cyr` relies on post-return stack memory
 
-**Status**: documented constraint of the Cyrius stdlib we depend on (not a sit decision).
+**Status**: **obsolete at sit's toolchain pin (re-checked at cyrius 6.7.15, sit 1.7.1).** `lib/args.cyr`'s `args_init` now reads `/proc/self/cmdline` into an `alloc()`-backed buffer (2 MiB first chunk, grown to EOF; heap-backed since cyrius 5.9.5 per its own comment), and `argv(n)` returns a pointer into that heap buffer, so nothing here outlives a stack frame. The advice below (copy argv values up front with `argv_heap`) is harmless and still followed; it is no longer load-bearing. Kept, unrenumbered, as the record of why sit's code copies argv.
 **Affects**: any `argv(n)` call in `src/main.cyr`.
 
 ## The issue

@@ -4,6 +4,104 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.1] — 2026-10-19 — cyrius 6.7.15; a refused object write never moves a ref
+
+A toolchain patch. It folds patra 1.16.1–1.16.5, which 1.7.0 flagged as worth taking for their row-loss and fdatasync fixes. Taking them changed what a failed `patra_commit` means, and sit was ignoring that status, so this release also fixes the write paths that relied on it.
+
+### Fixed — a refused object write never moves a ref (data integrity)
+
+Since patra 1.16.2 a failed `patra_commit` rolls back the whole transaction, and a failed fdatasync is `PATRA_ERR_IO` rather than success. sit ignored both:
+
+- **`copy_objects`** (fetch, pull, clone, file:// push) counted objects before the commit and never read its status. fetch / push then wrote the ref, pointing it at objects that were never stored.
+- **`write_typed_object`** (add, commit, merge, tag, stash) ignored `patra_insert_row` and returned the hash anyway, so the index or a commit could record an object that does not exist.
+- **The loose-object migration** deleted each loose file whether or not its row was inserted. A refused insert destroyed the only copy.
+
+Repro: push a 2 MiB incompressible blob under a 1 MiB file-size limit (`ulimit -f 1024`, SIGXFSZ ignored), so the remote's `objects.patra` cannot grow.
+
+| build | push says | remote ref | remote `fsck` |
+|---|---|---|---|
+| 1.7.0 (patra 1.16.0) | pushed, 6 new objects | moved | 3 unreadable objects |
+| 1.7.0 source on 6.7.15 (patra 1.16.2) | pushed, 5 new objects | moved | the commit is missing |
+| 1.7.1 | `failed to store objects in the remote; remote ref not updated`, exit 1 | not created | clean |
+
+Now:
+- **A refused insert or commit fails `copy_objects` (-1), and fetch / push stop before any ref moves.** The same push succeeds once space allows and lands whole.
+- **A refused BEGIN is not a failure.** The transaction only batches fsyncs. When patra cannot open a WAL (for example, a read-only `.sit/`), every insert autocommits as it did before, and each one is checked.
+- **`write_typed_object` returns 0 on a refused insert.** Every caller already treated 0 as "failed to write object".
+- **The loose-object migration deletes a loose file only after its row lands.** It inserts with or-ignore, so a retry after an applied-but-unsynced insert does not duplicate the row.
+
+Integration section 24 (13 assertions) runs push, fetch, add and the migration under the limit, plus the refused-BEGIN push. 9 of its assertions fail on the unfixed source. Three adjacent gaps are slotted for 1.7.2 on the roadmap:
+- a source object that cannot be read is still skipped silently
+- the v0.1 plaintext-index migration has the same delete-anyway pattern
+- `patra_init` and prune's `patra_flush` statuses are unchecked
+
+### Fixed — stash message overread
+
+`stash pop`'s "; the stash is kept" message passed 21 as the length of a 20-byte literal, writing one byte past it to stderr (`src/history.cyr:450`). It was caught by the write-length lint cyrius 6.7.11 added. No other `syscall(SYS_WRITE, …, "literal", N)` in the tree mismatches.
+
+### Changed — cyrius pin 6.7.9 → **6.7.15**
+
+| fold | 6.7.9 | 6.7.15 |
+|---|---|---|
+| patra | 1.16.0 | **1.16.5** |
+| sigil | 3.13.11 | 3.13.12 |
+| sankoch | 2.8.3 | 2.8.7 |
+| sandhi | 1.10.9 | 1.13.1 |
+| sakshi | 2.5.8 | 2.5.10 |
+| bayan | 1.5.13 | 1.9.0 |
+
+**patra moves five patches in the storage layer, so the on-disk format was A/B-tested again.** A repo written by the 1.7.0 build was read and extended by the 1.7.1 build, and the reverse, 27/27 each. The cases were the same as 1.7.0's: >1 MiB random and compressible blobs, a signed commit, an annotated tag, `reset --hard` byte-identity, `fsck`, `verify-commit` and a `file://` clone. No format change.
+
+Changes in the range that touch sit:
+- **patra 1.16.2:** the commit / fdatasync contract above. It also fixes:
+  - acknowledged-row loss after a power loss in autocommit (sit uses none of the `ALTER` / `SELECT *` paths that lost rows)
+  - a free list that could hand out a live page after a refused statement
+  - a B-tree split that could drop other rows' index entries
+- **patra 1.16.5:** a corrupt BYTES / TEXT chain reads as `PATRA_ERR_PAGE`, and its length as -1. `db_object_read_raw` already treats both as a failed read.
+- **sankoch 2.8.6:** DEFLATE decodes long codes in bounded work and rejects the over-subscribed or incomplete code-length sets zlib rejects. This hardens the read of a hostile object or pack; valid zlib is unaffected.
+- **sandhi 1.13.1:** a failed `sit serve` says why and no longer leaks its listen socket.
+- **`dir_list` opens with `O_DIRECTORY`,** so a FIFO planted under `.sit/objects` no longer hangs the loose-object migration.
+- **`args_init` reads `/proc/self/cmdline` to EOF** (it stopped at 2 MiB) into a heap buffer. The stack-lifetime hazard in [architecture 001](docs/architecture/001-args-stack-buffer-lifetime.md) no longer applies, so the note is marked obsolete and the octopus-merge comment that cited it is corrected.
+- **TLS** for `https://` remotes and `serve --tls` is stricter: unsolicited or forbidden ServerHello / EncryptedExtensions extensions, trailing hello and signature bytes, and an ALPN pick the client never offered are all refused.
+- **The compiler:**
+  - 6.7.14 fixes a pair-return miscompile, the shape of sit's `var t, v = f()` destructures.
+  - 6.7.11–6.7.13 add the write-length and constant-offset overrun lints. The stash message above was their only hit.
+
+No other source change was needed for the build.
+
+### Changed — roadmap re-slotted by target version
+
+[`docs/development/roadmap.md`](docs/development/roadmap.md) is now organised by target version:
+- **Patch slots:** 1.7.2 small correctness, 1.7.3 history walks, 1.7.4 resource bounds.
+- **One section per planned minor:** 1.8.0 history ergonomics, 1.9.0 pack bundles + `gc`, 1.10.0 serving many repos, 1.11.0 `.git/` CLI parity, 1.12.0 CLI via cmdit.
+- **1.x — unscheduled.**
+
+Shipped items are deleted, and every line, count and version pin the remaining items cite was re-checked at 6.7.15. That includes the cmdit 1.4.0 migration map, which still compiles. Two upstream asks are closed:
+- patra's `ORDER BY` / `DELETE` ask was fixed in patra 1.13.9.
+- The sankoch match-finder ask is now its 2.9.1.
+
+CLAUDE.md's roadmap convention now describes the version slots. Two durable rules were added:
+- Check every patra write status before anything points at the row.
+- Give every new object kind or ref / log location an `fsck` root, with a test that drops `.sit/logs` first.
+
+**Benchmarks** (best of two quiet runs, 1.7.0 vs 1.7.1, [`docs/benchmarks/2026-10-19-v1.7.1.md`](docs/benchmarks/2026-10-19-v1.7.1.md)):
+
+| bench | 1.7.0 | 1.7.1 |
+|---|---:|---:|
+| patra-open-close | 27.14 µs | 29.20 µs (+7.6%) |
+| copy-objects-100 | 172.03 µs | 172.04 µs |
+| sha256-64B | 756 ns | 743 ns |
+| zlib-decompress-65536B | 343.43 µs | 344.55 µs |
+| `clone-100commits` vs git | 4.82x | 4.45x (pass-to-pass noise) |
+| `status-100files` vs git | 1.30x | 1.27x |
+
+`patra-open-close` is the one move. It fits patra 1.16.2's header verification and checked syncs, but was not bisected. Everything else is flat, so the checked insert and commit statuses cost nothing measurable.
+
+**Verification:**
+- 425 unit, 274 integration and 15 fuzz pass.
+- The poisoned-allocator unit, integration and fuzz runs pass, and the 0xA5 / 0x5A fill runs match.
+- The on-disk A/B is 27/27 both ways.
+
 ## [1.7.0] — 2026-10-19 — cyrius 6.7.9; bearer tokens bound to remotes; unresolved conflicts refused at commit
 
 The first 1.7.x minor carries the two follow-ons the 2026-10-19 audit ([`docs/audit/2026-10-19-audit.md`](docs/audit/2026-10-19-audit.md)) left as design work, plus the toolchain bump.

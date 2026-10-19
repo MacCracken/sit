@@ -1353,16 +1353,11 @@ fn cmd_merge_octopus(first_arg) {
     var acc_merged = 0;
     var acc_tip = head_copy;
 
-    # ⚠ Read EVERY argv value up front, before any deep-stack work.
-    #
-    # `lib/args.cyr` stashes a pointer into a 4 KiB stack buffer that is already
-    # out of scope (docs/architecture/001), so `argc()` / `argv(n)` read memory
-    # the runtime may reuse. It survives in practice only while the call depth
-    # stays near where args_init() ran. This loop interleaves patra reads,
-    # find_merge_base's DAG BFS and a full diff between argv calls, which
-    # clobbers that region — the first cut segfaulted on every octopus merge
-    # for exactly that reason. 001 names this as the first suspect for a crash
-    # that looks like corrupted argv, and it was.
+    # Read EVERY argv value up front, before any deep-stack work. The first cut
+    # of octopus (1.5.2) read argv between patra reads and DAG walks and
+    # segfaulted on every merge; docs/architecture/001 was the suspect then. At
+    # cyrius 6.7.15 argv points into a heap buffer and 001 is obsolete, but
+    # copying up front costs nothing and stays.
     var names = vec_new();
     var argn = argc();
     var ci = first_arg;

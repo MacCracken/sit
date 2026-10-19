@@ -83,6 +83,8 @@ CYRIUS_DCE=1 cyrius build src/main.cyr build/sit   # dead-code-eliminated releas
 - **Repo-path writes go through the `sf_*` wrappers** (`sf_write_all`, `sf_unlink`, `sf_rename`, …), never a raw `file_write_all` / `xunlink` on a repo path — they are what refuses to write through a symlink.
 - **`[lib]` / `[lib.read]` modules use only public stdlib API.** Consumers pin older toolchains (owl: cyrius 6.6.2); a stdlib-internal `_name` that exists only in sit's pin breaks their build. Verify with the downstream check before a release.
 - **Do not re-hash or decompress objects during wire transfer** — `fetch` / `push` copy raw compressed bytes DB-to-DB; SHA-256 roundtrips belong in `fsck`, not the hot path.
+- **Check every patra write status before anything points at the row** — an insert's or `patra_commit`'s refusal must fail the command before a ref moves, a hash is handed back, or a source copy is deleted. Since patra 1.16.2 a failed commit means the whole transaction rolled back, and a failed fdatasync is reported, not swallowed.
+- **Every new object kind or ref / log location gets a root or edge in `fsck_collect_roots` / `fsck_walk_reachable`**, plus a test that deletes `.sit/logs` before `fsck --prune`. `--prune` deletes whatever the walk cannot reach, so a missing root is silent data loss.
 
 ## Process
 
@@ -190,7 +192,7 @@ Run a closeout pass before tagging `X.Y.0` or `X.0.0`. Ship as the last patch of
 - [`docs/architecture/`](docs/architecture/) — non-obvious constraints and quirks a reader can't derive from the code. **Skim this before writing new code** — e.g. [001](docs/architecture/001-args-stack-buffer-lifetime.md) documents a stdlib `args.cyr` lifetime hazard that silently affects any `argv(n)` usage.
 - [`docs/guides/`](docs/guides/) — task-oriented how-tos. [Getting started](docs/guides/getting-started.md) covers build + every shipped command.
 - [`docs/examples/`](docs/examples/) — runnable examples. [`local-vcs-loop/`](docs/examples/local-vcs-loop/) is the canonical end-to-end walkthrough.
-- [`docs/development/roadmap.md`](docs/development/roadmap.md) — **forward-looking backlog only**. Single source of truth for what sit does next. Items are grouped by *kind of work*, not by version number (version-keyed headings rot the moment a release ships); only the themed minor line carries versions, because those are scope commitments. **When an item ships, delete it** — CHANGELOG is the record, and struck-through entries are not.
+- [`docs/development/roadmap.md`](docs/development/roadmap.md) — **forward-looking backlog only**. Single source of truth for what sit does next. Work is **slotted by target version**: the current patch line (`1.7.x`) with one heading per planned patch, one section per planned minor (`1.8.0`, `1.9.0`, …), then `1.x — unscheduled` for anything not yet committed to a release. Upstream asks, on-hold items and "decided — do not re-attempt" notes follow the slots. **When an item ships, delete it** — CHANGELOG is the record, and struck-through entries are not. **When a slot slips, re-slot it** to the next version rather than leaving a stale number; at every release, re-check the line / count pins the remaining items cite.
 - [`docs/development/state.md`](docs/development/state.md) — live state snapshot, refreshed every release.
 - [`CHANGELOG.md`](CHANGELOG.md) — tagged-release source of truth for all changes.
 

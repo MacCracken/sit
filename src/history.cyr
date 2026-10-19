@@ -447,7 +447,7 @@ fn _stash_pop(drop_only) {
             if (base != 0) {
                 syscall(SYS_WRITE, STDERR, "sit:   stash@{0} is on ", 23);
                 syscall(SYS_WRITE, STDERR, base, 12);
-                syscall(SYS_WRITE, STDERR, "; the stash is kept\n", 21);
+                syscall(SYS_WRITE, STDERR, "; the stash is kept\n", 20);
             }
             return 1;
         }

@@ -233,8 +233,11 @@ fn write_typed_object(type_str, type_len, content, content_len) {
         store64(&bptrs + 16, compressed);
         var blens[24];
         store64(&blens + 16, clen);
-        patra_insert_row(db, "objects", 7, 3,
-          &types, &ivals, &sptrs, &slens, &bptrs, &blens);
+        # 1.7.1: a refused insert is a failure, not a stored object. Handing
+        # back the hash anyway let add / commit record an id that was never
+        # written. Since patra 1.16.2 a failed fdatasync also lands here.
+        if (patra_insert_row(db, "objects", 7, 3,
+            &types, &ivals, &sptrs, &slens, &bptrs, &blens) != PATRA_OK) { return 0; }
     }
     return hex;
 }
@@ -575,10 +578,13 @@ fn object_db_migrate_from_loose(db) {
                         store64(&bptrs + 16, compressed);
                         var blens[24];
                         store64(&blens + 16, clen);
-                        patra_insert_row(db, "objects", 7, 3,
-                          &types, &ivals, &sptrs, &slens, &bptrs, &blens);
-
-                        sf_unlink(loose_path);
+                        # 1.7.1: unlink only what the table now holds. A
+                        # refused insert keeps the loose file for the next open;
+                        # or-ignore makes that retry skip a row that did land.
+                        if (patra_insert_row_or_ignore(db, "objects", 7, 3,
+                            &types, &ivals, &sptrs, &slens, &bptrs, &blens) == PATRA_OK) {
+                            sf_unlink(loose_path);
+                        }
                     }
                 }
                 fi = fi + 1;
