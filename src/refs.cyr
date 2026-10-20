@@ -325,14 +325,14 @@ fn write_head_ref(hex) {
 # .sit/logs/HEAD. Call this AFTER a successful write_head_ref, passing the
 # tip read BEFORE the write as old_hex (0 → creation). Best-effort: a failed
 # append never propagates, so logging can't undo a committed ref move.
-# Lives here (not reflog.cyr) because it reads read_head_ref_path, which is
-# defined later than reflog.cyr in the single-pass dist bundle order.
 fn reflog_head_move(old_hex, new_hex, msg) {
     # Resolve identity + timestamp ONCE so the HEAD log and the branch log
     # record an identical (ts, name, email) for this one atomic move (git's
     # single-timestamp-per-transaction behaviour).
-    var nm = _reflog_user_name();
-    var em = _reflog_user_email();
+    var who[16];
+    commit_ident(&who);
+    var nm = load64(&who);
+    var em = load64(&who + 8);
     var ts = clock_epoch_secs();
     _reflog_append_full("HEAD", old_hex, new_hex, msg, nm, em, ts);
     var branch = read_head_ref_path();

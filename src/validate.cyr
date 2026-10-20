@@ -379,24 +379,35 @@ fn tree_entry_name_valid(name) {
     if (last == 32) { return 0; }
     if (last == 46) { return 0; }
 
-    # Case-fold comparison to dot-directories we guard, skipping HFS-ignorable
-    # codepoints so `.g<ZWNJ>it` cannot spell `.git` past this check (v1.4.8).
-    # Gated on the first significant codepoint being '.' — see the note on
-    # _starts_with_dot_hfs for why that guard is not just `load8(name) == 46`.
-    if (_starts_with_dot_hfs(name, len) == 1) {
-        if (_name_iequal_hfs(name, len, ".sit", 4) == 1) { return 0; }
-        if (_name_iequal_hfs(name, len, ".git", 4) == 1) { return 0; }
-        if (_name_iequal_hfs(name, len, ".ssh", 4) == 1) { return 0; }
-    }
+    if (name_spoofs_dotdir(name, len) == 1) { return 0; }
 
     # NTFS reserved names
     if (_is_ntfs_reserved(name, len) == 1) { return 0; }
 
+    return 1;
+}
+
+# 1 if the `len` bytes at `name` name, or on some filesystem resolve to, one of
+# the dot-directories sit guards: `.git`, `.sit`, `.ssh`. Shared by tree entry
+# names and by the directory `sit clone` creates (1.12.2: a clone of a URL
+# ending in `/.git` wrote the remote's tree into `./.git`).
+fn name_spoofs_dotdir(name, len) {
+    # Case-fold comparison, skipping HFS-ignorable codepoints so `.g<ZWNJ>it`
+    # cannot spell `.git` past this check (v1.4.8). Gated on the first
+    # significant codepoint being '.' — see the note on _starts_with_dot_hfs
+    # for why that guard is not just `load8(name) == 46`.
+    if (_starts_with_dot_hfs(name, len) == 1) {
+        if (_name_iequal_hfs(name, len, ".sit", 4) == 1) { return 1; }
+        if (_name_iequal_hfs(name, len, ".git", 4) == 1) { return 1; }
+        if (_name_iequal_hfs(name, len, ".ssh", 4) == 1) { return 1; }
+    }
+
     # 1.6.4 (E12): NTFS 8.3 short names of the guarded dot-directories. On NTFS
     # `GIT~1` / `SIT~1` resolve to `.git` / `.sit`, so a tree entry spelled that
     # way writes into repository metadata (CVE-2014-9390 / CVE-2019-1353 class;
-    # git rejects these by default on every platform). Trailing dots and spaces
-    # are already refused above, so the exact five bytes are the whole check.
+    # git rejects these by default on every platform). A tree entry's trailing
+    # dots and spaces are refused before this, so the exact five bytes are the
+    # whole check.
     if (len == 5) {
         if ((load8(name + 3) & 0xFF) == 126) {
             if ((load8(name + 4) & 0xFF) == 49) {
@@ -405,15 +416,14 @@ fn tree_entry_name_valid(name) {
                 var c2 = load8(name + 2) & 0xDF;
                 if (c1 == 73) {
                     if (c2 == 84) {
-                        if (c0 == 71) { return 0; }   # GIT~1
-                        if (c0 == 83) { return 0; }   # SIT~1
+                        if (c0 == 71) { return 1; }   # GIT~1
+                        if (c0 == 83) { return 1; }   # SIT~1
                     }
                 }
             }
         }
     }
-
-    return 1;
+    return 0;
 }
 
 # Flattened tree path (S-03 second gate).

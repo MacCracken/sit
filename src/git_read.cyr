@@ -122,7 +122,9 @@ fn _git_line_is_objectformat_sha256(p, n) {
 
 fn _git_detect_hash_algo() {
     var pair[16];
-    if (read_file_heap(".git/config", &pair) != 0) { return 0; }
+    # 1.12.2 (G5): a freelist buffer, freed below. Every sit_repo_open (owl and
+    # thoth call it per refresh) kept the whole of .git/config on the heap.
+    if (read_file_fl(".git/config", &pair) != 0) { return 0; }
     var buf = load64(&pair);
     var len = load64(&pair + 8);
     var pos = 0;
@@ -142,6 +144,7 @@ fn _git_detect_hash_algo() {
         }
         pos = le + 1;
     }
+    fl_free(buf);
     return found;
 }
 
@@ -236,6 +239,7 @@ fn _git_read_loose_in(objdir, hex, out) {
 # Like git, sit then reads objects from wherever the repository points.
 
 var _GIT_ALT_MAX = 6;
+var _GIT_ALT_LINES = 64;        # alternates entries looked at per file (G5)
 var _git_objdirs = 0;          # this repository's objects directories, listed once
 
 # Forget the listed objects directories (a repository is being opened).
@@ -267,10 +271,11 @@ fn _git_alt_load(objdir, v) {
     memcpy(ap, objdir, dl);
     memcpy(ap + dl, "/info/alternates", 17);
     var pair[16];
-    if (read_file_heap(ap, &pair) != 0) { return 0; }
+    if (read_file_fl(ap, &pair) != 0) { return 0; }       # freed below (1.12.2, G5)
     var buf = load64(&pair);
     var len = load64(&pair + 8);
     var s = 0;
+    var examined = 0;
     var i = 0;
     while (i <= len) {
         var eol = 0;
@@ -285,16 +290,30 @@ fn _git_alt_load(objdir, v) {
             if (keep == 1) {
                 if (vec_len(v) >= _GIT_ALT_MAX) { keep = 0; }
             }
+            # 1.12.2 (G5): at most _GIT_ALT_LINES entries are looked at. Ones
+            # that name no directory never filled the list, so 300,000 of them
+            # cost 13 MB and as many warnings on every open.
+            if (keep == 1) {
+                if (examined >= _GIT_ALT_LINES) { keep = 0; }
+                else { examined = examined + 1; }
+            }
+            # K5: no path that long is a directory; it is passed over unread.
+            if (keep == 1) {
+                if (e - s > 4096) { keep = 0; }
+            }
             if (keep == 1) {
                 var ll = e - s;
                 var p = 0;
+                # K5: freelist memory, kept only for a directory that is listed.
                 if (load8(buf + s) == 47) {
-                    p = alloc_or_die(ll + 1);
+                    p = fl_alloc(ll + 1);
+                    if (p == 0) { fl_free(buf); return 0; }
                     memcpy(p, buf + s, ll);
                     store8(p + ll, 0);
                 }
                 else {
-                    p = alloc_or_die(dl + 1 + ll + 1);
+                    p = fl_alloc(dl + 1 + ll + 1);
+                    if (p == 0) { fl_free(buf); return 0; }
                     memcpy(p, objdir, dl);
                     store8(p + dl, 47);
                     memcpy(p + dl + 1, buf + s, ll);
@@ -320,13 +339,16 @@ fn _git_alt_load(objdir, v) {
                     else {
                         var miss = " does not exist; its objects read as missing\n";
                         eprint3("sit: warning: alternate object directory ", p, miss);
+                        fl_free(p);
                     }
                 }
+                else { fl_free(p); }
             }
             s = i + 1;
         }
         i = i + 1;
     }
+    fl_free(buf);
     return 0;
 }
 

@@ -43,3 +43,11 @@ sit already reads such files. Since 1.2.0 `git_pack.cyr` has read git packs for 
 - **Packs inside patra, one BYTES value per pack.** patra reads a BYTES value whole, so every object read would read its whole pack.
 - **A sit-native pack format.** It would need a new reader, with no git-checked differential and no fuzz history, to store bytes git's format already stores. That is not the kind of on-disk compatibility "that costs nothing" sit aims for.
 - **No gc, deltify on write.** That puts a delta search on every commit and pull. The win comes from history, so it belongs in a maintenance pass that sees all of it, as in git.
+
+## Amendment — 1.12.2: gc replaces a pack of the same name, and sweeps orphans
+
+"A crash leaves duplicates, never a gap" assumed that a pack already at the name gc produced was the one gc would have written. When the same objects packed the same way produced a pack named like one already there, gc kept the existing pair and deleted its own. Compaction then dropped the rows, so an existing `.idx` whose `.pack` was gone, or a damaged pack beside good rows, lost every object in it, with exit 0 (P1). This happens after a gc that stopped once its pack was named, if the pack is then damaged or partly removed.
+
+gc now renames its verified pair over a pack of the same name. When both are good the bytes are identical, and readers keep their mappings of the old file across the rename. gc also removes a `pack-<id>.pack` with no `.idx`. A gc killed between naming a pack and its index, or between removing an old index and its pack, left one that no later gc listed, because packs are found by their `.idx` (P4).
+
+`fsck --prune` now takes the store lock exclusively as gc does (architecture 008), and keeps whatever a kept dangling object reaches, commits included (audit L1 / X2).

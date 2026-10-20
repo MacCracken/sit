@@ -5,7 +5,7 @@
 # (is_ancestor, materialize_target, commit_tree_entries), and cmd_commit /
 # cmd_log.
 
-# Unsigned commit — thin wrapper over build_commit_signed (the real builder).
+# Unsigned commit — thin wrapper over build_commit_object (the real builder).
 fn build_commit(tree_hex, parent_hex, message) {
     return build_commit_signed(tree_hex, parent_hex, message, 0);
 }
@@ -13,76 +13,99 @@ fn build_commit(tree_hex, parent_hex, message) {
 # Same as build_commit, but when `seed` is non-zero, signs the commit with
 # an ed25519 key derived from the 32-byte seed and injects a sitsig header.
 fn build_commit_signed(tree_hex, parent_hex, message, seed) {
-    # Priority: env → .sit/config → ~/.sitconfig → fallback
+    var parents = vec_new();
+    if (parent_hex != 0) { vec_push(parents, parent_hex); }
+    return build_commit_object(tree_hex, parents, message, seed);
+}
+
+# The author / committer identity for a new commit or tag, at out16 as
+# {name, email}: env -> .sit/config -> ~/.sitconfig -> fallback. S-27: control
+# bytes, `<` and `>` are stripped BEFORE anything is framed (a newline here
+# forges a header line in the object), with the fallback again if that empties
+# a field.
+fn commit_ident(out16) {
     var name = getenv("SIT_AUTHOR_NAME");
     if (name == 0) { name = config_get("user.name"); }
     if (name == 0) { name = "sit user"; }
     var email = getenv("SIT_AUTHOR_EMAIL");
     if (email == 0) { email = config_get("user.email"); }
     if (email == 0) { email = "user@localhost"; }
-    # S-27: strip ident crud (control bytes, `<`, `>`) BEFORE the object is
-    # framed — a newline here forges a header line in the commit body.
-    # Re-fall-back if sanitizing emptied the field entirely.
     name = ident_sanitized(name);
     email = ident_sanitized(email);
     if (strlen(name) == 0) { name = "sit user"; }
     if (strlen(email) == 0) { email = "user@localhost"; }
+    store64(out16, name);
+    store64(out16 + 8, email);
+    return 0;
+}
+
+# Frame "<label><name> <<email>> <ts> +0000\n" at body + pos (`label` carries
+# its trailing space). Returns the position after it.
+fn commit_put_person(body, pos, label, name, email, ts) {
+    var ll = strlen(label);
+    var nl = strlen(name);
+    var el = strlen(email);
+    memcpy(body + pos, label, ll); pos = pos + ll;
+    memcpy(body + pos, name, nl); pos = pos + nl;
+    memcpy(body + pos, " <", 2); pos = pos + 2;
+    memcpy(body + pos, email, el); pos = pos + el;
+    memcpy(body + pos, "> ", 2); pos = pos + 2;
+    pos = pos + write_decimal(body + pos, ts);
+    memcpy(body + pos, " +0000\n", 7); pos = pos + 7;
+    return pos;
+}
+
+# Build and write a commit of `tree_hex` whose parents are `parents`, a vec of
+# 64-byte hex ids in order (empty for a root commit; read as 64 bytes each, so
+# they need not be NUL-terminated). Signed when `seed` is non-zero. The message
+# gets a final newline unless it has one. Returns the commit's hex id, or 0 when
+# it could not be signed or written: a commit asked to be signed is never
+# written unsigned.
+#
+# 1.12.2: the one commit builder. Plain, merge, octopus and stash commits each
+# framed their own copy until now, and the copies had drifted: the plain and
+# merge builders wrote an unsigned commit if signing failed, and the octopus
+# builder added a second newline to a message that ended in one.
+fn build_commit_object(tree_hex, parents, message, seed) {
+    var who[16];
+    commit_ident(&who);
+    var name = load64(&who);
+    var email = load64(&who + 8);
     var ts = clock_epoch_secs();
-
-    var name_len = strlen(name);
-    var email_len = strlen(email);
     var msg_len = strlen(message);
+    var np = vec_len(parents);
 
-    var cap = 512 + msg_len + name_len * 2 + email_len * 2;
-    if (parent_hex != 0) { cap = cap + 80; }
+    var cap = 512 + msg_len + strlen(name) * 2 + strlen(email) * 2 + np * 80;
     var body = alloc_or_die(cap);
     var pos = 0;
 
     memcpy(body + pos, "tree ", 5); pos = pos + 5;
     memcpy(body + pos, tree_hex, 64); pos = pos + 64;
     store8(body + pos, 10); pos = pos + 1;
-
-    if (parent_hex != 0) {
+    var i = 0;
+    while (i < np) {
         memcpy(body + pos, "parent ", 7); pos = pos + 7;
-        memcpy(body + pos, parent_hex, 64); pos = pos + 64;
+        memcpy(body + pos, vec_get(parents, i), 64); pos = pos + 64;
         store8(body + pos, 10); pos = pos + 1;
+        i = i + 1;
     }
-
-    memcpy(body + pos, "author ", 7); pos = pos + 7;
-    memcpy(body + pos, name, name_len); pos = pos + name_len;
-    memcpy(body + pos, " <", 2); pos = pos + 2;
-    memcpy(body + pos, email, email_len); pos = pos + email_len;
-    memcpy(body + pos, "> ", 2); pos = pos + 2;
-    var digits = write_decimal(body + pos, ts); pos = pos + digits;
-    memcpy(body + pos, " +0000\n", 7); pos = pos + 7;
-
-    memcpy(body + pos, "committer ", 10); pos = pos + 10;
-    memcpy(body + pos, name, name_len); pos = pos + name_len;
-    memcpy(body + pos, " <", 2); pos = pos + 2;
-    memcpy(body + pos, email, email_len); pos = pos + email_len;
-    memcpy(body + pos, "> ", 2); pos = pos + 2;
-    digits = write_decimal(body + pos, ts); pos = pos + digits;
-    memcpy(body + pos, " +0000\n", 7); pos = pos + 7;
+    pos = commit_put_person(body, pos, "author ", name, email, ts);
+    pos = commit_put_person(body, pos, "committer ", name, email, ts);
 
     store8(body + pos, 10); pos = pos + 1;
     memcpy(body + pos, message, msg_len); pos = pos + msg_len;
-    if (msg_len == 0) { store8(body + pos, 10); pos = pos + 1; }
-    else {
-        if (load8(message + msg_len - 1) != 10) {
-            store8(body + pos, 10); pos = pos + 1;
-        }
+    var eol = 1;
+    if (msg_len > 0) {
+        if (load8(message + msg_len - 1) == 10) { eol = 0; }
     }
+    if (eol == 1) { store8(body + pos, 10); pos = pos + 1; }
 
-    if (seed != 0) {
-        var new_len_slot[8];
-        store64(&new_len_slot, 0);
-        var signed = sign_commit_body(body, pos, seed, &new_len_slot);
-        if (signed == 0) {
-            return write_typed_object("commit", 6, body, pos);
-        }
-        return write_typed_object("commit", 6, signed, load64(&new_len_slot));
-    }
-    return write_typed_object("commit", 6, body, pos);
+    if (seed == 0) { return write_typed_object("commit", 6, body, pos); }
+    var slen[8];
+    store64(&slen, 0);
+    var signed = sign_commit_body(body, pos, seed, &slen);
+    if (signed == 0) { return 0; }
+    return write_typed_object("commit", 6, signed, load64(&slen));
 }
 
 # Read a commit's parent hexes — the out+48 vec from parse_commit_body, or 0
@@ -474,7 +497,7 @@ fn print_indented_message(body, msg_start, body_len) {
 
 # Parse a commit object body. Writes to out (56 bytes):
 #   [0..8)   tree_hex ptr (heap, null-term 64 chars)
-#   [8..16)  parent_hex ptr (or 0 for root commit) — LAST parent line seen
+#   [8..16)  parent_hex ptr (or 0 for root commit) — the FIRST parent line
 #   [16..24) author identity ptr (or 0)
 #   [24..32) author epoch timestamp
 #   [32..40) author tz ptr (or 0)
@@ -482,9 +505,9 @@ fn print_indented_message(body, msg_start, body_len) {
 #   [48..56) parents vec — EVERY parent hex, in body order; 0 for root commit
 # Returns 0 on success, -1 if body has no tree line.
 #
-# out+8 keeps the last-parent pointer for back-compat with single-parent-chain
-# readers (cmd_log, merge_base). out+48's vec is the multi-parent surface that
-# reachability + ancestor walks consume so merge commits don't drop edges.
+# out+8 is the first parent, for first-parent readers (cmd_log, cmd_show).
+# out+48's vec is the multi-parent surface that reachability + ancestor walks
+# consume so merge commits don't drop edges.
 # S-25: ceiling on a linear commit-history walk. Well above any real repository
 # (the Linux kernel is ~1.3M commits), low enough that a cyclic or corrupt store
 # fails in seconds instead of never.
@@ -575,10 +598,15 @@ fn parse_commit_body_a(a, body, body_len, out) {
                             if (p == 0) { return 0 - 1; }
                             memcpy(p, body + pos + 7, hexlen);
                             store8(p + hexlen, 0);
-                            store64(out + 8, p);
+                            # 1.12.2 (G3): out+8 is the FIRST parent, the
+                            # mainline git's first-parent walks follow. It was
+                            # the last, so `sit log` went down a merge's
+                            # merged-in branch and never showed the mainline,
+                            # and `sit show` diffed a merge against that branch.
+                            if (load64(out + 8) == 0) { store64(out + 8, p); }
                             # Collect every parent (merge commits have 2+) into a
                             # vec at out+48 so reachability + ancestor walks follow
-                            # all edges, not just the last one captured at out+8.
+                            # all edges, not just the first one at out+8.
                             var pv = load64(out + 48);
                             if (pv == 0) {
                                 if (a == 0) { pv = vec_new(); }
@@ -1270,8 +1298,11 @@ fn cmd_commit() {
             eprintln("sit:   the next commit may wrongly become a merge — remove the file manually");
             return 1;
         }
-        merge_msg_clear();
     }
+    # 1.12.2 (L7): cleared after every commit, not only one that resolves a
+    # merge. A MERGE_MSG left by a merge abandoned without --abort (MERGE_HEAD
+    # removed by hand, as S-16's message says) titled the next merge's commit.
+    merge_msg_clear();
 
     conflicts_clear();
 

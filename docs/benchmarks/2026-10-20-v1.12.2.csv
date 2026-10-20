@@ -1,0 +1,39 @@
+operation,v176,v1101,v1110,v1121,v1122,unit,method
+add x100 (one file each) (cpu),100.8,111.0,110.4,111.3,112.2,ms,ab1122: min of 9 alternating runs per child CPU; load 3
+commit (cpu),1.5,1.5,1.5,1.6,1.5,ms,ab1122: min of 9 alternating runs per child CPU; load 3
+"status, 200 files (cpu)",5.5,5.6,5.6,5.7,5.7,ms,ab1122: min of 9 alternating runs per child CPU; load 3
+"log --oneline, 300 commits (cpu)",23.6,23.7,23.9,24.2,23.8,ms,ab1122: min of 9 alternating runs per child CPU; load 3
+"checkout 100 changed files, there and back (cpu)",66.4,67.2,68.3,68.6,67.8,ms,ab1122: min of 9 alternating runs per child CPU; load 3
+"clone, 100 commits (cpu)",44.0,44.5,45.1,45.4,45.0,ms,ab1122: min of 9 alternating runs per child CPU; load 3
+"fsck, 100 commits (cpu)",43.3,42.7,42.9,43.3,42.6,ms,ab1122: min of 9 alternating runs per child CPU; load 3
+sha256-64B,0.976,,,,0.852,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+sha256-1024B,5.308,,,,4.158,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+sha256-65536B,267.673,,,,227.790,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+zlib-compress-1024B,189.996,,,,149.934,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+zlib-compress-65536B,1364.000,,,,1329.000,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+zlib-decompress-1024B,13.098,,,,12.001,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+zlib-decompress-65536B,453.405,,,,448.644,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+patra-open-close,36.188,,,,37.093,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+copy-objects-100,245.243,,,,211.298,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+commit-parse+iso8601,1.740,,,,1.759,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+ed25519-sign,2449.000,,,,2468.000,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+ed25519-verify,7234.000,,,,6576.000,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+refname_valid-good,0.376,,,,0.345,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+tree_entry_name_valid-good,0.130,,,,0.092,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+tree_flat_path_valid-good,0.962,,,,0.761,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+hex_prefix_valid-64char,0.327,,,,0.244,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+lcs-diff-100x100,482.491,,,,460.312,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+lcs-diff-1000x1000,43322.000,,,,41066.000,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+lcs-diff-4000x4000,623927.000,,,,576800.000,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+is_ignored-10pat,11.008,,,,9.675,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+is_ignored-50pat,50.169,,,,49.978,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+is_ignored-200pat,201.470,,,,186.892,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+blob-hash-1024B,6.474,,,,6.483,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+blob-hash-65536B,374.874,,,,367.957,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+blob-hash-1048576B,6319.000,,,,6173.000,us,cyrius bench: min of 3 alternating runs (1.7.6 tree vs 1.12.2); load 3-12
+sit add 40 x 15 MB peak RSS,,,,1785,52,MB,ru_maxrss (audit L10)
+sit add 10000 paths argv scan,,,,9900,490,ms,wall; the same path repeated 10000 times (audit L10)
+reflog entries kept under 150 concurrent deletes,,,,120,150,of 150,stress (audit L6)
+--repos request while another repository's lock is held,,,,3695,0.4,ms,curl time_total under a 4 s flock -x (audit X6)
+--repos GET /refs server CPU per request,,,,120.0,120.0,us,4000 requests min of 6 alternating runs; second of two runs (first: 122.5 vs 135.0); load 13-15
+--repos GET /objects/<HEAD> server CPU per request,,,,340.0,347.5,us,as above (first run: 455.0 vs 407.5)

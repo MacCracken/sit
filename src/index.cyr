@@ -17,10 +17,22 @@
 fn cmd_add() {
     var forced = 0;
     var raw = vec_new();
+    # 1.12.2 (L10): one pass. argc() and argv(n) each rescan the command line,
+    # so asking for every argument by number was quadratic: 10 s of 55 for
+    # 10,000 paths. The arguments are consecutive NUL-terminated strings.
+    var ac = argc();
     var ai = 2;
-    while (ai < argc()) {
-        if (streq(argv(ai), "-f") == 1) { forced = 1; }
-        else { vec_push(raw, argv_heap(ai)); }
+    var a = 0;
+    if (ac > 2) { a = argv(2); }
+    while (ai < ac) {
+        var al = strlen(a);
+        if (streq(a, "-f") == 1) { forced = 1; }
+        else {
+            var ac_copy = alloc(al + 1);
+            memcpy(ac_copy, a, al + 1);
+            vec_push(raw, ac_copy);
+        }
+        a = a + al + 1;
         ai = ai + 1;
     }
     if (vec_len(raw) == 0) {
@@ -56,6 +68,7 @@ fn cmd_add() {
             return 1;
         }
         var hex = write_blob_object(load64(&cp), load64(&cp + 8));
+        fl_free(load64(&cp));                  # 1.12.2 (L10): one file held at a time
         if (hex == 0) {
             eprintln("sit: failed to write object");
             if (vec_len(paths) > 1) { eprintln("sit: nothing was staged"); }
@@ -163,8 +176,9 @@ fn _add_check(path, forced) {
     return path;
 }
 
-# Read the file `_add_check` passed into a heap buffer: {ptr, len} at out16.
-# 0, or -1 when it cannot be opened or has grown past the blob ceiling since.
+# Read the file `_add_check` passed into a freelist buffer the caller frees:
+# {ptr, len} at out16. 0, or -1 when it cannot be opened or read, or has grown
+# past the blob ceiling since.
 fn _add_read(path, out16) {
     var fd = sf_open(path, 0, 0);
     if (fd < 0) {
@@ -179,7 +193,12 @@ fn _add_read(path, out16) {
         eprint3("sit: '", path, "' is too large (sit stores blobs up to 16 MiB)\n");
         return 0 - 1;
     }
-    var content = alloc(size + 1);
+    var content = fl_alloc(size + 1);
+    if (content == 0) {
+        file_close(fd);
+        eprint3("sit: out of memory reading '", path, "'\n");
+        return 0 - 1;
+    }
     var total = 0;
     var rgo = 1;
     while (rgo == 1) {
@@ -193,10 +212,7 @@ fn _add_read(path, out16) {
     return 0;
 }
 
-# Common setup for read-side commands: parse prefix, resolve to full hash,
-# read+decompress. On success: writes 24-byte struct to obj_out, returns 0.
-# On error: emits message to stderr and returns non-zero for main to return.
-# v1.4.6 — index on entries(path), the precondition for index_upsert's
+# v1.4.6 — index on entries(path), the precondition for _index_delete_row's
 # targeted `DELETE ... WHERE path = ?`. Without it that delete degrades to a
 # full scan and staging N files stays O(N^2) in time even though it is now
 # O(N) in rows written.
@@ -404,7 +420,7 @@ fn rewrite_index(entries) {
 
     # Paths present now but absent from the target, or whose hash changed, are
     # removed. A changed path is removed here and re-inserted below, which is
-    # what index_upsert does for a single path.
+    # what index_upsert_many does for each path it stages.
     if (current != 0) {
         var cn = vec_len(current);
         var ci = 0;
@@ -471,46 +487,11 @@ fn rewrite_index(entries) {
     return 0;
 }
 
-# Upsert a single (hash, path) entry — replaces any existing row for that path.
-# Used by `sit add` to stage a file.
-#
-# v1.4.6 — this used to read the whole index, filter `path` out in memory, and
-# hand the survivors to rewrite_index(), i.e. DELETE-all + re-INSERT every row,
-# for EACH file staged. Staging N files therefore wrote O(N^2) rows. patra's
-# DELETE does not return emptied pages to a freelist, so that write volume also
-# landed on disk permanently: a 1,000-file fixture reached a 277 MB
-# .sit/index.patra holding 1,000 live entries, and `sit status` full-scans that
-# file on every invocation. Measured: 10x the files cost 59x the index-parse
-# time — the superlinearity 1.4.5 went looking for and did not find.
-#
-# Now: delete only this path's row, insert only this path's row. O(1) rows
-# written per staged file, so the index tracks live entries rather than total
-# stagings ever performed.
-fn index_upsert(hash_hex, path) {
-    var db = get_index_db();
-    if (db == 0) { return 0 - 1; }
-
-    # Validate before writing anything — a bad hash must not leave the row
-    # deleted with no replacement.
-    var bytes = hex_decode(hash_hex, 64);
-    if (bytes == 0) { return 0 - 1; }
-    if (strlen(path) == 0) { return 0 - 1; }
-
-    # 1.7.6 (L12): one transaction. In autocommit a failed page write inside
-    # patra's insert was not reported (the header write after it succeeded),
-    # so `sit add` printed "added" with nothing staged — and the DELETE before
-    # the INSERT was its own statement, so a refused INSERT left the path
-    # unstaged. In a transaction both statements land or neither does, and the
-    # commit reports a write that did not.
-    if (patra_begin(db) != PATRA_OK) { return 0 - 1; }
-    if (_index_delete_row(db, path) != 0) { patra_rollback(db); return 0 - 1; }
-    if (_index_insert_row(db, hash_hex, path) != 0) { patra_rollback(db); return 0 - 1; }
-    if (patra_commit(db) != PATRA_OK) { return 0 - 1; }
-    return 0;
-}
-
 # Stage `paths[i]` at `hexes[i]` for every i, in one transaction: all of them
-# land or the index is unchanged (1.12.1, `sit add` of several paths).
+# land or the index is unchanged (1.12.1, `sit add` of several paths). Each
+# path's old row is deleted and the new one inserted inside it, so a refused
+# insert never leaves a path unstaged, and patra_commit reports a page write
+# that did not land (1.7.6, L12: in autocommit it was not).
 fn index_upsert_many(hexes, paths) {
     var db = get_index_db();
     if (db == 0) { return 0 - 1; }

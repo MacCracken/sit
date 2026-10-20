@@ -39,3 +39,22 @@ Three things stood in the way, and all three had to move together:
 - **One port per repository.** That is what was possible before. It needs a process per repository, and each would hold its own lock for its lifetime.
 - **Close and reopen the store on every request instead of comparing its identity.** Simpler, but it puts a `patra_open` (about 30 µs) and a pack listing on every request to catch an event, gc, that is rare. The identity check costs one `stat`.
 - **A generation number written by gc instead of the inode.** A 1.10.x gc would not write it, yet could run against a 1.11 server between requests. The inode changes whatever replaced the file.
+
+## Amendment — 1.12.2: checked on every request, and one repository's lock is its own
+
+The 1.12.2 closeout (audit [`2026-10-20-1.12.2-audit.md`](../audit/2026-10-20-1.12.2-audit.md)) found three ways the decision above did not hold as written:
+- **A name was checked once.** "Every directory … must be a real directory" held for a repository's first request only. After that its cached path, store handle and lock descriptor were used as they were, so a directory swapped for a symlink served, and took pushes into, a repository outside `<dir>` (S3).
+- **Eviction kept the pack list.** The pack lists are keyed by root and outlive a context. A repository evicted from the 64 came back with no handle, so the store-identity check never ran, and after a gc its packed objects answered 404 (S1).
+- **Lock waits were shared.** The server is one loop. While a gc held one repository's lock, the request waiting on it held up every other repository's (X6).
+
+Now:
+- **Every request re-checks its repository** (`_serve_repo_kept`: at most 17 `lstat`s, no allocation). The directory must also be the one kept, by device and inode. One that fails either is closed and resolved afresh, with a new handle and lock descriptor. That also covers a repository replaced by another real directory, such as one restored from a backup. A narrow race remains between the check and the opens within one request. Closing it means opening everything relative to a directory descriptor opened `O_NOFOLLOW` from `<dir>`, which is roadmapped. It needs write access to a directory under `<dir>`.
+- **Every store session compares the store file's identity** with the one seen at the last session, handle or not. On a change it forgets that root's pack list and the mappings of packs that are gone.
+- **Under `--repos`, a store whose lock is held answers 503 at once** (`_store_session_wait_ms = 0`). A one-repository server, and the read API, still wait for the gc.
+- **Only regular files are served as packs, and refs only from real directories.** A ref that is a link is listed only when it stays in the refs tree: relative, no `..`, through real directories to a regular file. Packs, refs, and a `refs/heads` linked in from another repository were served as the repository's own (S4, K4).
+
+**Eviction and mappings: kept.** The roadmap asked whether eviction should also unmap a repository's packs. It does not. The mappings of packs that still exist cost address space only: two per packed repository, 200 for 100 gc'd repositories, against a `max_map_count` near a million. They are reused if the repository comes back. Mappings of packs a gc removed are now forgotten at that repository's next session. Before, they were kept until some other repository's gc happened to forget them.
+
+**One token, every repository.** `--token` authorizes a push to every repository the server serves. There is no per-repository credential, as forges have. Put repositories that need different push rights behind different servers, or behind a proxy that authorizes by path (X7).
+
+**Measured** (`--repos`, a repository at a two-segment name, server CPU over 4,000 requests, minimum of 6 alternating runs, two runs at host load 13–15): the per-request check is inside the noise. `GET /refs` cost +12.5 µs and then +0.0 µs, and an object read −47.5 µs and then +7.5 µs, against 1.12.1. The clock's resolution here is 2.5 µs per request. A request for a repository whose lock a gc holds now takes 0.3 ms. Before, it waited for the whole gc, and so did every other repository: 3.7 s for an unrelated one under a 4 s lock.

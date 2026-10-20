@@ -474,8 +474,8 @@ fn test_parse_commit_multiparent() {
     assert_eq(vec_len(mpv), 2, "merge commit exposes 2 parents");
     assert_streq(vec_get(mpv, 0), p1, "merge parent 0 = p1 (body order)");
     assert_streq(vec_get(mpv, 1), p2, "merge parent 1 = p2 (body order)");
-    # Back-compat: out+8 still carries the last parent for single-chain readers.
-    assert_streq(load64(&info + 8), p2, "out+8 keeps last parent (cmd_log/merge_base)");
+    # 1.12.2 (G3): out+8 is the FIRST parent, the mainline log / show follow.
+    assert_streq(load64(&info + 8), p1, "out+8 is the first parent (cmd_log / cmd_show)");
 
     # Single-parent commit — vec of length 1.
     var sbody = "tree 3333333333333333333333333333333333333333333333333333333333333333\nparent 1111111111111111111111111111111111111111111111111111111111111111\nauthor x <x@y> 0 +0000\ncommitter x <x@y> 0 +0000\n\nmsg\n";  #skip-lint (fixture literal)
@@ -1646,6 +1646,21 @@ fn test_serve_request_arena() {
     var lk2 = _srv_put(".sit/refs/heads/dirlink", "", 0);
     sys_unlink(lk2);
     xsymlink("feature", lk2);
+    # 1.12.2 (S4): one that leaves the refs tree is not, absolute or by `..`.
+    var outside = _srv_ref_with("outside-ref", "\n", 1);
+    var lk3 = _srv_put(".sit/refs/heads/escape", "", 0);
+    sys_unlink(lk3);
+    xsymlink(outside, lk3);
+    var lk4 = _srv_put(".sit/refs/heads/climb", "", 0);
+    sys_unlink(lk4);
+    xsymlink("../../../outside-ref", lk4);
+    # K4: nor through a directory link on the way (dl -> elsewhere, hop -> dl/…).
+    var lk5 = _srv_put(".sit/refs/heads/dl", "", 0);
+    sys_unlink(lk5);
+    xsymlink(_srv_root, lk5);
+    var lk6 = _srv_put(".sit/refs/heads/hop", "", 0);
+    sys_unlink(lk6);
+    xsymlink("dl/outside-ref", lk6);
     sit_set_repo_root(_srv_root);
     var a = _serve_req_alloc();
 
@@ -1672,6 +1687,9 @@ fn test_serve_request_arena() {
     assert(strstr(body, "\"refs/tags/v1\"") >= 0, "a tag listed");
     assert(strstr(body, "\"refs/heads/alias\"") >= 0, "a symlink to a ref file is listed");
     assert_eq(strstr(body, "dirlink"), 0 - 1, "a symlink to a directory is not");
+    assert_eq(strstr(body, "escape"), 0 - 1, "a symlink out of the refs tree (absolute) is not");
+    assert_eq(strstr(body, "climb"), 0 - 1, "nor one that climbs out with ..");
+    assert_eq(strstr(body, "hop"), 0 - 1, "nor one through a linked directory (two hops)");
     assert_eq(strstr(body, "bad"), 0 - 1, "a ref file without a hash is left out");
     assert_eq(strstr(body, "BAD"), 0 - 1, "an invalid ref name is left out");
     assert_eq(memeq(body, "{\"refs\":[{", 10), 1, "the body opens the list");
@@ -2206,6 +2224,49 @@ fn test_1120_git_parity() {
     return 0;
 }
 
+# ── 1.12.2: the closeout's pure fixes — reserved clone names, git reflog lines ──
+fn test_1122_closeout() {
+    test_group("validate.cyr / wire.cyr / reflog.cyr — closeout fixes (v1.12.2)");
+    assert_eq(name_spoofs_dotdir(".git", 4), 1, ".git");
+    assert_eq(name_spoofs_dotdir(".SIT", 4), 1, ".SIT, any case");
+    assert_eq(name_spoofs_dotdir(".ssh", 4), 1, ".ssh");
+    assert_eq(name_spoofs_dotdir("GIT~1", 5), 1, "the NTFS short name");
+    assert_eq(name_spoofs_dotdir(".g\xe2\x80\x8cit", 7), 1, "an HFS-ignorable codepoint inside");
+    assert_eq(name_spoofs_dotdir(".gitignore", 10), 0, ".gitignore is not .git");
+    assert_eq(name_spoofs_dotdir("proj", 4), 0, "an ordinary name");
+    assert_eq(tree_entry_name_valid(".git"), 0, "tree entries still refuse .git");
+    assert_eq(tree_entry_name_valid("GIT~1"), 0, "and its short name");
+    var u = "/srv/proj/.git";
+    assert_streq(_clone_name_from(u, 0, strlen(u)), "proj", ".../proj/.git clones into proj");
+    var u2 = "/srv/proj/.sit///";
+    assert_streq(_clone_name_from(u2, 0, strlen(u2)), "proj", "so does .../proj/.sit/");
+    var u3 = "/srv/a/..";
+    assert_streq(_clone_name_from(u3, 0, strlen(u3)), "a", "a '..' segment is passed over");
+    var u4 = "/.git";
+    assert_eq(_clone_name_from(u4, 0, strlen(u4)), 0, "nothing left to name it after");
+    var u5 = "proj";
+    assert_streq(_clone_name_from(u5, 0, strlen(u5)), "proj", "a bare relative name");
+    assert_eq(_clone_target_reserved("x/.git/"), 1, "a target ending in .git/");
+    assert_eq(_clone_target_reserved("."), 0, "'.' is a target");
+    assert_eq(_clone_target_reserved(".gitx"), 0, "and so is .gitx");
+    var z = "0000000000000000000000000000000000000000000000000000000000000000";
+    var line = alloc(256);
+    var n = 0;
+    memcpy(line, z, 64); n = 64;
+    memcpy(line + n, " ", 1); n = n + 1;
+    memcpy(line + n, z, 64); n = n + 64;
+    var tail = " t <t@t> 1700000000 +0000\n";
+    memcpy(line + n, tail, strlen(tail)); n = n + strlen(tail);
+    assert_eq(_reflog_line_ts(line, n), 1700000000, "a git reflog line with no message still dates");
+    var tail2 = " t <t@t> 1700000000 +0000\r\n";
+    memcpy(line + 129, tail2, strlen(tail2));
+    assert_eq(_reflog_line_ts(line, 129 + strlen(tail2)), 1700000000, "with CRLF too");
+    var tab = " t <t@t> 1700000001 +0000\tcommit: x\n";
+    memcpy(line + 129, tab, strlen(tab));
+    assert_eq(_reflog_line_ts(line, 129 + strlen(tab)), 1700000001, "and a line with one, as before");
+    return 0;
+}
+
 # Run every test group; exit status is the failure count.
 fn main() {
     alloc_init();
@@ -2253,6 +2314,7 @@ fn main() {
     test_1100_packs();
     test_1110_serving();
     test_1120_git_parity();
+    test_1122_closeout();
     return assert_summary();
 }
 

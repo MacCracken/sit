@@ -92,7 +92,10 @@ fn remote_objects_open(repo_path) {
     }
     # 1.10.0: that repository's store lock, before its store is opened, so a
     # `sit gc` there cannot replace the file under this process (object_db.cyr).
-    store_lock_shared(repo_path);
+    if (store_lock_shared(repo_path) == 0 - 2) {
+        eprintln("sit: the remote's object store stayed locked (a `sit gc` there, or another holder); try again later");
+        return 0;
+    }
     var db = patra_open(p);
     if (db == 0) { return 0; }
     store_register_root(db, repo_path);
@@ -1736,6 +1739,92 @@ fn _clone_origin_url(url) {
     #endif
 }
 
+# The directory a clone names itself after: the last '/'-separated segment of
+# s[floor..end), trailing slashes dropped, as a heap cstring. A segment that is
+# `.` / `..` or spells `.git`, `.sit` or `.ssh` (name_spoofs_dotdir) is passed
+# over for the one before it, as git names a clone of `.../proj/.git` "proj".
+# 0 when no segment is left.
+fn _clone_name_from(s, floor, end) {
+    var pend = end;
+    var pstart = end;
+    var scan = 0;
+    var out = 0;
+    var tries = 0;
+    while (tries < 8) {
+        scan = 1;
+        while (scan == 1) {
+            if (pend <= floor) { scan = 0; }
+            else {
+                if (load8(s + pend - 1) == 47) { pend = pend - 1; }
+                else { scan = 0; }
+            }
+        }
+        pstart = pend;
+        scan = 1;
+        while (scan == 1) {
+            if (pstart <= floor) { scan = 0; }
+            else {
+                if (load8(s + pstart - 1) == 47) { scan = 0; }
+                else { pstart = pstart - 1; }
+            }
+        }
+        if (pend <= pstart) { tries = 8; }
+        else {
+            if (_clone_segment_reserved(s + pstart, pend - pstart) == 1) {
+                pend = pstart;
+                tries = tries + 1;
+            }
+            else {
+                out = alloc(pend - pstart + 1);
+                memcpy(out, s + pstart, pend - pstart);
+                store8(out + pend - pstart, 0);
+                tries = 8;
+            }
+        }
+    }
+    return out;
+}
+
+# 1 for a clone directory name sit will not use: `.`, `..`, or a spelling of
+# `.git` / `.sit` / `.ssh`.
+fn _clone_segment_reserved(name, len) {
+    if (len == 1) {
+        if (load8(name) == 46) { return 1; }
+    }
+    if (len == 2) {
+        if (load8(name) == 46) {
+            if (load8(name + 1) == 46) { return 1; }
+        }
+    }
+    return name_spoofs_dotdir(name, len);
+}
+
+# 1 when the last component of a clone target (trailing slashes dropped)
+# spells `.git`, `.sit` or `.ssh`. `.` stays allowed: `sit clone <url> .`
+# fills an empty current directory, as git does.
+fn _clone_target_reserved(target) {
+    var end = strlen(target);
+    var scan = 1;
+    while (scan == 1) {
+        if (end <= 0) { scan = 0; }
+        else {
+            if (load8(target + end - 1) == 47) { end = end - 1; }
+            else { scan = 0; }
+        }
+    }
+    var start = end;
+    scan = 1;
+    while (scan == 1) {
+        if (start <= 0) { scan = 0; }
+        else {
+            if (load8(target + start - 1) == 47) { scan = 0; }
+            else { start = start - 1; }
+        }
+    }
+    if (end <= start) { return 0; }
+    return name_spoofs_dotdir(target + start, end - start);
+}
+
 # `sit clone [--depth <n>] <url> [<dir>]` — init, add origin, fetch and check out.
 fn cmd_clone() {
     if (argc() < 3) {
@@ -1827,56 +1916,38 @@ fn cmd_clone() {
             }
             # 1.11.0: a URL with a path (`sit serve --repos`) names the
             # repository by its last segment, as git does.
-            var pend = ulen;
-            var trimming = 1;
-            while (trimming == 1) {
-                if (pend <= host_end) { trimming = 0; }
+            # The path starts after the first '/' past the host (and port).
+            var path0 = host_end;
+            scanning = 1;
+            while (scanning == 1) {
+                if (path0 >= ulen) { scanning = 0; }
                 else {
-                    if (load8(url + pend - 1) == 47) { pend = pend - 1; }
-                    else { trimming = 0; }
+                    if (load8(url + path0) == 47) { scanning = 0; }
+                    path0 = path0 + 1;
                 }
             }
-            var pstart = pend;
-            var seeking = 1;
-            while (seeking == 1) {
-                if (pstart <= host_end) { seeking = 0; }
-                else {
-                    if (load8(url + pstart - 1) == 47) { seeking = 0; }
-                    else { pstart = pstart - 1; }
-                }
-            }
-            if (pend > pstart) {
-                if (pstart > host_end) {
-                    derived = alloc(pend - pstart + 1);
-                    memcpy(derived, url + pstart, pend - pstart);
-                    store8(derived + pend - pstart, 0);
-                }
+            if (path0 < ulen) {
+                var named = _clone_name_from(url, path0, ulen);
+                if (named != 0) { derived = named; }
             }
         }
         else {
             var src_str = remote_normalize(url);
-            var slen = strlen(src_str);
-            while (slen > 0) {
-                if (load8(src_str + slen - 1) != 47) { break; }
-                slen = slen - 1;
-            }
-            var tail = slen;
-            while (tail > 0) {
-                if (load8(src_str + tail - 1) == 47) { break; }
-                tail = tail - 1;
-            }
-            var tlen = slen - tail;
-            if (tlen > 0) {
-                derived = alloc(tlen + 1);
-                memcpy(derived, src_str + tail, tlen);
-                store8(derived + tlen, 0);
-            }
+            derived = _clone_name_from(src_str, 0, strlen(src_str));
         }
         if (derived == 0) {
             eprintln("sit: cannot derive target dir from url (pass one explicitly)");
             return 1;
         }
         target = derived;
+    }
+
+    # 1.12.2: never `.git`, `.sit` or `.ssh`, given or derived: the remote's
+    # tree would become a repository's metadata (a `config` git runs commands
+    # from) or a user's ssh keys.
+    if (_clone_target_reserved(target) == 1) {
+        eprint3("sit: refusing to clone into '", target, "' (a .git, .sit or .ssh directory)\n");
+        return 1;
     }
 
     # S-23: opt-in gate on absolute target paths.

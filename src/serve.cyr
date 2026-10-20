@@ -273,7 +273,10 @@ fn serve_emit_refs_subtree(a, sb, prefix, dir, st) {
     # walk saw nothing and `serve` advertised zero refs (1.3.2).
     var adir = sit_abs_a(a, dir);
     if (adir == 0) { store64(st + 8, 1); return 0; }
-    if (file_exists(adir) != 1) { return 0; }
+    # 1.12.2 (S4, K4): a real directory, reached through real directories. A
+    # `.sit/refs/heads` linked to another repository's listed all its heads.
+    if (_sf_parent_symlink(dir) == 1) { return 0; }
+    if (path_lstat_kind(adir) != 0x4000) { return 0; }
     return _serve_emit_refs_dir(a, sb, prefix, adir, 0, st);
 }
 
@@ -334,17 +337,57 @@ fn _serve_emit_refs_dir(a, sb, prefix, adir, depth, st) {
             _serve_emit_refs_dir(a, sb, rname, child, depth + 1, st);
         }
         if (kind == 0x8000) { _serve_emit_ref(a, sb, rname, child, st); }
+        # A link to a ref file is listed, as dir_walk listed it — 1.12.2 (S4):
+        # only one that stays in the refs tree. A link planted in a served
+        # repository published whatever 64 hex it reached, another repository's
+        # tips among them (under --repos, another tenant's).
         if (kind == 0xA000) {
-            var tst[256];                          # stat follows the link
-            if (xstat(child, &tst) == 0) {
-                if ((load32(&tst + STAT_MODE) & 0xF000) == 0x8000) {
-                    _serve_emit_ref(a, sb, rname, child, st);
-                }
-            }
+            if (_serve_ref_link_inside(child) == 1) { _serve_emit_ref(a, sb, rname, child, st); }
         }
         i = i + 1;
     }
     return 0;
+}
+
+# 1 when the symlink at `path` (a ref) names, relatively and without `..`, a
+# regular file beside or below it through real directories: one hop, inside the
+# refs tree. (K4: a directory link on the way, `d -> <elsewhere>` with
+# `evil -> d/main`, reached out of it.)
+fn _serve_ref_link_inside(path) {
+    var t[256];
+    var tn = xreadlink(path, &t, 255);
+    if (tn <= 0) { return 0; }
+    if (tn >= 255) { return 0; }
+    store8(&t + tn, 0);
+    if (load8(&t) == 47) { return 0; }
+    if (strstr(&t, "..") >= 0) { return 0; }
+    var pl = strlen(path);
+    var d = pl;
+    var seeking = 1;
+    while (seeking == 1) {
+        if (d <= 0) { seeking = 0; }
+        else {
+            if (load8(path + d - 1) == 47) { seeking = 0; }
+            else { d = d - 1; }
+        }
+    }
+    if (d + tn + 1 > 4352) { return 0; }
+    var j[4352];
+    memcpy(&j, path, d);
+    memcpy(&j + d, &t, tn + 1);
+    var k = 0;
+    var ok = 1;
+    while (k < tn) {
+        if (load8(&t + k) == 47) {
+            store8(&j + d + k, 0);
+            if (path_lstat_kind(&j) != 0x4000) { ok = 0; }
+            store8(&j + d + k, 47);
+        }
+        k = k + 1;
+    }
+    if (ok == 0) { return 0; }
+    if (path_lstat_kind(&j) != 0x8000) { return 0; }
+    return 1;
 }
 
 # Append `{"name":…,"hash":…}` for the ref file at `path`, if the name is a valid
@@ -1132,12 +1175,13 @@ fn serve_handle_request(ctx, cfd, buf, n) {
     var rctx = _serve_repo_for(path, &subp);
     if (rctx == 0) { _serve_send_status(cfd, 404, "Not Found"); return 0; }
     store_ctx_load(rctx);
-    # A repository removed since its state was kept answers as one never served.
-    var hb[4352];
-    var hp = sit_abs_into(".sit/HEAD", &hb, 4352);
-    if (hp == 0) { _serve_send_status(cfd, 404, "Not Found"); return 0; }
-    if (path_lstat_kind(hp) != 0x8000) { _serve_send_status(cfd, 404, "Not Found"); return 0; }
-    store_enter();
+    # 1.12.2 (X6): a repository whose store a gc holds answers 503 at once; its
+    # wait stalled every request to every repository behind it.
+    if (store_enter() != 0) {
+        store_ctx_save(rctx);
+        _serve_send_status(cfd, 503, "Service Unavailable");
+        return 0;
+    }
     rc = _serve_route(cfd, buf, n, method, load64(&subp));
     store_leave();
     store_ctx_save(rctx);
@@ -1224,12 +1268,27 @@ fn _serve_repo_for(path, sub_out) {
     if (_serve_repos == 0) { _serve_repos = map_new(); }
     _serve_repos_tick = _serve_repos_tick + 1;
     var cell = map_get(_serve_repos, &name);
+    if (cell != 0) {
+        # 1.12.2 (X3 / S3): a kept repository is checked again on every request,
+        # and must still be the directory it was. The path was checked once and
+        # then trusted, so a directory under <dir> swapped for a symlink served,
+        # and took pushes into, a repository outside <dir> — through the old
+        # lock descriptor, which a gc there did not see. A repository replaced
+        # by another real directory (restored from a backup) was served through
+        # the old one's store handle.
+        if (_serve_repo_kept(cell) == 0) {
+            store_ctx_close(load64(cell));
+            map_delete(_serve_repos, &name);
+            cell = 0;
+        }
+    }
     if (cell == 0) {
         var root = _serve_repo_resolve(&name, nlen);
         if (root == 0) { return 0; }
         if (map_size(_serve_repos) >= SERVE_REPOS_OPEN) { _serve_repos_evict(); }
-        cell = alloc_or_die(16);
+        cell = alloc_or_die(32);
         store64(cell, store_ctx_new(root));
+        if (path_file_id(root, cell + 16) != 0) { return 0; }
         var kc = alloc_or_die(nlen + 1);
         memcpy(kc, &name, nlen + 1);
         map_set(_serve_repos, kc, cell);
@@ -1239,39 +1298,61 @@ fn _serve_repo_for(path, sub_out) {
     return load64(cell);
 }
 
-# `<dir>/<name>` as a heap cstring when every directory on the way is a real
-# directory and the last holds `.sit/HEAD`, else 0.
+# `<dir>/<name>` as a heap cstring when it passes _serve_repo_check, else 0.
 fn _serve_repo_resolve(name, nlen) {
     var dl = strlen(_serve_repos_dir);
-    var root = alloc_or_die(dl + 1 + nlen + 16);
+    var root = alloc_or_die(dl + 1 + nlen + 1);
     memcpy(root, _serve_repos_dir, dl);
     store8(root + dl, 47);
     memcpy(root + dl + 1, name, nlen);
     store8(root + dl + 1 + nlen, 0);
+    if (_serve_repo_check(root) == 0) { return 0; }
+    return root;
+}
+
+# 1 when `root` (`<dir>/<name>`) is a repository --repos serves: every directory
+# below <dir> on the way is a real directory, not a symlink, and the last holds
+# a `.sit` directory with `.sit/HEAD` a regular file. Nothing is allocated.
+fn _serve_repo_check(root) {
+    var rl = strlen(root);
+    var dl = strlen(_serve_repos_dir);
+    if (rl + 12 > 4352) { return 0; }
+    var b[4352];
+    memcpy(&b, root, rl + 1);
     var i = dl + 1;
     var ok = 1;
-    while (i <= dl + 1 + nlen) {
+    while (i <= rl) {
         if (ok == 1) {
-            var c = load8(root + i);
+            var c = load8(&b + i);
             if (c == 47) {
-                store8(root + i, 0);
-                if (path_lstat_kind(root) != 0x4000) { ok = 0; }
-                store8(root + i, 47);
+                store8(&b + i, 0);
+                if (path_lstat_kind(&b) != 0x4000) { ok = 0; }
+                store8(&b + i, 47);
             }
             if (c == 0) {
-                if (path_lstat_kind(root) != 0x4000) { ok = 0; }
+                if (path_lstat_kind(&b) != 0x4000) { ok = 0; }
             }
         }
         i = i + 1;
     }
     if (ok == 0) { return 0; }
-    var rl = dl + 1 + nlen;
-    memcpy(root + rl, "/.sit", 6);
-    if (path_lstat_kind(root) != 0x4000) { return 0; }
-    memcpy(root + rl, "/.sit/HEAD", 11);
-    if (path_lstat_kind(root) != 0x8000) { return 0; }
-    store8(root + rl, 0);
-    return root;
+    memcpy(&b + rl, "/.sit", 6);
+    if (path_lstat_kind(&b) != 0x4000) { return 0; }
+    memcpy(&b + rl, "/.sit/HEAD", 11);
+    if (path_lstat_kind(&b) != 0x8000) { return 0; }
+    return 1;
+}
+
+# 1 when the repository a kept cell {store state, last use, dev, ino} names
+# still passes _serve_repo_check and is the same directory as when it was kept.
+fn _serve_repo_kept(cell) {
+    var root = load64(load64(cell));             # store_ctx_new keeps root first
+    if (_serve_repo_check(root) == 0) { return 0; }
+    var id[16];
+    if (path_file_id(root, &id) != 0) { return 0; }
+    if (load64(&id) != load64(cell + 16)) { return 0; }
+    if (load64(&id + 8) != load64(cell + 24)) { return 0; }
+    return 1;
 }
 
 # Close the least recently used repository's store state, making room.
@@ -1974,6 +2055,7 @@ fn cmd_serve() {
             else { rpl = 0; }
         }
         _serve_repos_dir = repo_path;
+        _store_session_wait_ms = 0;        # 1.12.2 (X6): 503, not a stalled server
     }
     else {
         sit_set_repo_root(repo_path);

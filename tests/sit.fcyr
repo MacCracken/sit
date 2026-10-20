@@ -1244,6 +1244,45 @@ fn fuzz_serve_repo_paths(rounds) {
     return 0;
 }
 
+# 1.12.2: the directory a clone names itself after, from any path. Whatever
+# comes back is a non-empty segment with no '/', and never `.`, `..`, nor a
+# spelling of `.git` / `.sit` / `.ssh`; a reserved target is refused whatever
+# leads to it. And the timestamp of any reflog line is -1 or non-negative.
+fn fuzz_clone_names(rounds) {
+    var alpha = "/.gitsGITSh~1-xa";
+    var buf = alloc(80);
+    var seed = 0x1122C;
+    var i = 0;
+    while (i < rounds) {
+        var n = (seed >> 7) % 40;
+        var k = 0;
+        while (k < n) {
+            store8(buf + k, load8(alpha + ((seed >> (k % 11)) & 0xFFFF) % 16));
+            seed = seed * 6364136223846793005 + 1442695040888963407;
+            k = k + 1;
+        }
+        store8(buf + n, 0);
+        var nm = _clone_name_from(buf, 0, n);
+        if (nm != 0) {
+            var nl = strlen(nm);
+            if (nl == 0) { println("fuzz: clone name is empty"); return 1; }
+            if (strstr(nm, "/") >= 0) { println("fuzz: clone name holds a '/'"); return 1; }
+            if (_clone_segment_reserved(nm, nl) == 1) { println("fuzz: clone name is reserved"); return 1; }
+            if (_clone_target_reserved(nm) == 1) {
+                println("fuzz: a derived clone name is refused as a target");
+                return 1;
+            }
+        }
+        var ts = _reflog_line_ts(buf, n);
+        if (ts < 0) {
+            if (ts != 0 - 1) { println("fuzz: reflog line time is negative"); return 1; }
+        }
+        seed = seed * 6364136223846793005 + 1442695040888963407;
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Run every fuzz target; exit 1 on the first invariant broken.
 fn main() {
     alloc_init();
@@ -1293,6 +1332,8 @@ fn main() {
     if (fuzz_pack_codec(500000) != 0) { return 1; }
     println("fuzz: serve_repo_paths (200000 rounds)");
     if (fuzz_serve_repo_paths(200000) != 0) { return 1; }
+    println("fuzz: clone_names (300000 rounds)");
+    if (fuzz_clone_names(300000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

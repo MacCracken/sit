@@ -40,20 +40,13 @@ var SIT_DESCRIBE_CANDIDATES = 62;
 # Build an annotated tag object body. `seed` non-zero also signs it.
 # Returns the heap body with its length at *out_len, or 0 on failure.
 fn build_tag_body(target_hex, name, message, seed, out_len) {
-    # Same identity resolution and sanitisation as build_commit_signed:
-    # env -> .sit/config -> ~/.sitconfig -> fallback, then S-27 stripping of
-    # control bytes and <> BEFORE framing, so a newline in SIT_AUTHOR_NAME
-    # cannot forge a `object`/`type`/`tag` header line here either.
-    var tname = getenv("SIT_AUTHOR_NAME");
-    if (tname == 0) { tname = config_get("user.name"); }
-    if (tname == 0) { tname = "sit user"; }
-    var temail = getenv("SIT_AUTHOR_EMAIL");
-    if (temail == 0) { temail = config_get("user.email"); }
-    if (temail == 0) { temail = "user@localhost"; }
-    tname = ident_sanitized(tname);
-    temail = ident_sanitized(temail);
-    if (strlen(tname) == 0) { tname = "sit user"; }
-    if (strlen(temail) == 0) { temail = "user@localhost"; }
+    # The identity commits use (commit_ident): S-27 stripping of control bytes
+    # and <> BEFORE framing, so a newline in SIT_AUTHOR_NAME cannot forge an
+    # `object` / `type` / `tag` header line here either.
+    var who[16];
+    commit_ident(&who);
+    var tname = load64(&who);
+    var temail = load64(&who + 8);
 
     var ts = clock_epoch_secs();
     var nlen = strlen(name);
@@ -77,13 +70,7 @@ fn build_tag_body(target_hex, name, message, seed, out_len) {
     memcpy(body + pos, name, nlen); pos = pos + nlen;
     store8(body + pos, 10); pos = pos + 1;
 
-    memcpy(body + pos, "tagger ", 7); pos = pos + 7;
-    memcpy(body + pos, tname, tnlen); pos = pos + tnlen;
-    memcpy(body + pos, " <", 2); pos = pos + 2;
-    memcpy(body + pos, temail, telen); pos = pos + telen;
-    memcpy(body + pos, "> ", 2); pos = pos + 2;
-    var digits = write_decimal(body + pos, ts); pos = pos + digits;
-    memcpy(body + pos, " +0000\n", 7); pos = pos + 7;
+    pos = commit_put_person(body, pos, "tagger ", tname, temail, ts);
 
     store8(body + pos, 10); pos = pos + 1;          # blank line
     memcpy(body + pos, message, mlen); pos = pos + mlen;

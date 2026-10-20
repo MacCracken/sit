@@ -1,6 +1,6 @@
 # 007 — `file_exists` / `sf_exists` mean "can be opened for reading"
 
-**Status:** current (cyrius 6.7.15 stdlib; sit 1.7.6).
+**Status:** current (cyrius 6.7.15 stdlib; sit 1.7.6, re-checked at 1.12.2).
 
 ## The quirk
 
@@ -22,6 +22,14 @@ Code of the shape "if it exists, read it and merge into it; otherwise start fres
 - `sit serve`'s ref push (K2): an unreadable ref read as absent, so the push created it over the old tip with no fast-forward check.
 
 And a FIFO at any probed path hung the reader (R11): `.sit/HEAD`, `.git/HEAD`, an `.idx`.
+
+The 1.12.2 closeout found the same shape four more times, each a sibling of a path that had been fixed:
+- `fsck`'s roots (L2): an unreadable branch, stash ref, refs directory or reflog was read as no root, so `--prune-now` deleted what it named, with exit 0. The roots are now collected by `lstat`. One that exists but cannot be read is named on stderr and makes `--prune` refuse.
+- `sit stash` (L3): a tracked file the user could not read was recorded as deleted, and the stash then wrote HEAD's copy over the edit.
+- `.sit/refs/stash` (L4): unreadable read as "no stash entries", and the next push replaced it.
+- `fsck --prune`'s in-progress guards: an unreadable MERGE_HEAD was no merge in progress.
+
+The reverse case matters as much. A worktree path under a symlinked directory exists, and reading it reads outside the repository (G1). Status and diff now ask `wt_readable` (util.cyr), which refuses that, as the write paths have since 1.6.4.
 
 ## What to do
 

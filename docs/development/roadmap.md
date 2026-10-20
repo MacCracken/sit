@@ -22,31 +22,6 @@ Each item ships under the usual test / fuzz / poison / bench gates.
 
 ---
 
-## 1.12.x — the closeout arc (before 1.13.0)
-
-1.8.0 through 1.12.0 shipped five minors without the closeout pass CLAUDE.md requires before each minor bump; the last P(-1) was 1.7.6. Those minors added the most attack surface since 1.0:
-- packs and `sit gc` (a new on-disk format, a store swap, the store lock),
-- `sit serve --repos` (request paths that name directories),
-- base-path URLs,
-- `.git/` CLI parity (alternates that point outside the repository; trees read with the checkout rules off).
-
-### 1.12.2 — closeout P(-1) over 1.8.0–1.12.x
-
-The P(-1) pass (CLAUDE.md § P(-1), § Closeout), its findings in `docs/audit/YYYY-MM-DD-audit.md`:
-- **Security review of the new surfaces.**
-  - The pack writer and reader under hostile input: a crafted pack in `.sit/packs/` or a file:// remote's.
-  - gc's crash points: kill it at each step and check that every object is still readable.
-  - The store lock's protocol and its agnos degradation.
-  - `--repos` name resolution, including races between `lstat` and open.
-  - Base-path URL parsing.
-  - Alternates that point anywhere, and git trees read with the relaxed name rules.
-- **Dead code and refactor pass.** The 1.10–1.12 additions (gc's helpers, the store contexts, the git-mode branches in diff / status) are where parallel paths accreted.
-- **Benchmarks.** Re-take the 1.11.0 command A/B on a quiet host; its table was taken at load ~25 and carries no conclusion. Save the CSV as the new baseline.
-- **Downstream.** owl and thoth against the read bundle, which changed in 1.10.0 (packs), 1.11.0 (store sessions, R6) and 1.12.0 (mode-aware status).
-- **`sit serve --repos` evictions.** A repository evicted from the 64 keeps its pack mappings for the process (ADR 0017). Decide whether eviction unmaps them (`_git_file_forget_*` by root), or document the bound.
-
----
-
 ## 1.13.x — everyday revisions and paths
 
 Gaps every git user hits on day one, all verified at 1.12.0. The commands exist; the syntax around them does not.
@@ -55,13 +30,22 @@ Gaps every git user hits on day one, all verified at 1.12.0. The commands exist;
 
 - **`<rev>~<n>`, `<rev>^<n>` and `<rev>:<path>`.** None resolve today: `sit log HEAD~1` says "cannot resolve", and `sit cat-file HEAD:a.txt` says "no object matches". Parse them once in the resolver every command uses (`resolve_commit_hash` / `resolve_hash`), on both backends (a `.git/` repository reads the same syntax). `~` follows first parents and `^<n>` the n-th parent. `:` resolves a path in the commit's tree to the blob or tree id. Fuzz the parser; differential against `git rev-parse` in both object formats.
 - **`sit log [<rev>] [--] <path>…`.** Today a path is read as a ref ("cannot resolve 'a.txt'"). Show the commits whose tree changes a given path, against their first parent (git's default, without rename following). It shares the tree walk `blame` already does.
-- **`sit add <dir>` and `sit add .`.** A directory is refused ("is a directory — name its files", 1.12.1). Walk it with `list_working_walk` (so `.sitignore` applies, and `-f` overrides it), then stage the files as one `sit add` of several paths does (1.12.1).
+- **`sit add <dir>` and `sit add .`.** A directory is refused ("is a directory — name its files", 1.12.1). Walk it with `list_working_walk` (so `.sitignore` applies, and `-f` overrides it), then stage the files as one `sit add` of several paths does (1.12.1). The index update is what a whole tree will feel: `index_upsert_many` deletes and inserts one row per path. 10,000 small files take 55 s against git's 3.4 s, measured at 1.12.1 under load; argument scanning and memory were fixed in 1.12.2 (audit L10). Measure it on a quiet host, then batch it.
+- **Upper-case hex ids, and bare `@{N}`.** `sit cat-file 12FA6B69` matches nothing, where git folds case (audit G7). Bare `@{N}` (HEAD's log), and `<branch>@{N}` when the branch's log is empty (git falls back to the ref), do not resolve (G8). Both fail closed today; they belong with the resolver work above.
 
 ### 1.13.1 — the remaining read commands on `.git/`
 
 `sit blame`, `sit describe` and `sit merge-base` are read-only but still refuse a `.git/` repository (rc 1, verified at 1.12.0). Open them through `cli_read_repo` as 1.12.0 opened status / log / diff. They need the 1.12.0 width fixes (`_id_dup`) on their own paths, plus a differential against `git blame --porcelain`, `git describe` and `git merge-base` in both object formats.
 
-### 1.13.2 — closeout P(-1) over 1.13.x
+### 1.13.2 — hardening carried from the 1.12.2 audit
+
+What [the 1.12.2 audit](../audit/2026-10-20-1.12.2-audit.md) left partly fixed:
+- **`--repos` resolution relative to a directory descriptor (S3).** Since 1.12.2 a kept repository is re-checked on every request, but a swap between that check and the opens still races: about 60 of 300 rounds in the reviewer's racer, when every request re-resolved. Open `<dir>` once, walk each name segment with `openat(…, O_NOFOLLOW | O_DIRECTORY)`, and open the store, the lock and the refs relative to the repository's descriptor. The stdlib's `openat` surface has to be checked against owl's toolchain first, since `serve.cyr` is in `[lib]`.
+- **A connectivity check before a served ref moves (X2c).** `serve_handle_put_ref` checks only that the new tip exists and is a commit. A push spans requests, and a `fsck --prune` between them can delete objects that arrived but that no ref named yet. Walk the new tip's commits and trees down to what the old tip (or any ref) reaches, as git's `check_connected` does, and refuse a hole with a 409. Bound the walk as the fast-forward check is bounded (60 s, then 503).
+- **Reflogs past 64 MiB (L5).** `read_file_heap`'s cap makes such a log unreadable to `sit reflog`, `@{…}` and `reflog expire`, which is the command that would shrink it. `fsck --prune` refuses while one exists (1.12.2). Read and rewrite logs in chunks.
+- **Tree expansion on the status path (G4).** A 124 KB repository whose HEAD tree is a 16-way, 5-level DAG expands to about a million paths: 8 s and 824 MB for `sit status`, and 3.3 GB over three API calls. It is bounded (2M nodes) and fails closed. Give status and diff a lower ceiling, or stop expanding the HEAD tree there once 1.14.0's DIRC reader lands.
+
+### 1.13.3 — closeout P(-1) over 1.13.x
 
 ---
 
@@ -98,6 +82,11 @@ Measured on the 1,600-commit fixture: the first gc takes 5.3 s, 2.8 s of it read
 - pack incrementally (new objects into a second pack) instead of `repack -a -d` every time.
 
 Measure on a larger, more varied history first.
+
+Also from the 1.12.2 audit:
+- **gc's memory follows the largest commit (P9).** `GC_CACHE_MAX` is checked between commits, and `_gc_take` holds every blob it packs. One commit of 400 × 1 MiB files peaks at 418 MB. Trimming inside a tree walk would free buffers the walk still holds, so the drain has to stop handing them out first.
+- **The delta base cache and the depth limit (P10).** A cache hit ends a chain walk, so past 4,095 links whether an object reads depends on what is cached: `fsck`'s reads in id order passed a chain a fresh `cat-file` refused. Keep each cached entry's depth and refuse when it plus the remaining links passes the limit. Only invalid packs reach it.
+- **A store of one object per pack (P6, rest).** 1.12.2 asks the pack that answered last first. That does nothing for N objects in N packs, which is still N² index lookups (8,400 in 20 s). gc never writes such a store, but a file:// remote can serve one: cap the packs read per store, or index them together.
 
 ### 1.15.2 — consume the upstream fixes
 
@@ -137,13 +126,12 @@ Wanted, but each waits for a consumer or a decision before it takes an arc.
   
     | flag | location |
     |---|---|
-    | `add -f` | `index.cyr:17` |
-    | `rm --cached` | `index.cyr:774` |
-    | `reset --hard` | `index.cyr:663` |
-    | `checkout -b` | `refs.cyr:771` |
-    | `branch -d` | `refs.cyr:653` |
-    | `tag -d` / `-a` / `-s` | `refs.cyr:473,515,517` |
-    | `merge --abort` | `merge.cyr:732`; `-S` / `-m <msg>` are scanned anywhere (`cmd_merge`'s argument loop) |
+        | `rm --cached` | `index.cyr:851` |
+    | `reset --hard` | `index.cyr:740` |
+    | `checkout -b` | `refs.cyr:775` |
+    | `branch -d` | `refs.cyr:657` |
+    | `tag -d` / `-a` / `-s` | `refs.cyr:477,519,521` |
+    | `merge --abort` | `merge.cyr:666`; `-S` / `-m <msg>` are scanned anywhere (`cmd_merge`'s argument loop) |
     | `rebase --abort` / `--continue` | `rebase.cyr:257,292` |
     | `config --global` | `config.cyr:360` |
   - **Option-shaped names are refused** where a name is created (`ref_name_is_option`, `refs.cyr`) and where `commit` takes a bare message (`commit.cyr`); a cmdit table must keep those refusals.
@@ -151,18 +139,18 @@ Wanted, but each waits for a consumer or a decision before it takes an arc.
   
     | command | function | notes |
     |---|---|---|
-    | `log` | `cmd_log`, `commit.cyr:1013` | |
-    | `commit -S` / `-m` | `cmd_commit`, `commit.cyr:1168` | with no message, a merge's saved `-m` (`MERGE_MSG`) |
-    | `reflog -n` | `cmd_reflog`, `reflog.cyr:399` | a missing value is ignored; `show` / `expire` / `delete` sub-commands |
-    | `fsck --prune` / `--prune-now` | `cmd_fsck`, `object_db.cyr:1186` | everything else is ignored |
-    | `clone` | `cmd_clone`, `wire.cyr:1565` | |
-    | `serve` | `cmd_serve`, `serve.cyr:1602` | `<repo>` fixed at `argv(2)` |
-    | `diff` / `show` | `diff.cyr:1058,1336` | |
+    | `log` | `cmd_log`, `commit.cyr:1029` | |
+    | `commit -S` / `-m` | `cmd_commit`, `commit.cyr:1180` | with no message, a merge's saved `-m` (`MERGE_MSG`) |
+    | `reflog -n` | `cmd_reflog`, `reflog.cyr:390` | a missing value is ignored; `show` / `expire` / `delete` sub-commands |
+    | `fsck --prune` / `--prune-now` | `cmd_fsck`, `object_db.cyr:2012` | everything else is ignored |
+    | `clone` | `cmd_clone`, `wire.cyr:1829` | |
+    | `serve` | `cmd_serve`, `serve.cyr:1858` | `<repo>` fixed at `argv(2)` |
+    | `diff` / `show` | `diff.cyr:1303,1610` | |
   - **Sub-commands:**
-    - `stash push | list | pop | drop` (default push): `cmd_stash`, `history.cyr:587`.
+    - `stash push | list | pop | drop` (default push): `cmd_stash`, `history.cyr:609`.
     - `key generate | show`: `cmd_key`, `sign.cyr:293`.
-    - `remote add | list | remove` (default list): `cmd_remote`, `wire.cyr:1287`.
-    - `reflog [show] | expire | delete` (default show): `cmd_reflog`, `reflog.cyr:399`.
+    - `remote add | list | remove` (default list): `cmd_remote`, `wire.cyr:1372`.
+    - `reflog [show] | expire | delete` (default show): `cmd_reflog`, `reflog.cyr:390`.
     - The `getenv` reads (`SIT_AUTHOR_*`, `SIT_OWL`, `HOME`, …) are not flag fallbacks and stay.
 
   The plan:
@@ -177,12 +165,12 @@ Wanted, but each waits for a consumer or a decision before it takes an arc.
   
     stash, key, remote and reflog become nested re-entry (`cmdit_dispatch_argv` on `cmdit_verb_argc` / `_argv`), each keeping its own unknown-sub-command text.
   - **Gap, blocking diff/show only.** `-U<N>` is an *attached* short value, and cmdit rejects `-U3` as `CMDIT_ERR_BUNDLED`.
-    - It is pinned by `tests/integration/run.sh:475,480` (`show -U0`, `show -U4611686018427387904`) and CI's "diff -U<N>" smoke (`ci.yml:399`).
+    - It is pinned by `tests/integration/run.sh:486,491` (`show -U0`, `show -U4611686018427387904`) and CI's "diff -U<N>" smoke (`ci.yml:401`).
     - Keep diff/show hand-rolled, or strip `-U*` before `cmdit_parse_verb`.
     - cmdit's roadmap already records sit's `-U<N>` as demand for an opt-in "attached short value" (its won't-ship-without-cause list).
   - **Caller-side rules (not gaps):**
-    - serve's `--stdio` / `--listen` and `--tls` / `--stdio` exclusions, and `--tls` needing `--cert` / `--key` (`serve.cyr:1693-1738`)
-    - `merge` taking `-S` / `-m <msg>` before or after its branches
+    - serve's `--stdio` / `--listen` and `--tls` / `--stdio` exclusions, and `--tls` needing `--cert` / `--key` (`serve.cyr:1956-2006`)
+    - `merge` taking `-S` / `-m <msg>` before or after its branches, and `add` taking `-f` anywhere (1.12.1)
     - config's `--list` / `--unset` / `<key>` exclusivity
   - **Decide, don't drift:**
     - Dash-leading paths and messages will need `--`.
@@ -200,6 +188,10 @@ Blocked on another repo. Per [CLAUDE.md](../../CLAUDE.md), each belongs on the *
 - **sankoch — every inflate keeps 32 B: `br_init`'s bit reader.** `br_init` (`src/bitreader.cyr` in sankoch) takes its 32-byte reader from `_sankoch_alloc` on every `_deflate_decompress_inner` / `_deflate_decompress_dict_inner` call and never frees it, so `zlib_decompress` and `zlib_decompress_with_ratio_cap` keep 32 B per call (an `fl_alloc` / `fl_free` round trip keeps 0). It is all `sit serve` and git read mode still keep: a ref push over 2,000 commits keeps 63,968 B, and a git-mode read 32 B per loose object, about 1 KB per packed object at chain depth 33. A stack reader in the two decoders, which own its lifetime, closes both. **Filed on sankoch's roadmap as 2.9.11** (2026-10-20, checked at 2.8.7); it reaches sit with the cyrius release that folds it.
 - **sandhi — an allocator-taking `sandhi_server_content_length`.** It reads the header through `sandhi_server_find_header`, so the value lands on the global heap on every call. `_sandhi_server_recv_request_dl` and `_sandhi_server_tls_recv_request` call it on every request with a body, so a long-running server keeps about 8 B per such request. `sit serve` parses `Content-Length` itself over its request arena (`_serve_content_length`, differential-fuzzed against sandhi's), but cannot reach the accept loop's call. An `_a` form, or an in-place scan that allocates nothing, closes both. **Filed on sandhi's roadmap in its open 1.13.x line** (2026-10-20, checked at 1.13.1); it reaches sit with the cyrius release that folds it.
 - **patra — `page_write`'s return is ignored inside statements (L12).** `tbl_insert`, `tbl_delete`, `btree_insert` and `_bt_push_up` discard it, so in autocommit a page that never reached the disk is reported as `PATRA_OK` (reproduced with `RLIMIT_FSIZE` standing in for EIO / ENOSPC: `sit add` printed "added" and staged nothing). Inside a transaction the failure is reported, which is why sit writes the index only in transactions. **On patra's own roadmap** (its "Open — patra's own" list, found there at 1.16.2).
+
+- **patra — free the WAL path `patra_open` allocates, and parse `CREATE TABLE` without keeping what it builds (S5).** Every open keeps about 4.4 KB of bump heap, nearly all of it inside `patra_open` (its `.wal` path) and the `CREATE TABLE` sit runs on open. `sit serve --repos` past 64 repositories reopens a store on every evicting request, so the server grows by that much per request. A freelisted path, or one on the handle and freed by `patra_close`, closes the patra side. **Not yet filed** on patra's roadmap; dedupe against it first.
+- **patra — open its files `O_CLOEXEC` (P7).** The store and WAL descriptors are inherited by children sit spawns (owl, ssh), opened read-write. Architecture 008 made sit's own lock file close-on-exec for the same reason. **Not yet filed.**
+- **cmdit — completion scripts that keep file names whole (L11).** The bash script fills `COMPREPLY` with an unquoted `$(compgen -f …)`, which splits `my file.txt` into two candidates. The fish script has a global `complete -c sit -f` and no file completion after the command, though 1.9.0's CHANGELOG promises "command names, then files". `mapfile -t COMPREPLY < <(compgen -f -- "$cur")` with `compopt -o filenames`, and a `complete -c sit -n 'not __fish_use_subcommand' -F` line, fix them (`lib/cmdit.cyr`'s generators). **Not yet filed** on cmdit's roadmap.
 
 ## On hold — keep sandhi
 

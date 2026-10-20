@@ -284,6 +284,17 @@ fn _sf_parent_symlink(p) {
     return 0;
 }
 
+# 1 when the worktree file at repo-relative `path` can be read without passing
+# through a symlinked directory (git's "beyond a symbolic link"). Status and
+# diff count a tracked path under a symlinked directory as deleted, so neither
+# ever reads a file outside the worktree (1.12.2, X4 / G1): with `d` swapped for
+# a link to `~/.ssh`, `sit diff` printed `~/.ssh/<tracked name>`, and so did
+# what owl and thoth get from sit_diff_path, from a checkout anyone could ship.
+fn wt_readable(path) {
+    if (_sf_parent_symlink(path) == 1) { return 0; }
+    return sf_exists(path);
+}
+
 # sit_abs into `abuf`, a 4352-byte buffer the caller owns (on its stack), or on
 # the heap as sit_abs does when the join does not fit.
 fn _sf_abs(rel, abuf) {
@@ -476,14 +487,74 @@ fn sf_read_all(p, buf, maxlen) {
     return file_read_all(sit_abs(p), buf, maxlen);
 }
 
-# file_append_locked on a repo-root-relative path; refuses (-ELOOP) to append
-# through a symlink at the path or above it (a `.sit/logs/HEAD -> ~/x` made every
-# reflog entry land in ~/x through 1.6.3).
+# Append `buf` to a repo-root-relative path under an exclusive flock, as one
+# contiguous record; refuses (-ELOOP) to append through a symlink at the path or
+# above it (a `.sit/logs/HEAD -> ~/x` made every reflog entry land in ~/x
+# through 1.6.3). Returns `len`, or a negative errno.
+#
+# 1.12.2 (L6): sit's own, not stdlib's file_append_locked, which locks whichever
+# file it opened. `reflog expire` / `delete` rewrite a log under its lock and
+# rename the new file over it, so an append that was waiting on that lock wrote
+# into the replaced file, and the entry was lost (30 of 150 in a stress run).
+# With the lock held, the open file must still be the one at the path, or the
+# append reopens.
 fn sf_append_locked(p, buf, len) {
     if (_sf_parent_symlink(p) == 1) { return 0 - 40; }
     var ap = sit_abs(p);
     if (path_is_symlink(ap) == 1) { return 0 - 40; }
-    return file_append_locked(ap, buf, len);
+    var flags = O_WRONLY | O_CREAT;
+    #ifndef CYRIUS_TARGET_AGNOS
+    flags = flags | O_APPEND;
+    #endif
+    var tries = 0;
+    while (tries < 16) {
+        var fd = file_open(ap, flags, 0x1A4);
+        if (fd < 0) { return fd; }
+        file_lock(fd);
+        if (_sf_fd_is_path(fd, ap) == 1) {
+            #ifdef CYRIUS_TARGET_AGNOS
+            xlseek(fd, 0, 2);                  # SEEK_END: agnos has no O_APPEND yet
+            #endif
+            var n = sit_write_full(fd, buf, len);
+            file_unlock(fd);
+            file_close(fd);
+            return n;
+        }
+        file_unlock(fd);
+        file_close(fd);
+        tries = tries + 1;
+    }
+    return 0 - 11;                             # EAGAIN: replaced 16 times running
+}
+
+# The identity of the file at the absolute path `ap` (stat, following a link)
+# at out16: {device, inode}, or {inode, 0} on agnos. 0, or -1 when it cannot be
+# stat'd. Two reads that agree name the same file, even after a rename over it.
+fn path_file_id(ap, out16) {
+    var st[256];
+    if (xstat(ap, &st) != 0) { return 0 - 1; }
+    #ifdef CYRIUS_TARGET_AGNOS
+    store64(out16, load64(&st + STAT_INO));
+    store64(out16 + 8, 0);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    store64(out16, load64(&st));
+    store64(out16 + 8, load64(&st + 8));
+    #endif
+    return 0;
+}
+
+# 1 when the open `fd` is the file now at the absolute path `ap` (same device
+# and inode), 0 when the path names another file or none. 1 where the
+# platform cannot say (agnos has no fstat), which is how appends behaved before.
+fn _sf_fd_is_path(fd, ap) {
+    var fs[256];
+    var ps[256];
+    if (sys_fstat(fd, &fs) != 0) { return 1; }
+    if (xstat(ap, &ps) != 0) { return 0; }
+    if (load64(&fs) != load64(&ps)) { return 0; }             # st_dev
+    if (load64(&fs + 8) != load64(&ps + 8)) { return 0; }     # st_ino
+    return 1;
 }
 
 # sit_mkdir on a repo-root-relative path.
@@ -616,10 +687,13 @@ fn content_length_sane(v, max) {
 
 # Write three cstrings to stderr, unbuffered — "<a><path><b>" — so messages
 # that wrap a path need no hand-counted byte lengths (several were short by the
-# 3-byte em dash and lost their newline).
+# 3-byte em dash and lost their newline). The middle one is external bytes at
+# nearly every caller (a worktree or tree name, an argument, a line of
+# `.git/objects/info/alternates`), so it goes out display-safe (1.12.2): an
+# escape sequence in it reached the terminal raw.
 fn eprint3(a, path, b) {
     syscall(SYS_WRITE, STDERR, a, strlen(a));
-    syscall(SYS_WRITE, STDERR, path, strlen(path));
+    write_sanitized(STDERR, path, strlen(path));
     syscall(SYS_WRITE, STDERR, b, strlen(b));
     return 0;
 }
@@ -955,13 +1029,40 @@ fn text_sanitized(bytes, len, out_len) {
     return out;
 }
 
-# Write bytes to `fd` made display-safe by text_sanitized.
+# Write bytes to `fd` made display-safe as text_sanitized makes them. Through a
+# stack buffer, so nothing is allocated: 1.12.2 (K5) made eprint3 sanitize
+# every message, and a long-lived process (sit serve, owl, thoth) kept a heap
+# copy of each one.
 fn write_sanitized(fd, bytes, len) {
     if (len <= 0) { return 0; }
-    var olen[8];
-    var out = text_sanitized(bytes, len, &olen);
-    if (fd == STDOUT) { stdout_write(out, load64(&olen)); }
-    else { syscall(SYS_WRITE, fd, out, load64(&olen)); }
+    var buf[1024];
+    var o = 0;
+    var i = 0;
+    while (i < len) {
+        if (o > 1016) {                               # a run is at most 4 bytes
+            _write_to(fd, &buf, o);
+            o = 0;
+        }
+        var r = _text_run(bytes + i, len - i);
+        if (r > 0) {
+            store8(&buf + o, 63);                     # '?'
+            o = o + 1;
+            i = i + r;
+        }
+        else {
+            memcpy(&buf + o, bytes + i, 0 - r);
+            o = o + (0 - r);
+            i = i + (0 - r);
+        }
+    }
+    if (o > 0) { _write_to(fd, &buf, o); }
+    return 0;
+}
+
+# `n` bytes at `b` to `fd`: stdout through its buffer, anything else directly.
+fn _write_to(fd, b, n) {
+    if (fd == STDOUT) { stdout_write(b, n); }
+    else { syscall(SYS_WRITE, fd, b, n); }
     return 0;
 }
 

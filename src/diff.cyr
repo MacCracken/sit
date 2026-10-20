@@ -24,7 +24,7 @@ fn is_dirty() {
             var head_ent = tree_find(head_entries, path);
             if (head_ent == 0) { return 1; }
             if (streq(tree_entry_hash(head_ent), idx_hex) == 0) { return 1; }
-            if (sf_exists(path) == 1) {
+            if (wt_readable(path) == 1) {
                 # 1.6.4 (B2): a file that cannot be hashed (over the 64 MiB read
                 # cap, or a tracked file replaced by a directory) used to count
                 # as UNCHANGED, so checkout / merge / pull then overwrote it —
@@ -62,7 +62,7 @@ fn worktree_differs_from_index() {
     while (i < n) {
         var e = vec_get(index_entries, i);
         var path = entry_path(e);
-        if (sf_exists(path) != 1) { return 1; }
+        if (wt_readable(path) != 1) { return 1; }
         var wh = hash_file_as_blob(path);
         if (wh == 0) { return 1; }
         if (streq(wh, hex_encode(entry_hash(e), 32)) == 0) { return 1; }
@@ -295,6 +295,7 @@ fn _status_link_differs(hex, ap) {
 # How the worktree compares with HEAD's entry `e` at `path`: 0 unchanged,
 # 1 modified, 3 deleted.
 fn _status_entry_state(e, path) {
+    if (_sf_parent_symlink(path) == 1) { return 3; }    # 1.12.2 (G1): not through a link
     var ab[4352];
     var ap = sit_abs_into(path, &ab, 4352);
     if (ap == 0) { return 1; }
@@ -521,7 +522,7 @@ fn cmd_status() {
             }
             if (label != 0) { push_status_item(staged, label, path); }
 
-            if (sf_exists(path) == 1) {
+            if (wt_readable(path) == 1) {
                 # A file status cannot hash is reported, never assumed clean (B2).
                 var working_hex = hash_file_as_blob(path);
                 if (working_hex == 0) { push_status_item(unstaged, "modified:  ", path); }
@@ -1455,7 +1456,7 @@ fn cmd_diff() {
                 var path = tree_entry_name(he);
                 var head_hex = tree_entry_hash(he);
 
-                if (sf_exists(path) == 1) {
+                if (wt_readable(path) == 1) {
                     var working_hex = hash_file_as_blob(path);
                     if (working_hex != 0) {
                         if (streq(head_hex, working_hex) == 0) {
@@ -1556,7 +1557,7 @@ fn cmd_diff() {
             }
         }
         else {
-            if (sf_exists(path) == 1) {
+            if (wt_readable(path) == 1) {
                 var working_hex = hash_file_as_blob(path);
                 if (working_hex != 0) {
                     if (streq(working_hex, idx_hash_hex) == 0) {
@@ -1584,7 +1585,28 @@ fn cmd_diff() {
     return 0;
 }
 
-# Load a commit's tree and return its flattened entries. Returns 0 on error.
+# The content `sit show` compares for the tree entry `e`, at out16 {ptr, len}:
+# its blob, or for a gitlink (160000, another repository's commit) the line
+# git shows, `Subproject commit <id>`. 0, or -1 when the blob cannot be read.
+# 1.12.2 (G6): a gitlink's id was read as a blob, so a commit object that
+# happened to be in the store printed as the file's content.
+fn _show_entry_content(e, out16) {
+    if (streq(tree_entry_mode(e), "160000") == 0) {
+        return read_blob_content(tree_entry_hash(e), out16);
+    }
+    var h = tree_entry_hash(e);
+    var hl = strlen(h);
+    var b = alloc_or_die(hl + 20);
+    memcpy(b, "Subproject commit ", 18);
+    memcpy(b + 18, h, hl);
+    store8(b + 18 + hl, 10);
+    store64(out16, b);
+    store64(out16 + 8, hl + 19);
+    return 0;
+}
+
+# `sit show [--stat] [<commit>]` — a commit's header, then its diff against its
+# first parent (an empty tree for a root commit).
 fn cmd_show() {
     # 1.12.0: a `.git/` repository too, read-only.
     if (cli_read_repo() < 0) { return 1; }
@@ -1697,7 +1719,7 @@ fn cmd_show() {
         var old_ent = tree_find(old_entries, path);
         if (old_ent == 0) {
             var np[16];
-            if (read_blob_content(new_hash, &np) == 0) {
+            if (_show_entry_content(e, &np) == 0) {
                 if (stat_mode == 1) {
                     print_file_stat(path, 0, 0, load64(&np), load64(&np + 8), &stat_pair);
                     tot_files = tot_files + 1;
@@ -1713,8 +1735,8 @@ fn cmd_show() {
             if (streq(tree_entry_hash(old_ent), new_hash) == 0) {
                 var op[16];
                 var np[16];
-                if (read_blob_content(tree_entry_hash(old_ent), &op) == 0) {
-                    if (read_blob_content(new_hash, &np) == 0) {
+                if (_show_entry_content(old_ent, &op) == 0) {
+                    if (_show_entry_content(e, &np) == 0) {
                         if (stat_mode == 1) {
                             print_file_stat(path,
                               load64(&op), load64(&op + 8),
@@ -1743,7 +1765,7 @@ fn cmd_show() {
         var path = tree_entry_name(e);
         if (tree_find(new_entries, path) == 0) {
             var op[16];
-            if (read_blob_content(tree_entry_hash(e), &op) == 0) {
+            if (_show_entry_content(e, &op) == 0) {
                 if (stat_mode == 1) {
                     print_file_stat(path, load64(&op), load64(&op + 8), 0, 0, &stat_pair);
                     tot_files = tot_files + 1;

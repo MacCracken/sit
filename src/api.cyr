@@ -138,7 +138,7 @@ fn _sit_diff_path_in(path) {
     var new_buf = 0;
     var new_len = 0;
     var wp[16];
-    if (sf_exists(path) == 1) {
+    if (wt_readable(path) == 1) {
         if (read_file_fl(path, &wp) == 0) {
             new_buf = load64(&wp);
             new_len = load64(&wp + 8);

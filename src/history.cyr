@@ -266,16 +266,26 @@ fn cmd_revert() {
 # not sit's to move out from under the user.
 fn stash_ref_path() { return ".sit/refs/stash"; }
 
-# Newest stash commit oid (heap cstring), or 0 if the stack is empty.
+# Newest stash commit oid (heap cstring), 0 if the stack is empty, or -1 (said
+# on stderr) when .sit/refs/stash exists but cannot be read or is not an id.
+# 1.12.2: existence is lstat's question (architecture 007). An unreadable ref
+# read as "no stash entries", and the next `sit stash` replaced it, orphaning
+# every earlier entry for `fsck --prune` to delete.
 fn stash_read_top() {
     var p = stash_ref_path();
-    if (sf_exists(p) != 1) { return 0; }
+    if (path_lstat_kind(sit_abs(p)) < 0) { return 0; }
     var pair[16];
-    if (read_file_heap(p, &pair) != 0) { return 0; }
+    var ok = 0;
+    if (read_file_heap(p, &pair) == 0) {
+        if (load64(&pair + 8) >= 64) {
+            if (hex_prefix_valid(load64(&pair), 64) == 1) { ok = 1; }
+        }
+    }
+    if (ok == 0) {
+        eprintln("sit: cannot read .sit/refs/stash — the stash is left as it is");
+        return 0 - 1;
+    }
     var buf = load64(&pair);
-    var len = load64(&pair + 8);
-    if (len < 64) { return 0; }
-    if (hex_prefix_valid(buf, 64) == 0) { return 0; }
     var hex = alloc(65);
     memcpy(hex, buf, 64);
     store8(hex + 64, 0);
@@ -310,7 +320,10 @@ fn _stash_working_tree() {
     while (i < n) {
         var e = vec_get(entries, i);
         var path = entry_path(e);
-        if (sf_exists(path) == 1) {
+        # 1.12.2 (L3): present is lstat's answer, not "can be opened" (sf_exists):
+        # an unreadable edited file was recorded as deleted, and the stash then
+        # wrote HEAD's copy over it, so the A14 refusal below never ran.
+        if (path_lstat_kind(sit_abs(path)) >= 0) {
             # write_blob_object, NOT hash_file_as_blob: the latter only hashes
             # (status uses it to compare), so a tree built from it names blobs
             # the store does not contain and `stash pop` fails with "cannot
@@ -408,6 +421,7 @@ fn _stash_push() {
     store8(msg + 7 + blen + 14, 0);
 
     var prev = stash_read_top();
+    if (prev == (0 - 1)) { return 1; }
     var stash_hex = 0;
     if (prev == 0) { stash_hex = build_commit_signed(tree_hex, head_hex, msg, 0); }
     else { stash_hex = build_merge_commit_signed(tree_hex, head_hex, prev, msg, 0); }
@@ -435,6 +449,7 @@ fn _stash_push() {
 
 fn _stash_list() {
     var cur = stash_read_top();
+    if (cur == (0 - 1)) { return 1; }
     var idx = 0;
     while (cur != 0) {
         var m = commit_message_of(cur);
@@ -461,6 +476,7 @@ fn _stash_list() {
 
 fn _stash_pop(drop_only) {
     var top = stash_read_top();
+    if (top == (0 - 1)) { return 1; }
     if (top == 0) {
         eprintln("sit: no stash entries");
         return 1;
@@ -497,6 +513,12 @@ fn _stash_pop(drop_only) {
             # stash is kept, and nothing moves HEAD.
             if (base == 0) {
                 eprintln("sit: this stash has no base commit to apply it against — the stash is kept");
+                return 1;
+            }
+            # 1.12.2 (L8): an unborn branch has no tree to apply onto; the
+            # three-way apply read HEAD's tree from a null id and crashed.
+            if (head == 0) {
+                eprintln("sit: HEAD has no commit to apply the stash onto — the stash is kept");
                 return 1;
             }
             var ar = _stash_apply_three_way(top, base, head);

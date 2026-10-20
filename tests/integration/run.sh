@@ -2600,6 +2600,176 @@ assert_contains "$OUT" "b.txt" "43d: and stages the rest"
 "$SIT" add >/dev/null 2>&1; assert_eq "$?" "1" "43d: no path is a usage error"
 "$SIT" add -f >/dev/null 2>&1; assert_eq "$?" "1" "43d: nor is -f alone"
 
+hr "1.12.2 closeout: the P(-1) fixes"
+Q="$WORK/s44"; mkdir -p "$Q/src/proj/.git" "$Q/w" "$Q/e" "$Q/outside"
+echo OUTSIDE-SECRET > "$Q/outside/f.txt"
+# 44a (X1 / S2). A clone never names its directory .git, .sit or .ssh.
+(cd "$Q/src/proj/.git" && "$SIT" init >/dev/null && echo a > a && "$SIT" add a >/dev/null && "$SIT" commit -m a >/dev/null)
+cd "$Q/w"
+OUT=$("$SIT" clone "$Q/src/proj/.git" 2>&1); RC=$?
+assert_eq "$RC" "0" "44a: a clone of .../proj/.git"
+assert_contains "$OUT" "into proj" "44a: is named proj, as git names it"
+[ -e "$Q/w/.git" ]; assert_eq "$?" "1" "44a: and no ./.git is made"
+"$SIT" clone "$Q/src/proj/.git" .git >/dev/null 2>&1; assert_eq "$?" "1" "44a: an explicit .git target is refused"
+"$SIT" clone "$Q/src/proj/.git" sub/.SIT >/dev/null 2>&1; assert_eq "$?" "1" "44a: so is .SIT, in any case"
+"$SIT" clone "$Q/src/proj/.git" .ssh >/dev/null 2>&1; assert_eq "$?" "1" "44a: and .ssh"
+cd "$Q/e"; "$SIT" clone "$Q/src/proj/.git" . >/dev/null 2>&1; assert_eq "$?" "0" "44a: '.' still fills an empty directory"
+# 44b (X4 / G1). status and diff never read through a symlinked directory.
+R="$Q/lnk"; mkdir -p "$R/d"; cd "$R"; "$SIT" init >/dev/null
+echo inside > d/f.txt; "$SIT" add d/f.txt >/dev/null; "$SIT" commit -m x >/dev/null
+mv d d.real; ln -s "$Q/outside" d
+assert_contains "$("$SIT" status)" "deleted:   d/f.txt" "44b: a tracked file under a symlinked directory reads as deleted"
+case "$("$SIT" diff 2>&1)" in *OUTSIDE-SECRET*) bad "44b: diff read a file outside the worktree";; *) ok;; esac
+if command -v git >/dev/null 2>&1; then
+  G="$Q/glnk"; mkdir -p "$G/d"; cd "$G"; git init -q
+  echo inside > d/f.txt; git add d; git -c user.name=t -c user.email=t@t commit -qm x
+  mv d d.real; ln -s "$Q/outside" d
+  assert_contains "$("$SIT" status)" "deleted:   d/f.txt" "44b: in a .git/ repository too"
+  case "$("$SIT" diff 2>&1)" in *OUTSIDE-SECRET*) bad "44b: git-mode diff read a file outside the worktree";; *) ok;; esac
+  # 44c (X5 / G2, G5). The alternates warning is display-safe, and bounded.
+  printf '/nonexist\033]0;ALT\007\n' > .git/objects/info/alternates
+  case "$("$SIT" status 2>&1 >/dev/null)" in *$'\033'*) bad "44c: an escape in alternates reached the terminal";; *) ok;; esac
+  for i in $(seq 1 200); do echo "/nonexist$i"; done > .git/objects/info/alternates
+  assert_eq "$("$SIT" status 2>&1 >/dev/null | grep -c 'alternate object directory')" "64" "44c: at most 64 alternates lines are looked at"
+  rm -f .git/objects/info/alternates
+fi
+# 44d (L1 / X2). --prune keeps what a kept dangling commit reaches, commits too.
+R="$Q/prune"; mkdir -p "$R"; cd "$R"; "$SIT" init >/dev/null
+echo base > base.txt; "$SIT" add base.txt >/dev/null; "$SIT" commit -m base >/dev/null
+P=$(tr -d '\n' < .sit/refs/heads/main); PT=$("$SIT" cat-file "$P" | awk '/^tree /{print $2}')
+PB=$("$SIT" cat-file "$PT" | python3 -I -c 'import sys;t=sys.stdin.buffer.read();i=t.index(b"base.txt\0")+9;print(t[i:i+32].hex())')
+read -r OC OT UB <<< "$(python3 -I "$ROOT/tests/integration/plant_old_commit.py" "$P" "$PB")"
+printf '%s\n' "$OC" > .sit/refs/heads/topic
+"$SIT" checkout topic >/dev/null 2>&1; echo work > new.txt; "$SIT" add new.txt >/dev/null; "$SIT" commit -m recent >/dev/null
+B=$(tr -d '\n' < .sit/refs/heads/topic); "$SIT" checkout main >/dev/null 2>&1; "$SIT" branch -d topic >/dev/null 2>&1
+"$SIT" reflog expire --expire=now --all >/dev/null; rm -rf .sit/logs
+"$SIT" fsck --prune >/dev/null 2>&1
+"$SIT" cat-file "$B" >/dev/null 2>&1; assert_eq "$?" "0" "44d: a recent dangling commit is kept"
+"$SIT" cat-file "$OC" >/dev/null 2>&1; assert_eq "$?" "0" "44d: and so is its two-year-old parent"
+"$SIT" cat-file "$UB" >/dev/null 2>&1; assert_eq "$?" "0" "44d: with what that parent holds"
+assert_contains "$("$SIT" fsck 2>&1 | tail -1)" " 0 bad" "44d: fsck stays clean"
+# 44e (X2). --prune runs alone: refused while another process has the store.
+( flock -s .sit/objects.flock sleep 3 & ); sleep 0.3
+"$SIT" fsck --prune >/dev/null 2>&1; assert_eq "$?" "1" "44e: --prune refuses while the store is open elsewhere"
+sleep 3
+if [ "$(id -u)" != "0" ]; then
+  # 44f (L2). An unreadable ref is not "no ref".
+  R="$Q/unread"; mkdir -p "$R"; cd "$R"; "$SIT" init >/dev/null
+  echo a > a; "$SIT" add a >/dev/null; "$SIT" commit -m a >/dev/null
+  "$SIT" checkout -b feat >/dev/null 2>&1; echo f > f; "$SIT" add f >/dev/null; "$SIT" commit -m f >/dev/null
+  FT=$(tr -d '\n' < .sit/refs/heads/feat); "$SIT" checkout main >/dev/null 2>&1
+  rm -rf .sit/logs; chmod 000 .sit/refs/heads/feat
+  OUT=$("$SIT" fsck --prune-now 2>&1); RC=$?; chmod 644 .sit/refs/heads/feat
+  assert_eq "$RC" "1" "44f: --prune refuses while a ref cannot be read"
+  assert_contains "$OUT" "cannot read .sit/refs/heads/feat" "44f: and names it"
+  "$SIT" cat-file "$FT" >/dev/null 2>&1; assert_eq "$?" "0" "44f: whose tip it used to delete"
+  # 44g (L3). stash refuses an edited file it cannot read.
+  echo edit >> a; chmod 200 a
+  "$SIT" stash >/dev/null 2>&1; RC=$?; chmod 644 a
+  assert_eq "$RC" "1" "44g: stash refuses an edited file it cannot read"
+  assert_eq "$(tail -1 a)" "edit" "44g: and leaves the edit where it was"
+  # 44h (L4). An unreadable .sit/refs/stash is not an empty stash.
+  "$SIT" stash >/dev/null 2>&1; SOLD=$(tr -d '\n' < .sit/refs/stash)
+  echo e2 >> a; chmod 000 .sit/refs/stash
+  "$SIT" stash >/dev/null 2>&1; RC=$?; chmod 644 .sit/refs/stash
+  assert_eq "$RC" "1" "44h: stash refuses while .sit/refs/stash cannot be read"
+  assert_eq "$(tr -d '\n' < .sit/refs/stash)" "$SOLD" "44h: and does not replace it"
+fi
+# 44i (L7). A MERGE_MSG from an abandoned merge titles nothing later.
+R="$Q/mmsg"; mkdir -p "$R"; cd "$R"; "$SIT" init >/dev/null
+echo base > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m base >/dev/null
+"$SIT" checkout -b feat >/dev/null 2>&1; echo feat > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m feat >/dev/null
+"$SIT" checkout main >/dev/null 2>&1; "$SIT" checkout -b feat2 >/dev/null 2>&1; echo feat2 > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m feat2 >/dev/null
+"$SIT" checkout main >/dev/null 2>&1; echo main > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m m >/dev/null
+"$SIT" merge -m "OLD MESSAGE" feat >/dev/null 2>&1; rm -f .sit/MERGE_HEAD
+echo main-only > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m "carry on" >/dev/null
+[ -e .sit/MERGE_MSG ]; assert_eq "$?" "1" "44i: a commit clears a MERGE_MSG left behind"
+"$SIT" merge feat2 >/dev/null 2>&1; echo resolved > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit >/dev/null 2>&1
+assert_eq "$("$SIT" log --oneline | grep -c 'OLD MESSAGE')" "0" "44i: so the next merge is not titled by it"
+# 44j (L8). stash pop on an unborn branch refuses; it crashed.
+R="$Q/unborn"; mkdir -p "$R"; cd "$R"; "$SIT" init >/dev/null
+echo base > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m base >/dev/null
+echo s > a.txt; "$SIT" stash >/dev/null; printf 'ref: refs/heads/unborn\n' > .sit/HEAD
+"$SIT" rm --cached a.txt >/dev/null 2>&1; rm -f a.txt
+"$SIT" stash pop >/dev/null 2>&1; assert_eq "$?" "1" "44j: stash pop on an unborn branch refuses"
+assert_eq "$("$SIT" stash list | grep -c '^stash@')" "1" "44j: and keeps the entry"
+# 44k (G3). log and show follow a merge's first parent.
+R="$Q/fp"; mkdir -p "$R"; cd "$R"; "$SIT" init >/dev/null
+echo a > a; "$SIT" add a >/dev/null; "$SIT" commit -m base >/dev/null
+"$SIT" checkout -b feat >/dev/null 2>&1; echo f > f; "$SIT" add f >/dev/null; "$SIT" commit -m FEAT >/dev/null
+"$SIT" checkout main >/dev/null 2>&1; echo m > m; "$SIT" add m >/dev/null; "$SIT" commit -m MAINSIDE >/dev/null
+"$SIT" merge -m Merge feat >/dev/null 2>&1
+assert_eq "$("$SIT" log --oneline | cut -d' ' -f2 | tr '\n' ' ')" "Merge MAINSIDE base " "44k: log walks the first parent (the mainline)"
+assert_contains "$("$SIT" show --stat)" " f |" "44k: show diffs a merge against its first parent"
+if command -v git >/dev/null 2>&1; then
+  # 44l (G6). show prints a gitlink as git does.
+  G="$Q/glink"; mkdir -p "$G"; cd "$G"; git init -q
+  echo a > a; git add a; git -c user.name=t -c user.email=t@t commit -qm base; GC=$(git rev-parse HEAD)
+  git update-index --add --cacheinfo "160000,$GC,sub"; git -c user.name=t -c user.email=t@t commit -qm sub
+  assert_contains "$("$SIT" show)" "+Subproject commit $GC" "44l: show prints a gitlink as 'Subproject commit <id>'"
+  # 44m (L9). A git reflog line with no message still dates.
+  G="$Q/glog"; mkdir -p "$G"; cd "$G"; git init -q -b main
+  for i in 1 2 3; do echo $i > f; git add f; git -c user.name=t -c user.email=t@t commit -qm c$i; done
+  git update-ref refs/heads/main "$(git rev-parse HEAD~2)"
+  assert_eq "$("$SIT" log --oneline 'main@{now}' | head -1 | cut -d' ' -f2)" "c1" "44m: main@{now} reads a git reflog line with no message"
+fi
+# 44n (S1 / P2, S3 / X3, S4, X6). sit serve --repos.
+if command -v python3 >/dev/null 2>&1; then
+  SR="$Q/many"; mkdir -p "$SR"
+  for i in $(seq -w 0 65); do
+    mkdir -p "$SR/r$i"; (cd "$SR/r$i" && "$SIT" init >/dev/null && echo "$i" > f && "$SIT" add f >/dev/null && "$SIT" commit -m "c$i" >/dev/null)
+  done
+  O="$Q/outrepo"; mkdir -p "$O"; (cd "$O" && "$SIT" init >/dev/null && echo SECRET-X > f && "$SIT" add f >/dev/null && "$SIT" commit -m secret >/dev/null && "$SIT" gc >/dev/null 2>&1)
+  OH=$(tr -d '\n' < "$O/.sit/refs/heads/main")
+  mkdir -p "$SR/thief"; (cd "$SR/thief" && "$SIT" init >/dev/null && echo t > t && "$SIT" add t >/dev/null && "$SIT" commit -m t >/dev/null)
+  mkdir -p "$SR/thief/.sit/packs"
+  for f in "$O"/.sit/packs/pack-*; do ln -s "$f" "$SR/thief/.sit/packs/"; done
+  ln -s "$O/.sit/refs/heads/main" "$SR/thief/.sit/refs/heads/stolen"
+  mkdir -p "$SR/thief2"; (cd "$SR/thief2" && "$SIT" init >/dev/null && echo t > t && "$SIT" add t >/dev/null && "$SIT" commit -m t >/dev/null)
+  mv "$SR/thief2/.sit/refs/heads" "$SR/thief2/.sit/refs/heads.own"; ln -s "$O/.sit/refs/heads" "$SR/thief2/.sit/refs/heads"
+  (cd "$SR/r00" && "$SIT" gc >/dev/null 2>&1)
+  s44wait() { for _ in 1 2 3 4 5 6 7 8 9 10; do (echo > /dev/tcp/127.0.0.1/"$1") >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
+  "$SIT" serve "$SR" --repos --listen 127.0.0.1:18810 > "$Q/serve.out" 2>&1 & MS=$!
+  s44wait 18810
+  s44get() { python3 -I -c 'import http.client,sys,time
+t=time.time(); c=http.client.HTTPConnection("127.0.0.1",18810,timeout=10); c.request("GET",sys.argv[1]); r=c.getresponse(); b=r.read()
+print(r.status, "fast" if time.time()-t < 1.5 else "slow", "".join(c if 32 <= ord(c) < 127 else " " for c in b.decode("latin-1")))' "$1"; }
+  cd "$Q/w"; "$SIT" clone http://127.0.0.1:18810/r00 c00a >/dev/null 2>&1; assert_eq "$?" "0" "44n: clone a packed repository"
+  for i in $(seq -w 1 65); do s44get "/r$i/sit/v1/refs" >/dev/null; done
+  (cd "$SR/r00" && echo more >> f && "$SIT" add f >/dev/null && "$SIT" commit -m more >/dev/null && "$SIT" gc >/dev/null 2>&1)
+  NT=$(tr -d '\n' < "$SR/r00/.sit/refs/heads/main")
+  assert_eq "$(s44get "/r00/sit/v1/objects/$NT" | cut -d' ' -f1)" "200" "44n: evicted, gc'd, then asked for: the new tip is served (S1)"
+  "$SIT" clone http://127.0.0.1:18810/r00 c00b >/dev/null 2>&1; assert_eq "$?" "0" "44n: and it clones"
+  s44get "/r01/sit/v1/refs" >/dev/null
+  mv "$SR/r01" "$SR/r01.real"; ln -s "$O" "$SR/r01"
+  assert_eq "$(s44get "/r01/sit/v1/refs" | cut -d' ' -f1)" "404" "44n: a served name swapped for a symlink is a 404 at once (S3)"
+  OUT=$(s44get "/thief/sit/v1/refs")
+  case "$OUT" in *stolen*) bad "44n: a ref linked in from outside was served (S4)";; *) ok;; esac
+  assert_eq "$(s44get "/thief/sit/v1/objects/$OH" | cut -d' ' -f1)" "404" "44n: and a pack linked in from outside is not read (S4)"
+  case "$(s44get "/thief2/sit/v1/refs")" in *"$OH"*) bad "44n: a refs/heads linked to another repository's was listed (K4)";; *) ok;; esac
+  ( flock -x "$SR/r02/.sit/objects.flock" sleep 3 & ); sleep 0.3
+  assert_eq "$(s44get "/r02/sit/v1/refs" | cut -d' ' -f1,2)" "503 fast" "44n: a repository whose store a gc holds answers 503 (X6)"
+  assert_eq "$(s44get "/r03/sit/v1/refs" | cut -d' ' -f1,2)" "200 fast" "44n: without stalling the others"
+  sleep 3
+  kill $MS 2>/dev/null; wait $MS 2>/dev/null
+fi
+# 44o (P1, P4). gc replaces a same-name pack it did not verify; sweeps orphans.
+R="$Q/gcsame"; mkdir -p "$R"; cd "$R"; "$SIT" init >/dev/null
+for i in 1 2 3; do echo "$i" > "f$i"; "$SIT" add "f$i" >/dev/null; "$SIT" commit -m "c$i" >/dev/null; done
+cp .sit/objects.patra "$Q/rows.patra"
+"$SIT" gc >/dev/null 2>&1
+cp "$Q/rows.patra" .sit/objects.patra          # rows and the pack, as a gc stopped after naming it leaves
+rm -f .sit/packs/pack-*.pack                    # and the .pack lost, its .idx kept
+"$SIT" gc >/dev/null 2>&1; assert_eq "$?" "0" "44o: gc over an .idx whose .pack is gone"
+assert_eq "$("$SIT" log --oneline | wc -l | tr -d ' ')" "3" "44o: keeps the history it rebuilt the pack from"
+assert_contains "$("$SIT" fsck 2>&1 | tail -1)" " 0 bad" "44o: and the store is whole"
+cp .sit/packs/pack-*.pack ".sit/packs/pack-$(printf 'ab%.0s' $(seq 1 32)).pack"
+"$SIT" gc >/dev/null 2>&1
+assert_eq "$(ls .sit/packs | grep -c '\.pack$')" "1" "44o: a .pack with no .idx is swept by the next gc"
+cp .sit/packs/pack-*.idx ".sit/packs/pack-$(printf 'cd%.0s' $(seq 1 32)).idx"
+"$SIT" gc >/dev/null 2>&1
+assert_eq "$(ls .sit/packs | grep -c '\.idx$')" "1" "44o: and so is an .idx with no .pack (K6)"
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

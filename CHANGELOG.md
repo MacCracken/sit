@@ -4,6 +4,142 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.12.2] — 2026-10-20 — closing 1.12.x: a P(-1) audit of everything since 1.7.6
+
+The last 1.12.x patch: the P(-1) hardening and closeout pass that 1.8.0 through 1.12.0 shipped without. Five independent reviews covered the new surfaces: packs, gc and the store lock; serving and URLs; the 1.8–1.12 local write paths; the `.git/` read path; and external advisories. Two more findings came from the closeout's own refactor. Each of the 38 was reproduced against 1.12.1:
+- **3 HIGH:** 2 fixed, 1 partly fixed.
+- **9 MEDIUM:** 6 fixed, 1 partly fixed, 2 deferred.
+- **26 LOW:** 17 fixed, 3 partly fixed, 6 deferred.
+
+No CRITICAL. An independent review of the finished fix diff then found seven mistakes in the first cut (K3–K9), all fixed before release:
+- the lock file's `O_NONBLOCK`, which agnos's stdlib does not name, broke the `--agnos` build of sit and of thoth's bundle;
+- two routes S4's fix missed: a two-hop ref link, and a `refs/heads` linked into another repository;
+- G5's fix missed one long alternates line, and the newly sanitizing `eprint3` copied every message to the heap;
+- gc no longer swept an `.idx` whose `.pack` was gone;
+- a counter booked an object that failed to verify as written;
+- the reflog rewriters lacked the identity check L6 gave appends;
+- a FIFO at a refs directory still hung fsck.
+
+The full report is [`docs/audit/2026-10-20-1.12.2-audit.md`](docs/audit/2026-10-20-1.12.2-audit.md). The toolchain stays at cyrius 6.7.15, and there is no new surface.
+
+### Security — reaching outside the repository (HIGH)
+
+- **A clone could name its directory `.git` (X1 / S2).** The target was the URL's last segment. `sit clone http://host/x/.git` wrote the server's tree into `./.git`, `config` included, so the next `git status` in that directory ran the server's `core.fsmonitor`. `/x/.sit` planted a sit repository the same way, and `/x/.ssh` from `~` would have planted `authorized_keys`.
+  - A segment that is `.`, `..`, or spells `.git`, `.sit` or `.ssh` is now passed over for the one before it, as git names a clone of `…/proj/.git` "proj". Spellings count in any case, with HFS-ignorable codepoints, or as an NTFS short name.
+  - A target that spells one, given or derived, is refused. `.` still fills an empty directory.
+  - The spelling check is `name_spoofs_dotdir`, now shared with tree entry names.
+- **`status`, `diff` and the API read through a symlinked directory (G1 / X4).** With a tracked `d/f.txt` and `d` replaced by a link elsewhere, `sit diff` printed the outside file. So did owl's `sit_diff_path` and thoth's `sit_repo_status`, for any checkout that ships the link. Worktree reads now ask `wt_readable`, which refuses a path with a symlinked directory above it. Status reports the file deleted, as git does, on both backends.
+- **`sit serve --repos` checked a name once (S3 / X3).** After a repository's first request, its cached path, store handle and lock descriptor were trusted. A directory swapped for a symlink then served, and took pushes into, a repository outside `<dir>`, and a gc there ran mid-request.
+  - Every request now re-checks its repository (`_serve_repo_kept`: at most 17 `lstat`s, nothing allocated), which must also be the same directory by device and inode. Otherwise the server resolves it afresh, with a new handle and lock.
+  - That also covers a repository replaced by another real directory, such as one restored from a backup.
+  - **Partly fixed:** a swap between the check and the opens within one request still races. The `openat`-relative walk that closes it is roadmapped for 1.13.2.
+
+### Fixed — data loss with exit 0
+
+- **`fsck --prune` deleted the old parent of a commit it kept (L1 / X2a).** A dangling commit past the window was judged by its own date even with a kept commit or a tag on top of it. That left the kept one with a hole, and fsck reported `missing` from then on. Whatever a kept dangling object reaches is now kept, of any type, as git's prune keeps what a recent object reaches.
+- **`fsck --prune` ran beside fetches and pushes (X2b).** Under the shared lock it deleted objects that had arrived but that no ref named yet. It now takes the store lock exclusively, as `sit gc` does, and refuses while a command or a request is in progress. **Partly fixed:** a served push spans requests; a receive-side connectivity check is roadmapped for 1.13.2.
+- **An unreadable ref was not a root (L2).** A branch, stash ref, refs directory or reflog that existed but could not be read was taken as absent, and `--prune-now` deleted what it named. The roots are now found by `lstat`. One that exists and cannot be read is named on stderr, and `--prune` refuses while there is one. That covers a reflog past `read_file_heap`'s 64 MiB too (L5). The MERGE_HEAD / CHERRY_PICK_HEAD / REVERT_HEAD / REBASE_ORIG guards ask `lstat` as well.
+- **`sit stash` overwrote an edit it could not read (L3).** A tracked file the user could not read was recorded as deleted, then HEAD's copy replaced it. Presence is now `lstat`'s answer, so 1.6.4's "cannot save … — nothing stashed" refusal runs.
+- **gc deleted the only good copies of a pack's objects (P1).** When gc produced a pack named like one already there, it kept that pair unverified and deleted its own. An `.idx` whose `.pack` was gone, or a pack damaged beside good rows, lost every object in it. gc now renames its verified pair over the old one.
+- **An unreadable `.sit/refs/stash` was "no stash entries" (L4).** The next `sit stash` then replaced it. Push, list and pop now refuse.
+- **`reflog expire` / `delete` lost concurrent appends (L6).** An append waiting on the log's lock wrote into the file the rewrite renamed away: 30 of 150 entries were lost in a stress run. `sf_append_locked` is now sit's own, and checks that the locked file is still the one at the path. 150 of 150 kept.
+
+### Fixed — serving
+
+- **An evicted repository was served from its old pack list (S1 / P2).** Past 64 repositories, one evicted, then gc'd, answered 404 for its packed objects, and clones failed until a restart. Every store session now compares the store file's identity with the last session's, handle or not, and forgets that repository's pack list on a change.
+- **One repository's lock stalled the whole server (X6).** The loop waited on the locked repository: 3.7 s for an unrelated repository's request, under a 4 s lock. Under `--repos` a repository whose store a gc holds now answers 503 at once.
+- **Packs and refs linked in from elsewhere were served (S4).** A served repository's `.sit/packs/*`, `refs/heads/*` or `refs/heads` itself linked into another repository published that one's history. `sit_packs` now lists regular files only. The refs walk enters only real directories, and follows a ref link only to a regular file inside the refs tree through real directories.
+- **A file:// remote's lock could hang a clone (P5).** It was waited on for ever, and a FIFO raced in after the `lstat` hung the open. It is now opened non-blocking and checked on the descriptor, and waited on for 60 s, then refused.
+- **On agnos a command started during gc ran without the lock (P11).** flock cannot block there. The wait now polls.
+- **One `--require-auth` token authorizes pushes to every repository a `--repos` server serves (X7).** This was never written down. ADR 0017 and the guide now say so.
+
+### Fixed — correctness
+
+- **`sit log` and `sit show` followed a merge's last parent (G3).** The mainline vanished from `log`, and `show` diffed a merge against the merged-in branch. `parse_commit_body`'s single-parent slot is now the first parent. Only those two commands read it.
+- **A stale MERGE_MSG titled a later merge (L7).** It was left behind by a merge abandoned by removing MERGE_HEAD. A conflict stop without `-m` now clears it, and so does every commit.
+- **`sit stash pop` on an unborn branch segfaulted (L8, 1.8.0).** It is now refused, and the entry kept.
+- **In git mode `@{<time>}` skipped a reflog line with no message (L9).** git omits the tab when the message is empty.
+- **`sit show` printed a gitlink's commit object as file content (G6).** It now prints `Subproject commit <id>`, as git does.
+- **gc's refusal printed garbage for the object's id (P3)**, read from a stack frame that was gone.
+- **gc left a `.pack` without its `.idx` when killed between the two (P4).** No later gc saw it. gc now removes any pack file without a regular-file partner.
+- **gc reported write failures as objects that "do not verify" (P8).**
+
+### Fixed — memory and time
+
+- **`sit add` of many paths (L10).** Argument scanning was quadratic: 9.9 s for 10,000 paths, now 0.49 s. Every file's bytes and two working buffers per object were kept until exit: 40 × 15 MB files peaked at 1,785 MB, now 52 MB. `write_typed_object`'s buffers are freelist memory now, for every command. **Partly fixed:** the per-row index update remains, roadmapped with 1.13.0's `add <dir>`.
+- **Every `sit_repo_open` in git mode kept `.git/config` and the alternates file (G5).** 300,000 missing alternates cost 13.5 MB and as many warnings per open. They are now freelist reads, and at most 64 alternates lines are looked at.
+- **Every packed-object lookup asked every pack (P6).** The pack that answered last is now asked first, as git mode's reader does. **Partly fixed:** a store of one object per pack is still quadratic.
+- **The alternates warning printed a repository's bytes raw (G2 / X5).** `eprint3` now writes its middle argument display-safe, so every caller's message is safe: nearly all of them pass a path or name from outside.
+
+### Changed — closeout
+
+- **One commit builder (K2).** `build_commit_signed`, `build_merge_commit_signed` and `build_octopus_commit` were three copies of the same 55 lines, and had drifted. Two would have written an unsigned commit if signing failed; signing cannot fail today, but a commit asked to be signed must never be written unsigned. The octopus copy doubled a message's trailing newline. All three now call `build_commit_object`. Every commit and tag body is byte-identical to 1.12.1's, except an octopus message ending in a newline.
+- **One identity (K1).** Commits, tags and the reflog share `commit_ident`. The reflog took the identity raw, so `<` or `>` in a name made a person field the commit never had.
+- **Dead code:** `index_upsert`, without callers since 1.12.1, is removed. The floor unreachable from `main` is 22 functions:
+  - the public `sit_*` API and its helpers and resets (`_api_enter` / `_api_leave`, `_sit_*_in`, `store_repo_reset`, `index_db_reset`, `_git_objdirs_reset`, `_dbc_reset`, `_git_pack_forget_last`);
+  - the `build_commit` / `build_merge_commit` wrappers;
+  - `is_ignored` and `_git_apply_delta`;
+  - `sf_read_all` and `sf_stat`.
+- **A stale doc comment above `cmd_show`, and an orphaned one in `index.cyr`, are fixed.** The roadmap's line pins are re-checked: 19 had moved, and `add -f`'s no longer applies (1.12.1 takes it anywhere).
+
+### Deferred (roadmap)
+
+- **1.13.2 (hardening):**
+  - the `openat`-relative `--repos` walk (S3's remaining race);
+  - a connectivity check before a served ref moves (X2c);
+  - reflogs past 64 MiB (L5);
+  - a lower tree-expansion ceiling for status (G4).
+- **1.13.0:** upper-case hex ids (G7) and bare `@{N}` (G8), with the resolver work. **1.15.1:** gc's per-commit memory (P9), a depth-aware delta base cache (P10), and one object per pack (P6's remainder).
+- **Upstream asks**, on sit's roadmap and not yet filed:
+  - patra: free the WAL path `patra_open` keeps, about 4.4 KB per reopen under `--repos` (S5); open its files `O_CLOEXEC` (P7);
+  - cmdit: completion scripts that keep file names whole (L11).
+
+### Docs
+
+- ADR 0017 gains a 1.12.2 amendment (re-checks, 503, the token's scope, why eviction keeps the mappings of live packs: 2 per packed repository) and ADR 0016 one (the same-name pack, orphan sweep). Architecture 008 describes the polling, bounded waits and `--prune`'s lock, and architecture 007 the four new cases of its rule.
+- CLAUDE.md gains two rules: worktree reads ask `wt_readable`, and a name derived from outside data is checked every time it is used. The guide covers the 503, the token's scope, clone naming, symlinked directories in status, and first-parent `log`.
+
+### Performance
+
+DCE builds, cyrius 6.7.15, a quiet host (load about 3 on 16 cores, the first since 1.7.x). Snapshot and CSV: [`docs/benchmarks/2026-10-20-v1.12.2.md`](docs/benchmarks/2026-10-20-v1.12.2.md).
+
+| operation, CPU ms (min of 9 alternating runs) | 1.7.6 | 1.11.0 | 1.12.1 | 1.12.2 |
+|---|---:|---:|---:|---:|
+| add ×100 | 100.8 | 110.4 | 111.3 | 112.2 |
+| commit | 1.5 | 1.5 | 1.6 | 1.5 |
+| status, 200 files | 5.5 | 5.6 | 5.7 | 5.7 |
+| log --oneline, 300 commits | 23.6 | 23.9 | 24.2 | 23.8 |
+| checkout 100 files, there and back | 66.4 | 68.3 | 68.6 | 67.8 |
+| clone, 100 commits | 44.0 | 45.1 | 45.4 | 45.0 |
+| fsck, 100 commits | 43.3 | 42.9 | 43.3 | 42.6 |
+
+- **1.12.1 → 1.12.2:** no path got slower.
+- **Since the last closeout:** only `add` moved beyond noise, by about 0.11 ms per invocation. All of it had arrived by 1.10.1: 1.9.0's cmdit dispatch, then 1.10.0's store lock.
+- **The 1.11.0 table, re-taken here on a quiet host, holds no change beyond −2.2% … +1.6%.** Its −23% on `status` was the host.
+- **`--repos` re-checks:** within the noise of server CPU per request: `GET /refs` +0.0 / +12.5 µs over two runs at load 13–15, against a clock resolution of 2.5 µs.
+- **Micro-benchmarks:** no regression against 1.7.6. Code unchanged since then moved by −1% to −22% between alternating runs, which is the noise floor at load 3–12.
+
+### Tests
+
+- **Unit, 681 → 704:**
+  - `test_1122_closeout` covers `name_spoofs_dotdir`, clone naming and reserved targets, and reflog lines with no tab or with CRLF.
+  - The serve refs walk lists an in-tree ref link, but not one that leaves the tree: absolutely, by `..`, or through a linked directory.
+  - The first-parent slot is now asserted as the first parent.
+- **Integration, 684 → 731 (section 44).** 36 of its 47 assertions fail on 1.12.1. It covers:
+  - clone naming;
+  - status and diff under a symlinked directory, on both backends;
+  - the alternates warning and its line cap;
+  - prune keeping an old parent, and refusing while the store is open elsewhere;
+  - an unreadable ref, an unreadable edited file, an unreadable stash ref (each skipped as root);
+  - MERGE_MSG;
+  - pop on an unborn branch;
+  - first-parent `log` and `show`;
+  - a gitlink in `show`;
+  - a git reflog line with no message;
+  - a 66-repository `--repos` server through eviction plus gc, a symlink swap, linked packs, refs and `refs/heads`, and a held lock;
+  - gc over an `.idx` whose `.pack` is gone, and the sweep of a lone `.pack` or `.idx`.
+- **Fuzz, 23 → 24 targets:** `fuzz_clone_names` drives clone naming and the reserved-target check over paths dense in dots, slashes and the letters of `.git` / `.sit` / `.ssh`, and `_reflog_line_ts` over random lines.
+
 ## [1.12.1] — 2026-10-20 — `sit add` takes every path it is given
 
 ### Fixed
