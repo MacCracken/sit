@@ -100,3 +100,8 @@ stdlib = [
     "sigil",
     "patra",
 ]
+
+[deps.cmdit]
+git = "https://github.com/MacCracken/cmdit.git"
+tag = "1.4.0"
+modules = ["dist/cmdit.cyr"]

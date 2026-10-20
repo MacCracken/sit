@@ -2152,6 +2152,51 @@ else
   echo "  (skipped 37: python3 not available)"
 fi
 
+# ── 38. 1.9.0 top-level CLI through cmdit ────────────────────────────
+# cmdit identifies the command; every argument after it still reaches the
+# command untouched. New: --help / -h (stdout, exit 0), --version / -V, and
+# `completions`. Usage errors keep their text and exit 1.
+hr "1.9.0 top-level CLI (cmdit)"
+R="$WORK/cli190"; mkdir -p "$R"; cd "$R"
+HOUT=$("$SIT" --help 2>/dev/null); HRC=$?
+assert_eq "$HRC" "0" "38a: --help exits 0"
+assert_contains "$HOUT" "commands:" "38a: and prints the command table on stdout"
+assert_eq "$("$SIT" --help 2>&1 >/dev/null)" "" "38a: with nothing on stderr"
+assert_eq "$("$SIT" -h 2>/dev/null)" "$HOUT" "38a: -h is the same"
+assert_eq "$("$SIT" --help status 2>/dev/null)" "$HOUT" "38a: --help before a command still means help"
+VER=$(tr -d '[:space:]' < "$ROOT/VERSION")
+assert_eq "$("$SIT" --version)" "sit $VER" "38b: --version prints 'sit <VERSION>'"
+assert_eq "$("$SIT" -V)" "sit $VER" "38b: -V is the same"
+"$SIT" bogus >/dev/null 2>&1; assert_eq "$?" "1" "38c: an unknown command exits 1"
+assert_eq "$("$SIT" bogus 2>&1 | head -1)" "sit: unknown command" "38c: with the same first line as before"
+"$SIT" >/dev/null 2>&1; assert_eq "$?" "1" "38c: no command prints the table and exits 1"
+[ -z "$("$SIT" 2>/dev/null)" ] && ok || bad "38c: the no-command table goes to stderr"
+"$SIT" -x status >/dev/null 2>&1; assert_eq "$?" "1" "38c: an unknown option before the command is a usage error"
+assert_eq "$("$SIT" -- status 2>&1 | head -1)" "sit: unknown command" "38c: a '--' before the command does not shift its arguments"
+"$SIT" init >/dev/null; echo a > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m one >/dev/null
+assert_contains "$("$SIT" status --version 2>&1)" "On branch" "38d: flags after the command reach the command"
+assert_contains "$("$SIT" log --oneline)" "one" "38d: as do its own flags"
+for sh in bash zsh fish; do
+  COUT=$("$SIT" completions $sh 2>/dev/null); CRC=$?
+  assert_eq "$CRC" "0" "38e: completions $sh"
+  assert_contains "$COUT" "checkout" "38e: the $sh script names the commands"
+done
+"$SIT" completions tcsh >/dev/null 2>&1; assert_eq "$?" "1" "38e: an unknown shell is a usage error"
+"$SIT" completions >/dev/null 2>&1; assert_eq "$?" "1" "38e: and so is no shell"
+"$SIT" completions bash > "$R/sit.bash"; bash -n "$R/sit.bash"; assert_eq "$?" "0" "38e: the bash script parses"
+if command -v zsh >/dev/null 2>&1; then
+  "$SIT" completions zsh > "$R/_sit"; zsh -n "$R/_sit"; assert_eq "$?" "0" "38e: the zsh script parses"
+fi
+if command -v fish >/dev/null 2>&1; then
+  "$SIT" completions fish > "$R/sit.fish"; fish -n "$R/sit.fish"; assert_eq "$?" "0" "38e: the fish script parses"
+fi
+# 38f: the usage table, the verb table and the completions cannot drift — every
+# command the table lists completes, and every completed command is listed.
+TABLE=$("$SIT" --help | sed -n '/^commands:/,/^$/p' | awk 'NR>1 && /^  [a-z]/{print $1}' | sort -u | tr '\n' ' ')
+COMPL=$("$SIT" completions bash | sed -n "s/^ *local verbs='\(.*\)'/\1/p" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+assert_eq "$TABLE" "$COMPL" "38f: the usage table and the completion verbs list the same commands"
+assert_eq "$(printf '%s' "$COMPL" | wc -w | tr -d ' ')" "36" "38f: 36 commands"
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

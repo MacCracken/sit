@@ -469,6 +469,8 @@ Simplification vs git (documented in `src/index.cyr`): a non-segment `**` (e.g. 
 - `sit merge -S <branch>` — signed merge commit (same ed25519 flow as `sit commit -S`)
 - `sit cat-file <hash>` — emit object content to stdout; supports 4-char hash prefixes
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
+- `sit --help` / `-h` — the command list, on stdout (exit 0); `sit --version` / `-V` — `sit <version>` (1.9.0)
+- `sit completions <bash|zsh|fish>` — print a shell completion script for sit's commands (1.9.0). For example `sit completions bash > ~/.local/share/bash-completion/completions/sit`, `sit completions zsh > ~/.zfunc/_sit` (with `~/.zfunc` on `fpath`), or `sit completions fish > ~/.config/fish/completions/sit.fish`
 - **Read an existing git repository (read-only, 1.2.0)** — point sit at a directory with a `.git/` (no `.sit/`) and it transparently opens the git store: `sit cat-file` / `sit owl-file` read git objects — loose *and* packed (packfiles decoded via `.idx` v2 binary search + a first-party OFS/REF delta interpreter), SHA-1 or SHA-256, refs resolved from `HEAD` / `refs/` / `packed-refs`. The `dist/sit.cyr` **library API** (`sit_diff_path`, `sit_repo_branch`, `sit_repo_status`) additionally reports branch / status / diff for consumers like owl + thoth. Read-only — no `.git/` write-back; sit stays `.sit/`-native for its own repos. Modules `src/git_read.cyr` + `src/git_pack.cyr`; see [ADR 0011](../adr/0011-git-read-mode.md).
 
 ## What doesn't yet

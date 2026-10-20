@@ -18,105 +18,6 @@ Each item ships under the usual test / fuzz / poison / bench gates.
 
 ---
 
-## 1.9.0 — CLI parsing via cmdit (minor)
-
-Checked against **cmdit 1.4.0** (its own pin is cyrius 6.7.9); its `dist/cmdit.cyr` compiles on sit's toolchain. Take the latest cmdit tag when the slot opens.
-
-**Why it's worth it, and why it's modest.** sit has the most hand-rolled CLI of the tier-2 verb tools: 35 commands and ~150 `argc()` / `argv()` / `argv_heap()` sites in 17 `src/` files. But it has **no global flags**, so cmdit's before-or-after-verb fix buys it nothing. The gain is:
-- one verb table
-- `--help` and `--version` (new surface, hence a minor)
-- completions
-- uniform errors
-
-**Hand-rolled today**
-
-- **Top-level dispatch:** `src/main.cyr:105-139` is `streq(cmd, …)` over 35 commands, with no aliases.
-  - No args → `print_usage` (`main.cyr:50-92`, stderr) and exit 1. An unknown command prints "sit: unknown command" plus usage and exits 1.
-  - There is no `--help` / `--version`, and every usage error exits **1**.
-- **Fixed-index flags.** `cmd_*` read `argv(n)` by fixed index, and most flags count only at `argv(2)`:
-
-  | flag | location |
-  |---|---|
-  | `add -f` | `index.cyr:17` |
-  | `rm --cached` | `index.cyr:774` |
-  | `reset --hard` | `index.cyr:663` |
-  | `checkout -b` | `refs.cyr:771` |
-  | `branch -d` | `refs.cyr:653` |
-  | `tag -d` / `-a` / `-s` | `refs.cyr:473,515,517` |
-  | `merge --abort` | `merge.cyr:732`; `-S` / `-m <msg>` are scanned anywhere (`cmd_merge`'s argument loop) |
-  | `rebase --abort` / `--continue` | `rebase.cyr:257,292` |
-  | `config --global` | `config.cyr:360` |
-- **Option-shaped names are refused** where a name is created (`ref_name_is_option`, `refs.cyr`) and where `commit` takes a bare message (`commit.cyr`); a cmdit table must keep those refusals.
-- **Scanning loops:**
-
-  | command | function | notes |
-  |---|---|---|
-  | `log` | `cmd_log`, `commit.cyr:1013` | |
-  | `commit -S` / `-m` | `cmd_commit`, `commit.cyr:1168` | with no message, a merge's saved `-m` (`MERGE_MSG`) |
-  | `reflog -n` | `cmd_reflog`, `reflog.cyr:399` | a missing value is ignored; `show` / `expire` / `delete` sub-commands |
-  | `fsck --prune` / `--prune-now` | `cmd_fsck`, `object_db.cyr:1186` | everything else is ignored |
-  | `clone` | `cmd_clone`, `wire.cyr:1565` | |
-  | `serve` | `cmd_serve`, `serve.cyr:1602` | `<repo>` fixed at `argv(2)` |
-  | `diff` / `show` | `diff.cyr:1058,1336` | |
-- **Sub-commands:**
-  - `stash push | list | pop | drop` (default push): `cmd_stash`, `history.cyr:587`.
-  - `key generate | show`: `cmd_key`, `sign.cyr:293`.
-  - `remote add | list | remove` (default list): `cmd_remote`, `wire.cyr:1287`.
-  - `reflog [show] | expire | delete` (default show): `cmd_reflog`, `reflog.cyr:399`.
-  - The `getenv` reads (`SIT_AUTHOR_*`, `SIT_OWL`, `HOME`, …) are not flag fallbacks and stay.
-
-**Placement constraint.**
-- Every `cmd_*` is in a `[lib]` module and ships in the bundles: `dist/sit.cyr` has 40 `fn cmd_` and `dist/sit-read.cyr` has 22.
-- So `cmdit_*` calls must stay out of `[lib]` / `[lib.read]`. Put them in `src/main.cyr` or a new `src/cli.cyr` that neither profile lists, or owl and thoth inherit an unresolved dependency.
-- That is also why a `[deps.cmdit]` git block is safe despite [ADR 0012](../adr/0012-deps-pinned-through-the-toolchain.md). The ADR covers the stdlib-folded modules; cmdit is not folded, and `distlib` leaving it out of `dist/sit.deps` is harmless when no bundled module calls it.
-
-**Step 1 — top level only (no `cmd_*` or dist change)**
-
-- **Dispatch:** 35 `cmdit_verb` rows plus `cmdit_dispatch` in `main.cyr`. Switch on `cmdit_verb_matched` and call the existing `cmd_*()`.
-  - Handlers still index raw argv, so check the verb is `argv(1)`: a pre-verb `--` (consumed by cmdit) would shift every index.
-- **Help:** `CMDIT_HELP` keeps `print_usage`. Generated help has no synopsis column, and named-positional help is on cmdit's v2 backlog.
-- **Version:** `CMDIT_VERSION` → `cmdit_version(h, sit_version_string())` (`src/version.cyr:12`).
-- **Unknown verb:** `cmdit_error(h) == CMDIT_ERR_UNKNOWN_VERB`, today's text, exit 1.
-- **Optional:** a `completions` verb via `cmdit_completions`, as stiva does.
-
-**Step 2 — per-command handles (only if wanted)**
-
-- **Parsing:** parse each command in `cli.cyr` (a child handle plus `cmdit_parse_verb`), pass the values into `cmd_*`, and regenerate both bundles.
-
-  | kind | flags |
-  |---|---|
-  | bools | `-f --cached -b -a -s -S --abort --continue --global --list --oneline --graph --staged --stat --prune --prune-now --force-absolute --stdio --tls --require-auth` |
-  | strings | `-d -m --hard --unset --listen --token --cert --key --expire=` |
-  | ints | `-n`, `--depth` (`cmdit_range` ≥ 1) |
-
-  stash, key, remote and reflog become nested re-entry (`cmdit_dispatch_argv` on `cmdit_verb_argc` / `_argv`), each keeping its own unknown-sub-command text.
-- **Gap, blocking diff/show only.** `-U<N>` is an *attached* short value, and cmdit rejects `-U3` as `CMDIT_ERR_BUNDLED`.
-  - It is pinned by `tests/integration/run.sh:475,480` (`show -U0`, `show -U4611686018427387904`) and CI's "diff -U<N>" smoke (`ci.yml:399`).
-  - Keep diff/show hand-rolled, or strip `-U*` before `cmdit_parse_verb`.
-  - cmdit's roadmap already records sit's `-U<N>` as demand for an opt-in "attached short value" (its won't-ship-without-cause list).
-- **Caller-side rules (not gaps):**
-  - serve's `--stdio` / `--listen` and `--tls` / `--stdio` exclusions, and `--tls` needing `--cert` / `--key` (`serve.cyr:1693-1738`)
-  - `merge` taking `-S` / `-m <msg>` before or after its branches
-  - config's `--list` / `--unset` / `<key>` exclusivity
-- **Decide, don't drift:**
-  - Dash-leading paths and messages will need `--`.
-  - `atoi` junk (`-n x`) becomes an int error.
-  - Arguments ignored today (fsck, reflog, extras) become errors.
-- **`sit serve <repo> --stdio` is a cross-version contract.** The SSH client builds exactly that remote command line (`wire_ssh.cyr:408`), so it must keep parsing byte for byte.
-
-**cyrius.cyml, tests, identity**
-
-- **Deps:** there is no stdlib `flags` module to drop, and `args` + `io` are already in `[deps] stdlib`:
-
-  ```
-  [deps.cmdit]
-  git = "https://github.com/MacCracken/cmdit.git"
-  tag = "<latest>"
-  modules = ["dist/cmdit.cyr"]
-  ```
-- **Tests:** `tests/sit.tcyr` / `tests/sit.fcyr` don't touch CLI parsing. The bar is `tests/integration/run.sh` plus CI's smoke steps (and `scripts/benchmark.sh`'s invocations), with stdout / stderr byte-identical.
-- **argv safety:** `lib/args.cyr` (`args_init` at `:167-173`) reads the command line into a heap buffer, so `cmdit_argv`'s stored pointers are safe. The old stack-buffer hazard ([architecture 001](../architecture/001-args-stack-buffer-lifetime.md)) no longer applies.
-
 ## 1.10.0 — storage: pack bundles + `gc` (minor)
 
 The largest measured gap sit has. Measured 2026-08-20 at 1,600 commits, both sides verified:
@@ -157,6 +58,64 @@ Wanted, not yet committed to a release. Each earns its own minor when its time c
 
 - **A commit-parent cache (commit-graph).** Every history walk reads each commit object afresh, about 75 µs apiece. That makes whole-ancestry walks cost about 150 ms per 2,000 commits: `find_merge_base` on every merge, `rebase`'s pending set, and `describe` when a merge lies between the commit and its nearest tag. git keeps a commit-graph file for the same reason. A parent table in `objects.patra`, filled on write and backfilled once, would cut the walks to table reads. Measure `merge-base` / `describe` / `rebase` on a 100k-commit fixture first.
 - **Hooks** (`pre-commit`, `pre-push`, …), if a consumer asks.
+- **Per-command parsing through cmdit (ADR 0015's step 2), only if wanted.** 1.9.0 dispatches the top level through cmdit; each `cmd_*` still reads its own arguments by position. Moving them onto cmdit handles would give per-command `--help` and uniform flag errors, at the cost of changing how 35 commands read their arguments. The calls must stay in `src/main.cyr` or a new `src/cli.cyr` outside both `[lib]` profiles (the bundles ship every `cmd_*`). What is hand-rolled today:
+
+  - **Fixed-index flags.** `cmd_*` read `argv(n)` by fixed index, and most flags count only at `argv(2)`:
+  
+    | flag | location |
+    |---|---|
+    | `add -f` | `index.cyr:17` |
+    | `rm --cached` | `index.cyr:774` |
+    | `reset --hard` | `index.cyr:663` |
+    | `checkout -b` | `refs.cyr:771` |
+    | `branch -d` | `refs.cyr:653` |
+    | `tag -d` / `-a` / `-s` | `refs.cyr:473,515,517` |
+    | `merge --abort` | `merge.cyr:732`; `-S` / `-m <msg>` are scanned anywhere (`cmd_merge`'s argument loop) |
+    | `rebase --abort` / `--continue` | `rebase.cyr:257,292` |
+    | `config --global` | `config.cyr:360` |
+  - **Option-shaped names are refused** where a name is created (`ref_name_is_option`, `refs.cyr`) and where `commit` takes a bare message (`commit.cyr`); a cmdit table must keep those refusals.
+  - **Scanning loops:**
+  
+    | command | function | notes |
+    |---|---|---|
+    | `log` | `cmd_log`, `commit.cyr:1013` | |
+    | `commit -S` / `-m` | `cmd_commit`, `commit.cyr:1168` | with no message, a merge's saved `-m` (`MERGE_MSG`) |
+    | `reflog -n` | `cmd_reflog`, `reflog.cyr:399` | a missing value is ignored; `show` / `expire` / `delete` sub-commands |
+    | `fsck --prune` / `--prune-now` | `cmd_fsck`, `object_db.cyr:1186` | everything else is ignored |
+    | `clone` | `cmd_clone`, `wire.cyr:1565` | |
+    | `serve` | `cmd_serve`, `serve.cyr:1602` | `<repo>` fixed at `argv(2)` |
+    | `diff` / `show` | `diff.cyr:1058,1336` | |
+  - **Sub-commands:**
+    - `stash push | list | pop | drop` (default push): `cmd_stash`, `history.cyr:587`.
+    - `key generate | show`: `cmd_key`, `sign.cyr:293`.
+    - `remote add | list | remove` (default list): `cmd_remote`, `wire.cyr:1287`.
+    - `reflog [show] | expire | delete` (default show): `cmd_reflog`, `reflog.cyr:399`.
+    - The `getenv` reads (`SIT_AUTHOR_*`, `SIT_OWL`, `HOME`, …) are not flag fallbacks and stay.
+
+  The plan:
+
+  - **Parsing:** parse each command in `cli.cyr` (a child handle plus `cmdit_parse_verb`), pass the values into `cmd_*`, and regenerate both bundles.
+  
+    | kind | flags |
+    |---|---|
+    | bools | `-f --cached -b -a -s -S --abort --continue --global --list --oneline --graph --staged --stat --prune --prune-now --force-absolute --stdio --tls --require-auth` |
+    | strings | `-d -m --hard --unset --listen --token --cert --key --expire=` |
+    | ints | `-n`, `--depth` (`cmdit_range` ≥ 1) |
+  
+    stash, key, remote and reflog become nested re-entry (`cmdit_dispatch_argv` on `cmdit_verb_argc` / `_argv`), each keeping its own unknown-sub-command text.
+  - **Gap, blocking diff/show only.** `-U<N>` is an *attached* short value, and cmdit rejects `-U3` as `CMDIT_ERR_BUNDLED`.
+    - It is pinned by `tests/integration/run.sh:475,480` (`show -U0`, `show -U4611686018427387904`) and CI's "diff -U<N>" smoke (`ci.yml:399`).
+    - Keep diff/show hand-rolled, or strip `-U*` before `cmdit_parse_verb`.
+    - cmdit's roadmap already records sit's `-U<N>` as demand for an opt-in "attached short value" (its won't-ship-without-cause list).
+  - **Caller-side rules (not gaps):**
+    - serve's `--stdio` / `--listen` and `--tls` / `--stdio` exclusions, and `--tls` needing `--cert` / `--key` (`serve.cyr:1693-1738`)
+    - `merge` taking `-S` / `-m <msg>` before or after its branches
+    - config's `--list` / `--unset` / `<key>` exclusivity
+  - **Decide, don't drift:**
+    - Dash-leading paths and messages will need `--`.
+    - `atoi` junk (`-n x`) becomes an int error.
+    - Arguments ignored today (fsck, reflog, extras) become errors.
+  - **`sit serve <repo> --stdio` is a cross-version contract.** The SSH client builds exactly that remote command line (`wire_ssh.cyr:408`), so it must keep parsing byte for byte.
 - **An arena per public-API call (R1, rest).** `sit_repo_status` frees every blob and file it compares; what it still keeps, ~94 KB per call on 200 files, is the flattened HEAD tree, the worktree listing and the result records, all on the bump heap. Running each call on an arena rewound at entry, as `sit serve` does per request, would close it — but the returned vec is the caller's, so the records must be copied out or the contract changed (ADR 0009). Measure with `tests/integration/api_heap_probe.cyr`.
 
 ---

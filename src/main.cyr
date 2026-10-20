@@ -46,101 +46,216 @@ fn cmd_init() {
     }
     return 0;
 }
-# Print the command table to stderr.
-fn print_usage() {
-    eprintln("usage: sit <command> [<args>]");
-    eprintln("");
-    eprintln("commands:");
-    eprintln("  init                    create an empty sit repository");
-    eprintln("  add [-f] <path>         hash and store a file as a blob object");
-    eprintln("  rm [--cached] <path>    remove a tracked file from working tree and index");
-    eprintln("  mv <src> <dst>          rename a tracked file in the working tree and index");
-    eprintln("  branch [-d <name>|<name>]  list / create / delete branch (-d deletes)");
-    eprintln("  checkout [-b] <branch>  switch to <branch>, optionally creating it first");
-    eprintln("  tag [-a|-s] [-d <name>|<name> [-m <msg>] [<commit>]]  list / create / delete tag");
-    eprintln("  merge [-S] [-m <msg>] <branch>...  merge into HEAD (fast-forward, 3-way, or octopus)");
-    eprintln("  cherry-pick <commit>    apply <commit>'s change onto HEAD as a new commit");
-    eprintln("  revert <commit>         apply the inverse of <commit> as a new commit");
-    eprintln("  rebase <upstream>       replay this branch onto <upstream> (--continue|--abort)");
-    eprintln("  stash [push|list|pop|drop]  save / restore working-tree changes");
-    eprintln("  merge-base <a> <b>      print the lowest common ancestor of two commits");
-    eprintln("  describe [<commit>]     name a commit by the nearest tag (tag-N-g<short>)");
-    eprintln("  reset <path> | --hard <ref>  unstage a path, or move HEAD to <ref>");
-    eprintln("  config [--global] <key> [<value>]  read or write a config value");
-    eprintln("  fsck [--prune]          verify object integrity; --prune removes dangling objects");
-    eprintln("  key generate | show     manage the local ed25519 signing key (~/.sit/)");
-    eprintln("  verify-commit [<hash>]  verify a commit's sitsig signature (defaults HEAD)");
-    eprintln("  verify-tag <tag>        verify an annotated tag's sitsig signature");
-    eprintln("  remote add|list|remove  manage named remotes (file/http/https/ssh)");
-    eprintln("  fetch <remote> [<ref>]  copy objects + ref from a remote (no merge)");
-    eprintln("  pull <remote> [<ref>]   fetch + fast-forward merge (diverged → use merge)");
-    eprintln("  push <remote> [<ref>]   push HEAD's branch to a remote (fast-forward only)");
-    eprintln("  clone [--depth <n>] <url> [<dir>]  init + remote add origin + fetch + checkout");
-    eprintln("  serve <repo> [--stdio|--listen 127.0.0.1:<port>] [--tls]  sit/v1 daemon (read + push)");
-    eprintln("  commit [-S] [-m] <msg>  record staged changes as a new commit (-S to sign)");
-    eprintln("  log [--oneline] [--graph]  show commit history from HEAD");
-    eprintln("  reflog [show] [-n <count>] [<ref>]  show ref movement history (default HEAD)");
-    eprintln("  reflog expire [--expire=<when>] (--all | <ref>...) | reflog delete <ref>@{N}");
-    eprintln("  status                  show working tree status");
-    eprintln("  diff [--staged|HEAD]    show unstaged / staged / working-vs-HEAD diffs");
-    eprintln("  show [--stat] [<hash>]  show a single commit (full diff or per-file stat)");
-    eprintln("  blame <path>            show the commit that last touched each line");
-    eprintln("  cat-file <hash>         emit object content to stdout (plumbing)");
-    eprintln("  owl-file <hash>         view object through owl (bat-like viewer)");
+# Print the command table: to stderr after a usage error, to stdout for
+# `--help` (1.9.0).
+fn print_usage(fd) {
+    _usage_line(fd, "usage: sit <command> [<args>]");
+    _usage_line(fd, "");
+    _usage_line(fd, "commands:");
+    _usage_line(fd, "  init                    create an empty sit repository");
+    _usage_line(fd, "  add [-f] <path>         hash and store a file as a blob object");
+    _usage_line(fd, "  rm [--cached] <path>    remove a tracked file from working tree and index");
+    _usage_line(fd, "  mv <src> <dst>          rename a tracked file in the working tree and index");
+    _usage_line(fd, "  branch [-d <name>|<name>]  list / create / delete branch (-d deletes)");
+    _usage_line(fd, "  checkout [-b] <branch>  switch to <branch>, optionally creating it first");
+    _usage_line(fd, "  tag [-a|-s] [-d <name>|<name> [-m <msg>] [<commit>]]  list / create / delete tag");
+    _usage_line(fd, "  merge [-S] [-m <msg>] <branch>...  merge into HEAD (fast-forward, 3-way, or octopus)");
+    _usage_line(fd, "  cherry-pick <commit>    apply <commit>'s change onto HEAD as a new commit");
+    _usage_line(fd, "  revert <commit>         apply the inverse of <commit> as a new commit");
+    _usage_line(fd, "  rebase <upstream>       replay this branch onto <upstream> (--continue|--abort)");
+    _usage_line(fd, "  stash [push|list|pop|drop]  save / restore working-tree changes");
+    _usage_line(fd, "  merge-base <a> <b>      print the lowest common ancestor of two commits");
+    _usage_line(fd, "  describe [<commit>]     name a commit by the nearest tag (tag-N-g<short>)");
+    _usage_line(fd, "  reset <path> | --hard <ref>  unstage a path, or move HEAD to <ref>");
+    _usage_line(fd, "  config [--global] <key> [<value>]  read or write a config value");
+    _usage_line(fd, "  fsck [--prune]          verify object integrity; --prune removes dangling objects");
+    _usage_line(fd, "  key generate | show     manage the local ed25519 signing key (~/.sit/)");
+    _usage_line(fd, "  verify-commit [<hash>]  verify a commit's sitsig signature (defaults HEAD)");
+    _usage_line(fd, "  verify-tag <tag>        verify an annotated tag's sitsig signature");
+    _usage_line(fd, "  remote add|list|remove  manage named remotes (file/http/https/ssh)");
+    _usage_line(fd, "  fetch <remote> [<ref>]  copy objects + ref from a remote (no merge)");
+    _usage_line(fd, "  pull <remote> [<ref>]   fetch + fast-forward merge (diverged → use merge)");
+    _usage_line(fd, "  push <remote> [<ref>]   push HEAD's branch to a remote (fast-forward only)");
+    _usage_line(fd, "  clone [--depth <n>] <url> [<dir>]  init + remote add origin + fetch + checkout");
+    _usage_line(fd, "  serve <repo> [--stdio|--listen 127.0.0.1:<port>] [--tls]  sit/v1 daemon (read + push)");
+    _usage_line(fd, "  commit [-S] [-m] <msg>  record staged changes as a new commit (-S to sign)");
+    _usage_line(fd, "  log [--oneline] [--graph]  show commit history from HEAD");
+    _usage_line(fd, "  reflog [show] [-n <count>] [<ref>]  show ref movement history (default HEAD)");
+    _usage_line(fd, "  reflog expire [--expire=<when>] (--all | <ref>...) | reflog delete <ref>@{N}");
+    _usage_line(fd, "  status                  show working tree status");
+    _usage_line(fd, "  diff [--staged|HEAD]    show unstaged / staged / working-vs-HEAD diffs");
+    _usage_line(fd, "  show [--stat] [<hash>]  show a single commit (full diff or per-file stat)");
+    _usage_line(fd, "  blame <path>            show the commit that last touched each line");
+    _usage_line(fd, "  cat-file <hash>         emit object content to stdout (plumbing)");
+    _usage_line(fd, "  owl-file <hash>         view object through owl (bat-like viewer)");
+    _usage_line(fd, "  completions <bash|zsh|fish>  print a shell completion script for sit");
+    _usage_line(fd, "");
+    _usage_line(fd, "options:");
+    _usage_line(fd, "  -h, --help              print this list (to stdout)");
+    _usage_line(fd, "  -V, --version           print sit's version");
     return 0;
 }
 
-# Entry point: dispatch argv[1] to its cmd_* handler.
+# One line of the command table, newline-terminated, to `fd`.
+fn _usage_line(fd, s) {
+    var n = strlen(s);
+    if (fd == STDOUT) {
+        stdout_write(s, n);
+        stdout_write("\n", 1);
+        return 0;
+    }
+    syscall(SYS_WRITE, STDERR, s, n);
+    syscall(SYS_WRITE, STDERR, "\n", 1);
+    return 0;
+}
+
+# The command table cmdit dispatches over (1.9.0): one verb per command, in
+# print_usage's order, with print_usage's descriptions (completions show them).
+# sit has no global flags; cmdit adds -h/--help and -V/--version.
+fn _sit_cli() {
+    var h = cmdit_new("sit");
+    cmdit_verb(h, "init", "create an empty sit repository");
+    cmdit_verb(h, "add", "hash and store a file as a blob object");
+    cmdit_verb(h, "rm", "remove a tracked file from working tree and index");
+    cmdit_verb(h, "mv", "rename a tracked file in the working tree and index");
+    cmdit_verb(h, "branch", "list / create / delete branch (-d deletes)");
+    cmdit_verb(h, "checkout", "switch to <branch>, optionally creating it first");
+    cmdit_verb(h, "tag", "list / create / delete tag");
+    cmdit_verb(h, "merge", "merge into HEAD (fast-forward, 3-way, or octopus)");
+    cmdit_verb(h, "cherry-pick", "apply <commit>'s change onto HEAD as a new commit");
+    cmdit_verb(h, "revert", "apply the inverse of <commit> as a new commit");
+    cmdit_verb(h, "rebase", "replay this branch onto <upstream> (--continue|--abort)");
+    cmdit_verb(h, "stash", "save / restore working-tree changes");
+    cmdit_verb(h, "merge-base", "print the lowest common ancestor of two commits");
+    cmdit_verb(h, "describe", "name a commit by the nearest tag (tag-N-g<short>)");
+    cmdit_verb(h, "reset", "unstage a path, or move HEAD to <ref>");
+    cmdit_verb(h, "config", "read or write a config value");
+    cmdit_verb(h, "fsck", "verify object integrity; --prune removes dangling objects");
+    cmdit_verb(h, "key", "manage the local ed25519 signing key (~/.sit/)");
+    cmdit_verb(h, "verify-commit", "verify a commit's sitsig signature (defaults HEAD)");
+    cmdit_verb(h, "verify-tag", "verify an annotated tag's sitsig signature");
+    cmdit_verb(h, "remote", "manage named remotes (file/http/https/ssh)");
+    cmdit_verb(h, "fetch", "copy objects + ref from a remote (no merge)");
+    cmdit_verb(h, "pull", "fetch + fast-forward merge (diverged → use merge)");
+    cmdit_verb(h, "push", "push HEAD's branch to a remote (fast-forward only)");
+    cmdit_verb(h, "clone", "init + remote add origin + fetch + checkout");
+    cmdit_verb(h, "serve", "sit/v1 daemon (read + push)");
+    cmdit_verb(h, "commit", "record staged changes as a new commit (-S to sign)");
+    cmdit_verb(h, "log", "show commit history from HEAD");
+    cmdit_verb(h, "reflog", "show ref movement history (default HEAD)");
+    cmdit_verb(h, "status", "show working tree status");
+    cmdit_verb(h, "diff", "show unstaged / staged / working-vs-HEAD diffs");
+    cmdit_verb(h, "show", "show a single commit (full diff or per-file stat)");
+    cmdit_verb(h, "blame", "show the commit that last touched each line");
+    cmdit_verb(h, "cat-file", "emit object content to stdout (plumbing)");
+    cmdit_verb(h, "owl-file", "view object through owl (bat-like viewer)");
+    cmdit_verb(h, "completions", "print a shell completion script for sit");
+    return h;
+}
+
+# Entry point: cmdit identifies the command (or --help / --version), then
+# argv[1] is dispatched to its cmd_* handler, which reads the rest of argv itself.
+#
+# 1.9.0: through cmdit (ADR 0015). What a command sees is unchanged: every
+# argument after the command name reaches it as before, flags included (cmdit
+# hands anything that is not -h/--help/-V/--version before the command to the
+# command's own scope). New: `sit --help` / `-h` (exit 0, stdout), `sit
+# --version` / `-V`, and `sit completions <shell>`. A usage error still prints
+# "sit: unknown command" and the table to stderr, exit 1.
 fn main() {
     alloc_init();
     args_init();
 
     if (argc() < 2) {
-        print_usage();
+        print_usage(STDERR);
         return 1;
     }
 
+    var h = _sit_cli();
+    var dr = cmdit_dispatch(h);
+    if (dr == CMDIT_HELP) {
+        print_usage(STDOUT);
+        return 0;
+    }
+    if (dr == CMDIT_VERSION) {
+        cmdit_version(h, sit_version_string());
+        return 0;
+    }
+    if (dr != CMDIT_OK) { return _sit_unknown_command(); }
+    var vi = cmdit_verb_matched(h);
+    if (vi < 0) { return _sit_unknown_command(); }
+    # The handlers read argv by position, so the command must be argv[1]: a
+    # pre-command `--` (which cmdit consumes) would shift every index.
     var cmd = argv(1);
+    if (streq(cmd, cmdit_verb_name_at(h, vi)) == 0) { return _sit_unknown_command(); }
 
-    if (streq(cmd, "init")     == 1) { return cmd_init(); }
-    if (streq(cmd, "add")      == 1) { return cmd_add(); }
-    if (streq(cmd, "rm")       == 1) { return cmd_rm(); }
-    if (streq(cmd, "mv")       == 1) { return cmd_mv(); }
-    if (streq(cmd, "branch")   == 1) { return cmd_branch(); }
+    if (streq(cmd, "init") == 1) { return cmd_init(); }
+    if (streq(cmd, "add") == 1) { return cmd_add(); }
+    if (streq(cmd, "rm") == 1) { return cmd_rm(); }
+    if (streq(cmd, "mv") == 1) { return cmd_mv(); }
+    if (streq(cmd, "branch") == 1) { return cmd_branch(); }
     if (streq(cmd, "checkout") == 1) { return cmd_checkout(); }
-    if (streq(cmd, "tag")      == 1) { return cmd_tag(); }
-    if (streq(cmd, "merge")    == 1) { return cmd_merge(); }
+    if (streq(cmd, "tag") == 1) { return cmd_tag(); }
+    if (streq(cmd, "merge") == 1) { return cmd_merge(); }
     if (streq(cmd, "cherry-pick") == 1) { return cmd_cherry_pick(); }
-    if (streq(cmd, "revert")   == 1) { return cmd_revert(); }
-    if (streq(cmd, "stash")    == 1) { return cmd_stash(); }
-    if (streq(cmd, "blame")    == 1) { return cmd_blame(); }
-    if (streq(cmd, "rebase")   == 1) { return cmd_rebase(); }
+    if (streq(cmd, "revert") == 1) { return cmd_revert(); }
+    if (streq(cmd, "stash") == 1) { return cmd_stash(); }
+    if (streq(cmd, "blame") == 1) { return cmd_blame(); }
+    if (streq(cmd, "rebase") == 1) { return cmd_rebase(); }
     if (streq(cmd, "merge-base") == 1) { return cmd_merge_base(); }
-    if (streq(cmd, "reset")    == 1) { return cmd_reset(); }
-    if (streq(cmd, "config")   == 1) { return cmd_config(); }
-    if (streq(cmd, "fsck")     == 1) { return cmd_fsck(); }
-    if (streq(cmd, "key")      == 1) { return cmd_key(); }
+    if (streq(cmd, "reset") == 1) { return cmd_reset(); }
+    if (streq(cmd, "config") == 1) { return cmd_config(); }
+    if (streq(cmd, "fsck") == 1) { return cmd_fsck(); }
+    if (streq(cmd, "key") == 1) { return cmd_key(); }
     if (streq(cmd, "verify-commit") == 1) { return cmd_verify_commit(); }
-    if (streq(cmd, "verify-tag")    == 1) { return cmd_verify_tag(); }
-    if (streq(cmd, "describe")      == 1) { return cmd_describe(); }
-    if (streq(cmd, "remote")   == 1) { return cmd_remote(); }
-    if (streq(cmd, "fetch")    == 1) { return cmd_fetch(); }
-    if (streq(cmd, "pull")     == 1) { return cmd_pull(); }
-    if (streq(cmd, "push")     == 1) { return cmd_push(); }
-    if (streq(cmd, "clone")    == 1) { return cmd_clone(); }
-    if (streq(cmd, "serve")    == 1) { return cmd_serve(); }
-    if (streq(cmd, "commit")   == 1) { return cmd_commit(); }
-    if (streq(cmd, "log")      == 1) { return cmd_log(); }
-    if (streq(cmd, "reflog")   == 1) { return cmd_reflog(); }
-    if (streq(cmd, "status")   == 1) { return cmd_status(); }
-    if (streq(cmd, "diff")     == 1) { return cmd_diff(); }
-    if (streq(cmd, "show")     == 1) { return cmd_show(); }
+    if (streq(cmd, "verify-tag") == 1) { return cmd_verify_tag(); }
+    if (streq(cmd, "describe") == 1) { return cmd_describe(); }
+    if (streq(cmd, "remote") == 1) { return cmd_remote(); }
+    if (streq(cmd, "fetch") == 1) { return cmd_fetch(); }
+    if (streq(cmd, "pull") == 1) { return cmd_pull(); }
+    if (streq(cmd, "push") == 1) { return cmd_push(); }
+    if (streq(cmd, "clone") == 1) { return cmd_clone(); }
+    if (streq(cmd, "serve") == 1) { return cmd_serve(); }
+    if (streq(cmd, "commit") == 1) { return cmd_commit(); }
+    if (streq(cmd, "log") == 1) { return cmd_log(); }
+    if (streq(cmd, "reflog") == 1) { return cmd_reflog(); }
+    if (streq(cmd, "status") == 1) { return cmd_status(); }
+    if (streq(cmd, "diff") == 1) { return cmd_diff(); }
+    if (streq(cmd, "show") == 1) { return cmd_show(); }
     if (streq(cmd, "cat-file") == 1) { return cmd_cat_file(); }
     if (streq(cmd, "owl-file") == 1) { return cmd_owl_file(); }
+    if (streq(cmd, "completions") == 1) { return _cmd_completions(h); }
+    return _sit_unknown_command();
+}
 
+# A usage error: today's text and exit code, unchanged by 1.9.0.
+fn _sit_unknown_command() {
     eprintln("sit: unknown command");
-    print_usage();
+    print_usage(STDERR);
     return 1;
+}
+
+# `sit completions <bash|zsh|fish>` — print cmdit's completion script for the
+# command table (command names and descriptions) to stdout.
+fn _cmd_completions(h) {
+    if (argc() != 3) {
+        eprintln("usage: sit completions <bash|zsh|fish>");
+        return 1;
+    }
+    var shell = argv(2);
+    var ok = 0;
+    if (streq(shell, "bash") == 1) { ok = 1; }
+    if (streq(shell, "zsh") == 1) { ok = 1; }
+    if (streq(shell, "fish") == 1) { ok = 1; }
+    if (ok == 0) {
+        eprintln("usage: sit completions <bash|zsh|fish>");
+        return 1;
+    }
+    if (cmdit_completions(h, shell) != 0) {
+        eprintln("sit: cannot write the completion script");
+        return 1;
+    }
+    return 0;
 }
 
 var r = main();

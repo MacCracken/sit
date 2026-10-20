@@ -44,10 +44,10 @@ jobs:
           echo "CYRIUS_HOME=$HOME/.cyrius" >> "$GITHUB_ENV"
 
       - name: Resolve deps
-        # Stdlib-only as of v1.3.6 — cp the snapshot from install.sh's
-        # $HOME/.cyrius/lib into the project ./lib/ (where cc5's preprocessor
-        # reads from). No `[deps.X]` git crates remain; `cyrius deps` is kept
-        # as a no-op guard. See ci.yml for the full rationale.
+        # cp the stdlib snapshot from install.sh's $HOME/.cyrius/lib into the
+        # project ./lib/ (where cc5's preprocessor reads from), then `cyrius
+        # deps` resolves the one git dependency, cmdit (1.9.0, ADR 0015). See
+        # ci.yml for the full rationale.
         run: |
           mkdir -p lib
           cp -rL "$HOME/.cyrius/lib/"* lib/

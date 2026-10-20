@@ -4,6 +4,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-10-19 — the top-level CLI through cmdit: `--help`, `--version`, shell completions
+
+The 1.9.0 minor. sit's command dispatch moves onto cmdit, the AGNOS argument-parsing distlib ([ADR 0015](docs/adr/0015-cli-dispatch-through-cmdit.md)). What every command does with its arguments is unchanged; the toolchain stays at cyrius 6.7.15.
+
+### Added
+
+- **`sit --help` / `sit -h`** prints the command table on **stdout** and exits 0, including `sit --help <command>`. Until now `--help` was an unknown command.
+- **`sit --version` / `sit -V`** prints `sit <version>` (from `sit_version_string()`, generated from `VERSION`). CI now checks it matches `VERSION`.
+- **`sit completions <bash|zsh|fish>`** prints a completion script for sit's commands, with their descriptions where the shell shows them. Install: `sit completions bash > ~/.local/share/bash-completion/completions/sit`, `sit completions zsh > ~/.zfunc/_sit`, `sit completions fish > ~/.config/fish/completions/sit.fish`. The scripts complete command names, then files. Per-command flags arrive with per-command parsing, which stays optional on the roadmap.
+
+### Changed — dispatch through cmdit, everything after the command unchanged
+
+- `src/main.cyr` registers one cmdit verb per command, with `print_usage`'s descriptions, and calls `cmdit_dispatch`. A matched command runs the same `cmd_*()` as before, which still reads the rest of argv itself. cmdit hands every token after the command that is not one of its own flags to the command, and sit has no global flags, so `sit status --version` or `sit commit --help` reach the command as they did.
+- Usage errors keep their text and exit code: an unknown command, an unknown option before the command (`sit -x status`) and a `--` before the command all print `sit: unknown command` and the table to stderr, exit 1; no arguments prints the table to stderr, exit 1. cmdit's own error text and exit code 2 are not used. The `--` case is a guard: cmdit consumes a pre-command `--`, which would shift every `argv(n)` a handler reads.
+- The usage table gains the `completions` row and an `options:` section for `-h` / `-V`.
+
+### Dependencies
+
+- **cmdit 1.4.0**, sit's one git dependency (`[deps.cmdit]`, pinned by tag). It is called only from `src/main.cyr`, which neither `[lib]` profile lists, so `dist/sit.cyr` and `dist/sit-read.cyr` contain none of it. A new CLAUDE.md rule keeps it that way.
+- `cyrius distlib` now attributes the stdlib leaves cmdit brings (`args`, `alloc`, `string`, `io`, with `vec` / `result`) to cmdit, so the bundles' requires block and `.deps` sidecars no longer list them (`dist/sit.deps` 20 → 14 leaves, `dist/sit-read.deps` 16 → 11). The bundles' consumers compile them against their own stdlib lists: owl (cyrius 6.6.2) builds unchanged and passes its 7 tests, and thoth (6.6.6) builds. A consumer relying on the requires block alone would add those leaves to its `[deps] stdlib`.
+
+### Performance
+
+cmdit costs about 0.05–0.08 ms per invocation, for registering 36 verbs and one dispatch pass. DCE builds, CPU time, minimum of 200 alternating runs: `sit status` 1.178 → 1.262 ms, `sit cat-file HEAD` 0.749 → 0.803 ms.
+
+### Docs
+
+- ADR 0015 records the decision and its boundary (cmdit in `main.cyr` only; per-command parsing not part of it).
+- The roadmap's 1.9.0 slot is done. Its optional second step (each command on its own cmdit handle) moves to unscheduled with its notes, and the next minor is 1.10.0, storage.
+- CI's and the release workflow's "resolve deps" comments described `cyrius deps` as a no-op guard with zero git deps; they now say it resolves cmdit.
+
+### Tests
+
+- **Integration, 479 → 506:** section 38 — `--help` / `-h` on stdout with exit 0 (and `--help <command>`), `--version` / `-V` against `VERSION`, the usage-error cases and their exit code, flags after a command reaching it, every shell's completion script (parsed by `bash -n`, and by `zsh -n` / `fish -n` where installed), and a drift check that the usage table and the completion verbs list the same 36 commands.
+- Unit (591) and fuzz (21 targets) are unchanged; they do not touch CLI parsing.
+
 ## [1.8.0] — 2026-10-19 — history ergonomics: `merge -m`, a three-way `stash pop`, reflog expiry and `@{<date>}`
 
 The 1.8.0 minor: new behaviour on existing commands. No new command, no storage or wire change; the toolchain stays at cyrius 6.7.15.

@@ -47,9 +47,9 @@ jobs:
         # `cyrius update` would also work but is fragile across CI $HOME
         # shapes; the direct cp is exactly what the build needs.
         #
-        # `cyrius deps` is retained as a no-op guard: it exits clean with zero
-        # git deps today, and fails loudly if one is ever re-added without the
-        # lib/ layout to match.
+        # `cyrius deps` resolves the one git dependency, cmdit (1.9.0, ADR
+        # 0015 — the top-level CLI; outside both [lib] profiles), into lib/
+        # at the tag cyrius.cyml pins, and fails loudly if it cannot.
         run: |
           mkdir -p lib
           cp -rL "$HOME/.cyrius/lib/"* lib/
@@ -60,6 +60,8 @@ jobs:
           mkdir -p build
           cyrius build src/main.cyr build/sit
           echo "sit: $(wc -c < build/sit) bytes"
+          # 1.9.0: `sit --version` reports VERSION (through cmdit_version).
+          test "$(./build/sit --version)" = "sit $(tr -d '[:space:]' < VERSION)" || { echo "FAIL: sit --version != VERSION"; exit 1; }
 
       - name: Verify ELF
         run: xxd -l 4 build/sit | grep -q "7f45 4c46"
