@@ -4,6 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.12.1] — 2026-10-20 — `sit add` takes every path it is given
+
+### Fixed
+
+- **`sit add a.txt b.txt` staged `a.txt` and silently ignored `b.txt`.** `cmd_add` read one path, `argv(2)` (or `argv(3)` after `-f`), and every argument after it was dropped without a word, so a user who listed several files believed they were all staged. It now takes every path, in two passes:
+  - Each path is first checked as one path always was: normalised, valid, not ignored (unless `-f`), not through or at a symlink, readable, and under the blob ceiling. If any fails, the command says why, adds "nothing was staged", and writes nothing: no object, no index row.
+  - Then the blobs are written, and every path is staged in **one index transaction** (`index_upsert_many`), so a write that fails part-way stages none either.
+- `-f` may come anywhere on the line (`sit add x.log b.txt -f`). A path given twice, or as `./a.txt` beside `a.txt`, is staged once.
+- A directory is refused by its kind ("is a directory — name its files"). Before, it was refused by accident, with a message that depended on the filesystem: on tmpfs `lseek` failed ("cannot stat file"), and on ext4 it returned a huge size ("file too large"). Adding a directory's files is roadmapped for 1.13.0.
+- The usage line reads `add [-f] <path>...`.
+
+### Tests
+
+- **Integration, 668 → 684:** section 43 covers an unreadable path among good ones and an ignored path among good ones (nothing staged, no object written), a directory, several paths with a duplicate staged once and committed together, `-f` after the paths, and the usage errors. On the 1.12.0 source, 11 of its 16 assertions fail.
+
 ## [1.12.0] — 2026-10-20 — `.git/` CLI parity: status, log, diff, show, reflog, `@{N}`, short ids
 
 The 1.12.0 minor. The read-only commands work on an existing git repository (SHA-1 or SHA-256), checked against git itself, and git trees are read as git wrote them. sit still writes nothing in a git repository. The toolchain stays at cyrius 6.7.15. Amendments to [ADR 0011](docs/adr/0011-git-read-mode.md) and [ADR 0009](docs/adr/0009-public-api-contract.md).

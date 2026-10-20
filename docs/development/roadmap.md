@@ -30,10 +30,6 @@ Each item ships under the usual test / fuzz / poison / bench gates.
 - base-path URLs,
 - `.git/` CLI parity (alternates that point outside the repository; trees read with the checkout rules off).
 
-### 1.12.1 — `sit add` takes every path it is given
-
-`sit add a.txt b.txt` stages `a.txt` and **silently ignores `b.txt`** (verified at 1.12.0): `cmd_add` reads one path, `argv(2)` (or `argv(3)` after `-f`). A user who lists several files believes they are staged. Stage each path in order, through the same validation one path gets today, and refuse the whole command (staging nothing) if any path fails, so a typo in the third path does not leave the first two half-done. `-f` keeps its meaning for every path. Integration: several paths, one bad among them, `-f` with several.
-
 ### 1.12.2 — closeout P(-1) over 1.8.0–1.12.x
 
 The P(-1) pass (CLAUDE.md § P(-1), § Closeout), its findings in `docs/audit/YYYY-MM-DD-audit.md`:
@@ -59,7 +55,7 @@ Gaps every git user hits on day one, all verified at 1.12.0. The commands exist;
 
 - **`<rev>~<n>`, `<rev>^<n>` and `<rev>:<path>`.** None resolve today: `sit log HEAD~1` says "cannot resolve", and `sit cat-file HEAD:a.txt` says "no object matches". Parse them once in the resolver every command uses (`resolve_commit_hash` / `resolve_hash`), on both backends (a `.git/` repository reads the same syntax). `~` follows first parents and `^<n>` the n-th parent. `:` resolves a path in the commit's tree to the blob or tree id. Fuzz the parser; differential against `git rev-parse` in both object formats.
 - **`sit log [<rev>] [--] <path>…`.** Today a path is read as a ref ("cannot resolve 'a.txt'"). Show the commits whose tree changes a given path, against their first parent (git's default, without rename following). It shares the tree walk `blame` already does.
-- **`sit add <dir>` and `sit add .`.** A directory fails with "cannot stat file". Walk it with `list_working_walk` (so `.sitignore` applies, and `-f` overrides it), then stage each file as 1.12.1 stages a list.
+- **`sit add <dir>` and `sit add .`.** A directory is refused ("is a directory — name its files", 1.12.1). Walk it with `list_working_walk` (so `.sitignore` applies, and `-f` overrides it), then stage the files as one `sit add` of several paths does (1.12.1).
 
 ### 1.13.1 — the remaining read commands on `.git/`
 

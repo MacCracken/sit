@@ -53,7 +53,7 @@ fn print_usage(fd) {
     _usage_line(fd, "");
     _usage_line(fd, "commands:");
     _usage_line(fd, "  init                    create an empty sit repository");
-    _usage_line(fd, "  add [-f] <path>         hash and store a file as a blob object");
+    _usage_line(fd, "  add [-f] <path>...      hash and stage files (all of them, or none)");
     _usage_line(fd, "  rm [--cached] <path>    remove a tracked file from working tree and index");
     _usage_line(fd, "  mv <src> <dst>          rename a tracked file in the working tree and index");
     _usage_line(fd, "  branch [-d <name>|<name>]  list / create / delete branch (-d deletes)");
@@ -117,7 +117,7 @@ fn _usage_line(fd, s) {
 fn _sit_cli() {
     var h = cmdit_new("sit");
     cmdit_verb(h, "init", "create an empty sit repository");
-    cmdit_verb(h, "add", "hash and store a file as a blob object");
+    cmdit_verb(h, "add", "hash and stage files (all of them, or none)");
     cmdit_verb(h, "rm", "remove a tracked file from working tree and index");
     cmdit_verb(h, "mv", "rename a tracked file in the working tree and index");
     cmdit_verb(h, "branch", "list / create / delete branch (-d deletes)");

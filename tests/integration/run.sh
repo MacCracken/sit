@@ -2568,6 +2568,38 @@ if command -v git >/dev/null 2>&1; then
   done
 fi
 
+# ── 43. 1.12.1 `sit add` takes every path it is given ──────────────
+# Through 1.12.0 only the first path was read: `sit add a b` staged a and said
+# nothing about b. Now every path is checked first, and if any fails nothing is
+# staged; then all are staged in one index transaction.
+hr "1.12.1 sit add <path>..."
+A="$WORK/add43"; mkdir -p "$A/d"; cd "$A"; "$SIT" init >/dev/null
+echo a > a.txt; echo b > b.txt; echo c > d/c.txt; echo '*.log' > .sitignore; echo x > x.log
+staged() { "$SIT" status | grep -c 'new file:'; }
+NOBJ0=$(objcount)
+OUT=$("$SIT" add a.txt nope.txt d/c.txt 2>&1); RC=$?
+assert_eq "$RC" "1" "43a: one path that cannot be read fails the command"
+assert_contains "$OUT" "nothing was staged" "43a: and says so"
+assert_eq "$(staged)" "0" "43a: nothing is staged, not even the paths before it"
+assert_eq "$(objcount)" "$NOBJ0" "43a: and no object was written"
+OUT=$("$SIT" add b.txt x.log 2>&1); RC=$?
+assert_eq "$RC" "1" "43b: an ignored path among others fails the command"
+assert_eq "$(staged)" "0" "43b: staging none of them"
+"$SIT" add d >/dev/null 2>&1; assert_eq "$?" "1" "43b: a directory is refused, by kind"
+OUT=$("$SIT" add a.txt b.txt ./a.txt d/c.txt .sitignore 2>&1); RC=$?
+assert_eq "$RC" "0" "43c: several good paths"
+assert_eq "$(printf '%s\n' "$OUT" | grep -c '^added ')" "4" "43c: each staged once (a path given twice is one)"
+assert_eq "$(staged)" "4" "43c: all of them staged"
+"$SIT" commit -m three >/dev/null
+assert_eq "$("$SIT" status | tail -1)" "nothing to commit, working tree clean" "43c: and committed together"
+echo bb >> b.txt
+OUT=$("$SIT" add x.log b.txt -f 2>&1); RC=$?
+assert_eq "$RC" "0" "43d: -f after the paths"
+assert_contains "$OUT" "x.log" "43d: overrides the ignore rule for the ignored one"
+assert_contains "$OUT" "b.txt" "43d: and stages the rest"
+"$SIT" add >/dev/null 2>&1; assert_eq "$?" "1" "43d: no path is a usage error"
+"$SIT" add -f >/dev/null 2>&1; assert_eq "$?" "1" "43d: nor is -f alone"
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

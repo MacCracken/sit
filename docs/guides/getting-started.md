@@ -431,7 +431,7 @@ Simplification vs git (documented in `src/index.cyr`): a non-segment `**` (e.g. 
 ## What works today
 
 - `sit init` — create empty repository
-- `sit add <path>` — hash, compress, and store a file as a blob object; append to staging index
+- `sit add [-f] <path>...` — hash, compress, and store each file as a blob object, and stage them all. Every path is checked first, and if any cannot be staged (unreadable, ignored without `-f`, a directory, a symlink) nothing is (1.12.1; through 1.12.0 only the first path was read)
 - `sit rm [--cached] <path>` — remove a tracked file from working tree + index (or just the index with `--cached`). Since 1.7.6 it refuses a file whose content differs from what is staged or committed, which it would otherwise delete unrecoverably; `--cached` still works
 - `sit branch [<name>]` — list branches, or create one at HEAD
 - `sit checkout [-b] <branch>` — switch branches; `-b` creates the branch first at HEAD
