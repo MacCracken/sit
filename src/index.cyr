@@ -700,6 +700,7 @@ fn cmd_reset() {
         # of a branch none of whose content it held, and that branch could
         # never be merged again ("already up to date").
         if (sf_exists(".sit/MERGE_HEAD") == 1) { sf_unlink(".sit/MERGE_HEAD"); }
+        merge_msg_clear();
         if (sf_exists(".sit/CHERRY_PICK_HEAD") == 1) { sf_unlink(".sit/CHERRY_PICK_HEAD"); }
         if (sf_exists(".sit/REVERT_HEAD") == 1) { sf_unlink(".sit/REVERT_HEAD"); }
         stdout_write("HEAD reset --hard to ", 21);

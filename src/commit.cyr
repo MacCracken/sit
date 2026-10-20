@@ -267,6 +267,19 @@ fn _materialize(target_hex, mode) {
         eprintln("sit: cannot read the target commit's tree — nothing changed");
         return 0 - 1;
     }
+    return _materialize_entries(target_entries, mode);
+}
+
+# materialize_target_safe for a tree that is not a commit's: `entries` is a
+# flattened tree ({mode, path, hex} records, as flatten_tree builds), and the
+# caller has checked the tracked tree is clean. The worktree and index become
+# `entries`; HEAD does not move. (1.8.0: a three-way `stash pop`.)
+fn materialize_entries_safe(entries) {
+    return _materialize_entries(entries, 2);
+}
+
+# _materialize's body, on an already-flattened target tree.
+fn _materialize_entries(target_entries, mode) {
     var curr_entries = read_head_tree_entries();
     if (curr_entries == 0) { curr_entries = vec_new(); }
 
@@ -1154,10 +1167,6 @@ fn commit_tree_entries(commit_hex) {
 # `sit commit [-S] -m <msg>` — record the staged index as a new commit (-S signs it).
 fn cmd_commit() {
     var ac = argc();
-    if (ac < 3) {
-        eprintln("usage: sit commit [-S] [-m] <message>");
-        return 1;
-    }
 
     # Parse flags + message — support `sit commit <msg>`, `sit commit -m <msg>`,
     # and either of those with `-S` prepended or interleaved.
@@ -1190,8 +1199,14 @@ fn cmd_commit() {
         }
     }
     if (message == 0) {
-        eprintln("sit: commit message required");
-        return 1;
+        # 1.8.0: the commit that resolves a `merge -m` conflict stop takes
+        # that message when given none (.sit/MERGE_MSG, git's MERGE_MSG).
+        message = merge_msg_saved();
+        if (message == 0) {
+            if (ac < 3) { eprintln("usage: sit commit [-S] [-m] <message>"); }
+            else { eprintln("sit: commit message required"); }
+            return 1;
+        }
     }
 
     if (sf_exists(".sit/HEAD") != 1) {
@@ -1271,6 +1286,7 @@ fn cmd_commit() {
             eprintln("sit:   the next commit may wrongly become a merge — remove the file manually");
             return 1;
         }
+        merge_msg_clear();
     }
 
     conflicts_clear();

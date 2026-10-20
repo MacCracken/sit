@@ -187,6 +187,58 @@ fn fuzz_reflog_index(rounds) {
         _reflog_nth_in_buf(input, size, 0, out);
         _reflog_nth_in_buf(input, size, 0 - 1, out);
         _reflog_line_msg(input, size, &pair);
+        # 1.8.0: the time readers over the same bytes. A timestamp is never
+        # negative, and an at-time resolve writes a 64-hex oid or nothing.
+        if (_reflog_line_ts(input, size) < 0 - 1) { println("fuzz: _reflog_line_ts below -1"); return 1; }
+        if (_reflog_at_time_in_buf(input, size, seed & 0xFFFFFFFF, out) == 1) {
+            if (hex_prefix_valid(out, 64) == 0) {
+                println("fuzz: _reflog_at_time_in_buf wrote a non-hex oid");
+                return 1;
+            }
+        }
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+    return 0;
+}
+
+# 1.8.0: `@{<time>}` and `--expire=<when>` come from the command line. The
+# parser either refuses (-1) or returns a time in [0, now]; a selector parse
+# hands back a base inside the string. Inputs mix time-spec vocabulary with
+# random bytes.
+fn fuzz_reflog_time(rounds) {
+    var cap = 64;
+    var input = alloc(cap + 8);
+    var name = alloc(cap + 16);
+    var words = "now yesterday 2026-10-19 12:34:56 T 1.week.ago 3 days ago months year seconds";
+    var wl = strlen(words);
+    var now = 1790000000;
+    var seed = 13;
+    var i = 0;
+    while (i < rounds) {
+        var size = (seed & 0x3F) + 1;
+        fill_pseudo_random(input, size, seed);
+        if ((i & 1) == 1) {
+            var j = 0;
+            while (j < size) {
+                store8(input + j, load8(words + ((load8(input + j) & 0xFF) % wl)));
+                j = j + 1;
+            }
+        }
+        var t = reflog_time_parse(input, size, now);
+        if (t != 0 - 1) {
+            if (t < 0) { println("fuzz: reflog_time_parse returned a negative time"); return 1; }
+            if (t > 253402300799) { println("fuzz: reflog_time_parse returned a time past 9999"); return 1; }
+        }
+        memcpy(name, "HEAD@{", 6);
+        memcpy(name + 6, input, size);
+        store8(name + 6 + size, 125);
+        store8(name + 7 + size, 0);
+        var ds[16];
+        if (_reflog_date_spec_parse(name, now, &ds) == 1) {
+            if (load64(&ds) != 4) { println("fuzz: date selector base is not HEAD"); return 1; }
+            if (load64(&ds + 8) < 0) { println("fuzz: date selector time is negative"); return 1; }
+        }
         seed = seed * 1103515245 + 12345;
         i = i + 1;
     }
@@ -1051,6 +1103,8 @@ fn main() {
     if (fuzz_obj_inflate(3000) != 0) { return 1; }
     println("fuzz: http_refs (200000 rounds)");
     if (fuzz_http_refs(200000) != 0) { return 1; }
+    println("fuzz: reflog_time (300000 rounds)");
+    if (fuzz_reflog_time(300000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

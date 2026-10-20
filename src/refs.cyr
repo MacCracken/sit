@@ -4,46 +4,61 @@
 # and .sit/refs/remotes/<remote>/<name>. ensure_parent_dirs (util.cyr) is called
 # by every write path so nested names like feature/foo work.
 
-# Resolve a "<base>@{N}" reflog selector to the new-oid recorded N moves
-# ago. Writes 64-hex + nul into out_buf. Returns 1 on success, 0 if `name`
-# isn't a reflog selector or the base has no log / N is out of range. The
-# base's log is found by class: HEAD → logs/HEAD; otherwise logs/refs/heads/
-# <base>, then logs/refs/remotes/<base> (tags aren't logged). Called from
-# resolve_ref_name in REVISION context — distinct from refname_valid, which
-# rejects '@{' in ref-NAME context (so x@{0} never becomes a ref file).
+# Resolve a reflog selector to an oid: "<base>@{N}" — the new-oid recorded N
+# moves ago — or, since 1.8.0, "<base>@{<time>}" — the value the ref had then
+# (`HEAD@{yesterday}`, `main@{2 days ago}`, `main@{2026-10-01}`; UTC). Writes
+# 64-hex + nul into out_buf. Returns 1 on success, 0 if `name` isn't a reflog
+# selector or the base has no log / the entry is out of range. The base's log
+# is found by class: HEAD → logs/HEAD; otherwise logs/refs/heads/<base>, then
+# logs/refs/remotes/<base> (tags aren't logged). Called from resolve_ref_name
+# in REVISION context — distinct from refname_valid, which rejects '@{' in
+# ref-NAME context (so x@{0} never becomes a ref file).
 fn resolve_reflog_spec(name, out_buf) {
     var spec[24];
-    if (_reflog_spec_parse(name, &spec) == 0) { return 0; }
-    var blen = load64(&spec + 8);
-    var num = load64(&spec + 16);
+    var blen = 0;
+    var num = 0;
+    var when = 0 - 1;
+    if (_reflog_spec_parse(name, &spec) == 1) {
+        blen = load64(&spec + 8);
+        num = load64(&spec + 16);
+    }
+    else {
+        var ds[16];
+        if (_reflog_date_spec_parse(name, clock_epoch_secs(), &ds) == 0) { return 0; }
+        blen = load64(&ds);
+        when = load64(&ds + 8);
+    }
     var base = alloc(blen + 1);
     memcpy(base, name, blen);
     store8(base + blen, 0);
+    var refpath = _reflog_spec_refpath(base);
+    if (refpath == 0) { return 0; }
+    if (when >= 0) { return reflog_read_at_time(refpath, when, out_buf); }
+    return reflog_read_nth(refpath, num, out_buf);
+}
 
-    if (streq(base, "HEAD") == 1) {
-        return reflog_read_nth("HEAD", num, out_buf);
-    }
+# The log refpath a selector's base names — "HEAD", or the branch or
+# remote-tracking ref that has a log — or 0.
+fn _reflog_spec_refpath(base) {
+    if (streq(base, "HEAD") == 1) { return "HEAD"; }
 
     # S-02: the base becomes a .sit/logs/ path component below; reject
     # traversal ('..', leading '/') and control chars before it does. An
     # invalid base simply isn't a resolvable selector → fall through (0).
     if (refname_valid(base) == 0) { return 0; }
+    var blen = strlen(base);
 
     var hp = alloc(11 + blen + 1);
     memcpy(hp, "refs/heads/", 11);
     memcpy(hp + 11, base, blen);
     store8(hp + 11 + blen, 0);
-    if (sf_exists(reflog_log_path(hp)) == 1) {
-        return reflog_read_nth(hp, num, out_buf);
-    }
+    if (sf_exists(reflog_log_path(hp)) == 1) { return hp; }
 
     var rp = alloc(13 + blen + 1);
     memcpy(rp, "refs/remotes/", 13);
     memcpy(rp + 13, base, blen);
     store8(rp + 13 + blen, 0);
-    if (sf_exists(reflog_log_path(rp)) == 1) {
-        return reflog_read_nth(rp, num, out_buf);
-    }
+    if (sf_exists(reflog_log_path(rp)) == 1) { return rp; }
     return 0;
 }
 

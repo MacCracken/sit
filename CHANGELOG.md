@@ -4,6 +4,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-10-19 — history ergonomics: `merge -m`, a three-way `stash pop`, reflog expiry and `@{<date>}`
+
+The 1.8.0 minor: new behaviour on existing commands. No new command, no storage or wire change; the toolchain stays at cyrius 6.7.15.
+
+### Added — `sit merge -m <msg>`
+
+`-m` was accepted and ignored since the command existed: every merge commit read "Merge branch '<x>'", and CI had passed `-m` since v0.5.x without noticing. It now sets the message.
+- **Anywhere on the line, for an octopus too.** `merge` parses its arguments once: `-S` and `-m <msg>` may come before, between or after the branches. Before, any flag sent the command down the single-branch path, so an octopus could be neither named nor signed; `sit merge o1 -S o2 -m "Octo"` now writes a signed three-parent commit.
+- **Across a conflict stop.** The message waits in `.sit/MERGE_MSG`, and a bare `sit commit` that resolves the merge takes it (git's MERGE_MSG). `merge --abort`, `reset --hard` and the resolving commit clear it. A `MERGE_MSG` with no merge in progress is never read.
+- Without `-m` the default messages are unchanged. `-m` with no message, and any other option, are refused.
+
+### Changed — `sit stash pop` onto a moved HEAD applies the stash three-way
+
+Since 1.6.4 (A5) pop refused once HEAD had moved past the commit the stash was made on, because restoring the snapshot wholesale rolled every later commit back. It now does what git does: it applies the stash's *change* — the commit it was made on → the snapshot — onto HEAD, without committing and without moving HEAD.
+- **Clean:** the worktree and index take the merged result (edits, files the stash added, files it deleted), and the entry is popped.
+- **Conflict:** markers are written through the same path merge and cherry-pick use, CONFLICTS is recorded (so `sit commit` refuses until they're resolved), and the entry is **kept**: resolve, `sit add`, `sit stash drop`.
+- **Refusals keep the entry and write nothing:** a dirty tree, an untracked file in the way, an unreadable tree.
+- Pop at the base commit is unchanged. The materializer gained an entry-level form (`materialize_entries_safe`), so the merged tree lands without a throwaway commit.
+
+### Added — `sit reflog expire`, `sit reflog delete`, and `<ref>@{<time>}`
+
+Reflogs never expired, so the objects they protected stayed until the logs were cleared by hand.
+- **`sit reflog expire [--expire=<when>] (--all | <ref>...)`** drops entries made at or before `<when>`: 90 days ago by default (git's gc.reflogExpire), `now` for all, `never` for none. **`sit reflog delete <ref>@{N}`** removes one entry. Both rewrite the log under the lock reflog appends take, through a lock file and rename, so a crash leaves the old log or the new one. `sit reflog show [<ref>]` is the listing's git name; a bare `sit reflog` still lists.
+- **`<ref>@{<time>}`** names the value a ref had then, anywhere a revision is accepted: `HEAD@{yesterday}`, `main@{2 days ago}` / `main@{2.weeks.ago}`, `main@{2026-10-01}`, `main@{2026-10-01 14:30[:00]}`. All times are UTC: sit writes every timestamp as `+0000` and has no time-zone database (git reads an unzoned date as local time; on a UTC host they agree). Before the log begins it falls back to the oldest value known, with a warning, as git does.
+
+### Changed — `fsck --prune` dates trees and blobs by the commits that reach them
+
+Under its 90-day window `--prune` could date only commits, so it kept every dangling tree and blob: after a discarded commit aged out it was pruned, and everything it held stayed dangling for ever. Now a dangling tree or blob reachable only from dangling commits past the window goes with them; one a dangling commit inside the window reaches is kept; one no dangling commit reaches (a blob staged and abandoned) is still undatable and kept. On a planted two-year-old discarded commit, 1.7.6's `--prune` removed 1 object and left 2 dangling; 1.8.0's removes all 3 and keeps the blob it shares with live history. `--prune-now` is unchanged.
+
+### Docs
+
+- The roadmap is forward-only: the current-state paragraph and the closed 1.7.x section are gone, and the upstream asks say which are on the other repo's roadmap. cmdit CLI parsing moves up to **1.9.0**, and storage (1.10.0), serving many repos (1.11.0) and `.git/` CLI parity (1.12.0) each move back one.
+- The 1.7.6 entry and audit report listed "a word-wise `memcpy`" as a sankoch ask; it was neither sankoch's nor needed, since sit's own delta copy does it (`_pack_copy`). Removed, and both now say which asks are filed where.
+
+### Performance
+
+No path got slower. DCE builds, each child's CPU time, minimum of 11 alternating runs against 1.7.6 (the host was saturated, load ~33 on 16 cores): `add` ×100 −1.0%, `commit` −2.8%, `status` −1.2%, `log --oneline` +3.3%, `checkout` there and back +1.8%, `clone` +0.6%, `fsck` −1.3% — all inside the noise of that load.
+
+### Tests
+
+- **Unit, 566 → 591:** `test_180_reflog_time` — the calendar arithmetic, every time form (and refused ones: a day the month lacks, a leap day in a common year, an unknown unit, trailing words), a log line's timestamp, and the date selector's parse.
+- **Integration, 424 → 479.** Section 35 (`merge -m`: before and after the branch, an octopus with `-S` and `-m`, MERGE_MSG through a conflict, cleared by abort and `reset --hard`, refusals, the default message), 36 (three-way pop: clean, conflict, dirty tree, untracked file in the way), 37 (`@{<time>}` against planted timestamps, `expire`, `delete`, `show`, and `--prune` taking a planted old commit with its tree and unique blob but not a blob a recent dangling commit shares). Section 18e now checks that `-m` names the merge, and 1.6.4's A5 case expects the apply instead of the refusal.
+- **Fuzz, 20 → 21 targets:** `fuzz_reflog_time` (300k inputs mixing time-spec words with random bytes through `reflog_time_parse` and the selector parse), and `fuzz_reflog_index` now drives the line-timestamp and at-time readers too.
+
 ## [1.7.6] — 2026-10-19 — closing 1.7.x: fetched objects are verified, and a P(-1) audit of everything since 1.6.4
 
 The last 1.7.x patch: a full P(-1) hardening and closeout pass over 1.7.0 → 1.7.5. Four reviews (network, local writes, the untrusted read path, external advisories) and a re-read of the fixes found 45 issues, each reproduced against 1.7.5 and red/green-tested:
@@ -95,8 +139,8 @@ Every one of these exited 0 on 1.7.5.
 
 ### Upstream
 
-- **patra:** `tbl_insert`, `tbl_delete`, `btree_insert` and `_bt_push_up` ignore `page_write`'s return; in autocommit a statement then reports `PATRA_OK` (L12).
-- **sankoch:** a word-wise `memcpy` (stdlib's is a byte loop, ~140 MB/s); `br_init`'s 32 B per inflate, carried from 1.7.5.
+- **patra:** `tbl_insert`, `tbl_delete`, `btree_insert` and `_bt_push_up` ignore `page_write`'s return; in autocommit a statement then reports `PATRA_OK` (L12). Already on patra's own roadmap (found there at 1.16.2).
+- **sankoch:** `br_init`'s 32 B per inflate, carried from 1.7.5. On sit's roadmap; not yet filed on sankoch's.
 
 ### Performance — what the fixes cost
 

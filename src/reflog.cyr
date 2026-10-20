@@ -402,10 +402,18 @@ fn cmd_reflog() {
         return 1;
     }
 
+    # 1.8.0: `expire` and `delete` subcommands; `show` is the listing's name
+    # (git's), and a bare `sit reflog [<ref>]` still lists.
+    var ai = 2;
+    if (argc() > 2) {
+        var sub = argv(2);
+        if (streq(sub, "expire") == 1) { return _reflog_cmd_expire(); }
+        if (streq(sub, "delete") == 1) { return _reflog_cmd_delete(); }
+        if (streq(sub, "show") == 1) { ai = 3; }
+    }
     var ref_label = "HEAD";
     var refpath = "HEAD";
     var limit = 0 - 1;                # -1 = no limit
-    var ai = 2;
     while (ai < argc()) {
         var a = argv(ai);
         if (streq(a, "-n") == 1) {
@@ -477,4 +485,522 @@ fn cmd_reflog() {
     }
     stdout_flush();
     return 0;
+}
+
+# ── Time specs (1.8.0): `<ref>@{<date>}` and `reflog expire --expire=<when>` ──
+#
+# All UTC: sit writes every timestamp as `<epoch> +0000`, and has no time-zone
+# database to read a local date with. git reads an unzoned date as local time;
+# on a UTC host the two agree.
+
+# Days from 1970-01-01 to y-m-d (Gregorian, y >= 1970): Hinnant's
+# days_from_civil, positive years only.
+fn _reflog_days_from_civil(y, m, d) {
+    var yy = y;
+    if (m <= 2) { yy = yy - 1; }
+    var era = yy / 400;
+    var yoe = yy - era * 400;
+    var mp = m - 3;
+    if (m <= 2) { mp = m + 9; }
+    var doy = (153 * mp + 2) / 5 + d - 1;
+    var doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+# Days in month m of year y.
+fn _reflog_month_days(y, m) {
+    if (m == 2) {
+        var leap = 0;
+        if ((y % 4) == 0) { leap = 1; }
+        if ((y % 100) == 0) { leap = 0; }
+        if ((y % 400) == 0) { leap = 1; }
+        return 28 + leap;
+    }
+    if (m == 4) { return 30; }
+    if (m == 6) { return 30; }
+    if (m == 9) { return 30; }
+    if (m == 11) { return 30; }
+    return 31;
+}
+
+# The `n` decimal digits at s, or -1 if any is not a digit.
+fn _reflog_fixed_digits(s, n) {
+    var v = 0;
+    var i = 0;
+    var ok = 1;
+    while (i < n) {
+        var c = load8(s + i) & 0xFF;
+        if (c < 48) { ok = 0; }
+        if (c > 57) { ok = 0; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (ok == 0) { return 0 - 1; }
+    return v;
+}
+
+# YYYY-MM-DD[( |T)HH:MM[:SS]] as epoch seconds (UTC), or -1.
+fn _reflog_time_absolute(s, len) {
+    if (len < 10) { return 0 - 1; }
+    if (load8(s + 4) != 45) { return 0 - 1; }
+    if (load8(s + 7) != 45) { return 0 - 1; }
+    var y = _reflog_fixed_digits(s, 4);
+    var m = _reflog_fixed_digits(s + 5, 2);
+    var d = _reflog_fixed_digits(s + 8, 2);
+    if (y < 1970) { return 0 - 1; }
+    if (m < 1) { return 0 - 1; }
+    if (m > 12) { return 0 - 1; }
+    if (d < 1) { return 0 - 1; }
+    if (d > _reflog_month_days(y, m)) { return 0 - 1; }
+    var secs = 0;
+    if (len > 10) {
+        var sep = load8(s + 10);
+        var sep_ok = 0;
+        if (sep == 32) { sep_ok = 1; }
+        if (sep == 84) { sep_ok = 1; }               # 'T'
+        if (sep_ok == 0) { return 0 - 1; }
+        if (len != 16) { if (len != 19) { return 0 - 1; } }
+        if (load8(s + 13) != 58) { return 0 - 1; }
+        var hh = _reflog_fixed_digits(s + 11, 2);
+        var mi = _reflog_fixed_digits(s + 14, 2);
+        var ss = 0;
+        if (len == 19) {
+            if (load8(s + 16) != 58) { return 0 - 1; }
+            ss = _reflog_fixed_digits(s + 17, 2);
+        }
+        if (hh < 0) { return 0 - 1; }
+        if (hh > 23) { return 0 - 1; }
+        if (mi < 0) { return 0 - 1; }
+        if (mi > 59) { return 0 - 1; }
+        if (ss < 0) { return 0 - 1; }
+        if (ss > 59) { return 0 - 1; }
+        secs = hh * 3600 + mi * 60 + ss;
+    }
+    return _reflog_days_from_civil(y, m, d) * 86400 + secs;
+}
+
+# Seconds in one `unit` (singular or plural word of `ul` bytes), or 0.
+fn _reflog_unit_secs(u, ul) {
+    var n = ul;
+    if (n > 1) { if (load8(u + n - 1) == 115) { n = n - 1; } }   # plural 's'
+    if (n == 6) { if (memeq(u, "second", 6) == 1) { return 1; } }
+    if (n == 6) { if (memeq(u, "minute", 6) == 1) { return 60; } }
+    if (n == 4) { if (memeq(u, "hour", 4) == 1) { return 3600; } }
+    if (n == 3) { if (memeq(u, "day", 3) == 1) { return 86400; } }
+    if (n == 4) { if (memeq(u, "week", 4) == 1) { return 604800; } }
+    if (n == 5) { if (memeq(u, "month", 5) == 1) { return 2592000; } }   # 30 days, as git
+    if (n == 4) { if (memeq(u, "year", 4) == 1) { return 31536000; } }   # 365 days
+    return 0;
+}
+
+# <N>( |.)<unit>[( |.)ago] relative to `now`, or -1.
+fn _reflog_time_relative(s, len, now) {
+    var i = 0;
+    var num = 0;
+    var nd = 0;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (i >= len) { scanning = 0; }
+        else {
+            var c = load8(s + i) & 0xFF;
+            if (c < 48) { scanning = 0; }
+            else {
+                if (c > 57) { scanning = 0; }
+                else { num = num * 10 + (c - 48); nd = nd + 1; i = i + 1; }
+            }
+        }
+    }
+    if (nd == 0) { return 0 - 1; }
+    if (nd > 9) { return 0 - 1; }
+    if (i >= len) { return 0 - 1; }
+    var sp = load8(s + i);
+    if (sp != 32) { if (sp != 46) { return 0 - 1; } }
+    i = i + 1;
+    var us = i;
+    scanning = 1;
+    while (scanning == 1) {
+        if (i >= len) { scanning = 0; }
+        else {
+            var c2 = load8(s + i);
+            if (c2 == 32) { scanning = 0; }
+            else {
+                if (c2 == 46) { scanning = 0; }
+                else { i = i + 1; }
+            }
+        }
+    }
+    var unit = _reflog_unit_secs(s + us, i - us);
+    if (unit == 0) { return 0 - 1; }
+    if (i < len) {
+        # Only "ago" may follow the unit.
+        if (len - i != 4) { return 0 - 1; }
+        if (memeq(s + i + 1, "ago", 3) == 0) { return 0 - 1; }
+    }
+    var t = now - num * unit;
+    if (t < 0) { t = 0; }
+    return t;
+}
+
+# Epoch seconds for a time spec of `len` bytes at s, or -1: `now`,
+# `yesterday`, `<N> <unit> [ago]` (or dot-separated, as git's `1.week.ago`),
+# or `YYYY-MM-DD[ HH:MM[:SS]]`. UTC (see above).
+fn reflog_time_parse(s, len, now) {
+    if (len == 3) { if (memeq(s, "now", 3) == 1) { return now; } }
+    if (len == 9) { if (memeq(s, "yesterday", 9) == 1) { return now - 86400; } }
+    if (len >= 10) { if (load8(s + 4) == 45) { return _reflog_time_absolute(s, len); } }
+    return _reflog_time_relative(s, len, now);
+}
+
+# The timestamp of one log line (`... <email>> <ts> <tz>\t<msg>`), or -1.
+fn _reflog_line_ts(line, llen) {
+    var t = 0 - 1;
+    var i = 0;
+    while (i < llen) {
+        if (t < 0) { if (load8(line + i) == 9) { t = i; } }
+        i = i + 1;
+    }
+    if (t < 7) { return 0 - 1; }
+    if (load8(line + t - 6) != 32) { return 0 - 1; }      # " <ts> " before "+0000"
+    var e = t - 6;
+    var b = e;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (b <= 0) { scanning = 0; }
+        else {
+            var c = load8(line + b - 1) & 0xFF;
+            if (c < 48) { scanning = 0; }
+            else {
+                if (c > 57) { scanning = 0; }
+                else { b = b - 1; }
+            }
+        }
+    }
+    if (b == e) { return 0 - 1; }
+    if (e - b > 18) { return 0 - 1; }
+    var v = 0;
+    var k = b;
+    while (k < e) { v = v * 10 + ((load8(line + k) & 0xFF) - 48); k = k + 1; }
+    return v;
+}
+
+# Resolve `<ref>@{<time>}` within a log buffer: the value the ref had at time
+# `t` — the new oid of the newest entry made at or before `t`. Before the first
+# entry it is that entry's old oid, or — when the first entry created the ref —
+# its new oid, the oldest value known, as git does ("log only goes back to");
+# a warning says so. Writes 64 hex + NUL to out; 1 on success, 0 otherwise.
+fn _reflog_at_time_in_buf(buf, len, t, out) {
+    var starts = _reflog_line_starts(buf, len);
+    var n = vec_len(starts);
+    if (n == 0) { return 0; }
+    var found = 0 - 1;
+    var i = n - 1;
+    while (i >= 0) {
+        if (found < 0) {
+            var s = vec_get(starts, i);
+            var e = len;
+            if (i + 1 < n) { e = vec_get(starts, i + 1); }
+            var ts = _reflog_line_ts(buf + s, e - s);
+            if (ts >= 0) { if (ts <= t) { found = i; } }
+        }
+        i = i - 1;
+    }
+    var off = 65;                                   # the new oid
+    var at = 0;
+    if (found >= 0) { at = vec_get(starts, found); }
+    else { off = 0; }                               # before the log: the old oid
+    if (at + 129 > len) { return 0; }
+    if (load8(buf + at + 64) != 32) { return 0; }
+    if (hex_prefix_valid(buf + at + off, 64) == 0) { return 0; }
+    var zero = 1;
+    var z = 0;
+    while (z < 64) {
+        if (load8(buf + at + off + z) != 48) { zero = 0; }
+        z = z + 1;
+    }
+    if (zero == 1) {
+        off = 65;
+        if (hex_prefix_valid(buf + at + off, 64) == 0) { return 0; }
+    }
+    if (found < 0) {
+        eprintln("sit: warning: the reflog does not go back that far; using its oldest entry");
+    }
+    memcpy(out, buf + at + off, 64);
+    store8(out + 64, 0);
+    return 1;
+}
+
+# Resolve <ref>@{<time>} for the log at refpath; as reflog_read_nth.
+fn reflog_read_at_time(refpath, t, out) {
+    var pair[16];
+    if (read_file_heap(reflog_log_path(refpath), &pair) != 0) { return 0; }
+    return _reflog_at_time_in_buf(load64(&pair), load64(&pair + 8), t, out);
+}
+
+# Parse "<base>@{<time>}" (a time spec, not a bare ordinal). On success writes
+# the base length to out[0] and the epoch seconds to out[8] and returns 1.
+fn _reflog_date_spec_parse(name, now, out) {
+    var nlen = strlen(name);
+    if (nlen < 4) { return 0; }
+    if (load8(name + nlen - 1) != 125) { return 0; }   # '}'
+    var at = 0 - 1;
+    var i = 0;
+    while (i + 1 < nlen) {
+        if (at < 0) {
+            if (load8(name + i) == 64) { if (load8(name + i + 1) == 123) { at = i; } }
+        }
+        i = i + 1;
+    }
+    if (at <= 0) { return 0; }
+    var ip = name + at + 2;
+    var il = nlen - 1 - (at + 2);
+    if (il <= 0) { return 0; }
+    var digits = 1;
+    var k = 0;
+    while (k < il) {
+        var c = load8(ip + k) & 0xFF;
+        if (c < 48) { digits = 0; }
+        if (c > 57) { digits = 0; }
+        k = k + 1;
+    }
+    if (digits == 1) { return 0; }                    # an ordinal: not this form
+    var t = reflog_time_parse(ip, il, now);
+    if (t < 0) { return 0; }
+    store64(out, at);
+    store64(out + 8, t);
+    return 1;
+}
+
+# ── `reflog expire` / `reflog delete` (1.8.0) ──
+#
+# Both rewrite one log while holding its flock — the lock reflog appends take
+# (file_append_locked) — through `<log>.lock` and a rename, so a crash leaves
+# the old log or the new one. An append that was waiting on the lock while the
+# rewrite ran lands on the replaced file and is lost: one line, never a ref.
+
+# Rewrite the log at `path` (repo-relative) to the lines `keep` marks (one byte
+# per line, 1 = keep). Returns the number of lines dropped, or -1.
+fn _reflog_write_kept(path, buf, len, starts, keep) {
+    var n = vec_len(starts);
+    var out = alloc_or_die(len + 1);
+    var o = 0;
+    var dropped = 0;
+    var i = 0;
+    while (i < n) {
+        var s = vec_get(starts, i);
+        var e = len;
+        if (i + 1 < n) { e = vec_get(starts, i + 1); }
+        if (load8(keep + i) == 1) {
+            memcpy(out + o, buf + s, e - s);
+            o = o + e - s;
+        }
+        else { dropped = dropped + 1; }
+        i = i + 1;
+    }
+    if (dropped == 0) { return 0; }
+    if (sf_write_atomic(path, out, o) < 0) { return 0 - 1; }
+    return dropped;
+}
+
+# Open and flock the log at `path`; the fd, or -1 (absent, or not a plain file).
+fn _reflog_lock(path) {
+    var ap = sit_abs(path);
+    if (path_is_regular(ap) == 0) { return 0 - 1; }
+    if (path_is_symlink(ap) == 1) { return 0 - 1; }
+    var fd = file_open(ap, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    file_lock(fd);
+    return fd;
+}
+
+# Drop the entries of .sit/logs/<refpath> made at or before `cutoff`. Entries
+# whose time cannot be read are kept. Returns the number dropped, or -1.
+fn _reflog_expire_file(refpath, cutoff) {
+    var path = reflog_log_path(refpath);
+    var fd = _reflog_lock(path);
+    if (fd < 0) { return 0; }                        # no log: nothing to expire
+    var pair[16];
+    var r = 0 - 1;
+    if (read_file_heap(path, &pair) == 0) {
+        var buf = load64(&pair);
+        var len = load64(&pair + 8);
+        var starts = _reflog_line_starts(buf, len);
+        var n = vec_len(starts);
+        var keep = alloc_or_die(n + 1);
+        var i = 0;
+        while (i < n) {
+            var s = vec_get(starts, i);
+            var e = len;
+            if (i + 1 < n) { e = vec_get(starts, i + 1); }
+            var ts = _reflog_line_ts(buf + s, e - s);
+            store8(keep + i, 1);
+            if (ts >= 0) { if (ts <= cutoff) { store8(keep + i, 0); } }
+            i = i + 1;
+        }
+        r = _reflog_write_kept(path, buf, len, starts, keep);
+    }
+    file_unlock(fd);
+    file_close(fd);
+    return r;
+}
+
+# The log refpath a `reflog` ref argument names, or 0 (after saying why).
+fn _reflog_arg_refpath(label) {
+    if (streq(label, "HEAD") == 1) { return "HEAD"; }
+    # S-02: the label becomes a .sit/logs/ path component.
+    if (refname_valid(label) == 0) {
+        eprint3("sit: invalid ref name '", label, "'\n");
+        return 0;
+    }
+    return _reflog_log_refpath_for(label);
+}
+
+# Every log under .sit/logs as a refpath ("HEAD", "refs/heads/x", …).
+fn _reflog_all_refpaths() {
+    var out = vec_new();
+    if (path_lstat_kind(sit_abs(".sit/logs")) != 0x4000) { return out; }
+    var root = sit_abs(".sit/logs");
+    var rl = strlen(root);
+    var files = vec_new();
+    dir_walk(str_from(root), files);
+    var i = 0;
+    while (i < vec_len(files)) {
+        var fp = vec_get(files, i);
+        var fl = str_len(fp);
+        var fd = str_data(fp);
+        var take = 1;
+        if (fl <= rl + 1) { take = 0; }
+        if (take == 1) { if (memeq(fd, root, rl) == 0) { take = 0; } }
+        if (take == 1) {
+            if (fl >= 5) { if (memeq(fd + fl - 5, ".lock", 5) == 1) { take = 0; } }
+        }
+        if (take == 1) {
+            var rel = alloc_or_die(fl - rl);
+            memcpy(rel, fd + rl + 1, fl - rl - 1);
+            store8(rel + fl - rl - 1, 0);
+            vec_push(out, rel);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+# `sit reflog expire [--expire=<when>] (--all | <ref>...)` — drop old entries.
+# The default <when> is 90 days ago (git's gc.reflogExpire), `never` keeps
+# everything, `now` drops everything. Objects only the dropped entries kept
+# alive become prunable by `sit fsck --prune`.
+fn _reflog_cmd_expire() {
+    var all = 0;
+    var spec = 0;
+    var refpaths = vec_new();
+    var ai = 3;
+    while (ai < argc()) {
+        var a = argv(ai);
+        if (streq(a, "--all") == 1) { all = 1; }
+        else {
+            var is_expire = 0;
+            if (strlen(a) > 9) { if (memeq(a, "--expire=", 9) == 1) { is_expire = 1; } }
+            if (is_expire == 1) { spec = argv_heap(ai) + 9; }
+            else {
+                if (load8(a) == 45) {
+                    eprint3("sit: unknown reflog expire option '", a, "'\n");
+                    return 1;
+                }
+                var rp = _reflog_arg_refpath(argv_heap(ai));
+                if (rp == 0) { return 1; }
+                vec_push(refpaths, rp);
+            }
+        }
+        ai = ai + 1;
+    }
+    if (all == 0) {
+        if (vec_len(refpaths) == 0) {
+            eprintln("usage: sit reflog expire [--expire=<when>] (--all | <ref>...)");
+            return 1;
+        }
+    }
+    var now = clock_epoch_secs();
+    var cutoff = now - 90 * 86400;
+    if (spec != 0) {
+        if (streq(spec, "never") == 1) { return 0; }
+        var t = reflog_time_parse(spec, strlen(spec), now);
+        if (t < 0) {
+            eprint3("sit: cannot read the time '", spec, "'\n");
+            eprintln("sit:   use now, yesterday, '<N> <unit> ago' or YYYY-MM-DD[ HH:MM[:SS]] (UTC)");
+            return 1;
+        }
+        cutoff = t;
+    }
+    if (all == 1) { refpaths = _reflog_all_refpaths(); }
+    var total = 0;
+    var rc = 0;
+    var i = 0;
+    while (i < vec_len(refpaths)) {
+        var r = _reflog_expire_file(vec_get(refpaths, i), cutoff);
+        if (r < 0) {
+            eprint3("sit: cannot rewrite the reflog for '", vec_get(refpaths, i), "'\n");
+            rc = 1;
+        }
+        else { total = total + r; }
+        i = i + 1;
+    }
+    stdout_write("expired ", 8);
+    var nb[24];
+    var d = write_decimal(&nb, total);
+    stdout_write(&nb, d);
+    stdout_write(" reflog entries\n", 16);
+    return rc;
+}
+
+# `sit reflog delete <ref>@{N}` — remove one entry from that ref's log.
+fn _reflog_cmd_delete() {
+    if (argc() != 4) {
+        eprintln("usage: sit reflog delete <ref>@{N}");
+        return 1;
+    }
+    var spec_s = argv_heap(3);
+    var spec[24];
+    if (_reflog_spec_parse(spec_s, &spec) == 0) {
+        eprint3("sit: '", spec_s, "' is not a <ref>@{N} entry\n");
+        return 1;
+    }
+    var blen = load64(&spec + 8);
+    var num = load64(&spec + 16);
+    var base = alloc_or_die(blen + 1);
+    memcpy(base, spec_s, blen);
+    store8(base + blen, 0);
+    var refpath = _reflog_arg_refpath(base);
+    if (refpath == 0) { return 1; }
+    var path = reflog_log_path(refpath);
+    var fd = _reflog_lock(path);
+    if (fd < 0) {
+        eprint3("sit: no reflog for '", base, "'\n");
+        return 1;
+    }
+    var rc = 1;
+    var pair[16];
+    if (read_file_heap(path, &pair) == 0) {
+        var buf = load64(&pair);
+        var len = load64(&pair + 8);
+        var starts = _reflog_line_starts(buf, len);
+        var n = vec_len(starts);
+        if (num >= n) {
+            eprint3("sit: '", spec_s, "' is past the end of the reflog\n");
+        }
+        else {
+            var keep = alloc_or_die(n + 1);
+            var i = 0;
+            while (i < n) { store8(keep + i, 1); i = i + 1; }
+            store8(keep + (n - 1 - num), 0);
+            if (_reflog_write_kept(path, buf, len, starts, keep) == 1) {
+                stdout_write("deleted ", 8);
+                write_sanitized(STDOUT, spec_s, strlen(spec_s));
+                stdout_write("\n", 1);
+                rc = 0;
+            }
+            else { eprintln("sit: cannot rewrite the reflog"); }
+        }
+    }
+    file_unlock(fd);
+    file_close(fd);
+    return rc;
 }

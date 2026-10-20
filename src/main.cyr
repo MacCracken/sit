@@ -58,7 +58,7 @@ fn print_usage() {
     eprintln("  branch [-d <name>|<name>]  list / create / delete branch (-d deletes)");
     eprintln("  checkout [-b] <branch>  switch to <branch>, optionally creating it first");
     eprintln("  tag [-a|-s] [-d <name>|<name> [-m <msg>] [<commit>]]  list / create / delete tag");
-    eprintln("  merge <branch> [<branch> ...]  merge into HEAD (fast-forward, 3-way, or octopus)");
+    eprintln("  merge [-S] [-m <msg>] <branch>...  merge into HEAD (fast-forward, 3-way, or octopus)");
     eprintln("  cherry-pick <commit>    apply <commit>'s change onto HEAD as a new commit");
     eprintln("  revert <commit>         apply the inverse of <commit> as a new commit");
     eprintln("  rebase <upstream>       replay this branch onto <upstream> (--continue|--abort)");
@@ -79,7 +79,8 @@ fn print_usage() {
     eprintln("  serve <repo> [--stdio|--listen 127.0.0.1:<port>] [--tls]  sit/v1 daemon (read + push)");
     eprintln("  commit [-S] [-m] <msg>  record staged changes as a new commit (-S to sign)");
     eprintln("  log [--oneline] [--graph]  show commit history from HEAD");
-    eprintln("  reflog [-n <count>] [<ref>]  show ref movement history (default HEAD)");
+    eprintln("  reflog [show] [-n <count>] [<ref>]  show ref movement history (default HEAD)");
+    eprintln("  reflog expire [--expire=<when>] (--all | <ref>...) | reflog delete <ref>@{N}");
     eprintln("  status                  show working tree status");
     eprintln("  diff [--staged|HEAD]    show unstaged / staged / working-vs-HEAD diffs");
     eprintln("  show [--stat] [<hash>]  show a single commit (full diff or per-file stat)");

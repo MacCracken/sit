@@ -724,31 +724,8 @@ fn cmd_merge() {
         return 1;
     }
     if (argc() < 3) {
-        eprintln("usage: sit merge [-S] <branch> [<branch> ...] | sit merge --abort");
+        eprintln("usage: sit merge [-S] [-m <msg>] <branch> [<branch> ...] | sit merge --abort");
         return 1;
-    }
-
-    # v1.5.2: two or more BRANCH arguments is an octopus merge.
-    #
-    # ⚠ v1.6.2 — "argc() > 3" was not that test, and it broke `sit merge <branch>
-    # -m <msg>`: every argument after `merge` was taken as a branch name, so the
-    # flag itself was resolved as one ("cannot resolve '-m'"). `cmd_merge` has
-    # never implemented `-m` — it ignored trailing arguments — and that silent
-    # tolerance is what the CI smoke had been relying on since v0.5.x.
-    #
-    # The dispatch now requires that EVERY argument from index 2 on is a real
-    # branch name, i.e. none begins with '-'. A flag anywhere falls through to
-    # the single-branch path, which is exactly the pre-1.5.2 behaviour.
-    var mo_i = 2;
-    var mo_branches = 0;
-    var mo_flagged = 0;
-    while (mo_i < argc()) {
-        if ((load8(argv(mo_i)) & 0xFF) == 45) { mo_flagged = 1; }
-        else { mo_branches = mo_branches + 1; }
-        mo_i = mo_i + 1;
-    }
-    if (mo_flagged == 0) {
-        if (mo_branches > 1) { return cmd_merge_octopus(2); }
     }
 
     # --abort: restore working tree to HEAD, clear MERGE_HEAD.
@@ -773,39 +750,51 @@ fn cmd_merge() {
             eprintln("sit:   the next commit may wrongly become a merge — remove it manually");
             return 1;
         }
+        merge_msg_clear();
         conflicts_clear();
         stdout_write("merge aborted\n", 14);
         return 0;
     }
 
+    # 1.8.0: one parse. `-S` (sign) and `-m <msg>` may come anywhere; every
+    # other argument is a branch, tag or commit, in order. One target is a
+    # two-way merge, two or more an octopus. Through 1.7.x `-m` was accepted
+    # and ignored (the message was always "Merge branch '<x>'"), and a flag
+    # anywhere turned an octopus into a single-branch merge.
+    var targets = vec_new();
     var merge_sign = 0;
-    var merge_target_idx = 2;
-    if (streq(argv(2), "-S") == 1) {
-        merge_sign = 1;
-        merge_target_idx = 3;
-        if (argc() < 4) {
-            eprintln("usage: sit merge [-S] <branch>");
-            return 1;
-        }
-    }
-    var target_name = argv_heap(merge_target_idx);
-    var tnlen = strlen(target_name);
-    # 1.7.6 (L17): arguments after the branch were ignored wholesale, so
-    # `sit merge feat -S` merged unsigned without a word. -S counts anywhere;
-    # `-m <msg>` stays accepted and ignored (the merge message is fixed, and
-    # scripts pass it); anything else is refused before the merge starts.
-    var mk = merge_target_idx + 1;
+    var merge_msg = 0;
+    var mk = 2;
     while (mk < argc()) {
         var ma = argv(mk);
         if (streq(ma, "-S") == 1) { merge_sign = 1; mk = mk + 1; }
         else {
-            if (streq(ma, "-m") == 1) { mk = mk + 2; }
+            if (streq(ma, "-m") == 1) {
+                if (mk + 1 >= argc()) {
+                    eprintln("sit: -m requires a message argument");
+                    return 1;
+                }
+                merge_msg = argv_heap(mk + 1);
+                mk = mk + 2;
+            }
             else {
-                eprint3("sit: unexpected merge argument '", ma, "'\n");
-                return 1;
+                if (load8(ma) == 45) {
+                    eprint3("sit: unexpected merge argument '", ma, "'\n");
+                    return 1;
+                }
+                vec_push(targets, argv_heap(mk));
+                mk = mk + 1;
             }
         }
     }
+    if (vec_len(targets) == 0) {
+        eprintln("usage: sit merge [-S] [-m <msg>] <branch> [<branch> ...] | sit merge --abort");
+        return 1;
+    }
+    if (vec_len(targets) > 1) { return cmd_merge_octopus(targets, merge_msg, merge_sign); }
+
+    var target_name = vec_get(targets, 0);
+    var tnlen = strlen(target_name);
 
     var target_hex[72];
     var rr = resolve_commit_hash(target_name, &target_hex);
@@ -912,6 +901,13 @@ fn cmd_merge() {
             eprintln("sit: cannot write .sit/MERGE_HEAD — the next commit would not record this merge");
             return 1;
         }
+        # 1.8.0: a `-m` message waits for the resolving commit, which takes it
+        # when given none of its own (git's MERGE_MSG).
+        if (merge_msg != 0) {
+            if (sf_write_atomic(merge_msg_path(), merge_msg, strlen(merge_msg)) < 0) {
+                eprintln("sit: cannot save the merge message — give it to 'sit commit -m' when you commit");
+            }
+        }
 
         syscall(SYS_WRITE, STDERR, "sit: merge conflict in ", 23);
         var buf[24];
@@ -939,12 +935,15 @@ fn cmd_merge() {
         return 1;
     }
 
-    var msg_cap = 64 + tnlen + 32;
-    var msg = alloc_or_die(msg_cap);
-    memcpy(msg, "Merge branch '", 14);
-    memcpy(msg + 14, target_name, tnlen);
-    memcpy(msg + 14 + tnlen, "'", 1);
-    store8(msg + 14 + tnlen + 1, 0);
+    var msg = merge_msg;
+    if (msg == 0) {
+        var msg_cap = 64 + tnlen + 32;
+        msg = alloc_or_die(msg_cap);
+        memcpy(msg, "Merge branch '", 14);
+        memcpy(msg + 14, target_name, tnlen);
+        memcpy(msg + 14 + tnlen, "'", 1);
+        store8(msg + 14 + tnlen + 1, 0);
+    }
 
     var head_copy = alloc_or_die(65);
     memcpy(head_copy, head_hex, 64);
@@ -985,9 +984,48 @@ fn cmd_merge() {
 
     stdout_write("merge ", 6);
     stdout_write(merge_hex, 12);
-    stdout_write(": Merge branch '", 16);
-    stdout_write(target_name, tnlen);
-    stdout_write("'\n", 2);
+    stdout_write(": ", 2);
+    _merge_print_subject(msg);
+    stdout_write("\n", 1);
+    return 0;
+}
+
+# The first line of a commit message, display-safe (a `-m` message is the
+# user's, but the default one names a ref the user typed).
+fn _merge_print_subject(msg) {
+    var n = 0;
+    var go = 1;
+    while (go == 1) {
+        var c = load8(msg + n);
+        if (c == 0) { go = 0; }
+        else {
+            if (c == 10) { go = 0; }
+            else { n = n + 1; }
+        }
+    }
+    write_sanitized(STDOUT, msg, n);
+    return 0;
+}
+
+# `.sit/MERGE_MSG`: a `merge -m` message saved at a conflict stop (1.8.0).
+fn merge_msg_path() { return ".sit/MERGE_MSG"; }
+
+# The saved `merge -m` message as a heap cstring, or 0: only while a merge is
+# in progress (MERGE_HEAD), so a stale file cannot name an ordinary commit.
+fn merge_msg_saved() {
+    if (sf_exists(".sit/MERGE_HEAD") != 1) { return 0; }
+    var pair[16];
+    if (read_file_heap(merge_msg_path(), &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var n = load64(&pair + 8);
+    if (n <= 0) { return 0; }
+    store8(buf + n, 0);                              # read_file_heap leaves a spare byte
+    return buf;
+}
+
+# Remove a saved merge message; cleared wherever MERGE_HEAD is.
+fn merge_msg_clear() {
+    if (path_lstat_kind(sit_abs(merge_msg_path())) >= 0) { sf_unlink(merge_msg_path()); }
     return 0;
 }
 
@@ -1383,8 +1421,10 @@ fn _octopus_base(parents, t) {
     return 0 - 1;
 }
 
-# Octopus arm of `sit merge`: merge two or more branches into HEAD in one commit, refusing on any conflict.
-fn cmd_merge_octopus(first_arg) {
+# Octopus arm of `sit merge`: merge two or more branches (`names`, cstrings in
+# order) into HEAD in one commit, refusing on any conflict. `message` is a
+# `-m` message or 0 for "Merge branches 'a', 'b'"; `sign` is `-S`.
+fn cmd_merge_octopus(names, message, sign) {
     var head_hex = read_head_ref();
     if (head_hex == 0) {
         eprintln("sit: no commits yet");
@@ -1416,19 +1456,6 @@ fn cmd_merge_octopus(first_arg) {
     }
     var acc_merged = 0;
     var acc_tip = head_copy;
-
-    # Read EVERY argv value up front, before any deep-stack work. The first cut
-    # of octopus (1.5.2) read argv between patra reads and DAG walks and
-    # segfaulted on every merge; docs/architecture/001 was the suspect then. At
-    # cyrius 6.7.15 argv points into a heap buffer and 001 is obsolete, but
-    # copying up front costs nothing and stays.
-    var names = vec_new();
-    var argn = argc();
-    var ci = first_arg;
-    while (ci < argn) {
-        vec_push(names, argv_heap(ci));
-        ci = ci + 1;
-    }
 
     var ai = 0;
     var nnames = vec_len(names);
@@ -1509,24 +1536,37 @@ fn cmd_merge_octopus(first_arg) {
         return 1;
     }
 
-    var msg_cap = 64;
-    var ni = 0;
-    while (ni < vec_len(names)) { msg_cap = msg_cap + strlen(vec_get(names, ni)) + 4; ni = ni + 1; }
-    var msg = alloc_or_die(msg_cap);
-    var mp = 0;
-    memcpy(msg + mp, "Merge branches ", 15); mp = mp + 15;
-    ni = 0;
-    while (ni < vec_len(names)) {
-        if (ni > 0) { memcpy(msg + mp, ", ", 2); mp = mp + 2; }
-        store8(msg + mp, 39); mp = mp + 1;
-        var one = vec_get(names, ni);
-        memcpy(msg + mp, one, strlen(one)); mp = mp + strlen(one);
-        store8(msg + mp, 39); mp = mp + 1;
-        ni = ni + 1;
+    var msg = message;
+    if (msg == 0) {
+        var msg_cap = 64;
+        var ni = 0;
+        while (ni < vec_len(names)) { msg_cap = msg_cap + strlen(vec_get(names, ni)) + 4; ni = ni + 1; }
+        msg = alloc_or_die(msg_cap);
+        var mp = 0;
+        memcpy(msg + mp, "Merge branches ", 15); mp = mp + 15;
+        ni = 0;
+        while (ni < vec_len(names)) {
+            if (ni > 0) { memcpy(msg + mp, ", ", 2); mp = mp + 2; }
+            store8(msg + mp, 39); mp = mp + 1;
+            var one = vec_get(names, ni);
+            memcpy(msg + mp, one, strlen(one)); mp = mp + strlen(one);
+            store8(msg + mp, 39); mp = mp + 1;
+            ni = ni + 1;
+        }
+        store8(msg + mp, 0);
     }
-    store8(msg + mp, 0);
 
-    var oct_hex = build_octopus_commit(tree_hex, parents, msg, 0);
+    # 1.8.0: `-S` reaches the octopus too — any flag used to send the command
+    # down the single-branch path, so an octopus could never be signed.
+    var oseed = 0;
+    if (sign == 1) {
+        oseed = load_signing_seed();
+        if (oseed == 0) {
+            eprintln("sit: no signing key (run 'sit key generate')");
+            return 1;
+        }
+    }
+    var oct_hex = build_octopus_commit(tree_hex, parents, msg, oseed);
     if (oct_hex == 0) {
         eprintln("sit: failed to write octopus commit");
         return 1;
@@ -1544,7 +1584,7 @@ fn cmd_merge_octopus(first_arg) {
     stdout_write("octopus merge ", 14);
     stdout_write(oct_hex, 12);
     stdout_write(": ", 2);
-    stdout_write(msg, strlen(msg));
+    _merge_print_subject(msg);
     stdout_write("\n", 1);
     return 0;
 }

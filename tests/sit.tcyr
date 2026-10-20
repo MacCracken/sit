@@ -1886,6 +1886,40 @@ fn test_176_pure() {
     return 0;
 }
 
+# 1.8.0 pure-function guards: time specs and the at-time reflog resolve.
+fn test_180_reflog_time() {
+    test_group("reflog.cyr — @{<date>}, expire times (v1.8.0)");
+    assert_eq(_reflog_days_from_civil(1970, 1, 1), 0, "1970-01-01 is day 0");
+    assert_eq(_reflog_days_from_civil(2000, 3, 1), 11017, "2000-03-01 (after a leap day)");
+    assert_eq(_reflog_days_from_civil(2026, 10, 19), 20745, "2026-10-19");
+    var now = 1790000000;
+    assert_eq(reflog_time_parse("2026-02-01", 10, now), 1769904000, "a date is its UTC midnight");
+    assert_eq(reflog_time_parse("2026-02-01 01:02:03", 19, now), 1769907723, "date and time");
+    assert_eq(reflog_time_parse("2026-02-01T01:02", 16, now), 1769907720, "a T separator, no seconds");
+    assert_eq(reflog_time_parse("2026-02-30", 10, now), 0 - 1, "a day the month lacks is refused");
+    assert_eq(reflog_time_parse("2024-02-29", 10, now), 1709164800, "a leap day is accepted");
+    assert_eq(reflog_time_parse("2025-02-29", 10, now), 0 - 1, "and refused in a common year");
+    assert_eq(reflog_time_parse("now", 3, now), now, "now");
+    assert_eq(reflog_time_parse("yesterday", 9, now), now - 86400, "yesterday");
+    assert_eq(reflog_time_parse("2.weeks.ago", 11, now), now - 1209600, "dotted relative");
+    assert_eq(reflog_time_parse("1 hour ago", 10, now), now - 3600, "spaced relative");
+    assert_eq(reflog_time_parse("5 days", 6, now), now - 432000, "relative without ago");
+    assert_eq(reflog_time_parse("3 fortnights ago", 16, now), 0 - 1, "an unknown unit is refused");
+    assert_eq(reflog_time_parse("7 days hence", 12, now), 0 - 1, "only 'ago' may follow");
+    assert_eq(reflog_time_parse("", 0, now), 0 - 1, "empty is refused");
+    var line = "0000000000000000000000000000000000000000000000000000000000000000 1111111111111111111111111111111111111111111111111111111111111111 t <t@t> 1769904000 +0000\tcommit: x\n";  #skip-lint (fixture literal)
+    assert_eq(_reflog_line_ts(line, strlen(line)), 1769904000, "a line's timestamp");
+    assert_eq(_reflog_line_ts("no tab here", 11), 0 - 1, "no TAB, no timestamp");
+    var ds[16];
+    assert_eq(_reflog_date_spec_parse("main@{2026-02-01}", now, &ds), 1, "main@{<date>} parses");
+    assert_eq(load64(&ds), 4, "with base 'main'");
+    assert_eq(load64(&ds + 8), 1769904000, "and that date's time");
+    assert_eq(_reflog_date_spec_parse("main@{3}", now, &ds), 0, "an ordinal is not a date selector");
+    assert_eq(_reflog_date_spec_parse("@{yesterday}", now, &ds), 0, "an empty base is refused");
+    assert_eq(_reflog_date_spec_parse("main@{soon}", now, &ds), 0, "an unreadable time is refused");
+    return 0;
+}
+
 # Run every test group; exit status is the failure count.
 fn main() {
     alloc_init();
@@ -1929,6 +1963,7 @@ fn main() {
     test_apply_delta_into();
     test_parse_commit_body_a();
     test_176_pure();
+    test_180_reflog_time();
     return assert_summary();
 }
 

@@ -1468,38 +1468,70 @@ fn cmd_fsck() {
             }
         }
         # Age window: keep a still-dangling object unless it's older than the
-        # grace window. Only commits carry a timestamp (author ts); trees/blobs
-        # are undatable, so any positive window keeps them (grace 0 deletes
-        # everything dangling — the old --prune=now behaviour).
+        # grace window (grace 0 deletes everything dangling — the old
+        # --prune=now behaviour). Only commits carry a timestamp (author ts).
+        #
+        # 1.8.0: trees and blobs are dated by the commits that reach them. One
+        # reachable only from dangling commits past the window goes with them;
+        # one a kept dangling commit reaches stays; one no dangling commit
+        # reaches (a blob staged and abandoned) is undatable and stays. Before,
+        # every dangling tree and blob was kept under a positive window, so
+        # expiring the reflog let `--prune` drop an old discarded commit but
+        # never what it held.
         var now = clock_epoch_secs();
         var grace_secs = grace_days * 86400;
         var pruned = 0;
         var kept = 0;
+        var nd = vec_len(dangling_hexes);
+        var verdict = alloc_or_die(nd + 1);           # 0 delete, 1 keep, 2 tree/blob: decide below
+        var expired_reach = map_new();
+        var kept_reach = map_new();
         var pi = 0;
-        while (pi < vec_len(dangling_hexes)) {
+        while (pi < nd) {
             var dhex = vec_get(dangling_hexes, pi);
-            var keep = 0;
+            store8(verdict + pi, 0);
             if (grace_secs > 0) {
                 # Conservative default under a positive window: KEEP unless we
-                # can positively date the object past the window. Commits are
-                # datable (author ts); an undatable commit (unreadable body or
-                # unparseable ts) is kept just like trees/blobs — never delete
-                # something we can't prove is old.
-                keep = 1;
+                # can positively date the object past the window. An undatable
+                # commit (unreadable body or unparseable ts) is kept — never
+                # delete something we can't prove is old.
+                store8(verdict + pi, 1);
                 var dstored = map_get(ty_map, dhex);
                 if (dstored == 3) {                 # ty 2 (commit) + 1
                     var co[24];
+                    var old = 0;
                     if (read_object(dhex, &co) == 0) {
                         var cts = _fsck_commit_author_ts(load64(&co), load64(&co + 8));
                         if (cts > 0) {
-                            if (now - cts >= grace_secs) { keep = 0; }
+                            if (now - cts >= grace_secs) { old = 1; }
                         }
                     }
+                    if (old == 1) {
+                        store8(verdict + pi, 0);
+                        fsck_walk_reachable(dhex, expired_reach);
+                    }
+                    else { fsck_walk_reachable(dhex, kept_reach); }
+                }
+                else {
+                    if (dstored == 1) { store8(verdict + pi, 2); }    # blob
+                    if (dstored == 2) { store8(verdict + pi, 2); }    # tree
                 }
             }
-            if (keep == 1) { kept = kept + 1; }
+            pi = pi + 1;
+        }
+        pi = 0;
+        while (pi < nd) {
+            var dh = vec_get(dangling_hexes, pi);
+            var v = load8(verdict + pi);
+            if (v == 2) {
+                v = 1;
+                if (map_has(expired_reach, dh) == 1) {
+                    if (map_has(kept_reach, dh) == 0) { v = 0; }
+                }
+            }
+            if (v == 1) { kept = kept + 1; }
             else {
-                if (db_object_delete(db, dhex) == 0) { pruned = pruned + 1; }
+                if (db_object_delete(db, dh) == 0) { pruned = pruned + 1; }
             }
             pi = pi + 1;
         }

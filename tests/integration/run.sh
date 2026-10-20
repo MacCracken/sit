@@ -817,9 +817,8 @@ hr "merge argument dispatch (1.6.2 regression)"
 
 # 1.5.2 added octopus merge on "two or more arguments", which took EVERY
 # argument after `merge` as a branch name — so `sit merge <branch> -m <msg>`
-# tried to resolve "-m" as a branch. `cmd_merge` has never implemented -m; it
-# ignored trailing arguments, and the CI smoke had relied on that since v0.5.x.
-# Octopus now requires that every argument is a real branch name.
+# tried to resolve "-m" as a branch. Through 1.7.x `cmd_merge` ignored -m, and
+# the CI smoke relied on that since v0.5.x; 1.8.0 honours it (section 35).
 R="$WORK/mdisp"; mkdir -p "$R"; cd "$R"
 "$SIT" init >/dev/null
 printf 'base\n' > base.txt; "$SIT" add base.txt >/dev/null; "$SIT" commit -m base >/dev/null
@@ -833,6 +832,7 @@ assert_eq "$(printf '%s' "$MOUT" | grep -c "cannot resolve")" "0" \
   "a trailing flag is not mistaken for a branch name"
 assert_eq "$("$SIT" cat-file HEAD | grep -c '^parent')" "2" \
   "it produced a normal two-parent merge, not an octopus"
+assert_eq "$("$SIT" cat-file HEAD | sed -n '/^$/{n;p;q}')" "merge feature" "and -m names it (1.8.0)"
 
 # The octopus path itself must still fire on two or more REAL branches.
 R="$WORK/mdisp2"; mkdir -p "$R"; cd "$R"
@@ -1103,13 +1103,14 @@ a164 a4; echo "safe default" > cfg.txt; c164 cfg.txt; m164 R
 "$SIT" checkout main >/dev/null; "$SIT" merge b1 b2 >/dev/null 2>&1
 assert_eq "$(cat cfg.txt)" "safe default" "A4: octopus keeps HEAD's revert"
 
-# A5 — stash pop after a later commit refuses instead of rolling it back.
+# A5 — stash pop after a later commit must not roll it back. 1.6.4 made it
+# refuse; since 1.8.0 it applies the stash's change three-way instead.
 a164 a5; echo a > a.txt; echo b > b.txt; c164 a.txt b.txt; m164 base
 echo stashed > a.txt; "$SIT" stash >/dev/null 2>&1
 echo "committed later" > b.txt; c164 b.txt; m164 later
-"$SIT" stash pop >/dev/null 2>&1; assert_eq "$?" "1" "A5: pop on a moved HEAD refuses"
+"$SIT" stash pop >/dev/null 2>&1; assert_eq "$?" "0" "A5: pop on a moved HEAD applies the stash (1.8.0)"
 assert_eq "$(cat b.txt)" "committed later" "A5: the later commit is untouched"
-assert_contains "$("$SIT" stash list)" "stash@{0}" "A5: and the stash is kept"
+assert_eq "$(cat a.txt)" "stashed" "A5: and the stash's change is there"
 
 # B1 — add normalises ./ and refuses paths that would build a bad tree.
 a164 b1; echo hi > a.txt
@@ -2009,6 +2010,147 @@ for _ in $(seq 20000); do printf '%s\n' "$L"; done > .sit/logs/HEAD
 T0=$(date +%s); "$SIT" fsck >/dev/null 2>&1; FRC=$?; "$SIT" reflog -n 3 >/dev/null 2>&1; T1=$(date +%s)
 assert_eq "$FRC" "0" "R7: fsck over a 20,000-entry reflog succeeds"
 [ $((T1 - T0)) -lt 10 ] && ok || bad "R7: fsck + reflog over 20,000 entries took $((T1 - T0)) s (1.7.5: minutes)"
+
+# ── 35. 1.8.0 `merge -m` ─────────────────────────────────────────────
+# Through 1.7.x `-m` was accepted and ignored, and any flag sent an octopus
+# down the single-branch path (so an octopus could not be signed).
+hr "1.8.0 merge -m"
+R="$WORK/mm180"; mkdir -p "$R"; cd "$R"
+subj() { "$SIT" cat-file HEAD | sed -n '/^$/{n;p;q}'; }
+c() { "$SIT" add "$1" >/dev/null; }
+"$SIT" init >/dev/null; printf 'a\nb\nc\n' > f.txt; c f.txt; "$SIT" commit -m base >/dev/null
+for b in feat o1 o2 c1; do "$SIT" branch $b >/dev/null; done
+"$SIT" checkout feat >/dev/null; echo x > x.txt; c x.txt; "$SIT" commit -m feat >/dev/null
+"$SIT" checkout o1 >/dev/null; echo 1 > o1.txt; c o1.txt; "$SIT" commit -m o1 >/dev/null
+"$SIT" checkout o2 >/dev/null; echo 2 > o2.txt; c o2.txt; "$SIT" commit -m o2 >/dev/null
+"$SIT" checkout c1 >/dev/null; printf 'a\nC1\nc\n' > f.txt; c f.txt; "$SIT" commit -m c1 >/dev/null
+"$SIT" checkout main >/dev/null; echo m > m.txt; c m.txt; "$SIT" commit -m main >/dev/null
+"$SIT" merge -m "Bring in feat" feat >/dev/null 2>&1
+assert_eq "$(subj)" "Bring in feat" "35a: a clean merge takes -m's message (flag before the branch)"
+"$SIT" key generate >/dev/null 2>&1
+"$SIT" merge o1 -S o2 -m "Octo" >/dev/null 2>&1; ORC=$?
+assert_eq "$ORC" "0" "35b: an octopus with -S and -m merges"
+assert_eq "$("$SIT" cat-file HEAD | grep -c '^parent')" "3" "35b: as an octopus (three parents)"
+assert_eq "$(subj)" "Octo" "35b: under -m's message"
+assert_contains "$("$SIT" verify-commit 2>&1)" "good signature" "35b: and signed"
+printf 'a\nMAIN\nc\n' > f.txt; c f.txt; "$SIT" commit -m m2 >/dev/null
+"$SIT" merge c1 -m "Resolve c1" >/dev/null 2>&1
+assert_eq "$(cat .sit/MERGE_MSG 2>/dev/null)" "Resolve c1" "35c: a conflict stop saves the message"
+printf 'a\nBOTH\nc\n' > f.txt; c f.txt; "$SIT" commit >/dev/null 2>&1; CRC=$?
+assert_eq "$CRC" "0" "35c: and a bare 'sit commit' resolves with it"
+assert_eq "$(subj)" "Resolve c1" "35c: as the merge commit's message"
+assert_eq "$("$SIT" cat-file HEAD | grep -c '^parent')" "2" "35c: with both parents"
+[ -e .sit/MERGE_MSG ] && bad "35c: the commit left MERGE_MSG" || ok
+"$SIT" checkout -b c2 HEAD~1 >/dev/null 2>&1 || "$SIT" checkout -b c2 >/dev/null 2>&1
+printf 'a\nC2\nc\n' > f.txt; c f.txt; "$SIT" commit -m c2 >/dev/null; "$SIT" checkout main >/dev/null
+printf 'a\nM3\nc\n' > f.txt; c f.txt; "$SIT" commit -m m3 >/dev/null
+"$SIT" merge -m x c2 >/dev/null 2>&1; "$SIT" merge --abort >/dev/null 2>&1
+[ -e .sit/MERGE_MSG ] && bad "35d: merge --abort left MERGE_MSG" || ok
+"$SIT" merge -m y c2 >/dev/null 2>&1; "$SIT" reset --hard HEAD >/dev/null 2>&1
+[ -e .sit/MERGE_MSG ] && bad "35d: reset --hard left MERGE_MSG" || ok
+"$SIT" commit >/dev/null 2>&1; assert_eq "$?" "1" "35e: a bare commit with no merge in progress still needs a message"
+"$SIT" merge c2 -m >/dev/null 2>&1; assert_eq "$?" "1" "35e: -m without a message is refused"
+"$SIT" checkout -b d1 >/dev/null; echo d > d.txt; c d.txt; "$SIT" commit -m d1 >/dev/null
+"$SIT" checkout main >/dev/null; echo e > e.txt; c e.txt; "$SIT" commit -m e >/dev/null
+"$SIT" merge d1 >/dev/null 2>&1
+assert_eq "$(subj)" "Merge branch 'd1'" "35f: without -m the default message is unchanged"
+
+# ── 36. 1.8.0 three-way `stash pop` ──────────────────────────────────
+# Through 1.7.x pop refused once HEAD had moved past the stash's base. It now
+# applies the stash's change (base → snapshot) onto HEAD without committing,
+# and keeps the stash on a conflict or a refusal.
+hr "1.8.0 three-way stash pop"
+R="$WORK/sp180"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+printf 'a1\na2\na3\n' > a.txt; echo b > b.txt; echo gone > d.txt
+c a.txt; c b.txt; c d.txt; "$SIT" commit -m base >/dev/null
+printf 'a1\nSTASHED\na3\n' > a.txt; c a.txt; echo new > n.txt; c n.txt; "$SIT" rm d.txt >/dev/null
+"$SIT" stash >/dev/null
+echo b2 > b.txt; c b.txt; "$SIT" commit -m "move head" >/dev/null
+"$SIT" stash pop >/dev/null 2>&1; assert_eq "$?" "0" "36a: pop onto a moved HEAD applies cleanly"
+assert_eq "$(sed -n 2p a.txt)" "STASHED" "36a: the stash's edit lands"
+assert_eq "$(cat b.txt)" "b2" "36a: HEAD's later change stays"
+assert_eq "$(cat n.txt 2>/dev/null)" "new" "36a: a file the stash added arrives"
+[ -e d.txt ] && bad "36a: a file the stash deleted is still there" || ok
+assert_eq "$("$SIT" stash list)" "no stash entries" "36a: and the entry is popped"
+"$SIT" commit -m "apply" >/dev/null
+printf 'a1\nMINE\na3\n' > a.txt; c a.txt; "$SIT" stash >/dev/null
+printf 'a1\nTHEIRS\na3\n' > a.txt; c a.txt; "$SIT" commit -m "conflicting" >/dev/null
+"$SIT" stash pop >/dev/null 2>&1; assert_eq "$?" "1" "36b: a conflicting pop stops"
+assert_contains "$(cat a.txt)" "<<<<<<<" "36b: with conflict markers"
+assert_contains "$("$SIT" stash list)" "stash@{0}" "36b: and keeps the stash"
+"$SIT" commit -m x >/dev/null 2>&1; assert_eq "$?" "1" "36b: a commit refuses the unresolved file"
+printf 'a1\nBOTH\na3\n' > a.txt; c a.txt; "$SIT" commit -m resolved >/dev/null
+"$SIT" stash drop >/dev/null
+printf 'a1\nS3\na3\n' > a.txt; c a.txt; "$SIT" stash >/dev/null
+echo b3 > b.txt; c b.txt; "$SIT" commit -m mv3 >/dev/null; echo dirty >> b.txt
+"$SIT" stash pop >/dev/null 2>&1; assert_eq "$?" "1" "36c: a dirty tree refuses the pop"
+assert_eq "$(tail -1 b.txt)" "dirty" "36c: the uncommitted edit is intact"
+"$SIT" reset --hard HEAD >/dev/null; "$SIT" stash drop >/dev/null
+echo new > q.txt; c q.txt; "$SIT" stash >/dev/null
+echo b4 > b.txt; c b.txt; "$SIT" commit -m mv4 >/dev/null; echo precious > q.txt
+"$SIT" stash pop >/dev/null 2>&1; assert_eq "$?" "1" "36d: an untracked file in the way refuses"
+assert_eq "$(cat q.txt)" "precious" "36d: and is not overwritten"
+assert_contains "$("$SIT" stash list)" "stash@{0}" "36d: the stash is kept"
+
+# ── 37. 1.8.0 reflog expire / delete / @{<date>} ─────────────────────
+# Reflogs never expired, so `fsck --prune` could reclaim reflog-protected
+# objects only with --prune-now; and --prune dated only commits, so a discarded
+# old commit's trees and blobs stayed dangling for ever.
+hr "1.8.0 reflog expire, delete and @{<date>}"
+if command -v python3 >/dev/null 2>&1; then
+  R="$WORK/rl180"; mkdir -p "$R"; cd "$R"
+  "$SIT" init >/dev/null
+  for i in 1 2 3; do echo $i > f.txt; c f.txt; "$SIT" commit -m c$i >/dev/null; done
+  python3 -I -c '
+import re
+p = ".sit/logs/HEAD"; L = open(p).read().splitlines()
+ts = [1767225600, 1769904000, 1772323200]          # 2026-01-01, -02-01, -03-01 UTC
+open(p, "w").write("\n".join(re.sub(r"> \d+ \+0000\t", "> %d +0000\t" % t, l) for l, t in zip(L, ts)) + "\n")'
+  sel() { "$SIT" log --oneline "$1" 2>/dev/null | head -1 | cut -d' ' -f2; }
+  assert_eq "$(sel 'HEAD@{2026-01-15}')" "c1" "37a: @{<date>} is the value at that date"
+  assert_eq "$(sel 'HEAD@{2026-02-01}')" "c2" "37a: an entry made exactly then counts"
+  assert_eq "$(sel 'HEAD@{2026-02-01 00:00:00}')" "c2" "37a: date and time"
+  assert_eq "$(sel 'HEAD@{2026-05-01}')" "c3" "37a: after the last entry, the current value"
+  assert_eq "$(sel 'HEAD@{1.week.ago}')" "c3" "37a: relative (dotted)"
+  assert_eq "$(sel 'HEAD@{3 months ago}')" "c3" "37a: relative (spaced)"
+  assert_eq "$(sel 'HEAD@{2025-01-01}')" "c1" "37a: before the log, its oldest entry (git's fallback)"
+  "$SIT" log --oneline 'HEAD@{bogus}' >/dev/null 2>&1; assert_eq "$?" "1" "37a: an unreadable time is not a revision"
+  "$SIT" reflog expire --expire=2026-02-15 HEAD >/dev/null
+  assert_eq "$("$SIT" reflog | wc -l | tr -d ' ')" "1" "37b: expire drops the entries before the cutoff"
+  assert_contains "$("$SIT" reflog)" "c3" "37b: and keeps the later one"
+  "$SIT" reflog delete 'HEAD@{0}' >/dev/null
+  assert_eq "$("$SIT" reflog | wc -l | tr -d ' ')" "0" "37c: delete removes one entry"
+  "$SIT" reflog delete 'HEAD@{5}' >/dev/null 2>&1; assert_eq "$?" "1" "37c: past the end is refused"
+  "$SIT" reflog expire >/dev/null 2>&1; assert_eq "$?" "1" "37d: expire needs --all or a ref"
+  "$SIT" reflog expire --expire=whenever --all >/dev/null 2>&1; assert_eq "$?" "1" "37d: and a time it can read"
+  "$SIT" reflog expire --expire=never --all >/dev/null 2>&1; assert_eq "$?" "0" "37d: never keeps everything"
+  assert_contains "$("$SIT" reflog show main)" "main@{0}" "37d: reflog show is the listing"
+
+  # 37e: after expiry, --prune takes an old discarded commit AND what only it held.
+  R="$WORK/rl180p"; mkdir -p "$R"; cd "$R"
+  "$SIT" init >/dev/null; echo base > base.txt; c base.txt; "$SIT" commit -m base >/dev/null
+  P=$(tr -d '\n' < .sit/refs/heads/main)
+  echo "recent work" > r.txt; c r.txt; "$SIT" commit -m recent >/dev/null
+  RC=$(tr -d '\n' < .sit/refs/heads/main); RT=$("$SIT" cat-file "$RC" | awk '/^tree /{print $2}')
+  RB=$("$SIT" cat-file "$RT" | python3 -I -c 'import sys;t=sys.stdin.buffer.read();i=t.index(b"r.txt\0")+6;print(t[i:i+32].hex())')
+  "$SIT" reset --hard "$P" >/dev/null
+  read -r OC OT UB <<< "$(python3 -I "$ROOT/tests/integration/plant_old_commit.py" "$P" "$RB")"
+  "$SIT" fsck --prune >/dev/null 2>&1
+  "$SIT" cat-file "$RC" >/dev/null 2>&1; assert_eq "$?" "0" "37e: a reflog-protected recent commit survives --prune"
+  "$SIT" reflog expire --expire=now --all >/dev/null
+  rm -rf .sit/logs
+  "$SIT" fsck --prune >/dev/null 2>&1
+  "$SIT" cat-file "$OC" >/dev/null 2>&1; assert_eq "$?" "1" "37e: the old discarded commit is pruned"
+  "$SIT" cat-file "$UB" >/dev/null 2>&1; assert_eq "$?" "1" "37e: with the blob only it held (1.7.x kept it)"
+  "$SIT" cat-file "$OT" >/dev/null 2>&1; assert_eq "$?" "1" "37e: and its tree"
+  "$SIT" cat-file "$RC" >/dev/null 2>&1; assert_eq "$?" "0" "37e: the recent dangling commit is within grace"
+  "$SIT" cat-file "$RB" >/dev/null 2>&1; assert_eq "$?" "0" "37e: and so is the blob it shares with the old one"
+  "$SIT" cat-file "$P" >/dev/null 2>&1; assert_eq "$?" "0" "37e: live history is untouched"
+  assert_contains "$("$SIT" fsck)" "0 bad" "37e: fsck is clean after"
+else
+  echo "  (skipped 37: python3 not available)"
+fi
 
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"

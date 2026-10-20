@@ -491,20 +491,25 @@ fn _stash_pop(drop_only) {
             }
         }
         if (at_base == 0) {
-            eprintln("sit: HEAD has moved since this stash was made — pop it on the commit it was made on");
-            if (base != 0) {
-                syscall(SYS_WRITE, STDERR, "sit:   stash@{0} is on ", 23);
-                syscall(SYS_WRITE, STDERR, base, 12);
-                syscall(SYS_WRITE, STDERR, "; the stash is kept\n", 20);
+            # 1.8.0: HEAD has moved — apply the stash's CHANGE instead (base =
+            # the commit it was made on, ours = HEAD, theirs = the snapshot),
+            # as git's pop does. On a conflict the markers are written, the
+            # stash is kept, and nothing moves HEAD.
+            if (base == 0) {
+                eprintln("sit: this stash has no base commit to apply it against — the stash is kept");
+                return 1;
             }
-            return 1;
+            var ar = _stash_apply_three_way(top, base, head);
+            if (ar != 0) { return 1; }
         }
-        # Restore the snapshot. HEAD does not move — a stash is working-tree
-        # state, not history — so the stale removal compares the stash tree
-        # against HEAD's and drops what the stash did not carry.
-        if (materialize_target_safe(top, 0) != 0) {
-            eprintln("sit: failed to restore stash — stack unchanged");
-            return 1;
+        else {
+            # Restore the snapshot. HEAD does not move — a stash is working-tree
+            # state, not history — so the stale removal compares the stash tree
+            # against HEAD's and drops what the stash did not carry.
+            if (materialize_target_safe(top, 0) != 0) {
+                eprintln("sit: failed to restore stash — stack unchanged");
+                return 1;
+            }
         }
     }
     if (stash_write_top(prev) != 0) {
@@ -513,6 +518,68 @@ fn _stash_pop(drop_only) {
     }
     if (drop_only == 1) { stdout_write("dropped stash@{0}\n", 18); }
     else { stdout_write("restored stash@{0}\n", 19); }
+    return 0;
+}
+
+# Apply stash commit `top` (made on `base`) onto HEAD (`head`) as a three-way
+# merge of trees, without committing and without moving HEAD. Returns 0 when
+# it applied cleanly; 1 on a refusal (nothing written) or a conflict (markers
+# written, CONFLICTS recorded) — the caller keeps the stash either way.
+fn _stash_apply_three_way(top, base, head) {
+    # The tree is rewritten under the user, so the usual refusal comes first
+    # (materialize's own preflight then covers untracked files in the way).
+    if (is_dirty() == 1) {
+        eprintln("sit: working tree has uncommitted changes — commit or stash them first; the stash is kept");
+        return 1;
+    }
+    var base_entries = commit_tree_entries(base);
+    var ours_entries = commit_tree_entries(head);
+    var theirs_entries = commit_tree_entries(top);
+    if (base_entries == 0) {
+        eprintln("sit: cannot read the stash's base commit (missing or corrupt objects) — the stash is kept");
+        return 1;
+    }
+    if (ours_entries == 0) {
+        eprintln("sit: cannot read HEAD's tree (missing or corrupt objects) — the stash is kept");
+        return 1;
+    }
+    if (theirs_entries == 0) {
+        eprintln("sit: cannot read the stash's tree (missing or corrupt objects) — the stash is kept");
+        return 1;
+    }
+    var merged = vec_new();
+    var conflicts = vec_new();
+    three_way_merge_entries(base_entries, ours_entries, theirs_entries, merged, conflicts);
+    if (vec_len(conflicts) > 0) {
+        if (_apply_conflicted_merge(merged, conflicts, ours_entries, theirs_entries, "stash") != 0) {
+            eprintln("sit: stash not applied — the stash is kept");
+            return 1;
+        }
+        syscall(SYS_WRITE, STDERR, "sit: stash conflict in ", 23);
+        var nb[24];
+        var d = write_decimal(&nb, vec_len(conflicts));
+        syscall(SYS_WRITE, STDERR, &nb, d);
+        syscall(SYS_WRITE, STDERR, " file(s) — resolve them; the stash is kept ('sit stash drop' when done)\n", 74);
+        return 1;
+    }
+    # Clean: the merged entries are index-shaped (raw id + path); the
+    # materializer takes flattened tree records.
+    var target = vec_new();
+    var n = vec_len(merged);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(merged, i);
+        var flat = alloc_or_die(24);
+        store64(flat, "100644");
+        store64(flat + 8, entry_path(e));
+        store64(flat + 16, hex_encode(entry_hash(e), 32));
+        vec_push(target, flat);
+        i = i + 1;
+    }
+    if (materialize_entries_safe(target) != 0) {
+        eprintln("sit: failed to apply stash — the stash is kept");
+        return 1;
+    }
     return 0;
 }
 

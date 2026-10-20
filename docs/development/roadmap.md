@@ -1,21 +1,16 @@
 # sit Development Roadmap
 
-**Forward-looking only.** Shipped history lives in [`CHANGELOG.md`](../../CHANGELOG.md), the tagged-release source of truth. The live snapshot (current version, dependency versions, source layout, command inventory, recent releases) lives in [`state.md`](state.md). This file is only what is *next*.
+**Forward-looking only.** What shipped is in [`CHANGELOG.md`](../../CHANGELOG.md); the live snapshot (version, dependency pins, source layout, commands, consumers) is in [`state.md`](state.md). This file holds what is next and nothing else.
 
-> **How this file is organized.** Work is slotted by **target version**:
-> - the **1.7.x** patch line (no new surface, in suggested order)
-> - one section per planned **minor**, 1.8.0 onwards
-> - **1.x (unscheduled)** for work that is wanted but not yet committed to a release
+> **How this file is organized.** One section per planned **minor**, in order, then **1.x (unscheduled)** for wanted work not yet committed to a release. Patches between minors (fixes, toolchain bumps, consuming upstream fixes) take the next patch number as they arise and are not pre-slotted. Upstream asks, holds and closed decisions follow the slots.
 >
-> A slot is a plan, not a promise. When a release ships, **delete its items** (the CHANGELOG is the record) and re-slot anything that slipped. Do not leave struck-through entries behind. Upstream asks, holds and closed decisions sit at the end, outside the version slots.
-
-**Where we are:** `1.7.6`, on cyrius 6.7.15. The 1.6.x line closed with a P(-1) audit ([`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md); 16 HIGH, all fixed). 1.7.0 bound bearer tokens to remotes ([ADR 0014](../adr/0014-bearer-tokens-bound-to-remotes.md)) and refuses commits of unresolved conflicts. 1.7.1 took patra 1.16.x and makes a refused object insert or commit fail before any ref moves; 1.7.2 finished that sweep and shipped the audit's small fixes; 1.7.3 made `rebase` and `describe` walk every parent and see nested ref names; 1.7.4 bounded `sit serve` (nothing kept per read request, nor per TLS connection) and lifted git read mode's 64 MiB pack and depth-64 delta limits; 1.7.5 took the residuals 1.7.4 measured: a git-mode object read and a `sit serve` ref push keep nothing of sit's, and what each still keeps is sankoch's 32 bytes per inflate (upstream asks). **1.7.6 closes the 1.7.x line** with a P(-1) audit of 1.7.0 → 1.7.5 ([`../audit/2026-10-19-1.7.6-audit.md`](../audit/2026-10-19-1.7.6-audit.md); 4 HIGH, all fixed): fetched objects are verified before they land, and the read path keeps no blob or file per API call. **35 commands.** Next is 1.8.0.
+> A slot is a plan, not a promise. When an item ships, **delete it** (the CHANGELOG is the record). When a slot slips, re-slot it. At every release, re-check the line pins the remaining items cite.
 
 ---
 
 ## SemVer tiers (post-1.0)
 
-- **Patch (`1.x.y`):** no new *observable* surface. Bug fixes, perf, internal refactors, toolchain / dep bumps, consuming upstream fixes. Safe to take blindly.
+- **Patch (`1.x.y`):** no new *observable* surface. Bug fixes, perf, internal refactors, toolchain / dep bumps, consuming upstream fixes.
 - **Minor (`1.x.0`):** new *backward-compatible* surface: a command, flag, config key, public-API symbol, or wire capability.
 - **Major (`2.0.0`):** reserved for a breaking change to the CLI, `.sit/` layout, wire protocol, or public API. None planned.
 
@@ -23,62 +18,11 @@ Each item ships under the usual test / fuzz / poison / bench gates.
 
 ---
 
-## 1.7.x — patch line (no new surface)
+## 1.9.0 — CLI parsing via cmdit (minor)
 
-Closed by 1.7.6. Audit ids C1, D6, … refer to [`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md) (1.6.4); N, L, R, X, K ids to [`../audit/2026-10-19-1.7.6-audit.md`](../audit/2026-10-19-1.7.6-audit.md).
+Checked against **cmdit 1.4.0** (its own pin is cyrius 6.7.9); its `dist/cmdit.cyr` compiles on sit's toolchain. Take the latest cmdit tag when the slot opens.
 
----
-
-## 1.8.0 — history ergonomics (minor)
-
-New behaviour on existing commands, which is minor-level surface under the tiers above.
-
-- **`stash pop` with a three-way apply (A5 follow-on).** Since 1.6.4, pop refuses once HEAD has moved past the stash's base (it used to roll every later commit back). Applying the stash onto a moved HEAD is cherry-pick of the stash commit without committing: `_apply_one_commit` minus the commit, through `_apply_conflicted_merge` on a conflict.
-- **Honour `sit merge -m <msg>`.** Accepted and ignored since the command existed; CI has passed it since v0.5.x without noticing. git uses it to set the merge commit's message. It changes commit text, so it wants its own tests. The tolerance is pinned at `merge.cyr:802` (since 1.7.6 every other trailing option is refused, L17), `tests/integration/run.sh:830` and `.github/workflows/ci.yml:561`.
-- **Reflog `expire` / `delete` and the `@{<date>}` selector.**
-  - Reflog entries are unbounded, so `fsck --prune` reclaims reflog-protected objects only via `--prune-now`; expiry closes that.
-  - `expire` / `delete` are new subcommands, and `@{<date>}` is new selector syntax.
-  - Any new ref or log location needs a matching root in `fsck_collect_roots` and a test that drops `.sit/logs` first (CLAUDE.md).
-
-## 1.9.0 — storage: pack bundles + `gc` (minor)
-
-The largest measured gap sit has. Remeasured 2026-08-20 at 1,600 commits, both sides verified:
-
-| | sit `objects.patra` | git packed | git loose | ratio |
-|---|---:|---:|---:|---:|
-| 1,600 commits | **64.3 MB** | 1.6 MB | 4.3 MB | **39×** |
-
-sit is 15× git's *unpacked* store as well, so page overhead is not the explanation: the fixture's tree content is quadratic in commit count, and successive trees are near-identical, which is exactly what delta compression collapses. The read-performance argument is gone (lookups have been flat since patra's result-buffer fix, folded in 1.4.3); what remains is disk and transfer size.
-
-**Delta *generation* shipped in 1.6.1** (`src/delta.cyr`, differential-tested against the read-side interpreter: one byte changed in 8 KiB gives a 35-byte delta). What remains is storage and repack, a storage-format change in four coupled parts:
-
-1. **Schema:** an `objects` column naming the delta base, declared in two places (`object_db.cyr`, `wire.cyr`), plus migration for existing repos.
-2. **`read_object`:** reconstruct transparently. It is already the single choke point.
-3. **`fsck` integrity:** it re-hashes stored bytes against the object id. For a delta those bytes are not the content, so the pass must reconstruct first, or every deltified object reads `bad`.
-4. **`copy_objects`:** wire transfer copies raw compressed bytes DB-to-DB by design (CLAUDE.md forbids re-hashing on the hot path). A delta's base has to travel with it, and "the base is reachable anyway" needs proving, not assuming.
-
-A negotiated wire capability is a further step. **Ride-along: index paths over 255 bytes (B7 rest).** 1.6.4 refuses them at `sit add` and makes `rewrite_index` transactional. Lifting the limit needs a wider column, an index migration that belongs with this schema change.
-
-## 1.10.0 — serving many repos (minor)
-
-- **HTTP base-path routing.** `sit serve` serves one repo at `/sit/v1/…`. Accepting `http://host/repos/foo` changes what the wire endpoint accepts and needs real routing in `serve.cyr`. It is what serving multiple repos behind one origin requires.
-- **Per-repo caches (R6).** The patra object-store handle (`get_object_db`, `object_db.cyr`) and the `.idx` / `.pack` mapping cache (`_git_file_cached`, `git_pack.cyr`, keyed by repo-relative path) live for the process, so a second `sit_repo_open` in one process — owl or thoth switching repos, or a multi-repo server — reads the first repo's objects: two .sit repos A then B showed B's clean files as `N`, and two git repos with a pack of the same name read A's pack. Close and reset both when the root or backend changes, key the mappings by absolute path, and unmap packs that leave the listing. 1.7.6 resets its new last-pack cache per open, so it adds no exposure.
-
-## 1.11.0 — `.git/` CLI parity (minor)
-
-- **`sit status` / `log` / `diff` and `@{N}` on git repos.** The 1.2.0 *library* API already works on git; the CLI commands stay `.sit`-gated. Needs a shared `_compute_status_records()` in `diff.cyr` that both `cmd_status` and `api.cyr` use.
-  - Two sites defer to this entry, cross-referenced there since the 1.4.7 sweep:
-    - `resolve_ref_name` (`refs.cyr`): `@{N}` reflog specs are `.sit`-only, because a git repo has no `.sit/logs/`.
-    - `resolve_prefix` (`object_db.cyr`): short-prefix disambiguation over a git store would have to walk the loose fanout plus every pack `.idx`.
-  - Slot it earlier if a consumer asks for CLI parity.
-- **git-mode status on ordinary repos (R2).** The read path applies the write path's rules: `parse_tree` keeps only 100644 / 40000 entries and drops names that fail the checkout-safety rules (`aux.c`, `con/…`, `a:b.txt` on Linux), and `objects/info/alternates` is never read. So `sit_repo_status` calls executable files, symlinks, submodule contents and every file of a `git clone --shared` repo untracked, where `git status` is clean. Keep 100755 entries, compare 120000 against the link target, skip gitlinks (and their directories in the untracked walk), apply the NTFS / `:` rules only when writing a checkout, and read alternates or report their absence as an error. Mode-aware entries are new API surface, which is why this rides with CLI parity.
-- **A delta base cache, if `log` / `diff` walks need it.** 1.7.4 resolves chains to depth 4095 without one: git stores the newest version of an object whole, and the read API reads each file's HEAD blob once, so a cache would not pay there (depth-50 repo, all 320 blobs: 459 ms, the same as 1.7.3's recursion). Walks over many versions of one file are what a cache is for, and git mode gains those with this slot. Measure them first.
-
-## 1.12.0 — CLI parsing via cmdit (minor)
-
-Re-checked 2026-10-19 against **cmdit 1.4.0** (latest tag; its own pin is cyrius 6.7.9). Its `dist/cmdit.cyr` compiles on sit's cyrius 6.7.15. Demand-gated, not a forced sweep.
-
-**Why it's worth it, and why it's modest.** sit has the most hand-rolled CLI of the tier-2 verb tools: 35 commands and ~100 `argc()` / `argv()` sites in 17 `src/` files. But it has **no global flags**, so cmdit's before-or-after-verb fix buys it nothing. The gain is:
+**Why it's worth it, and why it's modest.** sit has the most hand-rolled CLI of the tier-2 verb tools: 35 commands and ~150 `argc()` / `argv()` / `argv_heap()` sites in 17 `src/` files. But it has **no global flags**, so cmdit's before-or-after-verb fix buys it nothing. The gain is:
 - one verb table
 - `--help` and `--version` (new surface, hence a minor)
 - completions
@@ -86,38 +30,39 @@ Re-checked 2026-10-19 against **cmdit 1.4.0** (latest tag; its own pin is cyrius
 
 **Hand-rolled today**
 
-- **Top-level dispatch:** `src/main.cyr:98-134` is `streq(cmd, …)` over 35 commands, with no aliases.
-  - No args → `print_usage` (`main.cyr:44-84`, stderr) and exit 1. An unknown command prints "sit: unknown command" plus usage and exits 1.
+- **Top-level dispatch:** `src/main.cyr:105-139` is `streq(cmd, …)` over 35 commands, with no aliases.
+  - No args → `print_usage` (`main.cyr:50-92`, stderr) and exit 1. An unknown command prints "sit: unknown command" plus usage and exits 1.
   - There is no `--help` / `--version`, and every usage error exits **1**.
-- **Fixed-index flags.** `cmd_*` read `argv(n)` by fixed index, and most flags count only at `argv(2)`, so a dash-leading path or message is treated as a positional:
+- **Fixed-index flags.** `cmd_*` read `argv(n)` by fixed index, and most flags count only at `argv(2)`:
 
   | flag | location |
   |---|---|
   | `add -f` | `index.cyr:17` |
-  | `rm --cached` | `index.cyr:738` |
-  | `reset --hard` | `index.cyr:637` |
-  | `checkout -b` | `refs.cyr:724` |
-  | `branch -d` | `refs.cyr:607` |
-  | `tag -d` / `-a` / `-s` | `refs.cyr:428,470,472` |
-  | `merge --abort` / `-S` | `merge.cyr:751,779` |
+  | `rm --cached` | `index.cyr:774` |
+  | `reset --hard` | `index.cyr:663` |
+  | `checkout -b` | `refs.cyr:771` |
+  | `branch -d` | `refs.cyr:653` |
+  | `tag -d` / `-a` / `-s` | `refs.cyr:473,515,517` |
+  | `merge --abort` | `merge.cyr:732`; `-S` / `-m <msg>` are scanned anywhere (`cmd_merge`'s argument loop) |
   | `rebase --abort` / `--continue` | `rebase.cyr:257,292` |
-  | `config --global` | `config.cyr:302` |
+  | `config --global` | `config.cyr:360` |
+- **Option-shaped names are refused** where a name is created (`ref_name_is_option`, `refs.cyr`) and where `commit` takes a bare message (`commit.cyr`); a cmdit table must keep those refusals.
 - **Scanning loops:**
 
   | command | function | notes |
   |---|---|---|
-  | `log` | `cmd_log`, `commit.cyr:983` | |
-  | `commit -S` / `-m` | `cmd_commit`, `commit.cyr:1138` | |
-  | `reflog -n` | `cmd_reflog`, `reflog.cyr:379` | a missing value is ignored |
-  | `fsck --prune` / `--prune-now` | `cmd_fsck`, `object_db.cyr:1106` | everything else is ignored |
-  | `clone` | `cmd_clone`, `wire.cyr:1420` | |
-  | `serve` | `cmd_serve`, `serve.cyr:1542` | `<repo>` fixed at `argv(2)` |
-  | `diff` / `show` | `diff.cyr:1029,1299` | |
+  | `log` | `cmd_log`, `commit.cyr:1013` | |
+  | `commit -S` / `-m` | `cmd_commit`, `commit.cyr:1168` | with no message, a merge's saved `-m` (`MERGE_MSG`) |
+  | `reflog -n` | `cmd_reflog`, `reflog.cyr:399` | a missing value is ignored; `show` / `expire` / `delete` sub-commands |
+  | `fsck --prune` / `--prune-now` | `cmd_fsck`, `object_db.cyr:1186` | everything else is ignored |
+  | `clone` | `cmd_clone`, `wire.cyr:1565` | |
+  | `serve` | `cmd_serve`, `serve.cyr:1602` | `<repo>` fixed at `argv(2)` |
+  | `diff` / `show` | `diff.cyr:1058,1336` | |
 - **Sub-commands:**
-  - `stash push | list | pop | drop` (default push): `cmd_stash`, `history.cyr:472`.
+  - `stash push | list | pop | drop` (default push): `cmd_stash`, `history.cyr:587`.
   - `key generate | show`: `cmd_key`, `sign.cyr:293`.
-  - `remote add | list | remove` (default list): `cmd_remote`, `wire.cyr:1153`.
-- **Silent tolerance is load-bearing.** `merge <branch> -m <msg>` ignores `-m` (1.8.0 above), and both the integration suite and CI pass it.
+  - `remote add | list | remove` (default list): `cmd_remote`, `wire.cyr:1287`.
+  - `reflog [show] | expire | delete` (default show): `cmd_reflog`, `reflog.cyr:399`.
   - The `getenv` reads (`SIT_AUTHOR_*`, `SIT_OWL`, `HOME`, …) are not flag fallbacks and stay.
 
 **Placement constraint.**
@@ -141,73 +86,101 @@ Re-checked 2026-10-19 against **cmdit 1.4.0** (latest tag; its own pin is cyrius
   | kind | flags |
   |---|---|
   | bools | `-f --cached -b -a -s -S --abort --continue --global --list --oneline --graph --staged --stat --prune --prune-now --force-absolute --stdio --tls --require-auth` |
-  | strings | `-d -m --hard --unset --listen --token --cert --key` |
+  | strings | `-d -m --hard --unset --listen --token --cert --key --expire=` |
   | ints | `-n`, `--depth` (`cmdit_range` ≥ 1) |
 
-  stash, key and remote become nested re-entry (`cmdit_dispatch_argv` on `cmdit_verb_argc` / `_argv`), each keeping its own unknown-sub-command text.
+  stash, key, remote and reflog become nested re-entry (`cmdit_dispatch_argv` on `cmdit_verb_argc` / `_argv`), each keeping its own unknown-sub-command text.
 - **Gap, blocking diff/show only.** `-U<N>` is an *attached* short value, and cmdit rejects `-U3` as `CMDIT_ERR_BUNDLED`.
-  - It is pinned by `tests/integration/run.sh:442,447` (`show -U0`, `show -U4611686018427387904`) and CI's "diff -U<N>" smoke (`ci.yml:399`).
+  - It is pinned by `tests/integration/run.sh:475,480` (`show -U0`, `show -U4611686018427387904`) and CI's "diff -U<N>" smoke (`ci.yml:399`).
   - Keep diff/show hand-rolled, or strip `-U*` before `cmdit_parse_verb`.
-  - This is concrete demand for cmdit's v2-backlog "attached short value" as an opt-in per-flag modifier.
+  - cmdit's roadmap already records sit's `-U<N>` as demand for an opt-in "attached short value" (its won't-ship-without-cause list).
 - **Caller-side rules (not gaps):**
-  - serve's `--stdio` / `--listen` and `--tls` / `--stdio` exclusions, and `--tls` needing `--cert` / `--key` (`serve.cyr:1633-1680`)
-  - `merge` registering `-m` and keeping "any flag → single-branch path"
+  - serve's `--stdio` / `--listen` and `--tls` / `--stdio` exclusions, and `--tls` needing `--cert` / `--key` (`serve.cyr:1693-1738`)
+  - `merge` taking `-S` / `-m <msg>` before or after its branches
   - config's `--list` / `--unset` / `<key>` exclusivity
 - **Decide, don't drift:**
   - Dash-leading paths and messages will need `--`.
   - `atoi` junk (`-n x`) becomes an int error.
   - Arguments ignored today (fsck, reflog, extras) become errors.
-- **`sit serve <repo> --stdio` is a cross-version contract.** The SSH client builds exactly that remote command line (`wire_ssh.cyr:410`), so it must keep parsing byte for byte.
+- **`sit serve <repo> --stdio` is a cross-version contract.** The SSH client builds exactly that remote command line (`wire_ssh.cyr:408`), so it must keep parsing byte for byte.
 
 **cyrius.cyml, tests, identity**
 
-- **Deps:** there is no stdlib `flags` module to drop, and `args` + `io` are already in `[deps] stdlib`. Take the latest cmdit tag at the time:
+- **Deps:** there is no stdlib `flags` module to drop, and `args` + `io` are already in `[deps] stdlib`:
 
   ```
   [deps.cmdit]
   git = "https://github.com/MacCracken/cmdit.git"
-  tag = "1.4.0"
+  tag = "<latest>"
   modules = ["dist/cmdit.cyr"]
   ```
 - **Tests:** `tests/sit.tcyr` / `tests/sit.fcyr` don't touch CLI parsing. The bar is `tests/integration/run.sh` plus CI's smoke steps (and `scripts/benchmark.sh`'s invocations), with stdout / stderr byte-identical.
-- **argv safety:** `lib/args.cyr` (cyrius 6.7.15, `args_init` at `:167-173`) reads the command line into a heap buffer, so `cmdit_argv`'s stored pointers are safe. The old stack-buffer hazard ([architecture 001](../architecture/001-args-stack-buffer-lifetime.md), and the octopus comment at `merge.cyr:1361`) no longer applies.
+- **argv safety:** `lib/args.cyr` (`args_init` at `:167-173`) reads the command line into a heap buffer, so `cmdit_argv`'s stored pointers are safe. The old stack-buffer hazard ([architecture 001](../architecture/001-args-stack-buffer-lifetime.md)) no longer applies.
+
+## 1.10.0 — storage: pack bundles + `gc` (minor)
+
+The largest measured gap sit has. Measured 2026-08-20 at 1,600 commits, both sides verified:
+
+| | sit `objects.patra` | git packed | git loose | ratio |
+|---|---:|---:|---:|---:|
+| 1,600 commits | **64.3 MB** | 1.6 MB | 4.3 MB | **39×** |
+
+sit is 15× git's *unpacked* store as well, so page overhead is not the explanation: the fixture's tree content is quadratic in commit count, and successive trees are near-identical, which is exactly what delta compression collapses. Lookups are flat (patra's result-buffer fix); what remains is disk and transfer size.
+
+Delta *generation* exists (`src/delta.cyr`, differential-tested against the read-side interpreter: one byte changed in 8 KiB gives a 35-byte delta). What remains is storage and repack, a storage-format change in four coupled parts:
+
+1. **Schema:** an `objects` column naming the delta base, declared in two places (`object_db.cyr`, `wire.cyr`), plus migration for existing repos.
+2. **`read_object`:** reconstruct transparently. It is already the single choke point.
+3. **`fsck` integrity:** it re-hashes stored bytes against the object id. For a delta those bytes are not the content, so the pass must reconstruct first, or every deltified object reads `bad`.
+4. **Transfer:** `copy_objects` moves raw compressed bytes and verifies each object against its id before storing it (`_object_verify`, CLAUDE.md). A deltified object can only be verified once its base is present, so the base has to travel first (or already be in the target), and verification must reconstruct the same way `fsck` does.
+
+A negotiated wire capability is a further step. **Ride-along: index paths over 255 bytes (B7 rest).** `sit add` and `sit mv` refuse them and `rewrite_index` is transactional. Lifting the limit needs a wider column, an index migration that belongs with this schema change.
+
+## 1.11.0 — serving many repos (minor)
+
+- **HTTP base-path routing.** `sit serve` serves one repo at `/sit/v1/…`. Accepting `http://host/repos/foo` changes what the wire endpoint accepts and needs real routing in `serve.cyr`. It is what serving multiple repos behind one origin requires.
+- **Per-repo caches (R6).** The patra object-store handle (`get_object_db`, `object_db.cyr`) and the `.idx` / `.pack` mapping cache (`_git_file_cached`, `git_pack.cyr`, keyed by repo-relative path) live for the process, so a second `sit_repo_open` in one process — owl or thoth switching repos, or a multi-repo server — reads the first repo's objects: two .sit repos A then B showed B's clean files as `N`, and two git repos with a pack of the same name read A's pack. Close and reset both when the root or backend changes, key the mappings by absolute path, and unmap packs that leave the listing. (The last-pack cache, `_git_last_idx`, is already reset per open.)
+
+## 1.12.0 — `.git/` CLI parity (minor)
+
+- **`sit status` / `log` / `diff` and `@{N}` on git repos.** The *library* API already works on git; the CLI commands stay `.sit`-gated. Needs a shared `_compute_status_records()` in `diff.cyr` that both `cmd_status` and `api.cyr` use.
+  - Two sites defer to this entry:
+    - `resolve_ref_name` (`refs.cyr`): `@{N}` reflog specs are `.sit`-only, because a git repo has no `.sit/logs/`.
+    - `resolve_prefix` (`object_db.cyr`): short-prefix disambiguation over a git store would have to walk the loose fanout plus every pack `.idx`.
+  - Slot it earlier if a consumer asks for CLI parity.
+- **git-mode status on ordinary repos (R2).** The read path applies the write path's rules: `parse_tree` keeps only 100644 / 40000 entries and drops names that fail the checkout-safety rules (`aux.c`, `con/…`, `a:b.txt` on Linux), and `objects/info/alternates` is never read. So `sit_repo_status` calls executable files, symlinks, submodule contents and every file of a `git clone --shared` repo untracked, where `git status` is clean. Keep 100755 entries, compare 120000 against the link target, skip gitlinks (and their directories in the untracked walk), apply the NTFS / `:` rules only when writing a checkout, and read alternates or report their absence as an error. Mode-aware entries are new API surface, which is why this rides with CLI parity.
+- **A delta base cache, if `log` / `diff` walks need it.** Chains resolve to depth 4095 without one: git stores the newest version of an object whole, and the read API reads each file's HEAD blob once, so a cache would not pay there (depth-50 repo, all 320 blobs: 459 ms either way). Walks over many versions of one file are what a cache is for, and git mode gains those with this slot. Measure them first.
 
 ## 1.x — unscheduled
 
 Wanted, not yet committed to a release. Each earns its own minor when its time comes.
 
-- **A commit-parent cache (commit-graph).** Every history walk reads each commit object afresh, about 75 µs apiece. That makes whole-ancestry walks cost about 150 ms per 2,000 commits: `find_merge_base` on every merge, `rebase`'s pending set, and `describe` when a merge lies between the commit and its nearest tag (1.7.3). git keeps a commit-graph file for the same reason. A parent table in `objects.patra`, filled on write and backfilled once, would cut the walks to table reads. Measure `merge-base` / `describe` / `rebase` on a 100k-commit fixture first.
+- **A commit-parent cache (commit-graph).** Every history walk reads each commit object afresh, about 75 µs apiece. That makes whole-ancestry walks cost about 150 ms per 2,000 commits: `find_merge_base` on every merge, `rebase`'s pending set, and `describe` when a merge lies between the commit and its nearest tag. git keeps a commit-graph file for the same reason. A parent table in `objects.patra`, filled on write and backfilled once, would cut the walks to table reads. Measure `merge-base` / `describe` / `rebase` on a 100k-commit fixture first.
 - **Hooks** (`pre-commit`, `pre-push`, …), if a consumer asks.
-- **An arena per public-API call (R1, rest).** Since 1.7.6 `sit_repo_status` frees every blob and file it compares; what it still keeps, ~94 KB per call on 200 files, is the flattened HEAD tree, the worktree listing and the result records, all on the bump heap. Running each call on an arena rewound at entry, as `sit serve` does per request, would close it — but the returned vec is the caller's, so the records must be copied out or the contract changed (ADR 0009). Measure with `tests/integration/api_heap_probe.cyr`.
+- **An arena per public-API call (R1, rest).** `sit_repo_status` frees every blob and file it compares; what it still keeps, ~94 KB per call on 200 files, is the flattened HEAD tree, the worktree listing and the result records, all on the bump heap. Running each call on an arena rewound at entry, as `sit serve` does per request, would close it — but the returned vec is the caller's, so the records must be copied out or the contract changed (ADR 0009). Measure with `tests/integration/api_heap_probe.cyr`.
 
 ---
 
 ## Upstream asks (not sit work)
 
-Blocked on another repo. Per [CLAUDE.md](../../CLAUDE.md), cross-project requests go on the **target repo's** roadmap.
+Blocked on another repo. Per [CLAUDE.md](../../CLAUDE.md), each belongs on the **target repo's** roadmap; each entry says whether it is there.
 
-- **sankoch — DEFLATE match-finder throughput.** Targets the `add-1MB` `zlib_compress` floor (~100 ms, about 6× git and the largest single cost in `sit add`). sankoch has adopted it as its own **2.9.1** item ("the trigger has fired"). sit's pin is sankoch 2.8.7 at cyrius 6.7.15, so it arrives with the cyrius release that folds sankoch 2.9.1.
-
-- **sandhi — an allocator-taking `sandhi_server_content_length`.** It reads the header through `sandhi_server_find_header`, so the value lands on the global heap on every call. `_sandhi_server_recv_request_dl` calls it on every request with a body, so a long-running server keeps about 8 B per such request. `sit serve` parses `Content-Length` itself over its request arena since 1.7.4 (`_serve_content_length`, differential-fuzzed against sandhi's), but cannot reach the accept loop's call. An `_a` form, or an in-place scan that allocates nothing, closes both.
-- **patra — `page_write`'s return is ignored inside statements (1.7.6, L12).** `tbl_insert` (`lib/patra.cyr` 5038 / 5046 / 5052), `tbl_delete` (5544 / 5552), `btree_insert` (4258 / 4316) and `_bt_push_up` (4121 / 4151 / 4204 / 4218) at patra 1.16.x. In autocommit the header write that follows then succeeds and the statement reports `PATRA_OK` for a page that never reached the disk (reproduced with `RLIMIT_FSIZE` standing in for EIO / ENOSPC: `sit add` printed "added" and staged nothing). Inside a transaction the failure is reported, which is why sit now writes the index only in transactions; any other autocommit caller is still exposed.
-- **sankoch / stdlib — a word-wise `memcpy`.** `lib/string.cyr`'s `memcpy` is a byte loop (~140 MB/s; the `rep movsb` was removed for aarch64 alignment). 1.7.6 copies delta ops eight bytes at a time itself (`_pack_copy`, `git_pack.cyr`), which made a 40-step chain of 16 MB results 5.4× faster; every other bulk copy in sit and sankoch still pays the byte loop.
-- **sankoch — every inflate keeps 32 B: `br_init`'s bit reader.** `br_init` (`lib/sankoch.cyr`, sankoch 2.8.7 at cyrius 6.7.15) takes its 32-byte reader from `_sankoch_alloc` on every `_deflate_decompress_inner` / `_deflate_decompress_dict_inner` call and never frees it, so `zlib_decompress` and `zlib_decompress_with_ratio_cap` keep 32 B per call after warm-up (an `fl_alloc` / `fl_free` round trip keeps 0). Since 1.7.5 it is all `sit serve` and git read mode still keep:
-  - `sit serve`'s fast-forward check inflates every commit it walks, so a ref push over 2,000 commits keeps 63,968 B, all of it this.
-  - A git-mode read keeps 32 B per loose object and about 1 KB per packed object at an average chain depth of 33, once per inflate in the chain.
-
-  A stack reader in the two decoders, which own its lifetime, closes both.
+- **sankoch — DEFLATE match-finder throughput.** Targets the `add-1MB` `zlib_compress` floor (~100 ms, about 6× git and the largest single cost in `sit add`). **On sankoch's roadmap** as its 2.9.1 item; it reaches sit with the cyrius release that folds that sankoch.
+- **sankoch — every inflate keeps 32 B: `br_init`'s bit reader.** `br_init` (`src/bitreader.cyr` in sankoch) takes its 32-byte reader from `_sankoch_alloc` on every `_deflate_decompress_inner` / `_deflate_decompress_dict_inner` call and never frees it, so `zlib_decompress` and `zlib_decompress_with_ratio_cap` keep 32 B per call (an `fl_alloc` / `fl_free` round trip keeps 0). It is all `sit serve` and git read mode still keep: a ref push over 2,000 commits keeps 63,968 B, and a git-mode read 32 B per loose object, about 1 KB per packed object at chain depth 33. A stack reader in the two decoders, which own its lifetime, closes both. **Not yet on sankoch's roadmap.**
+- **sandhi — an allocator-taking `sandhi_server_content_length`.** It reads the header through `sandhi_server_find_header`, so the value lands on the global heap on every call. `_sandhi_server_recv_request_dl` calls it on every request with a body, so a long-running server keeps about 8 B per such request. `sit serve` parses `Content-Length` itself over its request arena (`_serve_content_length`, differential-fuzzed against sandhi's), but cannot reach the accept loop's call. An `_a` form, or an in-place scan that allocates nothing, closes both. **Not yet on sandhi's roadmap.**
+- **patra — `page_write`'s return is ignored inside statements (L12).** `tbl_insert`, `tbl_delete`, `btree_insert` and `_bt_push_up` discard it, so in autocommit a page that never reached the disk is reported as `PATRA_OK` (reproduced with `RLIMIT_FSIZE` standing in for EIO / ENOSPC: `sit add` printed "added" and staged nothing). Inside a transaction the failure is reported, which is why sit writes the index only in transactions. **On patra's own roadmap** (its "Open — patra's own" list, found there at 1.16.2).
 
 ## On hold — keep sandhi
 
-Dropping sandhi for a hand-rolled `net`-direct loopback HTTP/1.0 server (surface minimization) is deliberately *not* scheduled. A future cyrius change is expected to make stdlib / lib consumption easier, which changes both the trade-off and the likely implementation. Until then, sit keeps consuming sandhi's `sandhi_server_*` surface (sandhi 1.13.1 at cyrius 6.7.15).
+Dropping sandhi for a hand-rolled `net`-direct loopback HTTP/1.0 server (surface minimization) is deliberately *not* scheduled. A future cyrius change is expected to make stdlib / lib consumption easier, which changes both the trade-off and the likely implementation. Until then, sit keeps consuming sandhi's `sandhi_server_*` surface.
 
 ## Decided — do not re-attempt
 
 Closed by measurement. The reasoning lives where cited; they are listed here only so they are not re-opened blindly.
 
-- **`clone` has no algorithmic defect left** (1.4.9). Its cost is a fixture whose content is quadratic in commit count, plus git's delta compression: the 1.9.0 item above. Phase profile in the 1.4.9 CHANGELOG entry.
-- **Memoizing `_wildmatch` is declined** (1.4.9). Both shapes cost 7–18% on `is_ignored` for a benign edge, since budget exhaustion shows a file rather than hiding it. Numbers at the call site in `src/index.cyr`; the `**` scan has been charged to the budget since 1.6.4.
+- **`clone` has no algorithmic defect left** (1.4.9). Its cost is a fixture whose content is quadratic in commit count, plus git's delta compression: the 1.10.0 item above. Phase profile in the 1.4.9 CHANGELOG entry.
+- **Memoizing `_wildmatch` is declined** (1.4.9). Both shapes cost 7–18% on `is_ignored` for a benign edge, since budget exhaustion shows a file rather than hiding it. Numbers at the call site in `src/index.cyr`.
 
 ---
 
-*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/), latest [`2026-10-19-v1.7.6.md`](../benchmarks/2026-10-19-v1.7.6.md). Security audit reports are in [`../audit/`](../audit/), latest [`2026-10-19-1.7.6-audit.md`](../audit/2026-10-19-1.7.6-audit.md).*
+*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Benchmark snapshots are in [`../benchmarks/`](../benchmarks/); security audit reports in [`../audit/`](../audit/). Audit ids (A5, B7, L12, R1, R2, R6, …) refer to those reports.*
