@@ -69,6 +69,7 @@ fn print_usage(fd) {
     _usage_line(fd, "  reset <path> | --hard <ref>  unstage a path, or move HEAD to <ref>");
     _usage_line(fd, "  config [--global] <key> [<value>]  read or write a config value");
     _usage_line(fd, "  fsck [--prune]          verify object integrity; --prune removes dangling objects");
+    _usage_line(fd, "  gc                      pack reachable objects with deltas and compact the store");
     _usage_line(fd, "  key generate | show     manage the local ed25519 signing key (~/.sit/)");
     _usage_line(fd, "  verify-commit [<hash>]  verify a commit's sitsig signature (defaults HEAD)");
     _usage_line(fd, "  verify-tag <tag>        verify an annotated tag's sitsig signature");
@@ -131,6 +132,7 @@ fn _sit_cli() {
     cmdit_verb(h, "reset", "unstage a path, or move HEAD to <ref>");
     cmdit_verb(h, "config", "read or write a config value");
     cmdit_verb(h, "fsck", "verify object integrity; --prune removes dangling objects");
+    cmdit_verb(h, "gc", "pack reachable objects with deltas and compact the store");
     cmdit_verb(h, "key", "manage the local ed25519 signing key (~/.sit/)");
     cmdit_verb(h, "verify-commit", "verify a commit's sitsig signature (defaults HEAD)");
     cmdit_verb(h, "verify-tag", "verify an annotated tag's sitsig signature");
@@ -206,6 +208,7 @@ fn main() {
     if (streq(cmd, "reset") == 1) { return cmd_reset(); }
     if (streq(cmd, "config") == 1) { return cmd_config(); }
     if (streq(cmd, "fsck") == 1) { return cmd_fsck(); }
+    if (streq(cmd, "gc") == 1) { return cmd_gc(); }
     if (streq(cmd, "key") == 1) { return cmd_key(); }
     if (streq(cmd, "verify-commit") == 1) { return cmd_verify_commit(); }
     if (streq(cmd, "verify-tag") == 1) { return cmd_verify_tag(); }

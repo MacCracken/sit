@@ -2195,7 +2195,175 @@ fi
 TABLE=$("$SIT" --help | sed -n '/^commands:/,/^$/p' | awk 'NR>1 && /^  [a-z]/{print $1}' | sort -u | tr '\n' ' ')
 COMPL=$("$SIT" completions bash | sed -n "s/^ *local verbs='\(.*\)'/\1/p" | tr ' ' '\n' | sort -u | tr '\n' ' ')
 assert_eq "$TABLE" "$COMPL" "38f: the usage table and the completion verbs list the same commands"
-assert_eq "$(printf '%s' "$COMPL" | wc -w | tr -d ' ')" "36" "38f: 36 commands"
+assert_eq "$(printf '%s' "$COMPL" | wc -w | tr -d ' ')" "37" "38f: 37 commands"
+
+# ── 39. 1.10.0 `sit gc`: packs, compaction, the store lock ───────────
+# gc packs every reachable object (git's SHA-256 pack v2 / idx v2, deltas
+# against the newer version at the same path), writes what nothing reaches back
+# as rows, rewrites objects.patra without the rest, and drops older packs. It
+# runs alone: every process holds .sit/objects.flock shared, gc exclusive.
+hr "1.10.0 sit gc"
+R="$WORK/gc"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null
+mkdir -p d
+for i in $(seq 1 25); do
+  seq 1 $((i * 40)) > a.txt; echo "v$i" > b.txt; seq $i 400 > d/c.txt
+  "$SIT" add a.txt >/dev/null; "$SIT" add b.txt >/dev/null; "$SIT" add d/c.txt >/dev/null
+  "$SIT" commit -m "c$i" >/dev/null
+done
+"$SIT" branch feature >/dev/null; "$SIT" checkout feature >/dev/null
+echo feat > f.txt; "$SIT" add f.txt >/dev/null; "$SIT" commit -m feat1 >/dev/null
+echo feat2 >> f.txt; "$SIT" add f.txt >/dev/null; "$SIT" commit -m feat2 >/dev/null
+"$SIT" checkout main >/dev/null
+"$SIT" tag -a v1 -m "release one" >/dev/null
+echo stashed >> a.txt; "$SIT" stash push >/dev/null
+echo staged > s.txt; "$SIT" add s.txt >/dev/null
+# Everything a reader sees, to compare after each gc.
+gcsnap() {
+  for b in main feature; do "$SIT" log --oneline "$b" 2>/dev/null; done
+  for h in $("$SIT" log --oneline | awk '{print $1}') $("$SIT" log --oneline feature | awk '{print $1}'); do
+    "$SIT" show --stat "$h" 2>/dev/null
+  done
+  "$SIT" cat-file v1 2>/dev/null; "$SIT" diff --staged 2>/dev/null; "$SIT" stash list 2>/dev/null
+}
+BEFORE=$(gcsnap); NOBJ=$(objcount); SZ0=$(wc -c < .sit/objects.patra)
+OUT=$("$SIT" gc 2>&1); RC=$?
+assert_eq "$RC" "0" "39a: gc succeeds"
+assert_contains "$OUT" "packed $NOBJ objects" "39a: and packs every object (all reachable: refs, tag, stash, index)"
+assert_eq "$(ls .sit/packs | grep -c '^pack-[0-9a-f]\{64\}\.pack$')" "1" "39a: into one pack"
+assert_eq "$(ls .sit/packs | grep -c '^pack-[0-9a-f]\{64\}\.idx$')" "1" "39a: with one index"
+[ "$(wc -c < .sit/objects.patra)" -lt "$SZ0" ] && ok || bad "39a: objects.patra shrinks"
+assert_eq "$(gcsnap)" "$BEFORE" "39a: every reader sees the same history, tag, stash and index"
+assert_eq "$("$SIT" fsck 2>&1)" "checked $NOBJ objects, 0 bad, 0 dangling" "39a: fsck: the same objects, clean"
+assert_contains "$("$SIT" status)" "s.txt" "39a: the staged file is still staged"
+HEADID=$(cat .sit/refs/heads/main)
+assert_eq "$("$SIT" cat-file "$(printf '%.8s' "$HEADID")" | head -1)" "$("$SIT" cat-file "$HEADID" | head -1)" "39a: a short id finds a packed object"
+PACK1=$(ls .sit/packs/*.pack)
+"$SIT" gc >/dev/null 2>&1; assert_eq "$?" "0" "39b: gc again"
+assert_eq "$(ls .sit/packs/*.pack)" "$PACK1" "39b: the same objects make the same pack"
+"$SIT" commit -m staged >/dev/null                      # pop wants a clean index
+"$SIT" stash pop >/dev/null 2>&1; assert_eq "$?" "0" "39b: stash pop reads the packed stash"
+assert_contains "$(cat a.txt)" "stashed" "39b: and restores it"
+"$SIT" add a.txt >/dev/null; "$SIT" commit -m after-gc >/dev/null
+# Reachable = checked - dangling (the popped stash is dangling now).
+reach() { "$SIT" fsck 2>/dev/null | sed -n 's/^checked \([0-9]*\) objects, [0-9]* bad, \([0-9]*\) dangling.*/\1 \2/p' | awk '{print $1 - $2}'; }
+NREACH=$(reach)
+OUT=$("$SIT" gc 2>&1)
+assert_contains "$OUT" "packed $NREACH objects" "39c: new commits join the next pack, the popped stash does not"
+assert_contains "$OUT" "left loose" "39c: the stash's objects are rows again"
+assert_eq "$(ls .sit/packs/*.pack | wc -l | tr -d ' ')" "1" "39c: which replaces the old one"
+[ "$(ls .sit/packs/*.pack)" != "$PACK1" ] && ok || bad "39c: under a new name"
+"$SIT" checkout feature >/dev/null 2>&1; assert_eq "$(cat f.txt)" "feat
+feat2" "39c: a packed branch checks out"
+"$SIT" checkout main >/dev/null 2>&1
+
+# 39d. What gc stops reaching is written back as rows; fsck --prune judges
+# those. A packed object --prune cannot delete; the next gc loosens it. With
+# .sit/logs gone, nothing reachable may be lost (CLAUDE.md fsck rule).
+"$SIT" branch -d feature >/dev/null 2>&1
+rm -rf .sit/logs
+OUT=$("$SIT" fsck --prune-now 2>&1); RC=$?
+assert_eq "$RC" "0" "39d: fsck --prune-now after gc, branch deleted, logs gone"
+assert_contains "$OUT" "packed (the next \`sit gc\` loosens them)" "39d: keeps the packed dangling objects"
+OUT=$("$SIT" gc 2>&1)
+assert_contains "$OUT" "left loose" "39d: gc writes them back as rows"
+OUT=$("$SIT" fsck --prune-now 2>&1)
+assert_contains "$OUT" "pruned 6 objects" "39d: and --prune-now deletes them (2 commits, 2 trees, 2 blobs)"
+assert_contains "$("$SIT" fsck 2>&1 | tail -1)" " 0 bad, 0 dangling" "39d: the rest is intact"
+assert_contains "$("$SIT" log --oneline | tail -1)" "c1" "39d: down to the first commit"
+
+# 39e. Clones and pushes: a packed object leaves expanded (the wire is
+# unchanged) and is verified on arrival as any other.
+cd "$WORK"
+"$SIT" clone "$R" gcl1 >/dev/null 2>&1; assert_eq "$?" "0" "39e: clone (file) from a packed repository"
+assert_eq "$(cd gcl1 && "$SIT" log --oneline)" "$(cd "$R" && "$SIT" log --oneline)" "39e: with all of its history"
+assert_eq "$(cd gcl1 && "$SIT" fsck 2>&1 | tail -1 | sed 's/checked [0-9]* objects, //')" "0 bad, 0 dangling" "39e: clean"
+cd gcl1 && "$SIT" gc >/dev/null 2>&1 && "$SIT" checkout -b topic >/dev/null 2>&1
+echo t > t.txt; "$SIT" add t.txt >/dev/null; "$SIT" commit -m topic >/dev/null
+"$SIT" push origin >/dev/null 2>&1; assert_eq "$?" "0" "39e: push from a packed clone into a packed repository"
+cd "$R"; assert_contains "$("$SIT" log --oneline topic)" "topic" "39e: arrives"
+assert_eq "$("$SIT" fsck 2>&1 | tail -1 | sed 's/checked [0-9]* objects, //')" "0 bad, 0 dangling" "39e: and the target stays clean"
+# A source named by a relative path: its packs are found relative to the cwd,
+# not to the clone's target (the reader resolves repo paths against the root).
+mkdir -p "$WORK/gcsub"; cd "$WORK/gcsub"
+"$SIT" clone ../gc gcl3 >/dev/null 2>&1; assert_eq "$?" "0" "39e: clone ../<packed repository> by a relative path"
+assert_eq "$(cd gcl3 && "$SIT" fsck 2>&1 | tail -1 | sed 's/checked [0-9]* objects, //')" "0 bad, 0 dangling" "39e: clean"
+cd gcl3 && "$SIT" checkout -b rel >/dev/null 2>&1 && echo r > r.txt && "$SIT" add r.txt >/dev/null && "$SIT" commit -m rel >/dev/null
+"$SIT" remote add up "$R" >/dev/null 2>&1
+OUT=$("$SIT" push up 2>&1)
+assert_contains "$OUT" "(3 new objects)" "39e: a push to it copies only what its pack lacks"
+cd "$WORK"
+if command -v python3 >/dev/null 2>&1; then
+  gcwait() { for _ in 1 2 3 4 5 6 7 8 9 10; do (echo > /dev/tcp/127.0.0.1/"$1") >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
+  "$SIT" serve "$R" --listen 127.0.0.1:18790 > /dev/null 2>&1 & GS=$!
+  gcwait 18790
+  "$SIT" clone --force-absolute http://127.0.0.1:18790 gcl2 >/dev/null 2>&1; assert_eq "$?" "0" "39e: clone (http) from a packed repository"
+  assert_eq "$(cd gcl2 && "$SIT" fsck 2>&1 | tail -1 | sed 's/checked [0-9]* objects, //')" "0 bad, 0 dangling" "39e: clean"
+  # 39f. A running server holds the store; gc refuses rather than replace it.
+  OUT=$(cd "$R" && "$SIT" gc 2>&1); RC=$?
+  assert_eq "$RC" "1" "39f: gc refuses while sit serve has the store open"
+  assert_contains "$OUT" "another sit process" "39f: and says why"
+  kill $GS 2>/dev/null; wait $GS 2>/dev/null
+  (cd "$R" && "$SIT" gc >/dev/null 2>&1); assert_eq "$?" "0" "39f: and runs once it is gone"
+fi
+cd "$R"
+if command -v flock >/dev/null 2>&1; then
+  flock -s .sit/objects.flock sleep 3 & FL=$!
+  sleep 0.3
+  "$SIT" gc >/dev/null 2>&1; assert_eq "$?" "1" "39f: gc refuses while any process holds the store lock"
+  wait $FL 2>/dev/null
+  flock -x .sit/objects.flock sleep 1 & FL=$!
+  sleep 0.3
+  OUT=$("$SIT" log --oneline 2>&1 | head -2)
+  assert_contains "$OUT" "waiting for \`sit gc\`" "39f: a command started during gc waits for it"
+  assert_contains "$OUT" "after-gc" "39f: then reads the store"
+  wait $FL 2>/dev/null
+fi
+
+# 39g. A damaged pack: fsck names it, gc refuses and changes nothing.
+cp -a "$R" "$WORK/gcbad"; cd "$WORK/gcbad"
+P=$(ls .sit/packs/*.pack); chmod u+w "$P"
+python3 -I -c 'import sys
+p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[len(b) // 2] ^= 0x55; open(p, "wb").write(b)' "$P"
+OUT=$("$SIT" fsck 2>&1); RC=$?
+assert_eq "$RC" "1" "39g: fsck fails on a damaged pack"
+assert_contains "$OUT" "bad pack" "39g: naming the pack"
+"$SIT" fsck --prune-now >/dev/null 2>&1; assert_eq "$?" "1" "39g: and --prune refuses"
+SUM=$(cksum < "$P")
+"$SIT" gc >/dev/null 2>&1; assert_eq "$?" "1" "39g: gc refuses"
+assert_eq "$(cksum < "$P")" "$SUM" "39g: and leaves the pack as it was"
+
+# 39h. Refusals: a symlinked .sit/packs, extra arguments, no repository, .git.
+R2="$WORK/gcsym"; mkdir -p "$R2" "$WORK/elsewhere"; cd "$R2"; "$SIT" init >/dev/null
+echo x > x.txt; "$SIT" add x.txt >/dev/null; "$SIT" commit -m x >/dev/null
+ln -s "$WORK/elsewhere" .sit/packs
+OUT=$("$SIT" gc 2>&1); RC=$?
+assert_eq "$RC" "1" "39h: gc refuses a symlinked .sit/packs"
+assert_eq "$(ls "$WORK/elsewhere" | wc -l | tr -d ' ')" "0" "39h: and writes nothing through it"
+rm .sit/packs
+"$SIT" gc extra >/dev/null 2>&1; assert_eq "$?" "1" "39h: gc takes no arguments"
+(cd "$WORK" && "$SIT" gc >/dev/null 2>&1); assert_eq "$?" "1" "39h: gc outside a repository"
+if command -v git >/dev/null 2>&1; then
+  G="$WORK/gcgit"; mkdir -p "$G"; (cd "$G" && git init -q . && "$SIT" gc >/dev/null 2>&1); assert_eq "$?" "1" "39h: gc refuses a .git repository"
+fi
+
+# 39i. git reads sit's packs: index-pack rebuilds the same .idx byte for byte,
+# and verify-pack accepts the pack.
+if command -v git >/dev/null 2>&1 && git init -q --object-format=sha256 "$WORK/gcx" >/dev/null 2>&1; then
+  cd "$R"; P=$(ls .sit/packs/*.pack)
+  cp "$P" "$WORK/gcx/x.pack"
+  (cd "$WORK/gcx" && git index-pack --object-format=sha256 -o x.idx x.pack >/dev/null 2>&1)
+  cmp -s "$WORK/gcx/x.idx" "${P%.pack}.idx"; assert_eq "$?" "0" "39i: git index-pack rebuilds sit's .idx byte for byte"
+  (cd "$WORK/gcx" && git verify-pack --object-format=sha256 x.idx >/dev/null 2>&1); assert_eq "$?" "0" "39i: git verify-pack accepts the pack"
+fi
+
+# 39j. The read bundle (owl, thoth) reads a packed repository.
+if [ -n "$API_PROBE" ]; then
+  cd "$R"
+  OUT=$("$API_PROBE" a.txt 3 2>&1); RC=$?
+  assert_eq "$RC" "0" "39j: the read API opens a packed repository"
+  assert_contains "$OUT" "DIFF" "39j: and diffs a packed blob"
+fi
 
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"

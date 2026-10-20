@@ -1,0 +1,40 @@
+operation,v190,v1100,unit,method
+object store (1600-commit fixture),65908736,896358,bytes,objects.patra (1.9.0) vs pack+idx+rows after sit gc
+git sha256 store (same fixture),,1030873,bytes,pack+idx+rev after git gc
+log --oneline (1600-commit fixture),116.2,61.8,ms,min of 7; unpacked 1.9.0 vs packed 1.10.0
+status (1600-commit fixture),31.7,31.3,ms,min of 7
+fsck (1600-commit fixture),7106,2018,ms,min of 3
+clone file:// (1600-commit fixture),5789,6955,ms,single runs; packed source expanded at level 1
+gc first (1600-commit fixture),,5278,ms,single run
+gc repeat (1600-commit fixture),,2565,ms,single run
+sha256-64B,0.768,0.824,us,cyrius bench min of 3
+sha256-1024B,3.739,3.773,us,cyrius bench min of 3
+sha256-65536B,203.737,209.587,us,cyrius bench min of 3
+zlib-compress-1024B,131.500,135.969,us,cyrius bench min of 3
+zlib-compress-65536B,1100.000,1138.000,us,cyrius bench min of 3
+zlib-decompress-1024B,10.017,10.278,us,cyrius bench min of 3
+zlib-decompress-65536B,363.880,375.022,us,cyrius bench min of 3
+patra-open-close,29.644,32.242,us,cyrius bench min of 3
+copy-objects-100,180.622,184.940,us,cyrius bench min of 3
+commit-parse+iso8601,1.412,1.452,us,cyrius bench min of 3
+ed25519-sign,1869.000,1965.000,us,cyrius bench min of 3
+ed25519-verify,5562.000,5812.000,us,cyrius bench min of 3
+refname_valid-good,0.293,0.304,us,cyrius bench min of 3
+tree_entry_name_valid-good,0.102,0.105,us,cyrius bench min of 3
+tree_flat_path_valid-good,0.792,0.805,us,cyrius bench min of 3
+hex_prefix_valid-64char,0.210,0.214,us,cyrius bench min of 3
+lcs-diff-100x100,393.597,399.643,us,cyrius bench min of 3
+lcs-diff-1000x1000,34731.000,35508.000,us,cyrius bench min of 3
+lcs-diff-4000x4000,483761.000,491816.000,us,cyrius bench min of 3
+is_ignored-10pat,7.967,8.219,us,cyrius bench min of 3
+is_ignored-50pat,40.051,40.967,us,cyrius bench min of 3
+is_ignored-200pat,160.826,162.645,us,cyrius bench min of 3
+blob-hash-1024B,5.626,5.513,us,cyrius bench min of 3
+blob-hash-65536B,327.455,320.163,us,cyrius bench min of 3
+blob-hash-1048576B,5236.000,5115.000,us,cyrius bench min of 3
+delta-tree-100,,23.837,us,cyrius bench min of 3
+delta-tree-2000,,404.232,us,cyrius bench min of 3
+pack-chain-10-cold,,673.098,us,cyrius bench min of 3
+pack-chain-10-warm,,27.475,us,cyrius bench min of 3
+pack-chain-50-cold,,2281.000,us,cyrius bench min of 3
+pack-chain-50-warm,,27.885,us,cyrius bench min of 3

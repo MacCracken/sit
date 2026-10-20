@@ -1920,6 +1920,136 @@ fn test_180_reflog_time() {
     return 0;
 }
 
+# ── 1.10.0: packs — entry codecs, the sit pack reader, the delta base cache ──
+fn test_1100_packs() {
+    test_group("gc.cyr / git_pack.cyr — pack codecs, sit packs, base cache (v1.10.0)");
+    # Entry headers round-trip through the reader's own decoder.
+    var sizes[96];
+    store64(&sizes, 0); store64(&sizes + 8, 1); store64(&sizes + 16, 15);
+    store64(&sizes + 24, 16); store64(&sizes + 32, 127); store64(&sizes + 40, 128);
+    store64(&sizes + 48, 2047); store64(&sizes + 56, 2048); store64(&sizes + 64, 65535);
+    store64(&sizes + 72, 1048576); store64(&sizes + 80, 16777216); store64(&sizes + 88, 268435455);
+    var hb[16];
+    var bad = 0;
+    var t = 1;
+    while (t <= 7) {
+        if (t != 5) {
+            var si = 0;
+            while (si < 12) {
+                var sz = load64(&sizes + si * 8);
+                var hl = _gc_entry_hdr(&hb, t, sz);
+                var cur[8];
+                var ts[8];
+                store64(&cur, 0);
+                store64(&ts, 0);
+                if (_pack_obj_header(&hb, &cur, &ts, hl) != sz) { bad = bad + 1; }
+                if (load64(&ts) != t) { bad = bad + 1; }
+                if (load64(&cur) != hl) { bad = bad + 1; }
+                si = si + 1;
+            }
+        }
+        t = t + 1;
+    }
+    assert_eq(bad, 0, "entry headers decode to the type and size written");
+    # OFS_DELTA distances, across every byte-count boundary of the encoding.
+    var ofs[88];
+    store64(&ofs, 1); store64(&ofs + 8, 127); store64(&ofs + 16, 128); store64(&ofs + 24, 129);
+    store64(&ofs + 32, 16511); store64(&ofs + 40, 16512); store64(&ofs + 48, 16513);
+    store64(&ofs + 56, 2113663); store64(&ofs + 64, 2113664); store64(&ofs + 72, 268435456);
+    store64(&ofs + 80, 34359738368);
+    bad = 0;
+    var oi = 0;
+    while (oi < 11) {
+        var v = load64(&ofs + oi * 8);
+        var ob[16];
+        var n = _gc_ofs_enc(&ob, v);
+        var oc[8];
+        store64(&oc, 0);
+        if (_ofs_varint(&ob, &oc, n) != v) { bad = bad + 1; }
+        if (load64(&oc) != n) { bad = bad + 1; }
+        oi = oi + 1;
+    }
+    assert_eq(bad, 0, "OFS_DELTA distances decode to what was written");
+    assert_eq(_gc_ofs_enc(&hb, 127), 1, "127 takes one byte");
+    assert_eq(_gc_ofs_enc(&hb, 128), 2, "128 takes two (each continuation adds one)");
+
+    var good = "pack-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.idx";
+    assert_eq(_sit_pack_idx_name(good, strlen(good)), 1, "pack-<64 hex>.idx is a pack index");
+    assert_eq(_sit_pack_idx_name(".gc-tmp.idx", 11), 0, "gc's temporary index is not");
+    var g2 = "pack-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.pack";
+    assert_eq(_sit_pack_idx_name(g2, strlen(g2)), 0, "nor is the .pack");
+    var g3 = "pack-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg.idx";
+    assert_eq(_sit_pack_idx_name(g3, strlen(g3)), 0, "nor a name with a non-hex digit");
+
+    # A two-entry pack in memory: a blob, then an OFS_DELTA against it.
+    var base = "the base content of a blob that the delta below copies from, twice over";
+    var bl = strlen(base);
+    var tgt = "the base content of a blob that the delta below copies from, twice over!";
+    var tl = strlen(tgt);
+    var dl[8];
+    var d = delta_generate(base, bl, tgt, tl, &dl);
+    assert(d != 0, "a delta is generated");
+    var pack = fl_alloc(1024);
+    memcpy(pack, "PACK", 4);
+    _gc_be32(pack + 4, 2);
+    _gc_be32(pack + 8, 2);
+    var pos = 12;
+    pos = pos + _gc_entry_hdr(pack + pos, 3, bl);
+    pos = pos + zlib_compress(base, bl, pack + pos, 256);
+    var off2 = pos;
+    pos = pos + _gc_entry_hdr(pack + pos, 6, load64(&dl));
+    pos = pos + _gc_ofs_enc(pack + pos, off2 - 12);
+    pos = pos + zlib_compress(d, load64(&dl), pack + pos, 256);
+    fl_free(d);
+    _dbc_reset();
+    var out[24];
+    var pt[8];
+    store64(&pt, 0);
+    assert_eq(_pack_obj_ex(pack, pos, off2, &out, &pt, 0), 0, "the delta entry reads");
+    assert_eq(load64(&out + 8), tl, "to the target's length");
+    assert_eq(memeq(load64(&out), tgt, tl), 1, "and its bytes");
+    assert_eq(load64(&pt), 3, "with its base's type");
+    assert(_dbc_get(pack, off2) != 0, "the result is cached");
+    assert(_dbc_get(pack, 12) != 0, "and so is the base it started from");
+    store8(load64(&out), 88);                         # the caller's copy is the caller's
+    fl_free(load64(&out));
+    store64(&pt, 0);
+    assert_eq(_pack_obj_ex(pack, pos, off2, &out, &pt, 0), 0, "a second read");
+    assert_eq(memeq(load64(&out), tgt, tl), 1, "is served intact from the cache");
+    assert_eq(load64(&pt), 3, "with the type cached too");
+    fl_free(load64(&out));
+    assert_eq(_pack_obj_ex(pack, pos, 12, &out, &pt, 0), 0, "the base itself, from the cache");
+    assert_eq(memeq(load64(&out), base, bl), 1, "is its bytes");
+    fl_free(load64(&out));
+    _dbc_reset();
+    assert_eq(_dbc_get(pack, off2), 0, "reset empties the cache");
+
+    # A REF_DELTA names its base by id: never in a sit pack.
+    var rpos = off2;
+    rpos = rpos + _gc_entry_hdr(pack + rpos, 7, 4);
+    var z = 0;
+    while (z < 32) { store8(pack + rpos + z, 0); z = z + 1; }
+    rpos = rpos + 32;
+    rpos = rpos + zlib_compress("abcd", 4, pack + rpos, 64);
+    assert_eq(_pack_obj_ex(pack, rpos, off2, &out, &pt, 0), 0 - 21, "a REF_DELTA is refused in a sit pack");
+    fl_free(pack);
+
+    # The cache stays under its limit, and refuses what is over an eighth of it.
+    var big = fl_alloc(_DBC_LIMIT / 8 + 1);
+    var k = 0;
+    while (k < 12) {
+        _dbc_put(big, 12 + k * 1000, big, _DBC_LIMIT / 8, 3);
+        k = k + 1;
+    }
+    assert(_dbc_bytes <= _DBC_LIMIT, "the cache holds at most its limit");
+    _dbc_put(big, 999999, big, _DBC_LIMIT / 8 + 1, 3);
+    assert_eq(_dbc_get(big, 999999), 0, "an entry over an eighth of it is not kept");
+    _dbc_reset();
+    assert_eq(_dbc_bytes, 0, "and reset gives it all back");
+    fl_free(big);
+    return 0;
+}
+
 # Run every test group; exit status is the failure count.
 fn main() {
     alloc_init();
@@ -1964,6 +2094,7 @@ fn main() {
     test_parse_commit_body_a();
     test_176_pure();
     test_180_reflog_time();
+    test_1100_packs();
     return assert_summary();
 }
 

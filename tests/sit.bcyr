@@ -462,6 +462,121 @@ fn bench_blob_hash(size, iters) {
     return 0;
 }
 
+# ── 1.10.0: gc's delta search, and reading a delta chain ─────────────
+
+# A tree-shaped buffer: `n` entries of "100644 fNNNNN.txt\0" + 32 id bytes.
+fn bench_make_tree(n, out_len) {
+    var buf = alloc(n * 49 + 64);
+    var pos = 0;
+    var i = 0;
+    while (i < n) {
+        memcpy(buf + pos, "100644 f", 8);
+        var d = write_decimal(buf + pos + 8, 10000 + i);
+        memcpy(buf + pos + 8 + d, ".txt", 4);
+        store8(buf + pos + 12 + d, 0);
+        pos = pos + 13 + d;
+        fill_pseudo_random(buf + pos, 32);
+        pos = pos + 32;
+        i = i + 1;
+    }
+    store64(out_len, pos);
+    return buf;
+}
+
+# delta_generate of a tree against the same tree with one entry more — gc's
+# common case, once per tree version.
+fn bench_delta_tree(n, iters) {
+    var nb = alloc(40);
+    memcpy(nb, "delta-tree-", 11);
+    var d = write_decimal(nb + 11, n);
+    store8(nb + 11 + d, 0);
+    var bl[8];
+    var base = bench_make_tree(n, &bl);
+    var blen = load64(&bl);
+    var cut = (blen / 2) - ((blen / 2) % 49);
+    var tgt = alloc(blen);
+    memcpy(tgt, base, cut);
+    memcpy(tgt + cut, base + cut + 49, blen - cut - 49);
+    var b = bench_new(nb);
+    bench_batch_start(b);
+    var i = 0;
+    while (i < iters) {
+        var dl[8];
+        var out = delta_generate(base, blen, tgt, blen - 49, &dl);
+        if (out != 0) { fl_free(out); }
+        i = i + 1;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    return 0;
+}
+
+# Read the deepest object of a `depth`-long OFS_DELTA chain over a 32 KiB blob,
+# cold (base cache emptied first) and warm (served from it).
+fn bench_pack_chain(depth, iters) {
+    var size = 32768;
+    var pack = alloc(size + depth * 256 + 1024);
+    var content = alloc(size);
+    fill_pseudo_random(content, size);
+    memcpy(pack, "PACK", 4);
+    _gc_be32(pack + 4, 2);
+    _gc_be32(pack + 8, depth + 1);
+    var pos = 12;
+    pos = pos + _gc_entry_hdr(pack + pos, 3, size);
+    pos = pos + zlib_compress(content, size, pack + pos, size + 256);
+    var prev = 12;
+    var cur = alloc(size);
+    memcpy(cur, content, size);
+    var k = 0;
+    while (k < depth) {
+        var next = alloc(size);
+        memcpy(next, cur, size);
+        store8(next + (k * 997) % size, load8(next + (k * 997) % size) ^ 0x5A);
+        var dl[8];
+        var dd = delta_generate(cur, size, next, size, &dl);
+        var here = pos;
+        pos = pos + _gc_entry_hdr(pack + pos, 6, load64(&dl));
+        pos = pos + _gc_ofs_enc(pack + pos, here - prev);
+        pos = pos + zlib_compress(dd, load64(&dl), pack + pos, 512);
+        fl_free(dd);
+        prev = here;
+        cur = next;
+        k = k + 1;
+    }
+    var nb = alloc(48);
+    memcpy(nb, "pack-chain-", 11);
+    var d = write_decimal(nb + 11, depth);
+    memcpy(nb + 11 + d, "-cold", 5);
+    store8(nb + 16 + d, 0);
+    var b = bench_new(nb);
+    bench_batch_start(b);
+    var i = 0;
+    while (i < iters) {
+        _dbc_reset();
+        var out[24];
+        if (_pack_obj_ex(pack, pos, prev, &out, 0, 0) == 0) { fl_free(load64(&out)); }
+        i = i + 1;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    var nw = alloc(48);
+    memcpy(nw, nb, 11 + d);
+    memcpy(nw + 11 + d, "-warm", 5);
+    store8(nw + 16 + d, 0);
+    var b2 = bench_new(nw);
+    bench_batch_start(b2);
+    i = 0;
+    while (i < iters) {
+        var out2[24];
+        if (_pack_obj_ex(pack, pos, prev, &out2, 0, 0) == 0) { fl_free(load64(&out2)); }
+        i = i + 1;
+    }
+    bench_batch_stop(b2, iters);
+    bench_report(b2);
+    _dbc_reset();
+    return 0;
+}
+
 # Run every benchmark.
 fn main() {
     alloc_init();
@@ -495,6 +610,12 @@ fn main() {
     bench_blob_hash(1024, 5000);
     bench_blob_hash(65536, 500);
     bench_blob_hash(1048576, 50);
+
+    # ── Phase 4: gc's delta search, delta-chain reads (1.10.0) ────
+    bench_delta_tree(100, 2000);
+    bench_delta_tree(2000, 200);
+    bench_pack_chain(10, 200);
+    bench_pack_chain(50, 50);
 
     return 0;
 }

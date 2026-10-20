@@ -953,6 +953,7 @@ fn fuzz_pack_obj(rounds) {
             mutated = 1;
         }
         var out[24];
+        _dbc_reset();                              # the same buffer, new bytes
         var r = _git_pack_obj(pack, pos, prev, &out);
         if (mutated == 0) {
             if (r != 0) { println("fuzz: pack_obj failed on a valid chain"); return 1; }
@@ -961,6 +962,30 @@ fn fuzz_pack_obj(rounds) {
                 println("fuzz: pack_obj rebuilt the wrong bytes");
                 return 1;
             }
+        }
+        # 1.10.0: the sit-pack read of the same bytes (no REF_DELTA), twice — the
+        # second from the delta base cache — agrees with the first read.
+        var out2[24];
+        var pt[8];
+        store64(&pt, 0);
+        _dbc_reset();
+        var r2 = _pack_obj_ex(pack, pos, prev, &out2, &pt, 0);
+        var out3[24];
+        var r3 = _pack_obj_ex(pack, pos, prev, &out3, &pt, 0);
+        if (r2 != r3) { println("fuzz: pack_obj gave a different answer from the cache"); return 1; }
+        if (r2 == 0) {
+            if (load64(&pt) < 1) { println("fuzz: pack_obj reported no type"); return 1; }
+            if (load64(&pt) > 4) { println("fuzz: pack_obj reported a delta type"); return 1; }
+            if (load64(&out2 + 8) != load64(&out3 + 8)) { println("fuzz: cached read changed length"); return 1; }
+            if (memeq(load64(&out2), load64(&out3), load64(&out2 + 8)) == 0) {
+                println("fuzz: cached read changed bytes");
+                return 1;
+            }
+            if (r == 0) {
+                if (load64(&out2 + 8) != load64(&out + 8)) { println("fuzz: sit and git reads differ"); return 1; }
+            }
+            fl_free(load64(&out2));
+            fl_free(load64(&out3));
         }
         if (r == 0) {
             if (load64(&out + 8) > 16777216) { println("fuzz: pack_obj passed the 16 MiB ceiling"); return 1; }
@@ -1060,6 +1085,37 @@ fn fuzz_http_refs(rounds) {
     return 0;
 }
 
+# gc.cyr — pack entry headers and OFS_DELTA distances, written then read back.
+fn fuzz_pack_codec(rounds) {
+    var seed = 0x10A0C0;
+    var b[32];
+    var i = 0;
+    while (i < rounds) {
+        var tsel = (seed >> 7) & 7;
+        var t = 1 + (tsel % 6);
+        if (t == 5) { t = 7; }
+        var bits = (seed >> 11) % 41;
+        var size = ((seed >> 3) & 0x7FFFFFFFFF) & ((1 << bits) - 1);
+        var hl = _gc_entry_hdr(&b, t, size);
+        var cur[8];
+        var ts[8];
+        store64(&cur, 0);
+        store64(&ts, 0);
+        if (_pack_obj_header(&b, &cur, &ts, hl) != size) { println("fuzz: entry header size mismatch"); return 1; }
+        if (load64(&ts) != t) { println("fuzz: entry header type mismatch"); return 1; }
+        if (load64(&cur) != hl) { println("fuzz: entry header length mismatch"); return 1; }
+        var obits = 1 + (seed >> 17) % 40;
+        var ofs = 1 + (((seed >> 5) & 0x7FFFFFFFFF) & ((1 << obits) - 1));
+        var n = _gc_ofs_enc(&b, ofs);
+        store64(&cur, 0);
+        if (_ofs_varint(&b, &cur, n) != ofs) { println("fuzz: ofs distance mismatch"); return 1; }
+        if (load64(&cur) != n) { println("fuzz: ofs length mismatch"); return 1; }
+        seed = seed * 6364136223846793005 + 1442695040888963407;
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Run every fuzz target; exit 1 on the first invariant broken.
 fn main() {
     alloc_init();
@@ -1105,6 +1161,8 @@ fn main() {
     if (fuzz_http_refs(200000) != 0) { return 1; }
     println("fuzz: reflog_time (300000 rounds)");
     if (fuzz_reflog_time(300000) != 0) { return 1; }
+    println("fuzz: pack_codec (500000 rounds)");
+    if (fuzz_pack_codec(500000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

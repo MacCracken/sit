@@ -1,0 +1,1218 @@
+# gc.cyr — `sit gc`: pack what is reachable, compact the store (1.10.0).
+#
+# One pass over everything reachable (refs, the stash, HEAD, every reflog
+# entry, then the staged index), newest commit first. Each object is read,
+# checked against its id, and written to a new pack, whole or as a delta when
+# that is under half its size. Deltas are skip-deltas, as Subversion stores
+# them. Counting the versions at a path newest first, version k deltas
+# against version k & (k - 1), so its chain is popcount(k) links: at most
+# log2 of the path's versions, and only the newest is whole (the one a
+# checkout reads). The adjacent newer version is the fallback when the skip
+# does not pay. Linear chains (each version against the next) held to 50
+# kept 33 whole trees in the 1,600-commit fixture's pack, 62% of it.
+#
+# Then, in an order that keeps every object readable somewhere throughout:
+#   1. The pack and its .idx are written under temporary names and synced.
+#      They are read back through the reader every command uses, each object
+#      reconstructed and hashed against its id, before they are named.
+#   2. objects.patra is rewritten beside itself, holding only what the pack does
+#      not: rows nothing reaches, plus the objects of older packs the new one
+#      dropped. Those are written back as rows ("loosened", as git's
+#      `repack -A` does), so `fsck --prune` can judge them by its grace window.
+#      Every row is verified, then the new file replaces the old one.
+#   3. The older packs are removed.
+# A crash leaves duplicates, never a gap, and the next gc tidies them.
+#
+# gc runs alone. It holds the store lock exclusively (object_db.cyr) and
+# refuses when another process has the store open. See ADR 0016.
+
+var GC_MAX_DEPTH = 50;
+# Base content kept between commits for the next delta at each path. Past it,
+# all of it is dropped, and a base is read again when one is next needed.
+var GC_CACHE_MAX = 268435456;
+
+# A packed object: {offset, crc32, depth, pack type, raw id[32]}.
+var _GC_REC = 64;
+# A path's history so far: {versions, levels (64 entries, made at the second
+# version), newest rec, then level 63 inline}. Version k is kept at level
+# tz(k), the newest at 63: exactly where every later version's skip-delta base
+# k & (k - 1) looks for it, as no version in between has as many trailing zeros.
+var _GC_PATH = 56;
+# One level: {rec, framed buffer or 0, content offset, length}.
+var _GC_LEVEL = 32;
+var _GC_WBUF = 1048576;
+
+var _gc_seen = 0;          # hex -> rec, every object packed this run
+var _gc_recs = 0;          # recs in pack order
+var _gc_paths = 0;         # "<type char><path>" -> path history
+var _gc_held = 0;          # levels holding a buffer
+var _gc_cached = 0;        # bytes those buffers hold
+var _gc_deltas = 0;
+var _gc_fail = 0;          # 0, or the id that stopped the walk
+var _gc_fail_kind = 0;     # 1 missing / unreadable, 2 does not hash to its id, 3 write failed
+
+# ── Pack writer ────────────────────────────────────────────────────
+
+# A buffered writer over `fd`: {fd, buffer, used, offset, failed}.
+fn _gcw_new(fd) {
+    var w = alloc_or_die(40);
+    store64(w, fd);
+    store64(w + 8, fl_alloc(_GC_WBUF));
+    store64(w + 16, 0);
+    store64(w + 24, 0);
+    store64(w + 32, 0);
+    if (load64(w + 8) == 0) { store64(w + 32, 1); }
+    return w;
+}
+
+# Write out what the buffer holds.
+fn _gcw_flush(w) {
+    var used = load64(w + 16);
+    if (used > 0) {
+        if (load64(w + 32) == 0) {
+            if (sit_write_full(load64(w), load64(w + 8), used) != used) { store64(w + 32, 1); }
+        }
+        store64(w + 16, 0);
+    }
+    return 0;
+}
+
+# Append `n` bytes at `p`; the offset counts them whether or not the write lands.
+fn _gcw_put(w, p, n) {
+    if (load64(w + 32) != 0) { return 0; }
+    if (n >= _GC_WBUF) {
+        _gcw_flush(w);
+        if (sit_write_full(load64(w), p, n) != n) { store64(w + 32, 1); }
+    }
+    else {
+        if (load64(w + 16) + n > _GC_WBUF) { _gcw_flush(w); }
+        _pack_copy(load64(w + 8) + load64(w + 16), p, n);
+        store64(w + 16, load64(w + 16) + n);
+    }
+    store64(w + 24, load64(w + 24) + n);
+    return 0;
+}
+
+# Store `v` big-endian in 4 bytes at `p`.
+fn _gc_be32(p, v) {
+    store8(p, (v >> 24) & 0xFF);
+    store8(p + 1, (v >> 16) & 0xFF);
+    store8(p + 2, (v >> 8) & 0xFF);
+    store8(p + 3, v & 0xFF);
+    return 0;
+}
+
+# A pack entry header: the type in bits 4..6 of the first byte, the size in its
+# low 4 bits and 7 more per following byte (high bit: more follow). Returns
+# its length.
+fn _gc_entry_hdr(out, ptype, size) {
+    var b = (ptype << 4) | (size & 15);
+    var n = size >> 4;
+    var p = 0;
+    while (n != 0) {
+        store8(out + p, b | 128);
+        p = p + 1;
+        b = n & 127;
+        n = n >> 7;
+    }
+    store8(out + p, b);
+    return p + 1;
+}
+
+# An OFS_DELTA distance: big-endian 7-bit groups, each continuation adding one
+# (git's pack-objects encoding, read back by _ofs_varint). Returns its length.
+fn _gc_ofs_enc(out, ofs) {
+    var tmp[16];
+    var pos = 15;
+    var o = ofs;
+    store8(&tmp + pos, o & 127);
+    o = o >> 7;
+    while (o != 0) {
+        o = o - 1;
+        pos = pos - 1;
+        store8(&tmp + pos, 128 | (o & 127));
+        o = o >> 7;
+    }
+    var n = 16 - pos;
+    memcpy(out, &tmp + pos, n);
+    return n;
+}
+
+# Write one entry, `data` compressed behind its header (and the distance back
+# to its base when `base_off` >= 0), recording its offset and CRC-32 in `rec`.
+# Returns 0, or -1.
+fn _gc_put_entry(w, rec, ptype, data, dlen, base_off) {
+    var cap = dlen + dlen / 10 + 64;
+    var ebuf = fl_alloc(cap + 32);
+    if (ebuf == 0) { return 0 - 1; }
+    var h = _gc_entry_hdr(ebuf, ptype, dlen);
+    if (base_off >= 0) { h = h + _gc_ofs_enc(ebuf + h, load64(w + 24) - base_off); }
+    var clen = zlib_compress(data, dlen, ebuf + h, cap);
+    if (clen <= 0) { fl_free(ebuf); return 0 - 1; }
+    store64(rec, load64(w + 24));
+    store64(rec + 8, crc32(ebuf, h + clen));
+    _gcw_put(w, ebuf, h + clen);
+    fl_free(ebuf);
+    if (load64(w + 32) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# ── Walk ───────────────────────────────────────────────────────────
+
+# The path history for `key`, made (with a heap copy of the key) when `make` is 1; 0 if none.
+fn _gc_slot(key, make) {
+    var s = map_get(_gc_paths, key);
+    if (s != 0) { return s; }
+    if (make == 0) { return 0; }
+    var kl = strlen(key);
+    var kc = alloc_or_die(kl + 1);
+    memcpy(kc, key, kl);
+    store8(kc + kl, 0);
+    s = alloc_or_die(_GC_PATH);
+    var i = 0;
+    while (i < _GC_PATH) { store64(s + i, 0); i = i + 8; }
+    map_set(_gc_paths, kc, s);
+    return s;
+}
+
+# The level for version `k`: tz(k), or 63 for the newest (k = 0).
+fn _gc_lv(k) {
+    if (k == 0) { return 63; }
+    var lv = 0;
+    var v = k;
+    while ((v & 1) == 0) {
+        v = v >> 1;
+        lv = lv + 1;
+    }
+    return lv;
+}
+
+# The entry of path history `s` at level `lv`.
+fn _gc_level(s, lv) {
+    if (lv == 63) { return s + 24; }
+    if (load64(s + 8) == 0) {
+        var lvs = alloc_or_die(64 * _GC_LEVEL);
+        var i = 0;
+        while (i < 64 * _GC_LEVEL) { store64(lvs + i, 0); i = i + 8; }
+        store64(s + 8, lvs);
+    }
+    return load64(s + 8) + lv * _GC_LEVEL;
+}
+
+# Release the buffer a level holds.
+fn _gc_slot_drop(e) {
+    if (load64(e + 8) != 0) {
+        fl_free(load64(e + 8));
+        _gc_cached = _gc_cached - load64(e + 24);
+        store64(e + 8, 0);
+    }
+    return 0;
+}
+
+# Make `rec` the level's object, holding its framed bytes when `buf` is not 0.
+fn _gc_slot_hold(e, rec, buf, coff, total) {
+    _gc_slot_drop(e);
+    store64(e, rec);
+    store64(e + 8, buf);
+    store64(e + 16, coff);
+    store64(e + 24, total);
+    if (buf != 0) {
+        _gc_cached = _gc_cached + total;
+        vec_push(_gc_held, e);
+    }
+    return 0;
+}
+
+# Record `rec` as the path's next version, at its level.
+fn _gc_version(s, rec, buf, coff, total) {
+    var k = load64(s);
+    _gc_slot_hold(_gc_level(s, _gc_lv(k)), rec, buf, coff, total);
+    store64(s, k + 1);
+    store64(s + 16, rec);
+    return 0;
+}
+
+# Between commits: drop every held buffer once they pass GC_CACHE_MAX.
+fn _gc_trim() {
+    if (_gc_cached <= GC_CACHE_MAX) { return 0; }
+    var i = 0;
+    while (i < vec_len(_gc_held)) {
+        _gc_slot_drop(vec_get(_gc_held, i));
+        i = i + 1;
+    }
+    _gc_held = vec_new();
+    _gc_cached = 0;
+    return 0;
+}
+
+# Write "<c><path>" into `kb` (at least plen + 2 bytes).
+fn _gc_key(kb, c, path, plen) {
+    store8(kb, c);
+    if (plen > 0) { memcpy(kb + 1, path, plen); }
+    store8(kb + 1 + plen, 0);
+    return kb;
+}
+
+# An object packed already, met at another path or commit: when it is not the
+# path's newest version, it becomes the next one, so older versions there can
+# delta against it (its bytes are read again then). An unchanged file adds none.
+fn _gc_slot_point(c, path, plen, rec) {
+    var kbuf[512];
+    var kb = &kbuf;
+    if (plen + 2 > 512) { kb = alloc_or_die(plen + 2); }
+    _gc_key(kb, c, path, plen);
+    var s = _gc_slot(kb, 1);
+    if (load64(s + 16) != rec) { _gc_version(s, rec, 0, 0, 0); }
+    return 0;
+}
+
+# Write the entry for `content` as a delta against the object level `e` holds,
+# when its chain has room and the delta is under half the content. Returns 1
+# written, 0 not worth it (nothing written), -1 the write failed.
+fn _gc_try_delta(w, rec, e, content, clen) {
+    var brec = load64(e);
+    if (brec == 0) { return 0; }
+    if (load64(brec + 16) >= GC_MAX_DEPTH) { return 0; }
+    if (load64(e + 8) == 0) {
+        # Not held (released, or a version met at another path): read it again.
+        var bhex[72];
+        _hex_into(brec + 32, 32, &bhex);
+        var bo[24];
+        if (read_object(&bhex, &bo) == 0) {
+            _gc_slot_hold(e, brec, load64(&bo), load64(&bo + 16), load64(&bo + 8));
+        }
+    }
+    if (load64(e + 8) == 0) { return 0; }
+    var bc = load64(e + 8) + load64(e + 16);
+    var bl = load64(e + 24) - load64(e + 16);
+    var dl[8];
+    var d = delta_generate(bc, bl, content, clen, &dl);
+    if (d == 0) { return 0; }
+    var r = 0;
+    if (load64(&dl) * 2 < clen) {
+        r = 0 - 1;
+        if (_gc_put_entry(w, rec, 6, d, load64(&dl), load64(brec)) == 0) {
+            store64(rec + 16, load64(brec + 16) + 1);
+            r = 1;
+        }
+    }
+    fl_free(d);
+    return r;
+}
+
+# Pack `hex`, reached at tree path `path` ("" for a commit, tag or root): read
+# it, check it against its id, and write it whole or as a skip-delta against an
+# earlier version at the same path (see the top of this file). Returns its
+# record and its framed bytes at out24 (valid until the walk next trims), or 0
+# with _gc_fail set.
+fn _gc_take(w, hex, path, plen, out24) {
+    var obj[24];
+    if (read_object(hex, &obj) != 0) {
+        _gc_fail = hex;
+        _gc_fail_kind = 1;
+        return 0;
+    }
+    var buf = load64(&obj);
+    var total = load64(&obj + 8);
+    var coff = load64(&obj + 16);
+    var want[32];
+    var got[32];
+    hex_decode_into(hex, 64, &want);
+    sha256(buf, total, &got);
+    if (memeq(&want, &got, 32) == 0) {
+        fl_free(buf);
+        _gc_fail = hex;
+        _gc_fail_kind = 2;
+        return 0;
+    }
+    var ptype = 0;
+    var tc = 0;
+    if (memeq(buf, "commit ", 7) == 1) { ptype = 1; tc = 99; }
+    if (memeq(buf, "tree ", 5) == 1) { ptype = 2; tc = 116; }
+    if (memeq(buf, "blob ", 5) == 1) { ptype = 3; tc = 98; }
+    if (memeq(buf, "tag ", 4) == 1) { ptype = 4; tc = 103; }
+    if (ptype == 0) {
+        fl_free(buf);
+        _gc_fail = hex;
+        _gc_fail_kind = 2;
+        return 0;
+    }
+    var content = buf + coff;
+    var clen = total - coff;
+
+    var kbuf[512];
+    var kb = &kbuf;
+    if (plen + 2 > 512) { kb = alloc_or_die(plen + 2); }
+    _gc_key(kb, tc, path, plen);
+    var s = _gc_slot(kb, 1);
+
+    var rec = alloc_or_die(_GC_REC);
+    store64(rec + 16, 0);
+    store64(rec + 24, ptype);
+    memcpy(rec + 32, &want, 32);
+
+    var written = 0;
+    var k = load64(s);
+    if (k > 0) {
+        if (clen >= 32) {
+            var skip = _gc_level(s, _gc_lv(k & (k - 1)));
+            written = _gc_try_delta(w, rec, skip, content, clen);
+            if (written == 0) {
+                var adj = _gc_level(s, _gc_lv(k - 1));
+                if (adj != skip) { written = _gc_try_delta(w, rec, adj, content, clen); }
+            }
+            if (written == 1) { _gc_deltas = _gc_deltas + 1; }
+        }
+    }
+    if (written == 0) {
+        if (_gc_put_entry(w, rec, ptype, content, clen, 0 - 1) == 0) { written = 1; }
+        else { written = 0 - 1; }
+    }
+    if (written < 0) {
+        fl_free(buf);
+        _gc_fail = hex;
+        _gc_fail_kind = 3;
+        return 0;
+    }
+    var hc = alloc_or_die(65);
+    memcpy(hc, hex, 64);
+    store8(hc + 64, 0);
+    map_set(_gc_seen, hc, rec);
+    vec_push(_gc_recs, rec);
+    _gc_version(s, rec, buf, coff, total);
+    store64(out24, buf);
+    store64(out24 + 8, total);
+    store64(out24 + 16, coff);
+    return rec;
+}
+
+# Index of the first `c` in body[from, blen), or blen when there is none.
+fn _gc_find(body, from, blen, c) {
+    var i = from;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (i >= blen) { scanning = 0; }
+        else {
+            if (load8(body + i) == c) { scanning = 0; }
+            else { i = i + 1; }
+        }
+    }
+    return i;
+}
+
+# Walk the entries of the tree body at `tp`, read in place: blobs are packed as
+# they come (the tree's own bytes stay in its slot meanwhile, as no entry shares
+# its key), subtrees not packed yet go on `pend` as {hex, path, length}.
+# Gitlinks name commits of another repository and are skipped. A malformed
+# entry ends the walk of that tree; whatever it hides stays a row.
+fn _gc_tree_entries(w, body, blen, tp, tpl, pend) {
+    var cb[4352];
+    var pos = 0;
+    while (pos < blen) {
+        var sp = _gc_find(body, pos, blen, 32);
+        var nul = blen;
+        if (sp < blen) { nul = _gc_find(body, sp + 1, blen, 0); }
+        if (nul + 33 > blen) { pos = blen; }
+        else {
+            var mlen = sp - pos;
+            var nlen = nul - sp - 1;
+            var chex[72];
+            _hex_into(body + nul + 1, 32, &chex);
+            var cpl = nlen;
+            if (tpl > 0) { cpl = tpl + 1 + nlen; }
+            var cp = &cb;
+            if (cpl + 1 > 4352) { cp = alloc_or_die(cpl + 1); }
+            if (tpl > 0) {
+                memcpy(cp, tp, tpl);
+                store8(cp + tpl, 47);
+                memcpy(cp + tpl + 1, body + sp + 1, nlen);
+            }
+            else { memcpy(cp, body + sp + 1, nlen); }
+            store8(cp + cpl, 0);
+            var kind = 98;                                   # blob
+            if (mlen == 5) { if (memeq(body + pos, "40000", 5) == 1) { kind = 116; } }
+            if (mlen == 6) { if (memeq(body + pos, "160000", 6) == 1) { kind = 0; } }
+            if (kind != 0) {
+                if (_gc_fail == 0) {
+                    var crec = map_get(_gc_seen, &chex);
+                    if (crec != 0) { _gc_slot_point(kind, cp, cpl, crec); }
+                    else {
+                        if (kind == 98) {
+                            var bo[24];
+                            _gc_take(w, &chex, cp, cpl, &bo);
+                        }
+                        else {
+                            var hcp = alloc_or_die(65);
+                            memcpy(hcp, &chex, 65);
+                            var pcp = alloc_or_die(cpl + 1);
+                            memcpy(pcp, cp, cpl + 1);
+                            var nc = alloc_or_die(24);
+                            store64(nc, hcp);
+                            store64(nc + 8, pcp);
+                            store64(nc + 16, cpl);
+                            vec_push(pend, nc);
+                        }
+                    }
+                }
+            }
+            pos = nul + 33;
+        }
+    }
+    return 0;
+}
+
+# Pack the subtrees waiting on `pend`, and everything under them.
+fn _gc_tree_drain(w, pend) {
+    while (vec_len(pend) > 0) {
+        var cell = vec_get(pend, vec_len(pend) - 1);
+        vec_pop(pend);
+        var th = load64(cell);
+        var tp = load64(cell + 8);
+        var tpl = load64(cell + 16);
+        if (_gc_fail == 0) {
+            var seenrec = map_get(_gc_seen, th);
+            if (seenrec != 0) { _gc_slot_point(116, tp, tpl, seenrec); }
+            else {
+                var obj[24];
+                var rec = _gc_take(w, th, tp, tpl, &obj);
+                if (rec != 0) {
+                    if (load64(rec + 24) == 2) {
+                        var body = load64(&obj) + load64(&obj + 16);
+                        var blen = load64(&obj + 8) - load64(&obj + 16);
+                        _gc_tree_entries(w, body, blen, tp, tpl, pend);
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# Pack the tree `hex` at `path` and everything under it not packed yet.
+fn _gc_tree(w, hex, path, plen) {
+    var pend = vec_new();
+    var cell = alloc_or_die(24);
+    store64(cell, hex);
+    store64(cell + 8, path);
+    store64(cell + 16, plen);
+    vec_push(pend, cell);
+    return _gc_tree_drain(w, pend);
+}
+
+# Pack everything reachable, newest commit first. Returns 0, or -1 with
+# _gc_fail set.
+fn _gc_walk(w) {
+    var queue = fsck_collect_roots();
+    fsck_collect_reflog_roots(queue);
+    var shallow = load_shallow_set();
+    var optional = map_new();
+    var qi = 0;
+    while (qi < vec_len(queue)) {
+        var hex = vec_get(queue, qi);
+        qi = qi + 1;
+        if (_gc_fail == 0) {
+            if (map_has(_gc_seen, hex) == 0) {
+                var obj[24];
+                var rec = _gc_take(w, hex, "", 0, &obj);
+                if (rec == 0) {
+                    # A shallow boundary's parents are absent by design.
+                    if (_gc_fail_kind == 1) {
+                        if (map_has(optional, hex) == 1) { _gc_fail = 0; }
+                    }
+                }
+                else {
+                    var body = load64(&obj) + load64(&obj + 16);
+                    var blen = load64(&obj + 8) - load64(&obj + 16);
+                    var pt = load64(rec + 24);
+                    if (pt == 1) {
+                        var parents = vec_new();
+                        fsck_collect_commit_parents(body, blen, parents);
+                        var boundary = map_has(shallow, hex);
+                        var t = fsck_extract_commit_tree(body, blen);
+                        var pi = 0;
+                        while (pi < vec_len(parents)) {
+                            var p = vec_get(parents, pi);
+                            if (boundary == 1) { map_set(optional, p, 1); }
+                            vec_push(queue, p);
+                            pi = pi + 1;
+                        }
+                        if (t != 0) { _gc_tree(w, t, "", 0); }
+                    }
+                    if (pt == 2) {
+                        # A root naming a tree (a tag of one): walk under it.
+                        var st = vec_new();
+                        _gc_tree_entries(w, body, blen, "", 0, st);
+                        _gc_tree_drain(w, st);
+                    }
+                    if (pt == 4) {
+                        var tinfo[40];
+                        if (parse_tag_body(body, blen, &tinfo) == 0) {
+                            if (load64(&tinfo) != 0) { vec_push(queue, load64(&tinfo)); }
+                        }
+                    }
+                }
+                _gc_trim();
+            }
+        }
+    }
+    # The staged index: blobs a commit has not reached yet, each paired with
+    # the committed version at its path.
+    var entries = parse_index();
+    if (entries != 0) {
+        var ii = 0;
+        while (ii < vec_len(entries)) {
+            if (_gc_fail == 0) {
+                var e = vec_get(entries, ii);
+                var ihex = hex_encode(entry_hash(e), 32);
+                var ip = entry_path(e);
+                var irec = map_get(_gc_seen, ihex);
+                if (irec == 0) {
+                    var io[24];
+                    _gc_take(w, ihex, ip, strlen(ip), &io);
+                }
+            }
+            ii = ii + 1;
+        }
+    }
+    if (_gc_fail != 0) { return 0 - 1; }
+    return 0;
+}
+
+# ── Pack and index files ───────────────────────────────────────────
+
+# fsync the directory at the repo-relative `dir`, so the names just given in it
+# are durable before anything that relies on them. Best effort, as patra's own.
+fn _gc_sync_dir(dir) {
+    var fd = file_open(sit_abs(dir), 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    xfsync(fd);
+    file_close(fd);
+    return 0;
+}
+
+# Create the repo-relative `p` for writing, refusing whatever is already there
+# or a symlinked directory above it. An fd, or negative.
+fn _gc_create(p) {
+    if (_sf_parent_symlink(p) == 1) { return 0 - 40; }
+    var ap = sit_abs(p);
+    if (path_lstat_kind(ap) >= 0) { sf_unlink(p); }
+    return file_open(ap, O_RDWR | O_CREAT | O_EXCL, 0x124);
+}
+
+# The SHA-256 of the first `len` bytes of `fd`, read back in 1 MiB chunks, into
+# `out`. Portable where a mapping is not (agnos). Returns 0, or -1.
+fn _gc_hash_fd(fd, len, out) {
+    if (syscall(SYS_LSEEK, fd, 0, SEEK_SET) != 0) { return 0 - 1; }
+    var buf = fl_alloc(_GC_WBUF);
+    if (buf == 0) { return 0 - 1; }
+    var ctx = sha256_init();
+    var left = len;
+    var rc = 0;
+    while (left > 0) {
+        var want = left;
+        if (want > _GC_WBUF) { want = _GC_WBUF; }
+        var got = file_read(fd, buf, want);
+        if (got <= 0) { rc = 0 - 1; left = 0; }
+        else {
+            sha256_update(ctx, buf, got);
+            left = left - got;
+        }
+    }
+    sha256_finalize(ctx, out);
+    fl_free(ctx);
+    fl_free(buf);
+    return rc;
+}
+
+# Finish the pack on `fd`: write the object count into its header, then the
+# SHA-256 of everything as its trailer (into `trailer` too), and sync it.
+# Returns 0, or -1.
+fn _gc_pack_finish(w, count, trailer) {
+    _gcw_flush(w);
+    if (load64(w + 32) != 0) { return 0 - 1; }
+    var fd = load64(w);
+    var cnt[4];
+    _gc_be32(&cnt, count);
+    if (syscall(SYS_LSEEK, fd, 8, SEEK_SET) != 8) { return 0 - 1; }
+    if (sit_write_full(fd, &cnt, 4) != 4) { return 0 - 1; }
+    var size = load64(w + 24);
+    if (_gc_hash_fd(fd, size, trailer) != 0) { return 0 - 1; }
+    if (syscall(SYS_LSEEK, fd, size, SEEK_SET) != size) { return 0 - 1; }
+    if (sit_write_full(fd, trailer, 32) != 32) { return 0 - 1; }
+    if (xfsync(fd) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# Order two records by raw id.
+fn _gc_rec_cmp(a, b) {
+    return _memcmp_n(a + 32, b + 32, 32);
+}
+
+# Write the idx v2 for the records in `sorted` (ordered by id) and the pack whose
+# trailer is `trailer`: magic, version, fanout, ids, CRC-32s, offsets (an
+# 8-byte table for those past 2 GiB), the pack's trailer, its own SHA-256.
+# git index-pack rebuilds it byte for byte. Returns 0, or -1.
+fn _gc_write_idx(p, sorted, trailer) {
+    var n = vec_len(sorted);
+    var nlarge = 0;
+    var i = 0;
+    while (i < n) {
+        if (load64(vec_get(sorted, i)) >= 2147483648) { nlarge = nlarge + 1; }
+        i = i + 1;
+    }
+    var size = 1032 + n * 40 + nlarge * 8 + 64;
+    var b = fl_alloc(size);
+    if (b == 0) { return 0 - 1; }
+    store8(b, 255);
+    memcpy(b + 1, "tOc", 3);
+    _gc_be32(b + 4, 2);
+    var fan = b + 8;
+    var names = b + 1032;
+    var crcs = names + n * 32;
+    var offs = crcs + n * 4;
+    var large = offs + n * 4;
+    var bucket = 0;
+    var li = 0;
+    i = 0;
+    while (i < n) {
+        var r = vec_get(sorted, i);
+        var first = load8(r + 32) & 0xFF;
+        while (bucket < first) {
+            _gc_be32(fan + bucket * 4, i);
+            bucket = bucket + 1;
+        }
+        memcpy(names + i * 32, r + 32, 32);
+        _gc_be32(crcs + i * 4, load64(r + 8));
+        var off = load64(r);
+        if (off >= 2147483648) {
+            _gc_be32(offs + i * 4, 2147483648 | li);
+            _gc_be32(large + li * 8, (off >> 32) & 4294967295);
+            _gc_be32(large + li * 8 + 4, off & 4294967295);
+            li = li + 1;
+        }
+        else { _gc_be32(offs + i * 4, off); }
+        i = i + 1;
+    }
+    while (bucket < 256) {
+        _gc_be32(fan + bucket * 4, n);
+        bucket = bucket + 1;
+    }
+    memcpy(b + size - 64, trailer, 32);
+    sha256(b, size - 32, b + size - 32);
+    var fd = _gc_create(p);
+    if (fd < 0) { fl_free(b); return 0 - 1; }
+    var rc = 0;
+    if (sit_write_full(fd, b, size) != size) { rc = 0 - 1; }
+    if (rc == 0) { if (xfsync(fd) != 0) { rc = 0 - 1; } }
+    file_close(fd);
+    fl_free(b);
+    return rc;
+}
+
+# Read every object back through the reader commands use — the .idx lookup and
+# the pack's chains — and hash each against its id; check both trailers.
+# Returns 0, or -1 naming the first failure.
+fn _gc_verify_pack(idx_path, pack_path, trailer) {
+    var ix[24];
+    if (_sit_idx_open(idx_path, &ix) != 0) {
+        eprintln("sit: gc: the new pack index does not read back");
+        return 0 - 1;
+    }
+    var pp[16];
+    if (_git_load_pack(pack_path, &pp) != 0) {
+        eprintln("sit: gc: the new pack does not read back");
+        return 0 - 1;
+    }
+    var pd = load64(&pp);
+    var pl = load64(&pp + 8);
+    if (_sit_trailer_ok(pd, pl) == 0) {
+        eprintln("sit: gc: the new pack's checksum is wrong");
+        return 0 - 1;
+    }
+    if (_sit_trailer_ok(load64(&ix), load64(&ix + 8)) == 0) {
+        eprintln("sit: gc: the new index's checksum is wrong");
+        return 0 - 1;
+    }
+    if (memeq(pd + pl - 32, trailer, 32) == 0) {
+        eprintln("sit: gc: the new pack is not the one written");
+        return 0 - 1;
+    }
+    var n = vec_len(_gc_recs);
+    if (load64(&ix + 16) != n) { eprintln("sit: gc: the new index does not list every object"); return 0 - 1; }
+    var rc = 0;
+    var i = 0;
+    while (i < n) {
+        if (rc == 0) {
+            var r = vec_get(_gc_recs, i);
+            if (_git_idx_lookup(idx_path, r + 32, 32) != load64(r)) { rc = 0 - 1; }
+            if (rc == 0) {
+                var res[24];
+                var pt[8];
+                store64(&pt, 0);
+                if (_pack_obj_ex(pd, pl, load64(r), &res, &pt, 0) != 0) { rc = 0 - 1; }
+                else {
+                    var word = _pack_type_word(load64(&pt));
+                    var body = load64(&res);
+                    var blen = load64(&res + 8);
+                    if (load64(&pt) != load64(r + 24)) { rc = 0 - 1; }
+                    if (rc == 0) {
+                        var hdr[32];
+                        var wl = strlen(word);
+                        memcpy(&hdr, word, wl);
+                        store8(&hdr + wl, 32);
+                        var dg = write_decimal(&hdr + wl + 1, blen);
+                        store8(&hdr + wl + 1 + dg, 0);
+                        var ctx = sha256_init();
+                        sha256_update(ctx, &hdr, wl + dg + 2);
+                        sha256_update(ctx, body, blen);
+                        var dig[32];
+                        sha256_finalize(ctx, &dig);
+                        fl_free(ctx);
+                        if (memeq(&dig, r + 32, 32) == 0) { rc = 0 - 1; }
+                    }
+                    fl_free(body);
+                }
+            }
+            if (rc != 0) {
+                var hx[72];
+                _hex_into(r + 32, 32, &hx);
+                eprint3("sit: gc: object ", &hx, " does not read back from the new pack\n");
+            }
+        }
+        i = i + 1;
+    }
+    return rc;
+}
+
+# ── Compaction ─────────────────────────────────────────────────────
+
+# Insert a row into a store gc is building. No pack check, unlike
+# db_object_insert_raw: an object loosened here still sits in a pack until that
+# pack is removed. Returns 0, or -1.
+fn _gc_row_insert(db, hex, ty, compressed, clen) {
+    var types[24];
+    store64(&types + 0, 1);
+    store64(&types + 8, 0);
+    store64(&types + 16, 2);
+    var ivals[24];
+    store64(&ivals + 8, ty);
+    var sptrs[24];
+    store64(&sptrs + 0, hex);
+    var slens[24];
+    store64(&slens + 0, 64);
+    var bptrs[24];
+    store64(&bptrs + 16, compressed);
+    var blens[24];
+    store64(&blens + 16, clen);
+    if (patra_insert_row(db, "objects", 7, 3,
+        &types, &ivals, &sptrs, &slens, &bptrs, &blens) != PATRA_OK) { return 0 - 1; }
+    return 0;
+}
+
+# The 64-hex ids an .idx lists, pushed onto `out` as heap cstrings. -1 if malformed.
+fn _gc_idx_oids(idx_path, out) {
+    var ix[24];
+    if (_sit_idx_open(idx_path, &ix) != 0) { return 0 - 1; }
+    var d = load64(&ix);
+    var n = load64(&ix + 16);
+    var k = 0;
+    while (k < n) {
+        var hx = alloc_or_die(72);
+        _hex_into(d + 1032 + k * 32, 32, hx);
+        vec_push(out, hx);
+        k = k + 1;
+    }
+    return n;
+}
+
+var _GC_STORE_NEW = ".sit/objects.patra.gc";
+var _GC_STORE_NEW_WAL = ".sit/objects.patra.gc.wal";
+
+# Rewrite objects.patra holding only what the new pack does not: the rows it
+# left out, then the objects of `old_packs` it dropped, loosened back into rows.
+# Each is verified going in and read back once written; then the new file
+# replaces the old. Writes {rows kept, objects loosened} to out16. 0, or -1.
+fn _gc_compact(old_packs, out16) {
+    var db = get_object_db();
+    if (db == 0) { return 0 - 1; }
+    sf_unlink(_GC_STORE_NEW);
+    sf_unlink(_GC_STORE_NEW_WAL);
+    if (_sf_parent_symlink(_GC_STORE_NEW) == 1) { return 0 - 1; }
+    var ndb = sf_patra_open(_GC_STORE_NEW);
+    if (ndb == 0) { eprintln("sit: gc: cannot create the compacted store"); return 0 - 1; }
+    var rc = 0;
+    if (patra_exec(ndb, "CREATE TABLE objects (hash STR, ty INT, content BYTES)") != 0) { rc = 0 - 1; }
+    if (rc == 0) { if (patra_exec(ndb, "CREATE INDEX ON objects (hash)") != 0) { rc = 0 - 1; } }
+    if (rc == 0) { if (patra_begin(ndb) != PATRA_OK) { rc = 0 - 1; } }
+    var written = map_new();
+    var wlist = vec_new();
+    var kept = 0;
+    var loosened = 0;
+    if (rc == 0) {
+        var rs = patra_query(db, "SELECT hash, ty FROM objects");
+        if (rs == 0) { rc = 0 - 1; }
+        else {
+            var cnt = patra_result_count(rs);
+            var hexes = vec_new();
+            var tys = vec_new();
+            var i = 0;
+            while (i < cnt) {
+                var hc = alloc_or_die(65);
+                memcpy(hc, patra_result_get_str(rs, i, 0), 64);
+                store8(hc + 64, 0);
+                vec_push(hexes, hc);
+                vec_push(tys, patra_result_get_int(rs, i, 1));
+                i = i + 1;
+            }
+            patra_result_free(rs);
+            i = 0;
+            while (i < cnt) {
+                var hex = vec_get(hexes, i);
+                if (rc == 0) {
+                    if (map_has(_gc_seen, hex) == 0) {
+                        if (map_has(written, hex) == 0) {
+                            var raw[24];
+                            if (db_row_read_raw(db, hex, &raw) != 0) { rc = 0 - 1; }
+                            else {
+                                var rty = vec_get(tys, i);
+                                var rb = load64(&raw);
+                                var rl = load64(&raw + 8);
+                                if (_object_verify_raw(hex, rty, rb, rl) != 0) { rc = 0 - 1; }
+                                if (rc == 0) { rc = _gc_row_insert(ndb, hex, rty, rb, rl); }
+                                fl_free(rb);
+                            }
+                            if (rc != 0) { eprint3("sit: gc: row ", hex, " does not verify; run `sit fsck`\n"); }
+                            else {
+                                map_set(written, hex, 1);
+                                vec_push(wlist, hex);
+                                kept = kept + 1;
+                            }
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+    }
+    var pi = 0;
+    while (pi < vec_len(old_packs)) {
+        if (rc == 0) {
+            var oids = vec_new();
+            if (_gc_idx_oids(load64(vec_get(old_packs, pi)), oids) < 0) {
+                eprintln("sit: gc: an older pack index is malformed; run `sit fsck`");
+                rc = 0 - 1;
+            }
+            var oi = 0;
+            while (oi < vec_len(oids)) {
+                var oh = vec_get(oids, oi);
+                if (rc == 0) {
+                    if (map_has(_gc_seen, oh) == 0) {
+                        if (map_has(written, oh) == 0) {
+                            var deco[24];
+                            if (sit_pack_read(0, oh, &deco) != 0) { rc = 0 - 1; }
+                            else {
+                                var dig[32];
+                                var want[32];
+                                sha256(load64(&deco), load64(&deco + 8), &dig);
+                                hex_decode_into(oh, 64, &want);
+                                if (memeq(&dig, &want, 32) == 0) { rc = 0 - 1; }
+                                var raw2[24];
+                                if (rc == 0) { if (_obj_raw_from_framed(&deco, &raw2) != 0) { rc = 0 - 1; } }
+                                if (rc == 0) {
+                                    rc = _gc_row_insert(ndb, oh, load64(&raw2 + 16), load64(&raw2), load64(&raw2 + 8));
+                                    fl_free(load64(&raw2));
+                                }
+                                fl_free(load64(&deco));
+                            }
+                            if (rc != 0) {
+                                eprint3("sit: gc: packed object ", oh, " does not verify; run `sit fsck`\n");
+                            }
+                            else {
+                                map_set(written, oh, 1);
+                                vec_push(wlist, oh);
+                                loosened = loosened + 1;
+                            }
+                        }
+                    }
+                }
+                oi = oi + 1;
+            }
+        }
+        pi = pi + 1;
+    }
+    if (rc == 0) {
+        if (patra_commit(ndb) != PATRA_OK) {
+            eprintln("sit: gc: the compacted store could not be committed");
+            rc = 0 - 1;
+        }
+    }
+    # Every row read back from the file it now lives in.
+    var wi = 0;
+    while (wi < vec_len(wlist)) {
+        if (rc == 0) {
+            var wh = vec_get(wlist, wi);
+            var o[24];
+            if (db_row_read(ndb, wh, &o) != 0) { rc = 0 - 1; }
+            else {
+                var d2[32];
+                var w2[32];
+                sha256(load64(&o), load64(&o + 8), &d2);
+                hex_decode_into(wh, 64, &w2);
+                if (memeq(&d2, &w2, 32) == 0) { rc = 0 - 1; }
+                fl_free(load64(&o));
+            }
+            if (rc != 0) { eprint3("sit: gc: row ", wh, " does not read back from the compacted store\n"); }
+        }
+        wi = wi + 1;
+    }
+    patra_close(ndb);
+    if (rc == 0) {
+        # An unfinished write to the old store (a .wal beside it) would be
+        # replayed onto the new one under the same name. gc holds the store
+        # alone, so there should be none; if there is, keep the old store.
+        if (path_lstat_kind(sit_abs(".sit/objects.patra.wal")) >= 0) {
+            eprintln("sit: gc: .sit/objects.patra.wal exists; the store was not compacted");
+            rc = 0 - 1;
+        }
+    }
+    if (rc != 0) {
+        sf_unlink(_GC_STORE_NEW);
+        sf_unlink(_GC_STORE_NEW_WAL);
+        return 0 - 1;
+    }
+    patra_close(db);
+    _object_db_cached = 0;
+    if (sf_rename(_GC_STORE_NEW, ".sit/objects.patra") != 0) {
+        eprintln("sit: gc: the compacted store could not replace .sit/objects.patra");
+        sf_unlink(_GC_STORE_NEW);
+        return 0 - 1;
+    }
+    _gc_sync_dir(".sit");
+    sf_unlink(_GC_STORE_NEW_WAL);
+    store64(out16, kept);
+    store64(out16 + 8, loosened);
+    return 0;
+}
+
+# ── Command ────────────────────────────────────────────────────────
+
+# Size in bytes of the repo-relative file `p`, or 0.
+fn _gc_file_size(p) {
+    var st[256];
+    if (xstat(sit_abs(p), &st) != 0) { return 0; }
+    return load64(&st + STAT_SIZE);
+}
+
+# Total size of the store's packs and their indexes.
+fn _gc_packs_size() {
+    var packs = sit_packs(0);
+    var t = 0;
+    var i = 0;
+    while (i < vec_len(packs)) {
+        var c = vec_get(packs, i);
+        t = t + _gc_file_size(load64(c)) + _gc_file_size(load64(c + 8));
+        i = i + 1;
+    }
+    return t;
+}
+
+# Print `n` bytes as KiB / MiB with one decimal.
+fn _gc_put_size(n) {
+    var unit = " KiB";
+    var div = 1024;
+    if (n >= 1048576) { unit = " MiB"; div = 1048576; }
+    write_unsigned(n / div);
+    stdout_write(".", 1);
+    write_unsigned(((n % div) * 10) / div);
+    stdout_write(unit, 4);
+    return 0;
+}
+
+var _GC_TMP_PACK = ".sit/packs/.gc-tmp.pack";
+var _GC_TMP_IDX = ".sit/packs/.gc-tmp.idx";
+
+# `sit gc` — pack the reachable objects, compact the store, drop old packs.
+fn cmd_gc() {
+    if (argc() > 2) {
+        eprintln("usage: sit gc");
+        return 1;
+    }
+    if (sf_exists(".sit/HEAD") != 1) {
+        if (sf_exists(".git/HEAD") == 1) {
+            eprintln("sit: gc packs a .sit/ store; for a .git/ repository use `git gc`");
+            return 1;
+        }
+        eprintln("sit: not a sit repository (run 'sit init')");
+        return 1;
+    }
+    var lr = store_lock_exclusive();
+    if (lr == 0 - 1) {
+        eprintln("sit: gc: another sit process has this repository's object store open");
+        eprintln("sit:   (a `sit serve`, or a command still running); run gc when it is done");
+        return 1;
+    }
+    if (lr != 0) {
+        eprintln("sit: gc: cannot take the store lock (.sit/objects.flock); is the repository read-only?");
+        return 1;
+    }
+    if (get_object_db() == 0) {
+        eprintln("sit: gc: cannot open the object store");
+        return 1;
+    }
+    var patra_before = _gc_file_size(".sit/objects.patra");
+    var packs_before = _gc_packs_size();
+    var old_packs = sit_packs(0);
+
+    var pk = path_lstat_kind(sit_abs(".sit/packs"));
+    if (pk < 0) {
+        if (_sf_parent_symlink(".sit/packs") == 1) { pk = 0xA000; }
+        else {
+            sf_mkdir(".sit/packs", 0x1ED);
+            pk = path_lstat_kind(sit_abs(".sit/packs"));
+        }
+    }
+    if (pk != 0x4000) {
+        eprintln("sit: gc: .sit/packs is not a directory");
+        return 1;
+    }
+    sf_unlink(_GC_TMP_IDX);
+    var fd = _gc_create(_GC_TMP_PACK);
+    if (fd < 0) {
+        eprintln("sit: gc: cannot create a pack in .sit/packs");
+        return 1;
+    }
+    crc32_init_table();
+    _gc_seen = map_new();
+    _gc_recs = vec_new();
+    _gc_paths = map_new();
+    _gc_held = vec_new();
+    _gc_cached = 0;
+    _gc_deltas = 0;
+    _gc_fail = 0;
+    _gc_fail_kind = 0;
+
+    var w = _gcw_new(fd);
+    var phdr[12];
+    memcpy(&phdr, "PACK", 4);
+    _gc_be32(&phdr + 4, 2);
+    _gc_be32(&phdr + 8, 0);
+    _gcw_put(w, &phdr, 12);
+    var walked = _gc_walk(w);
+    _gc_trim();
+    if (walked != 0) {
+        file_close(fd);
+        sf_unlink(_GC_TMP_PACK);
+        if (_gc_fail_kind == 1) {
+            eprint3("sit: gc: object ", _gc_fail, " is missing or unreadable; run `sit fsck`\n");
+        }
+        if (_gc_fail_kind == 2) {
+            eprint3("sit: gc: object ", _gc_fail, " does not match its id; run `sit fsck`\n");
+        }
+        if (_gc_fail_kind == 3) { eprintln("sit: gc: writing the pack failed (disk full?)"); }
+        return 1;
+    }
+    var n = vec_len(_gc_recs);
+    var final_idx = 0;
+    if (n > 0) {
+        var trailer[32];
+        if (_gc_pack_finish(w, n, &trailer) != 0) {
+            file_close(fd);
+            sf_unlink(_GC_TMP_PACK);
+            eprintln("sit: gc: writing the pack failed (disk full?)");
+            return 1;
+        }
+        file_close(fd);
+        var sorted = vec_new();
+        var si = 0;
+        while (si < n) { vec_push(sorted, vec_get(_gc_recs, si)); si = si + 1; }
+        vec_sort_by(sorted, &_gc_rec_cmp);
+        if (_gc_write_idx(_GC_TMP_IDX, sorted, &trailer) != 0) {
+            sf_unlink(_GC_TMP_PACK);
+            sf_unlink(_GC_TMP_IDX);
+            eprintln("sit: gc: writing the pack index failed (disk full?)");
+            return 1;
+        }
+        if (_gc_verify_pack(_GC_TMP_IDX, _GC_TMP_PACK, &trailer) != 0) {
+            sf_unlink(_GC_TMP_PACK);
+            sf_unlink(_GC_TMP_IDX);
+            eprintln("sit: gc: nothing was changed");
+            return 1;
+        }
+        # Named by its trailer, as git names its packs. The same objects packed
+        # the same way make the same pack: then the one there already stays.
+        var th[72];
+        _hex_into(&trailer, 32, &th);
+        var fp = alloc_or_die(96);
+        var fi = alloc_or_die(96);
+        memcpy(fp, ".sit/packs/pack-", 16);
+        memcpy(fp + 16, &th, 64);
+        memcpy(fp + 80, ".pack", 5);
+        store8(fp + 85, 0);
+        memcpy(fi, fp, 80);
+        memcpy(fi + 80, ".idx", 4);
+        store8(fi + 84, 0);
+        if (path_lstat_kind(sit_abs(fi)) == 0x8000) {
+            sf_unlink(_GC_TMP_PACK);
+            sf_unlink(_GC_TMP_IDX);
+        }
+        else {
+            # The .pack before the .idx: a pack is found by its .idx.
+            var r1 = sf_rename(_GC_TMP_PACK, fp);
+            var r2 = 0 - 1;
+            if (r1 == 0) { r2 = sf_rename(_GC_TMP_IDX, fi); }
+            if (r2 != 0) {
+                sf_unlink(_GC_TMP_PACK);
+                sf_unlink(_GC_TMP_IDX);
+                eprintln("sit: gc: the new pack could not be named; nothing was changed");
+                return 1;
+            }
+        }
+        _gc_sync_dir(".sit/packs");
+        final_idx = fi;
+    }
+    else {
+        file_close(fd);
+        sf_unlink(_GC_TMP_PACK);
+    }
+    sit_packs_reset();
+
+    var comp[16];
+    if (_gc_compact(old_packs, &comp) != 0) {
+        eprintln("sit: gc: the store was not compacted; the new pack is in place,");
+        eprintln("sit:   and the old store and packs are untouched");
+        return 1;
+    }
+    # The older packs: what the new one holds is there, the rest is rows now.
+    var removed = 0;
+    var oi = 0;
+    while (oi < vec_len(old_packs)) {
+        var c = vec_get(old_packs, oi);
+        var same = 0;
+        if (final_idx != 0) { same = streq(load64(c), final_idx); }
+        if (same == 0) {
+            sf_unlink(load64(c));
+            sf_unlink(load64(c + 8));
+            removed = removed + 1;
+        }
+        oi = oi + 1;
+    }
+    if (removed > 0) { _gc_sync_dir(".sit/packs"); }
+    sit_packs_reset();
+
+    stdout_write("packed ", 7);
+    write_unsigned(n);
+    stdout_write(" objects (", 10);
+    write_unsigned(_gc_deltas);
+    stdout_write(" as deltas)", 11);
+    if (load64(&comp) + load64(&comp + 8) > 0) {
+        stdout_write(", ", 2);
+        write_unsigned(load64(&comp) + load64(&comp + 8));
+        stdout_write(" left loose", 11);
+    }
+    stdout_write("\nobject store ", 14);
+    _gc_put_size(patra_before + packs_before);
+    stdout_write(" -> ", 4);
+    _gc_put_size(_gc_file_size(".sit/objects.patra") + _gc_packs_size());
+    stdout_write("\n", 1);
+    return 0;
+}

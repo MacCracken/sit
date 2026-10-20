@@ -37,6 +37,7 @@ modules = [
     "src/wire.cyr",
     "src/wire_http.cyr",
     "src/serve.cyr",
+    "src/gc.cyr",
     "src/api.cyr",
 ]
 

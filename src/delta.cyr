@@ -21,7 +21,7 @@
 # cleverer is a ratio/CPU trade to make against measurements, not up front.
 
 var DELTA_BLK = 16;            # match granularity
-var DELTA_HASH_BITS = 14;      # 16384 buckets
+var DELTA_HASH_BITS = 14;      # at most 16384 buckets (1.10.0: fewer for a small base)
 var DELTA_MAX_LIT = 127;       # INSERT opcode's literal ceiling
 
 # Write a git varint (7 bits per byte, high bit = continue). Returns bytes written.
@@ -40,8 +40,8 @@ fn _delta_put_varint(out, pos, v) {
     return w;
 }
 
-fn _delta_hash(buf, off) {
-    # FNV-ish over DELTA_BLK bytes, folded to DELTA_HASH_BITS.
+fn _delta_hash(buf, off, bits) {
+    # FNV-ish over DELTA_BLK bytes, folded to `bits`.
     var h = 2166136261;
     var i = 0;
     while (i < DELTA_BLK) {
@@ -49,11 +49,13 @@ fn _delta_hash(buf, off) {
         h = (h * 16777619) & 0xFFFFFFFF;
         i = i + 1;
     }
-    return (h ^ (h >> DELTA_HASH_BITS)) & ((1 << DELTA_HASH_BITS) - 1);
+    return (h ^ (h >> bits)) & ((1 << bits) - 1);
 }
 
 # Produce a delta that reconstructs `tgt` from `base`.
-# Writes the heap buffer's length to *out_len and returns the buffer, or 0.
+# Writes the buffer's length to *out_len and returns it, or 0. 1.10.0: the
+# buffer is freelist memory, the caller's to fl_free — `sit gc` deltifies every
+# object in a repository, and the bump heap never gives anything back.
 #
 # Returns 0 when a delta would not be a win — the caller stores the object
 # whole in that case. Refusing here rather than emitting a bad-ratio delta
@@ -68,15 +70,29 @@ fn delta_generate(base, base_len, tgt, tgt_len, out_len) {
     # is wasteful; step by DELTA_BLK so the table is base_len/16 entries.
     var nblk = base_len / DELTA_BLK;
     if (nblk <= 0) { return 0; }
-    var nbuckets = 1 << DELTA_HASH_BITS;
+    # 1.10.0: about one bucket per base block, from 256 up to 16384. Clearing a
+    # fixed 16384 made a 100-entry tree's delta take 101 us (22 us sized); gc
+    # makes one per changed object.
+    var hbits = 8;
+    var growing = 1;
+    while (growing == 1) {
+        if (hbits >= DELTA_HASH_BITS) { growing = 0; }
+        else {
+            if ((1 << hbits) >= nblk) { growing = 0; }
+            else { hbits = hbits + 1; }
+        }
+    }
+    var nbuckets = 1 << hbits;
     var heads = fl_alloc(nbuckets * 8);
     var chain = fl_alloc(nblk * 8);
+    if (heads == 0) { return 0; }
+    if (chain == 0) { fl_free(heads); return 0; }
     var i = 0;
     while (i < nbuckets) { store64(heads + i * 8, 0 - 1); i = i + 1; }
     var b = 0;
     while (b < nblk) {
         var off = b * DELTA_BLK;
-        var hh = _delta_hash(base, off);
+        var hh = _delta_hash(base, off, hbits);
         store64(chain + b * 8, load64(heads + hh * 8));
         store64(heads + hh * 8, b);
         b = b + 1;
@@ -86,7 +102,8 @@ fn delta_generate(base, base_len, tgt, tgt_len, out_len) {
     # plus the two size varints. Allocate that so the writer never bounds-check
     # mid-emit, and refuse below if the result is not actually smaller.
     var cap = tgt_len + (tgt_len / DELTA_MAX_LIT) + 32;
-    var out = alloc(cap);
+    var out = fl_alloc(cap);
+    if (out == 0) { fl_free(chain); fl_free(heads); return 0; }
     var pos = 0;
     pos = pos + _delta_put_varint(out, pos, base_len);
     pos = pos + _delta_put_varint(out, pos, tgt_len);
@@ -98,7 +115,7 @@ fn delta_generate(base, base_len, tgt, tgt_len, out_len) {
         var best_len = 0;
 
         if (t + DELTA_BLK <= tgt_len) {
-            var th = _delta_hash(tgt, t);
+            var th = _delta_hash(tgt, t, hbits);
             var cand = load64(heads + th * 8);
             var probes = 0;
             while (cand >= 0) {
@@ -110,6 +127,19 @@ fn delta_generate(base, base_len, tgt, tgt_len, out_len) {
                     # expected), then extend forward as far as both run.
                     if (memeq(base + coff, tgt + t, DELTA_BLK) == 1) {
                         var mlen = DELTA_BLK;
+                        # 1.10.0: eight bytes a step while both sides have
+                        # them, then byte by byte to the first difference.
+                        var wide = 1;
+                        while (wide == 1) {
+                            if (coff + mlen + 8 > base_len) { wide = 0; }
+                            else {
+                                if (t + mlen + 8 > tgt_len) { wide = 0; }
+                                else {
+                                    if (load64(base + coff + mlen) != load64(tgt + t + mlen)) { wide = 0; }
+                                    else { mlen = mlen + 8; }
+                                }
+                            }
+                        }
                         var extending = 1;
                         while (extending == 1) {
                             if (coff + mlen >= base_len) { extending = 0; }
@@ -129,9 +159,26 @@ fn delta_generate(base, base_len, tgt, tgt_len, out_len) {
         }
 
         if (best_len >= DELTA_BLK) {
+            # 1.10.0: extend the match backwards over the pending literal, as
+            # git's create_delta does. Base blocks start every DELTA_BLK bytes,
+            # so after a deletion the scan only resyncs at the next block start;
+            # without this, the up-to-15 bytes before it went out as a literal
+            # (a tree with one entry removed: 61-byte deltas, 15 with).
+            var back = 0;
+            var stepping = 1;
+            while (stepping == 1) {
+                if (t - back <= lit_start) { stepping = 0; }
+                else {
+                    if (best_off - back <= 0) { stepping = 0; }
+                    else {
+                        if (load8(base + best_off - back - 1) != load8(tgt + t - back - 1)) { stepping = 0; }
+                        else { back = back + 1; }
+                    }
+                }
+            }
             # Flush any pending literal run before the COPY.
-            pos = _delta_flush_literal(out, pos, tgt, lit_start, t);
-            pos = _delta_emit_copy(out, pos, best_off, best_len);
+            pos = _delta_flush_literal(out, pos, tgt, lit_start, t - back);
+            pos = _delta_emit_copy(out, pos, best_off - back, best_len + back);
             t = t + best_len;
             lit_start = t;
         }
@@ -143,7 +190,7 @@ fn delta_generate(base, base_len, tgt, tgt_len, out_len) {
     fl_free(heads);
 
     # Only worth it if the delta is actually smaller than the object.
-    if (pos >= tgt_len) { return 0; }
+    if (pos >= tgt_len) { fl_free(out); return 0; }
     store64(out_len, pos);
     return out;
 }

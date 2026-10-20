@@ -25,8 +25,103 @@ var _PACK_DELTA_MAX_DEPTH = 4095;
 # file repacked that way, which git reads. Past it the object reads as missing.
 var _PACK_CHAIN_MAX_OUT = 4294967296;
 # One link of a chain being resolved: the delta object's pack {data, len}, where
-# its zlib payload starts, and its declared (inflated) size.
-var _PACK_LINK = 32;
+# its zlib payload starts, its declared (inflated) size, and (1.10.0) where the
+# object itself starts — its key in the delta base cache.
+var _PACK_LINK = 40;
+
+# --- delta base cache (1.10.0) ------------------------------------------------
+# Objects reconstructed from a pack, by (pack mapping, offset): each step of a
+# chain, the base it started from, and the result. A chain read in order — the
+# newest version first, as `sit gc` writes and verifies them, as fsck reads them,
+# as a clone of a packed repository sends them — then costs one delta per
+# object rather than the whole chain. Without it, verifying the 1,600-commit
+# fixture's pack (chains up to 50) re-applied 40,000 deltas of ~36 KB. git
+# keeps the same (core.deltaBaseCacheLimit, 96 MiB).
+#
+# Direct-mapped, 32 MiB at most, an entry at most an eighth of that. Copies go
+# in and out, so a caller's buffer is always its own. Pack mappings live for
+# the process (_git_file_cached), so a key never outlives its pack.
+var _DBC_SLOTS = 1024;
+var _DBC_SLOT = 40;              # {pack data, offset, buffer, length, type}
+var _DBC_LIMIT = 33554432;
+var _dbc = 0;
+var _dbc_bytes = 0;
+var _dbc_evict = 0;
+
+# The cache slot (pack data, offset) maps to, or 0 when the table cannot be made.
+fn _dbc_slot(pdata, off) {
+    if (_dbc == 0) {
+        _dbc = fl_alloc(_DBC_SLOTS * _DBC_SLOT);
+        if (_dbc == 0) { return 0; }
+        var i = 0;
+        while (i < _DBC_SLOTS * _DBC_SLOT) { store64(_dbc + i, 0); i = i + 8; }
+    }
+    var h = ((pdata >> 4) * 31 + off * 2654435761) & (_DBC_SLOTS - 1);
+    return _dbc + h * _DBC_SLOT;
+}
+
+# The cached entry for (pack data, offset), or 0.
+fn _dbc_get(pdata, off) {
+    var s = _dbc_slot(pdata, off);
+    if (s == 0) { return 0; }
+    if (load64(s + 16) == 0) { return 0; }
+    if (load64(s) != pdata) { return 0; }
+    if (load64(s + 8) != off) { return 0; }
+    return s;
+}
+
+# Empty a slot.
+fn _dbc_drop(s) {
+    if (load64(s + 16) != 0) {
+        fl_free(load64(s + 16));
+        _dbc_bytes = _dbc_bytes - load64(s + 24);
+        store64(s + 16, 0);
+    }
+    return 0;
+}
+
+# Empty the cache. For a caller that rewrites a pack buffer in place (the fuzz
+# harness, tests); a mapped pack never changes under its address.
+fn _dbc_reset() {
+    if (_dbc == 0) { return 0; }
+    var i = 0;
+    while (i < _DBC_SLOTS) {
+        _dbc_drop(_dbc + i * _DBC_SLOT);
+        i = i + 1;
+    }
+    _dbc_bytes = 0;
+    return 0;
+}
+
+# Keep a copy of `len` bytes at `buf`, the object of pack type `type` at
+# (pack data, offset), evicting round-robin to stay under the limit.
+fn _dbc_put(pdata, off, buf, len, type) {
+    if (type < 1) { return 0; }
+    if (len > _DBC_LIMIT / 8) { return 0; }
+    var s = _dbc_slot(pdata, off);
+    if (s == 0) { return 0; }
+    if (load64(s + 16) != 0) {
+        if (load64(s) == pdata) { if (load64(s + 8) == off) { return 0; } }
+        _dbc_drop(s);
+    }
+    var guard = 0;
+    while (_dbc_bytes + len > _DBC_LIMIT) {
+        _dbc_drop(_dbc + _dbc_evict * _DBC_SLOT);
+        _dbc_evict = (_dbc_evict + 1) & (_DBC_SLOTS - 1);
+        guard = guard + 1;
+        if (guard > _DBC_SLOTS) { _dbc_bytes = 0; }
+    }
+    var copy = fl_alloc(len + 1);
+    if (copy == 0) { return 0; }
+    _pack_copy(copy, buf, len);
+    store64(s, pdata);
+    store64(s + 8, off);
+    store64(s + 16, copy);
+    store64(s + 24, len);
+    store64(s + 32, type);
+    _dbc_bytes = _dbc_bytes + len;
+    return 0;
+}
 
 # Reject an absurd object size from a hostile pack header before allocating.
 #
@@ -529,6 +624,15 @@ fn _pack_inflate(pdata, plen, body, size, out_len) {
 }
 
 fn _git_pack_obj(pdata, plen, offset, out24) {
+    return _pack_obj_ex(pdata, plen, offset, out24, 0, 1);
+}
+
+# _git_pack_obj, also reporting the object's pack type (1 commit, 2 tree,
+# 3 blob, 4 tag: its base's, through any chain) at `type_out` when that is not
+# 0. 1.10.0: `allow_ref` 0 refuses a REF_DELTA — sit's own packs (`sit gc`)
+# carry OFS_DELTA only, and a REF_DELTA there would resolve its base through
+# `.git/` — so a sit pack is always self-contained.
+fn _pack_obj_ex(pdata, plen, offset, out24, type_out, allow_ref) {
     var links_cap = 16;
     var links = fl_alloc(links_cap * _PACK_LINK);
     if (links == 0) { return 0 - 11; }
@@ -540,6 +644,8 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
     var base_len = 0;
     var base_owned = 0;      # 1 when `base` is a freelist buffer this read made
     var loose_buf = 0;       # a loose base's own buffer, freed when the chain is done
+    var base_type = 0;       # the chain's pack type; 0 for a loose base (not cached)
+    var base_fresh = 0;      # 1 when the base was inflated here (and so worth caching)
     var rc = 0;
     var walking = 1;
     while (walking == 1) {
@@ -549,11 +655,25 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
         if (cp == 0) { rc = 0 - 10; }
         if (rc == 0) { if (co < 12) { rc = 0 - 10; } }
         if (rc == 0) { if (co >= cl) { rc = 0 - 10; } }
+        if (rc == 0) {
+            # 1.10.0: an object reconstructed already ends the walk here.
+            var hit = _dbc_get(cp, co);
+            if (hit != 0) {
+                base = load64(hit + 16);
+                base_len = load64(hit + 24);
+                base_owned = 0;
+                base_type = load64(hit + 32);
+                if (type_out != 0) { store64(type_out, base_type); }
+                walking = 0;
+            }
+        }
         var cur[8];
         var type_slot[8];
         var size = 0;
         var type = 0;
-        if (rc == 0) {
+        var reading = 0;
+        if (rc == 0) { reading = walking; }
+        if (reading == 1) {
             store64(&cur, co);
             store64(&type_slot, 0);
             size = _pack_obj_header(cp, &cur, &type_slot, cl);
@@ -562,19 +682,28 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
             type = load64(&type_slot);
         }
         if (rc == 0) {
-            if (type >= 1) {
-                if (type <= 4) {
-                    var got[8];
-                    base = _pack_inflate(cp, cl, load64(&cur), size, &got);
-                    if (base == 0) { rc = 0 - 12; }
-                    else { base_len = load64(&got); base_owned = 1; }
-                    walking = 0;
+            if (reading == 1) {
+                if (type >= 1) {
+                    if (type <= 4) {
+                        if (type_out != 0) { store64(type_out, type); }
+                        var got[8];
+                        base = _pack_inflate(cp, cl, load64(&cur), size, &got);
+                        if (base == 0) { rc = 0 - 12; }
+                        else {
+                            base_len = load64(&got);
+                            base_owned = 1;
+                            base_type = type;
+                            base_fresh = 1;
+                        }
+                        walking = 0;
+                    }
                 }
             }
         }
         if (rc == 0) {
             if (walking == 1) {
                 if (type != 6) { if (type != 7) { rc = 0 - 21; } }
+                if (type == 7) { if (allow_ref == 0) { rc = 0 - 21; } }
                 if (rc == 0) { if (nlinks >= _PACK_DELTA_MAX_DEPTH) { rc = 0 - 13; } }
             }
         }
@@ -606,6 +735,7 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
                         store64(lk + 8, cl);
                         store64(lk + 16, load64(&cur));
                         store64(lk + 24, size);
+                        store64(lk + 32, co);
                         nlinks = nlinks + 1;
                         co = co - ofs;
                     }
@@ -623,6 +753,7 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
                         store64(lk2 + 8, cl);
                         store64(lk2 + 16, load64(&cur) + rawlen);
                         store64(lk2 + 24, size);
+                        store64(lk2 + 32, co);
                         nlinks = nlinks + 1;
                         var loose24[24];
                         if (_git_read_loose(&base_hex, &loose24) == 0) {
@@ -659,6 +790,11 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
     # one per step measured 28% slower, every buffer over 4 KiB being its own
     # mapping.
     var base_cap = base_len;           # an inflated base's buffer is reusable
+    if (rc == 0) {
+        if (nlinks > 0) {
+            if (base_fresh == 1) { _dbc_put(cp, co, base, base_len, base_type); }
+        }
+    }
     var other = 0;
     var other_cap = 0;
     var dbuf = 0;
@@ -721,6 +857,7 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
                     other = 0;
                     other_cap = 0;
                     if (prev_owned == 1) { other = prev; other_cap = prev_cap; }
+                    _dbc_put(lp, load64(l + 32), base, base_len, base_type);
                 }
             }
         }
@@ -736,6 +873,13 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
     }
     # The result is the caller's. (A loose base is only reached through a link,
     # so by now at least one delta has been applied and `base` is this read's.)
+    # A cached object asked for itself is copied out of the cache.
+    if (base_owned == 0) {
+        var own = fl_alloc(base_len + 1);
+        if (own == 0) { return 0 - 11; }
+        _pack_copy(own, base, base_len);
+        base = own;
+    }
     store64(out24, base);
     store64(out24 + 8, base_len);
     store64(out24 + 16, 0);

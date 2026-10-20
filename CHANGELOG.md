@@ -4,6 +4,77 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-10-20 — storage: packs and `sit gc`
+
+The 1.10.0 minor. Reachable history moves into git-format packs written by the new `sit gc`. The 1,600-commit benchmark history goes from **62.8 MiB to 875 KiB**, smaller than git's own store for the same history in the same object format. The patra schema is unchanged, the wire format is unchanged, and the toolchain stays at cyrius 6.7.15. Decision record: [ADR 0016](docs/adr/0016-packs-for-storage.md).
+
+### Added — `sit gc`
+
+- **Packs every reachable object.** That covers refs, the stash, HEAD, every reflog entry and the staged index. Everything goes into one pack, `.sit/packs/pack-<id>.pack` with its `.idx`, in **git's SHA-256 pack v2 / idx v2 format**. `git index-pack --object-format=sha256` rebuilds sit's `.idx` byte for byte, and `git verify-pack` and `git fsck --full` accept the pack. The integration suite asserts the first two whenever git is present.
+- **Skip-deltas**, as Subversion stores them. Counting the versions at a path newest first, version *k* is a delta against version `k & (k-1)` when that is under half its size, else against the adjacent version, else whole. A chain is at most popcount(*k*) links, so the newest version, the one a checkout reads, is whole and an old one is a few deltas away. In the fixture the deepest chain is 10 and one tree of 1,600 is whole. Linear chains (each version against the next, depth 50), the first cut, kept 33 whole trees, 62% of the pack.
+- **Then it compacts.** `.sit/objects.patra` is rewritten without the packed objects, keeping as rows what nothing reaches. Objects of older packs that are no longer reachable are written back as rows ("loosened", git's `repack -A`), so `fsck --prune` can judge them by its grace window. Superseded packs are removed.
+- **Checked before and after.** Every object is hashed against its id as it is read. The new pack and index are read back through the reader every command uses before they are named, each object reconstructed and hashed. Every row of the new store is verified going in and again from the file. On any mismatch gc changes nothing (`run sit fsck`). A crash leaves duplicates, never a gap.
+- **Runs alone.** It refuses while another sit process has the store open (`sit serve`, a command still running). See the store lock below.
+- `sit gc` takes no arguments, and refuses in a `.git/` repository (`use git gc`) and on a symlinked `.sit/packs`.
+
+### Added — reading packs
+
+- `read_object` reads packs first once a repository has any, then rows. `resolve_hash` finds short ids in packs too. `write_typed_object`, `db_object_has` and `db_object_insert_raw` count a packed object as present, so no command, fetch or push adds a row that duplicates one.
+- sit packs are self-contained: the reader refuses a REF_DELTA in one (`_pack_obj_ex(…, allow_ref = 0)`). It now also reports the object's type, which sit frames like a stored row.
+- **A delta base cache** in the pack reader (32 MiB, keyed by pack mapping and offset) serves git mode too. A chain read in order (gc's verification, fsck, a clone of a packed repository) costs one delta per object instead of the whole chain. Reading the end of a 50-delta chain over 32 KiB costs 2.08 ms cold and 25 µs warm. Without it, gc's read-back of the fixture's first pack took 3.7 s; with it, 0.43 s. The 1.12.0 slot's "delta base cache, if walks need it" is this.
+
+### Added — the store lock
+
+gc renames a new `objects.patra` over the old one. A process that opened the old file would go on writing into a file nothing reads. So every process that opens a store now first takes `.sit/objects.flock` shared and holds it until it exits; that covers `get_object_db` and a file:// remote's `remote_objects_open`. gc takes the lock exclusive or refuses, and a command started during a gc waits ("waiting for `sit gc` to finish with the object store"). The file is created `O_CREAT|O_EXCL` and opened read-only with `O_CLOEXEC`. Where it cannot be created (a read-only repository) the store opens unlocked, and gc cannot run there either. [Architecture 008](docs/architecture/008-gc-runs-alone.md).
+
+### Changed
+
+- **`fsck`** checks rows and packs apart, each through its own reader, so a row duplicating a packed object is checked too. It also checks every pack's and index's trailing SHA-256 and that the index names its pack (`bad pack <path>`, counted as bad, so `--prune` refuses).
+- **`fsck --prune` deletes rows only.** A packed dangling object is reported (`kept N packed (the next `sit gc` loosens them)`). Delta bases need no fsck edge, because a pack is self-contained and never pruned in part. Tested with `.sit/logs` deleted (CLAUDE.md rule).
+- **Transfer.** A packed object has no stored bytes of its own, so `db_object_read_raw` / `db_object_read_both` reconstruct it and compress it at level 1 as it leaves the store. Every clone, fetch, push and `sit serve` read goes through them. The receiving side is unchanged: it verifies every object against its id and stores the bytes as they came. The CLAUDE.md transfer rule says so.
+- **`delta_generate`** returns freelist memory, the caller's to free (it was bump-allocated, and gc makes thousands). It extends each match backwards over the pending literal, as git's `create_delta` does: a tree with one entry removed was a 61-byte delta and is now 15. It also sizes its hash table to the base, 256 to 16,384 buckets: a 100-entry tree's delta took 101 µs, now 22 µs. It still round-trips through the read side's interpreter in the differential test.
+
+### Security
+
+This release's security pass covered the new input and write paths:
+- **A file:// remote's packs are hostile input.** They are read through the hardened pack reader (S-24, D3–D6 and R3–R5 bounds). A REF_DELTA is refused in a sit pack, so a hostile pack cannot reach into `.git/`. `_sit_idx_open` checks the count against the file size before any table address is used, and the prefix scan bounds its fanout range by that count. Every object leaving a pack is verified against its id by the receiver, as before. The delta base cache is keyed by pack mapping, so one store's pack never answers for another's.
+- **gc's writes** go through `O_CREAT|O_EXCL` behind a parent-symlink check (`_gc_create`), and a symlinked `.sit/packs` is refused. The lock file is created `O_EXCL` and only ever flocked. Compaction refuses to rename over a store that has a write-ahead log beside it.
+- **Buffers.** Every new stack buffer is checked against its largest write (`_gc_ofs_enc`'s 16 bytes for a 10-byte encoding; the 512- and 4,352-byte key and path buffers fall back to the heap past their size; `getcwd` gets its buffer's size).
+
+### Compatibility
+
+A repository you have run `sit gc` in needs **sit ≥ 1.10.0** to read its history. Older builds do not know `.sit/packs/` and find the packed objects missing, and they fail closed: their `fsck` reports `missing` and refuses `--prune`. This includes consumers built against an older `dist/sit-read.cyr` (owl, thoth), which need this release's bundle. Nothing changes on disk until someone runs gc, and a store written by 1.9.0 needs no migration.
+
+### Performance
+
+All on the benchmark fixture (`scripts/benchmark.sh`'s history, 1,600 commits, one file added per commit), DCE builds:
+
+| | 1.9.0 | 1.10.0 after `sit gc` |
+|---|---:|---:|
+| object store | 62.8 MiB | **875 KiB** (pack 683 KB, idx 193 KB, rows 20 KB) |
+| git, same history, `--object-format=sha256`, `git gc` | | 1.03 MB (pack 819 KB, idx 193 KB, rev 19 KB) |
+| `log --oneline` | 116.2 ms | 61.8 ms (−47%) |
+| `fsck` | 7,106 ms | 2,018 ms (−72%) |
+| `status` / `show --stat` (oldest) | 31.7 / 4.4 ms | 31.3 / 4.2 ms |
+| `clone` (file://) of it | 5,789 ms | 6,955 ms (+20%: packed objects are compressed on the way out; 43% at level 6) |
+
+`sit gc` itself takes 5.3 s the first time on the fixture, 2.8 s of it reading 63 MB of rows out of patra, and 2.6 s on a repeat. git takes 0.6 s; that cost is the roadmap's "gc's remaining costs". On repositories that have not been gc'd, nothing moves: CPU minimum of 7 alternating runs, 1.9.0 → 1.10.0, add ×100 +1.0%, commit −1.9%, status +0.5%, log (300 commits) +1.1%, checkout −0.3%, clone +1.8%, fsck −1.6%.
+
+### Docs
+
+- [ADR 0016](docs/adr/0016-packs-for-storage.md) records the storage decision. It replaces the roadmap's plan, a delta-base column in `objects`: patra keeps each BYTES value in at least one 4 KiB page, so delta rows alone would have floored the fixture near 21 MB.
+- [Architecture 008](docs/architecture/008-gc-runs-alone.md) covers the store lock, what it costs, and its gaps (gc on a served repository is a 1.11.0 item).
+- CLAUDE.md gains a rule: only gc replaces the store or removes a pack, under the exclusive lock, and every store open takes it shared. The transfer rule covers packed objects. The bundle step now points at `cyrius.cyml`'s module lists instead of a hand list that had gone stale.
+- The getting-started guide documents `sit gc` and the pack-aware `fsck`.
+- **Roadmap.** The 1.10.0 slot is done. Its ride-along, index paths over 255 bytes, moves to unscheduled with the reason (no schema change to ride with). New entries: gc on a served repository (1.11.0), packs on the wire, gc's remaining costs (unscheduled).
+
+### Tests
+
+- **Unit, 591 → 616:** `test_1100_packs` covers entry headers and OFS distances round-tripping through the reader's decoders at every encoding boundary, the pack-name filter, an in-memory pack read cold and then from the cache (with ownership of the copy), the base itself served from the cache, REF_DELTA refused in a sit pack, and the cache staying under its limit.
+- **Integration, 506 → 561:** section 39 covers gc against every reader's view of history, tag, stash and index; a repeat gc producing the same pack; new commits making a new pack; loosening, then `--prune-now` with `.sit/logs` deleted; clone (file, relative path, http) from a packed repository; push into one copying only what it lacks; gc refusing under a running `sit serve` and under any shared lock; a command waiting under gc's lock; a damaged pack (`bad pack`, `--prune` and gc refusing, nothing changed); a symlinked `.sit/packs`; git rebuilding the same `.idx` and verifying the pack; and the read bundle's API on a packed repository.
+- **Fuzz, 21 → 22 targets:** `fuzz_pack_codec` round-trips 500,000 random entry headers and distances. `fuzz_pack_obj` also reads every mutated chain through the sit-pack path twice (the second from the cache) and requires the same answer.
+- **Benchmarks:** `delta-tree-100` / `-2000` and `pack-chain-10` / `-50`, cold and warm.
+
 ## [1.9.0] — 2026-10-19 — the top-level CLI through cmdit: `--help`, `--version`, shell completions
 
 The 1.9.0 minor. sit's command dispatch moves onto cmdit, the AGNOS argument-parsing distlib ([ADR 0015](docs/adr/0015-cli-dispatch-through-cmdit.md)). What every command does with its arguments is unchanged; the toolchain stays at cyrius 6.7.15.

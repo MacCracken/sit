@@ -90,8 +90,12 @@ fn remote_objects_open(repo_path) {
         eprintln("sit: refusing to follow symlink at remote's .sit/objects.patra");
         return 0;
     }
+    # 1.10.0: that repository's store lock, before its store is opened, so a
+    # `sit gc` there cannot replace the file under this process (object_db.cyr).
+    store_lock_shared(repo_path);
     var db = patra_open(p);
     if (db == 0) { return 0; }
+    store_register_root(db, repo_path);
     patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
     # P-11a: index the REMOTE's objects table too — `clone` reads every object
     # through this handle, so an unindexed remote leaves the whole transfer on
@@ -114,6 +118,8 @@ fn remote_objects_open(repo_path) {
 
 # Return 1 if `hex` exists in the given opened object DB, else 0.
 fn db_object_has(db, hex) {
+    # 1.10.0: packed objects are present too.
+    if (sit_pack_has(store_root_of(db), hex) == 1) { return 1; }
     # 1.7.4 (C1): freelist, as db_object_read_raw does — `sit serve` asks this
     # on every ref push, and copy_objects once per object.
     var sql = fl_alloc(128);
@@ -133,7 +139,48 @@ fn db_object_has(db, hex) {
 
 # Read compressed bytes + type code from an opened db by hex.
 # Layout at out: 0..8 = compressed_ptr, 8..16 = clen, 16..24 = ty.
+#
+# 1.10.0: a packed object has no stored bytes of its own (it may be a delta),
+# so it is reconstructed and compressed here, once, as it leaves the store.
+# Whatever receives it verifies and stores those bytes as they came, as for a
+# row; the wire format does not change. Shipping deltas themselves is a
+# negotiated capability for later (roadmap).
 fn db_object_read_raw(db, hex, out) {
+    var rr = db_row_read_raw(db, hex, out);
+    if (rr != 0 - 2) { return rr; }
+    var deco[24];
+    if (sit_pack_read(store_root_of(db), hex, &deco) != 0) { return 0 - 2; }
+    var cr = _obj_raw_from_framed(&deco, out);
+    fl_free(load64(&deco));
+    return cr;
+}
+
+# Compress the framed object in `deco` {ptr, len, content_off} into a freelist
+# buffer, writing db_object_read_raw's {compressed, clen, ty} to out. 0, or -4.
+# Level 1: this runs per packed object a clone or fetch takes, and level 6 made
+# a clone of the 1,600-commit fixture 43% slower than of the same repository
+# unpacked (1 is 20%); the rows it leaves the receiver are 3.5% larger, which
+# the receiver's own gc undoes.
+fn _obj_raw_from_framed(deco, out) {
+    var fb = load64(deco);
+    var fl = load64(deco + 8);
+    var sp = 0;
+    while (load8(fb + sp) != 32) { sp = sp + 1; }
+    var ty = type_code_of(fb, sp);
+    var cap = fl + fl / 10 + 64;
+    var cbuf = fl_alloc(cap);
+    if (cbuf == 0) { return 0 - 4; }
+    var clen = zlib_compress_level(fb, fl, cbuf, cap, 1);
+    if (clen <= 0) { fl_free(cbuf); return 0 - 4; }
+    store64(out, cbuf);
+    store64(out + 8, clen);
+    store64(out + 16, ty);
+    return 0;
+}
+
+# db_object_read_raw's row half: the stored bytes of a loose object, -2 when
+# `db` has no row for `hex`.
+fn db_row_read_raw(db, hex, out) {
     # S-26: gate the id before it becomes a SQL literal. 1.3.8 closed this in
     # `read_object` (the local-store path), but the wire layer talks to a
     # SEPARATE patra handle and never went through that gate — so an id lifted
@@ -241,7 +288,17 @@ fn _object_verify_raw(hex, claimed_ty, compressed, clen) {
 # compressed bytes can be cached and reused by copy_objects without a second
 # source-DB read (P-04).
 fn db_object_read_both(db, hex, raw_out, deco_out) {
-    if (db_object_read_raw(db, hex, raw_out) != 0) { return 0 - 1; }
+    var rr = db_row_read_raw(db, hex, raw_out);
+    if (rr == 0 - 2) {
+        # 1.10.0: packed — the reconstruction is the inflated view already.
+        if (sit_pack_read(store_root_of(db), hex, deco_out) != 0) { return 0 - 1; }
+        if (_obj_raw_from_framed(deco_out, raw_out) != 0) {
+            fl_free(load64(deco_out));
+            return 0 - 1;
+        }
+        return 0;
+    }
+    if (rr != 0) { return 0 - 1; }
     var compressed = load64(raw_out);
     var clen = load64(raw_out + 8);
     # 1.7.6 (R10): the shared inflate (it was a bump-heap copy of read_object's
@@ -268,6 +325,8 @@ fn db_object_insert_raw(db, hex, type_code, compressed, clen) {
     #
     # Contract preserved for callers (`copy_objects` counts only real inserts):
     # returns 1 when the object already existed, 0 when it was actually written.
+    # 1.10.0: a packed object already exists; a row would duplicate it.
+    if (sit_pack_has(store_root_of(db), hex) == 1) { return 1; }
     var types[24];
     store64(&types +  0, 1);
     store64(&types +  8, 0);
@@ -1096,6 +1155,17 @@ fn db_object_type(db, hex) {
     var ty = 0 - 1;
     if (patra_result_count(rs) > 0) { ty = patra_result_get_int(rs, 0, 0); }
     patra_result_free(rs);
+    if (ty < 0) {
+        # 1.10.0: a packed object's type is its framing's.
+        var deco[24];
+        if (sit_pack_read(store_root_of(db), hex, &deco) == 0) {
+            var fb = load64(&deco);
+            var sp = 0;
+            while (load8(fb + sp) != 32) { sp = sp + 1; }
+            ty = type_code_of(fb, sp);
+            fl_free(fb);
+        }
+    }
     return ty;
 }
 
@@ -1118,7 +1188,19 @@ fn _wire_walk_alloc() {
 # Returns 0, or negative as db_object_read_both does.
 fn _db_object_inflate_reuse(db, hex, cell, out16) {
     var raw[24];
-    if (db_object_read_raw(db, hex, &raw) != 0) { return 0 - 1; }
+    var rr = db_row_read_raw(db, hex, &raw);
+    if (rr == 0 - 2) {
+        # 1.10.0: packed — the reconstruction becomes the cell's buffer.
+        var deco[24];
+        if (sit_pack_read(store_root_of(db), hex, &deco) != 0) { return 0 - 1; }
+        if (load64(cell) != 0) { fl_free(load64(cell)); }
+        store64(cell, load64(&deco));
+        store64(cell + 8, load64(&deco + 8));
+        store64(out16, load64(&deco) + load64(&deco + 16));
+        store64(out16 + 8, load64(&deco + 8) - load64(&deco + 16));
+        return 0;
+    }
+    if (rr != 0) { return 0 - 1; }
     var compressed = load64(&raw);
     var clen = load64(&raw + 8);
     var dec_cap = clen * 4;
@@ -1397,7 +1479,7 @@ fn do_fetch(name, branch) {
     if (walk_reachable_phased(src, remote_tip, hashes, seen, raw_cache) != 0) { return 0; }
     var copied = copy_objects(src, dst_db, hashes, raw_cache);
 
-    if (src_db_local != 0) { patra_close(src_db_local); }
+    if (src_db_local != 0) { store_forget_root(src_db_local); patra_close(src_db_local); }
     if (http_handle != 0)  { wire_http_close(http_handle); }
     if (ssh_handle != 0)   { wire_ssh_close(ssh_handle); }
 
@@ -1860,6 +1942,7 @@ fn cmd_push() {
         var remote_head_branch = _remote_current_branch(repo_path);
         if (remote_head_branch != 0) {
             if (streq(remote_head_branch, branch) == 1) {
+                store_forget_root(dst_db);
                 patra_close(dst_db);
                 eprintln("sit: remote refuses to update its checked-out branch (denyCurrentBranch)");
                 return 1;
@@ -1870,6 +1953,7 @@ fn cmd_push() {
     if (remote_tip != 0) {
         # Fast-forward check: remote_tip must be an ancestor of local_tip.
         if (is_ancestor_in_db(src_db, remote_tip, local_tip) == 0) {
+            store_forget_root(dst_db);
             patra_close(dst_db);
             eprintln("sit: non-fast-forward push rejected (remote has diverged)");
             return 1;
@@ -1887,6 +1971,7 @@ fn cmd_push() {
     if (walk_reachable_phased(src, local_tip, hashes, seen, raw_cache) != 0) { return 1; }   # S-26
     var copied = copy_objects(src, dst_db, hashes, raw_cache);
 
+    store_forget_root(dst_db);
     patra_close(dst_db);
 
     if (copied < 0) {

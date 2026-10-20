@@ -72,6 +72,22 @@ fn resolve_hash(prefix, out_buf) {
         if (count > 1) { ret = 0 - 1; }
     }
     patra_result_free(rs);
+    # 1.10.0: and the packed objects. One object both packed and a row is one match.
+    if (ret >= 0) {
+        var phex[72];
+        var pc = sit_pack_prefix(0, prefix, plen, &phex);
+        if (pc > 1) { ret = 0 - 1; }
+        if (pc == 1) {
+            if (ret == 0) {
+                memcpy(out_buf, &phex, 64);
+                store8(out_buf + 64, 0);
+                ret = 1;
+            }
+            else {
+                if (memeq(out_buf, &phex, 64) == 0) { ret = 0 - 1; }
+            }
+        }
+    }
     return ret;
 }
 
@@ -174,6 +190,349 @@ fn obj_frame_total(buf, avail) {
     return end + 1 + n;
 }
 
+# ── Packs (1.10.0) ─────────────────────────────────────────────────
+#
+# `sit gc` moves every reachable object into a pack, `.sit/packs/pack-<id>.pack`
+# beside its `.idx`, in git's SHA-256 pack v2 / idx v2 format: byte for byte,
+# so `git index-pack` rebuilds the same .idx. Each object is a delta against the
+# newer version at the same path where that wins. git_pack.cyr's reader serves
+# them (OFS_DELTA only: a REF_DELTA is refused, so a sit pack is always
+# self-contained), and sit_pack_read frames the result like a stored row. Rows
+# in objects.patra are the loose objects: whatever was written since, and
+# whatever gc found unreachable. See ADR 0016.
+#
+# A store's pack list is read once per process. Packs change only under gc,
+# which runs alone (the store lock, below) and resets the list itself.
+
+# Store root ("" = this repository) -> vec of 16-byte {idx path, pack path} cells.
+var _sit_pack_lists = 0;
+
+# `root` as an absolute path. Another repository's root is relative to the
+# process cwd, as its patra_open is, but the pack reader resolves a relative
+# path against this repository's root (sit_abs) — so `sit clone ../src dst`,
+# with the root set to dst, looked for dst/../src's packs. agnos has no cwd and
+# takes absolute paths only.
+fn _sit_root_abs(root) {
+    if (load8(root) == 47) { return root; }
+    #ifdef CYRIUS_TARGET_AGNOS
+    return root;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var cwd[4096];
+    if (syscall(SYS_GETCWD, &cwd, 4096) <= 0) { return root; }
+    var cl = strlen(&cwd);
+    var rl = strlen(root);
+    var p = alloc_or_die(cl + rl + 2);
+    memcpy(p, &cwd, cl);
+    store8(p + cl, 47);
+    memcpy(p + cl + 1, root, rl);
+    store8(p + cl + 1 + rl, 0);
+    return p;
+    #endif
+}
+
+# The packs directory of the store at `root` (0 = this repository).
+fn _sit_packdir(root) {
+    if (root == 0) { return ".sit/packs"; }
+    var ar = _sit_root_abs(root);
+    var rl = strlen(ar);
+    var p = alloc_or_die(rl + 12);
+    memcpy(p, ar, rl);
+    memcpy(p + rl, "/.sit/packs", 11);
+    store8(p + rl + 11, 0);
+    return p;
+}
+
+# 1 when `nm` (`n` bytes) is a pack index name gc writes: `pack-<64 hex>.idx`.
+fn _sit_pack_idx_name(nm, n) {
+    if (n != 73) { return 0; }
+    if (memeq(nm, "pack-", 5) == 0) { return 0; }
+    if (memeq(nm + 69, ".idx", 4) == 0) { return 0; }
+    return hex_prefix_valid(nm + 5, 64);
+}
+
+# The packs of the store at `root`, listed on first use: a vec of {idx path,
+# pack path} cells. A packs directory that is not a plain directory (a planted
+# symlink) has none.
+fn sit_packs(root) {
+    if (_sit_pack_lists == 0) { _sit_pack_lists = map_new(); }
+    var key = root;
+    if (key == 0) { key = ""; }
+    var hit = map_get(_sit_pack_lists, key);
+    if (hit != 0) { return hit; }
+    var packs = vec_new();
+    var dir = _sit_packdir(root);
+    var dl = strlen(dir);
+    var adir = dir;
+    if (root == 0) { adir = sit_abs(dir); }
+    if (path_lstat_kind(adir) == 0x4000) {
+        var names = dir_list(str_from(adir));
+        var i = 0;
+        while (i < vec_len(names)) {
+            var ns = vec_get(names, i);
+            var nm = str_data(ns);
+            var nl = str_len(ns);
+            if (_sit_pack_idx_name(nm, nl) == 1) {
+                var ip = alloc_or_die(dl + 1 + nl + 1);
+                memcpy(ip, dir, dl);
+                store8(ip + dl, 47);
+                memcpy(ip + dl + 1, nm, nl);
+                store8(ip + dl + 1 + nl, 0);
+                var pp = alloc_or_die(dl + 1 + nl + 2);
+                memcpy(pp, ip, dl + 1 + nl - 4);
+                memcpy(pp + dl + 1 + nl - 4, ".pack", 5);
+                store8(pp + dl + 1 + nl + 1, 0);
+                var cell = alloc_or_die(16);
+                store64(cell, ip);
+                store64(cell + 8, pp);
+                vec_push(packs, cell);
+            }
+            i = i + 1;
+        }
+    }
+    var kl = strlen(key);
+    var kc = alloc_or_die(kl + 1);
+    memcpy(kc, key, kl);
+    store8(kc + kl, 0);
+    map_set(_sit_pack_lists, kc, packs);
+    return packs;
+}
+
+# Forget every store's pack list (gc, after installing or removing a pack).
+fn sit_packs_reset() {
+    _sit_pack_lists = 0;
+    return 0;
+}
+
+# How many packs the store at `root` has.
+fn sit_pack_count(root) {
+    return vec_len(sit_packs(root));
+}
+
+# Find `hex` (64 hex) in the store's packs: {pack data, pack len, offset} at
+# out24 and 0; -3 when no pack holds it, -2 when `hex` is not an id.
+fn sit_pack_locate(root, hex, out24) {
+    var packs = sit_packs(root);
+    var n = vec_len(packs);
+    if (n == 0) { return 0 - 3; }
+    var raw[32];
+    if (hex_decode_into(hex, 64, &raw) == 0) { return 0 - 2; }
+    var rc = 0 - 3;
+    var i = 0;
+    while (i < n) {
+        if (rc != 0) {
+            var cell = vec_get(packs, i);
+            var off = _git_idx_lookup(load64(cell), &raw, 32);
+            if (off >= 0) {
+                var pp[16];
+                if (_git_load_pack(load64(cell + 8), &pp) == 0) {
+                    store64(out24, load64(&pp));
+                    store64(out24 + 8, load64(&pp + 8));
+                    store64(out24 + 16, off);
+                    rc = 0;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return rc;
+}
+
+# 1 when one of the store's packs holds `hex`, else 0.
+fn sit_pack_has(root, hex) {
+    var loc[24];
+    if (sit_pack_locate(root, hex, &loc) == 0) { return 1; }
+    return 0;
+}
+
+# The framing word of pack type `t` (1 commit, 2 tree, 3 blob, 4 tag), or 0.
+fn _pack_type_word(t) {
+    if (t == 1) { return "commit"; }
+    if (t == 2) { return "tree"; }
+    if (t == 3) { return "blob"; }
+    if (t == 4) { return "tag"; }
+    return 0;
+}
+
+# Read `hex` from the store's packs into the read_object contract: a freelist
+# buffer holding "<type> <len>\0<content>" with its content offset. Returns 0,
+# -3 when no pack holds it, -6 out of memory, -7 when the entry does not
+# reconstruct. Like a row read, this does not re-hash; fsck and gc do.
+fn sit_pack_read(root, hex, out24) {
+    var loc[24];
+    var lr = sit_pack_locate(root, hex, &loc);
+    if (lr != 0) { return lr; }
+    var res[24];
+    var ptype[8];
+    store64(&ptype, 0);
+    if (_pack_obj_ex(load64(&loc), load64(&loc + 8), load64(&loc + 16), &res, &ptype, 0) != 0) {
+        return 0 - 7;
+    }
+    var body = load64(&res);
+    var blen = load64(&res + 8);
+    var word = _pack_type_word(load64(&ptype));
+    if (word == 0) { fl_free(body); return 0 - 7; }
+    var wl = strlen(word);
+    var hdr[32];
+    memcpy(&hdr, word, wl);
+    store8(&hdr + wl, 32);
+    var dg = write_decimal(&hdr + wl + 1, blen);
+    store8(&hdr + wl + 1 + dg, 0);
+    var hl = wl + dg + 2;
+    var framed = fl_alloc(hl + blen + 1);
+    if (framed == 0) { fl_free(body); return 0 - 6; }
+    memcpy(framed, &hdr, hl);
+    _pack_copy(framed + hl, body, blen);
+    fl_free(body);
+    store64(out24, framed);
+    store64(out24 + 8, hl + blen);
+    store64(out24 + 16, hl);
+    return 0;
+}
+
+# Validate the .idx at `path` (v2, 32-byte ids) and write {data, len, count}
+# to out24. Returns 0, or -1 when it is unreadable or malformed. The checks are
+# _git_idx_lookup's: magic, version, and a count the file can hold.
+fn _sit_idx_open(path, out24) {
+    var pr[16];
+    if (_git_file_cached(path, &pr) != 0) { return 0 - 1; }
+    var d = load64(&pr);
+    var len = load64(&pr + 8);
+    if (len < 1032 + 64) { return 0 - 1; }
+    if ((load8(d) & 0xFF) != 255) { return 0 - 1; }
+    if (memeq(d + 1, "tOc", 3) == 0) { return 0 - 1; }
+    if (_be32(d + 4) != 2) { return 0 - 1; }
+    var n = _be32(d + 8 + 255 * 4);
+    if (n < 0) { return 0 - 1; }
+    if (n > (len - 1032 - 64) / 40) { return 0 - 1; }
+    store64(out24, d);
+    store64(out24 + 8, len);
+    store64(out24 + 16, n);
+    return 0;
+}
+
+# Count the packed objects whose id starts with `prefix` (`plen` hex digits,
+# at least 2, already validated), up to 2, writing the first one's 64 hex to
+# `out` (65 bytes). resolve_hash's pack half.
+fn sit_pack_prefix(root, prefix, plen, out) {
+    var packs = sit_packs(root);
+    var found = 0;
+    var hx[72];
+    var b0 = 0;
+    var i = 0;
+    while (i < 2) {
+        var c = load8(prefix + i) & 0xFF;
+        var v = 0;
+        if (c >= 97) { v = c - 87; }
+        else {
+            if (c >= 65) { v = c - 55; }
+            else { v = c - 48; }
+        }
+        b0 = b0 * 16 + v;
+        i = i + 1;
+    }
+    var pi = 0;
+    while (pi < vec_len(packs)) {
+        var ix[24];
+        if (_sit_idx_open(load64(vec_get(packs, pi)), &ix) == 0) {
+            var d = load64(&ix);
+            var lo = 0;
+            if (b0 > 0) { lo = _be32(d + 8 + (b0 - 1) * 4); }
+            var hi = _be32(d + 8 + b0 * 4);
+            if (hi > load64(&ix + 16)) { hi = 0; }
+            var k = lo;
+            while (k < hi) {
+                if (found < 2) {
+                    _hex_into(d + 1032 + k * 32, 32, &hx);
+                    if (memeq(&hx, prefix, plen) == 1) {
+                        if (found == 0) {
+                            memcpy(out, &hx, 64);
+                            store8(out + 64, 0);
+                            found = 1;
+                        }
+                        else {
+                            if (memeq(out, &hx, 64) == 0) { found = 2; }
+                        }
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        pi = pi + 1;
+    }
+    return found;
+}
+
+# Push the 64-hex id (a heap cstring) of every object in the store's packs
+# onto `out`. An object two packs hold appears twice. Returns how many were
+# pushed, or -1 when an .idx is malformed.
+fn sit_pack_oids(root, out) {
+    var packs = sit_packs(root);
+    var total = 0;
+    var pi = 0;
+    while (pi < vec_len(packs)) {
+        var ix[24];
+        if (_sit_idx_open(load64(vec_get(packs, pi)), &ix) != 0) { return 0 - 1; }
+        var d = load64(&ix);
+        var n = load64(&ix + 16);
+        var k = 0;
+        while (k < n) {
+            var hx = alloc_or_die(72);
+            _hex_into(d + 1032 + k * 32, 32, hx);
+            vec_push(out, hx);
+            k = k + 1;
+        }
+        total = total + n;
+        pi = pi + 1;
+    }
+    return total;
+}
+
+# 1 when the last 32 bytes of {d, len} are the SHA-256 of everything before.
+fn _sit_trailer_ok(d, len) {
+    if (len < 32) { return 0; }
+    var h[32];
+    sha256(d, len - 32, &h);
+    return memeq(&h, d + len - 32, 32);
+}
+
+# fsck's check of the pack files themselves: every pack's trailing SHA-256 and
+# its .idx's, and that the .idx names its pack's. Reports each failure on
+# stderr and returns how many there were.
+fn sit_pack_verify_files(root) {
+    var packs = sit_packs(root);
+    var bad = 0;
+    var pi = 0;
+    while (pi < vec_len(packs)) {
+        var cell = vec_get(packs, pi);
+        var ok = 0;
+        var ix[24];
+        var pp[16];
+        if (_sit_idx_open(load64(cell), &ix) == 0) {
+            if (_git_load_pack(load64(cell + 8), &pp) == 0) {
+                var d = load64(&ix);
+                var il = load64(&ix + 8);
+                var pd = load64(&pp);
+                var pl = load64(&pp + 8);
+                if (_sit_trailer_ok(d, il) == 1) {
+                    if (_sit_trailer_ok(pd, pl) == 1) {
+                        if (memeq(d + il - 64, pd + pl - 32, 32) == 1) { ok = 1; }
+                    }
+                }
+            }
+        }
+        if (ok == 0) {
+            var ip = load64(cell);
+            syscall(SYS_WRITE, STDERR, "bad pack ", 9);
+            syscall(SYS_WRITE, STDERR, ip, strlen(ip));
+            syscall(SYS_WRITE, STDERR, "\n", 1);
+            bad = bad + 1;
+        }
+        pi = pi + 1;
+    }
+    return bad;
+}
+
 # Read and decompress an object by full 64-char hex hash.
 # On success, writes to out (24 bytes):
 #   out[0..8)    decompressed buffer ptr
@@ -213,6 +572,18 @@ fn read_object(hex, out) {
     var db = get_object_db();
     if (db == 0) { return 0 - 1; }
 
+    # 1.10.0: packs first when there are any. After a gc nearly every object is
+    # packed, and an index probe in a mapped .idx is cheaper than the row miss.
+    if (sit_pack_count(0) > 0) {
+        if (sit_pack_read(0, hex, out) == 0) { return 0; }
+    }
+    return db_row_read(db, hex, out);
+}
+
+# read_object's row half: the loose object `hex` (already validated) from the
+# patra store `db`, inflated. Same contract and return codes as read_object;
+# fsck calls it directly to check rows apart from packs.
+fn db_row_read(db, hex, out) {
     # S-24: SQL string via fl_alloc + fl_free; freed before any non-trivial
     # work below so we don't hold both the buffer and the result-set.
     var sql = fl_alloc(128);
@@ -281,7 +652,8 @@ fn write_typed_object(type_str, type_len, content, content_len) {
     var db = get_object_db();
     if (db == 0) { return 0; }
 
-    # Content-addressed — skip if hash already present.
+    # Content-addressed — skip if hash already present: packed (1.10.0), or a row.
+    if (sit_pack_has(0, hex) == 1) { return hex; }
     # S-24: SQL on the freelist; freed before the insert path runs.
     var check_sql = fl_alloc(128);
     memcpy(check_sql, "SELECT hash FROM objects WHERE hash = '", 39);
@@ -556,9 +928,138 @@ fn object_db_open() {
 # and closes the fd — no WAL flush — so skipping it at exit is safe).
 var _object_db_cached = 0;
 
+# ── Store lock (1.10.0) ────────────────────────────────────────────
+#
+# `sit gc` replaces `.sit/objects.patra` and deletes packs, so it must run with
+# no other process holding the store open: one that opened the old file would
+# go on writing into a file nothing reads any more, and lose those objects.
+# Every process that opens a store first takes a shared flock on
+# `<repo>/.sit/objects.flock` and holds it until it exits; gc takes it exclusive
+# and refuses when it cannot. A command started while gc runs waits for it, then
+# opens the store gc left. See ADR 0016 and architecture 008.
+#
+# The file is only ever locked, never written, so it is opened read-only, and
+# created O_CREAT|O_EXCL, which refuses a symlink planted at the path. Where it
+# cannot be opened (a read-only repository) the store opens unlocked: nothing
+# in that process can write it, and gc cannot run there either. agnos has only
+# non-blocking flock, so there a command does not wait for gc (accepted, as for
+# its other locks).
+
+var _store_lock_fd = 0 - 1;     # this repository's: shared, or exclusive under gc
+
+# O_CLOEXEC where the target has it: a child (an editor, ssh, owl) must not
+# inherit the lock and hold off gc after sit has exited.
+fn _store_lock_cloexec() {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return O_CLOEXEC;
+    #endif
+}
+
+# Open, creating if needed, the lock file at the resolved path `ap`: an fd, or
+# -1 when it cannot be opened or is not a regular file.
+fn _store_lock_open(ap) {
+    var kind = path_lstat_kind(ap);
+    if (kind < 0) {
+        var cfd = file_open(ap, O_RDONLY | O_CREAT | O_EXCL | _store_lock_cloexec(), 0x1A4);
+        if (cfd >= 0) { return cfd; }
+        kind = path_lstat_kind(ap);               # another process created it meanwhile
+    }
+    if (kind != 0x8000) { return 0 - 1; }
+    return file_open(ap, O_RDONLY | _store_lock_cloexec(), 0);
+}
+
+# Take the shared store lock of the repository at `root` (0 = this one) and
+# keep it for the life of the process. Waits while a gc holds it, saying so.
+# Returns the fd, or -1 when there is no lock to take.
+fn store_lock_shared(root) {
+    if (root == 0) {
+        if (_store_lock_fd >= 0) { return _store_lock_fd; }
+        if (_sf_parent_symlink(".sit/objects.flock") == 1) { return 0 - 1; }
+    }
+    var ap = 0;
+    if (root == 0) { ap = sit_abs(".sit/objects.flock"); }
+    else {
+        var rl = strlen(root);
+        ap = alloc_or_die(rl + 20);
+        memcpy(ap, root, rl);
+        memcpy(ap + rl, "/.sit/objects.flock", 19);
+        store8(ap + rl + 19, 0);
+    }
+    var fd = _store_lock_open(ap);
+    if (fd < 0) { return 0 - 1; }
+    if (xflock(fd, LOCK_SH | LOCK_NB) != 0) {
+        eprintln("sit: waiting for `sit gc` to finish with the object store");
+        file_lock_shared(fd);
+    }
+    if (root == 0) { _store_lock_fd = fd; }
+    return fd;
+}
+
+# Take this repository's store lock exclusively, without waiting: 0, -1 when
+# another process holds the store open, -2 when there is no lock file to take
+# (the repository is read-only, or .sit/ is not a plain directory). For gc,
+# before anything in the process opens the store.
+fn store_lock_exclusive() {
+    if (_store_lock_fd >= 0) { return 0 - 1; }
+    if (_sf_parent_symlink(".sit/objects.flock") == 1) { return 0 - 2; }
+    var fd = _store_lock_open(sit_abs(".sit/objects.flock"));
+    if (fd < 0) { return 0 - 2; }
+    if (file_trylock(fd) != 0) {
+        file_close(fd);
+        return 0 - 1;
+    }
+    _store_lock_fd = fd;
+    return 0;
+}
+
+# Stores opened from another repository (a file:// remote), and the root each
+# was opened at, so the wire layer finds that store's packs from its handle.
+# The local store is never listed: its root is 0.
+var _store_roots = 0;
+
+# Record that the patra handle `db` is the store of the repository at `root`.
+fn store_register_root(db, root) {
+    if (_store_roots == 0) { _store_roots = vec_new(); }
+    var cell = alloc_or_die(16);
+    store64(cell, db);
+    store64(cell + 8, root);
+    vec_push(_store_roots, cell);
+    return 0;
+}
+
+# Forget `db` before it is closed: patra may hand the same address to the next open.
+fn store_forget_root(db) {
+    if (_store_roots == 0) { return 0; }
+    var i = 0;
+    while (i < vec_len(_store_roots)) {
+        var cell = vec_get(_store_roots, i);
+        if (load64(cell) == db) { store64(cell, 0); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The repository root whose store `db` is: 0 for this repository's.
+fn store_root_of(db) {
+    if (_store_roots == 0) { return 0; }
+    if (db == 0) { return 0; }
+    var i = 0;
+    while (i < vec_len(_store_roots)) {
+        var cell = vec_get(_store_roots, i);
+        if (load64(cell) == db) { return load64(cell + 8); }
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Process-cached object DB handle; migrates loose objects into patra on first open.
 fn get_object_db() {
     if (_object_db_cached != 0) { return _object_db_cached; }
+    # 1.10.0: the store lock comes before the store is opened (see above).
+    store_lock_shared(0);
     _object_db_cached = object_db_open();
     if (_object_db_cached == 0) { return 0; }
     # v0.6.10 — investigated patra 1.8's BATCH sync mode here and reverted:
@@ -1261,29 +1762,78 @@ fn cmd_fsck() {
         patra_result_free(rs);
     }
 
+    # 1.10.0: rows and packs are checked apart, each through its own reader —
+    # read_object tries the packs first, so a row that duplicates a packed
+    # object would otherwise never be read. An object both hold is checked in
+    # both, and counted once.
+    var nrows = vec_len(hashes);
+    var packed = map_new();
+    var poids = vec_new();
+    if (sit_pack_oids(0, poids) < 0) {
+        eprintln("bad pack index under .sit/packs (malformed .idx)");
+        bad = bad + 1;
+    }
+    bad = bad + sit_pack_verify_files(0);
+    var pk = 0;
+    while (pk < vec_len(poids)) {
+        var ph = vec_get(poids, pk);
+        if (map_has(packed, ph) == 0) {
+            map_set(packed, ph, 1);
+            if (map_has(ty_map, ph) == 0) { vec_push(hashes, ph); }
+        }
+        pk = pk + 1;
+    }
+
     var hn = vec_len(hashes);
     var hi = 0;
     while (hi < hn) {
         var hex = vec_get(hashes, hi);
-        var obj[24];
-        if (read_object(hex, &obj) == 0) {
-            var buf = load64(&obj);
-            var blen = load64(&obj + 8);
-            var actual = hash_data(buf, blen);
-            if (streq(hex, actual) == 0) {
-                syscall(SYS_WRITE, STDERR, "bad object ", 11);
-                syscall(SYS_WRITE, STDERR, hex, 64);
-                syscall(SYS_WRITE, STDERR, "\n", 1);
-                bad = bad + 1;
+        var from_row = 0;
+        if (hi < nrows) { from_row = 1; }
+        var readable = 0;
+        var step = 0;
+        while (step < 2) {
+            var want = 0;
+            if (step == 0) { want = from_row; }
+            else { want = map_has(packed, hex); }
+            if (want == 1) {
+                var obj[24];
+                var rr = 0;
+                if (step == 0) { rr = db_row_read(db, hex, &obj); }
+                else { rr = sit_pack_read(0, hex, &obj); }
+                if (rr == 0) {
+                    readable = 1;
+                    var buf = load64(&obj);
+                    var blen = load64(&obj + 8);
+                    var actual = hash_data(buf, blen);
+                    if (streq(hex, actual) == 0) {
+                        syscall(SYS_WRITE, STDERR, "bad object ", 11);
+                        syscall(SYS_WRITE, STDERR, hex, 64);
+                        syscall(SYS_WRITE, STDERR, "\n", 1);
+                        bad = bad + 1;
+                    }
+                    else {
+                        # A packed object's type comes from its framing.
+                        if (map_has(ty_map, hex) == 0) {
+                            var sp0 = 0;
+                            while (load8(buf + sp0) != 32) { sp0 = sp0 + 1; }
+                            map_set(ty_map, hex, type_code_of(buf, sp0) + 1);
+                        }
+                    }
+                    fl_free(buf);
+                }
+                else {
+                    syscall(SYS_WRITE, STDERR, "unreadable ", 11);
+                    syscall(SYS_WRITE, STDERR, hex, 64);
+                    syscall(SYS_WRITE, STDERR, "\n", 1);
+                    bad = bad + 1;
+                }
             }
-            total = total + 1;
+            step = step + 1;
         }
-        else {
-            syscall(SYS_WRITE, STDERR, "unreadable ", 11);
-            syscall(SYS_WRITE, STDERR, hex, 64);
-            syscall(SYS_WRITE, STDERR, "\n", 1);
-            bad = bad + 1;
-        }
+        total = total + readable;
+        # An unreadable packed object still counts as stored (S-27 below).
+        if (map_has(ty_map, hex) == 0) { map_set(ty_map, hex, 0 - 1); }
         hi = hi + 1;
     }
 
@@ -1482,6 +2032,7 @@ fn cmd_fsck() {
         var grace_secs = grace_days * 86400;
         var pruned = 0;
         var kept = 0;
+        var kept_packed = 0;
         var nd = vec_len(dangling_hexes);
         var verdict = alloc_or_die(nd + 1);           # 0 delete, 1 keep, 2 tree/blob: decide below
         var expired_reach = map_new();
@@ -1529,8 +2080,13 @@ fn cmd_fsck() {
                     if (map_has(kept_reach, dh) == 0) { v = 0; }
                 }
             }
+            # 1.10.0: a packed object is not a row to delete. It stays until the
+            # next gc, which writes what is unreachable back as rows ("loosens"
+            # it, as git's repack -A does) for a later --prune to judge.
+            if (map_has(packed, dh) == 1) { v = 3; }
             if (v == 1) { kept = kept + 1; }
-            else {
+            if (v == 3) { kept_packed = kept_packed + 1; }
+            if (v == 0) {
                 if (db_object_delete(db, dh) == 0) { pruned = pruned + 1; }
             }
             pi = pi + 1;
@@ -1545,6 +2101,12 @@ fn cmd_fsck() {
             stdout_write(", kept ", 7);
             write_unsigned(kept);
             stdout_write(" within grace", 13);
+        }
+        if (kept_packed > 0) {
+            stdout_write(", kept ", 7);
+            write_unsigned(kept_packed);
+            var kpm = " packed (the next `sit gc` loosens them)";
+            stdout_write(kpm, strlen(kpm));
         }
         stdout_write("\n", 1);
         if (flush_rc != PATRA_OK) {

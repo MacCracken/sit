@@ -18,29 +18,11 @@ Each item ships under the usual test / fuzz / poison / bench gates.
 
 ---
 
-## 1.10.0 — storage: pack bundles + `gc` (minor)
-
-The largest measured gap sit has. Measured 2026-08-20 at 1,600 commits, both sides verified:
-
-| | sit `objects.patra` | git packed | git loose | ratio |
-|---|---:|---:|---:|---:|
-| 1,600 commits | **64.3 MB** | 1.6 MB | 4.3 MB | **39×** |
-
-sit is 15× git's *unpacked* store as well, so page overhead is not the explanation: the fixture's tree content is quadratic in commit count, and successive trees are near-identical, which is exactly what delta compression collapses. Lookups are flat (patra's result-buffer fix); what remains is disk and transfer size.
-
-Delta *generation* exists (`src/delta.cyr`, differential-tested against the read-side interpreter: one byte changed in 8 KiB gives a 35-byte delta). What remains is storage and repack, a storage-format change in four coupled parts:
-
-1. **Schema:** an `objects` column naming the delta base, declared in two places (`object_db.cyr`, `wire.cyr`), plus migration for existing repos.
-2. **`read_object`:** reconstruct transparently. It is already the single choke point.
-3. **`fsck` integrity:** it re-hashes stored bytes against the object id. For a delta those bytes are not the content, so the pass must reconstruct first, or every deltified object reads `bad`.
-4. **Transfer:** `copy_objects` moves raw compressed bytes and verifies each object against its id before storing it (`_object_verify`, CLAUDE.md). A deltified object can only be verified once its base is present, so the base has to travel first (or already be in the target), and verification must reconstruct the same way `fsck` does.
-
-A negotiated wire capability is a further step. **Ride-along: index paths over 255 bytes (B7 rest).** `sit add` and `sit mv` refuse them and `rewrite_index` is transactional. Lifting the limit needs a wider column, an index migration that belongs with this schema change.
-
 ## 1.11.0 — serving many repos (minor)
 
 - **HTTP base-path routing.** `sit serve` serves one repo at `/sit/v1/…`. Accepting `http://host/repos/foo` changes what the wire endpoint accepts and needs real routing in `serve.cyr`. It is what serving multiple repos behind one origin requires.
-- **Per-repo caches (R6).** The patra object-store handle (`get_object_db`, `object_db.cyr`) and the `.idx` / `.pack` mapping cache (`_git_file_cached`, `git_pack.cyr`, keyed by repo-relative path) live for the process, so a second `sit_repo_open` in one process — owl or thoth switching repos, or a multi-repo server — reads the first repo's objects: two .sit repos A then B showed B's clean files as `N`, and two git repos with a pack of the same name read A's pack. Close and reset both when the root or backend changes, key the mappings by absolute path, and unmap packs that leave the listing. (The last-pack cache, `_git_last_idx`, is already reset per open.)
+- **`sit gc` on a served repository.** gc needs the store to itself (architecture 008), and `sit serve` holds the store lock from its first request until it exits, so gc refuses on a served repo. Take the lock per request instead, and after each acquisition notice a gc that ran in between (a generation number gc bumps, or the store file's inode) and reopen the store and pack list. The same check is what lets a long-lived in-process consumer stop holding the lock.
+- **Per-repo caches (R6).** The patra object-store handle (`get_object_db`, `object_db.cyr`), the store lock (`_store_lock_fd`), the sit pack list (`sit_packs`, keyed `""` for the open repo) and the `.idx` / `.pack` mapping cache (`_git_file_cached`, `git_pack.cyr`, keyed by repo-relative path) live for the process, so a second `sit_repo_open` in one process — owl or thoth switching repos, or a multi-repo server — reads the first repo's objects: two .sit repos A then B showed B's clean files as `N`, and two git repos with a pack of the same name read A's pack. Close and reset both when the root or backend changes, key the mappings by absolute path, and unmap packs that leave the listing. (The last-pack cache, `_git_last_idx`, is already reset per open.)
 
 ## 1.12.0 — `.git/` CLI parity (minor)
 
@@ -50,13 +32,15 @@ A negotiated wire capability is a further step. **Ride-along: index paths over 2
     - `resolve_prefix` (`object_db.cyr`): short-prefix disambiguation over a git store would have to walk the loose fanout plus every pack `.idx`.
   - Slot it earlier if a consumer asks for CLI parity.
 - **git-mode status on ordinary repos (R2).** The read path applies the write path's rules: `parse_tree` keeps only 100644 / 40000 entries and drops names that fail the checkout-safety rules (`aux.c`, `con/…`, `a:b.txt` on Linux), and `objects/info/alternates` is never read. So `sit_repo_status` calls executable files, symlinks, submodule contents and every file of a `git clone --shared` repo untracked, where `git status` is clean. Keep 100755 entries, compare 120000 against the link target, skip gitlinks (and their directories in the untracked walk), apply the NTFS / `:` rules only when writing a checkout, and read alternates or report their absence as an error. Mode-aware entries are new API surface, which is why this rides with CLI parity.
-- **A delta base cache, if `log` / `diff` walks need it.** Chains resolve to depth 4095 without one: git stores the newest version of an object whole, and the read API reads each file's HEAD blob once, so a cache would not pay there (depth-50 repo, all 320 blobs: 459 ms either way). Walks over many versions of one file are what a cache is for, and git mode gains those with this slot. Measure them first.
 
 ## 1.x — unscheduled
 
 Wanted, not yet committed to a release. Each earns its own minor when its time comes.
 
 - **A commit-parent cache (commit-graph).** Every history walk reads each commit object afresh, about 75 µs apiece. That makes whole-ancestry walks cost about 150 ms per 2,000 commits: `find_merge_base` on every merge, `rebase`'s pending set, and `describe` when a merge lies between the commit and its nearest tag. git keeps a commit-graph file for the same reason. A parent table in `objects.patra`, filled on write and backfilled once, would cut the walks to table reads. Measure `merge-base` / `describe` / `rebase` on a 100k-commit fixture first.
+- **Packs on the wire, as a negotiated capability.** Since 1.10.0 a packed object leaves the store expanded and compressed (level 1), so the wire format is unchanged, but a clone of the packed 1,600-commit fixture takes 6.96 s against 5.79 s for the same history unpacked, and the receiver stores everything loose until its own `sit gc`. Shipping the pack (or a thin pack of what the receiver lacks) needs a capability both ends advertise, and a receiver-side pass that reconstructs and verifies every object against its id before anything lands — `_object_verify`'s rule, applied after delta resolution (CLAUDE.md).
+- **gc's remaining costs.** Measured on the 1,600-commit fixture: the first gc takes 5.3 s, 2.8 s of it reading 63 MB of rows out of patra; a repeat takes 2.6 s (git: 0.6 s). Commits are not deltified and are 251 KB of the 683 KB pack. Candidates: delta commits against their first parent, pack incrementally (new objects into a second pack) instead of `repack -a -d` every time. Measure on a larger, more varied history first.
+- **Index paths over 255 bytes (B7 rest).** `sit add` and `sit mv` refuse them, and `rewrite_index` is transactional. Planned as a ride-along to 1.10.0's object-store schema change, which did not happen (packs, ADR 0016), so it needs its own `index.patra` migration: patra's STR column is a fixed 256-byte slot, and its chain columns (TEXT / BYTES) cannot be indexed, so the `path` index needs a fixed-width key for long paths (a hash of the path) beside the path itself.
 - **Hooks** (`pre-commit`, `pre-push`, …), if a consumer asks.
 - **Per-command parsing through cmdit (ADR 0015's step 2), only if wanted.** 1.9.0 dispatches the top level through cmdit; each `cmd_*` still reads its own arguments by position. Moving them onto cmdit handles would give per-command `--help` and uniform flag errors, at the cost of changing how 35 commands read their arguments. The calls must stay in `src/main.cyr` or a new `src/cli.cyr` outside both `[lib]` profiles (the bundles ship every `cmd_*`). What is hand-rolled today:
 
@@ -137,7 +121,7 @@ Dropping sandhi for a hand-rolled `net`-direct loopback HTTP/1.0 server (surface
 
 Closed by measurement. The reasoning lives where cited; they are listed here only so they are not re-opened blindly.
 
-- **`clone` has no algorithmic defect left** (1.4.9). Its cost is a fixture whose content is quadratic in commit count, plus git's delta compression: the 1.10.0 item above. Phase profile in the 1.4.9 CHANGELOG entry.
+- **`clone` has no algorithmic defect left** (1.4.9). Its cost is a fixture whose content is quadratic in commit count, which git's deltas collapse; 1.10.0's packs do that for storage (ADR 0016), and packs on the wire (unscheduled, above) would do it for transfer. Phase profile in the 1.4.9 CHANGELOG entry.
 - **Memoizing `_wildmatch` is declined** (1.4.9). Both shapes cost 7–18% on `is_ignored` for a benign edge, since budget exhaustion shows a file rather than hiding it. Numbers at the call site in `src/index.cyr`.
 
 ---
