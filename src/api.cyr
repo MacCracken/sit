@@ -56,6 +56,11 @@ fn sit_repo_open(cwd) {
     #
     # On failure the root is cleared again so a rejected open leaves no state
     # behind for the next call.
+    # 1.11.0 (R6): drop what the previous repository left cached — its store
+    # handle and lock, its index handle, its pack lists — or the new one is
+    # read through them. Mappings are keyed by resolved path, so they stay.
+    store_repo_reset();
+    index_db_reset();
     sit_set_repo_root(cwd);
     _git_pack_forget_last();          # 1.7.6: per repo (see _git_pack_locate)
     if (_detect_repo_backend() < 0) {
@@ -82,6 +87,29 @@ fn sit_repo_close(repo) {
 # `kind` is 0 = keep / 1 = delete (was in HEAD, removed from working) /
 # 2 = add (in working, not in HEAD). Caller owns the returned vec.
 fn sit_diff_path(repo, path) {
+    _api_enter();
+    var ops = _sit_diff_path_in(path);
+    _api_leave();
+    return ops;
+}
+
+# 1.11.0: a consumer calls the API for as long as it runs, so the store lock is
+# taken per call (a store session, object_db.cyr), not held from the first read
+# to exit — `sit gc` can run between calls, and the next call reads what it left.
+# A .git/ repository has no sit store lock.
+fn _api_enter() {
+    if (_repo_backend == 0) { store_enter(); }
+    return 0;
+}
+
+# The end of an API call: give the store lock back.
+fn _api_leave() {
+    if (_repo_backend == 0) { store_leave(); }
+    return 0;
+}
+
+# sit_diff_path's body, inside a store session.
+fn _sit_diff_path_in(path) {
     if (path == 0) { return 0; }
 
     # Resolve HEAD's blob hash for `path`. Treat "no HEAD" / "path absent
@@ -205,6 +233,14 @@ fn _blob_differs_from_file(hex, path) {
 # ignore file (.gitignore in git mode). New public surface (ADR 0009): additive,
 # SemVer-minor. Caller owns the returned vec.
 fn sit_repo_status(repo) {
+    _api_enter();
+    var out = _sit_repo_status_in();
+    _api_leave();
+    return out;
+}
+
+# sit_repo_status's body, inside a store session.
+fn _sit_repo_status_in() {
     var out = vec_new();
     var head_entries = read_head_tree_entries();
     var work_files = list_working_files();

@@ -93,6 +93,21 @@ fn _dbc_reset() {
     return 0;
 }
 
+# Drop every cached object read from the pack mapped at `pdata`, before that
+# mapping goes away: a later mapping can be given the same address.
+fn _dbc_forget(pdata) {
+    if (_dbc == 0) { return 0; }
+    var i = 0;
+    while (i < _DBC_SLOTS) {
+        var s = _dbc + i * _DBC_SLOT;
+        if (load64(s + 16) != 0) {
+            if (load64(s) == pdata) { _dbc_drop(s); }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Keep a copy of `len` bytes at `buf`, the object of pack type `type` at
 # (pack data, offset), evicting round-robin to stay under the limit.
 fn _dbc_put(pdata, off, buf, len, type) {
@@ -315,30 +330,66 @@ fn _git_file_map(path, out_pair) {
     return 0;
 }
 
+# 1.11.0 (R6): keyed by the path resolved through the repository root, not the
+# repo-relative one. Two repositories opened in one process (the read API, sit
+# serve --repos) each have a `.git/objects/pack/pack-<x>.idx`, and git names a
+# pack by its object list, so two different packs can share a name: the second
+# repository read the first one's bytes at the second one's offsets. A cell is
+# {addr, len, 1 when mapped}: a read-in copy (no mmap) cannot be unmapped.
 fn _git_file_cached(path, out_pair) {
     if (_git_file_cache == 0) { _git_file_cache = map_new(); }
-    var hit = map_get(_git_file_cache, path);
+    var kbuf[4352];
+    var kpath = sit_abs_into(path, &kbuf, 4352);
+    if (kpath == 0) { return 0 - 1; }
+    var hit = map_get(_git_file_cache, kpath);
     if (hit != 0) {
         store64(out_pair, load64(hit));
         store64(out_pair + 8, load64(hit + 8));
         return 0;
     }
     var pr[16];
+    var mapped = 1;
     var mr = _git_file_map(path, &pr);
     if (mr == 0 - 1) { return 0 - 1; }
     if (mr != 0) {
         if (read_file_heap(path, &pr) != 0) { return 0 - 1; }
+        mapped = 0;
     }
-    var cell = alloc_or_die(16);
+    var cell = alloc_or_die(24);
     store64(cell, load64(&pr));
     store64(cell + 8, load64(&pr + 8));
-    var pl = strlen(path);
+    store64(cell + 16, mapped);
+    var pl = strlen(kpath);
     var key = alloc_or_die(pl + 1);
-    memcpy(key, path, pl);
+    memcpy(key, kpath, pl);
     store8(key + pl, 0);
     map_set(_git_file_cache, key, cell);
     store64(out_pair, load64(cell));
     store64(out_pair + 8, load64(cell + 8));
+    return 0;
+}
+
+# Unmap every cached .idx / .pack whose file is gone (1.11.0, R6), and drop the
+# delta base cache's entries from it: a store session after a gc, or a git gc
+# under a long-lived reader. Mappings otherwise live for the process, and each
+# gc would leave its predecessors' mapped for good.
+fn _git_file_forget_missing() {
+    if (_git_file_cache == 0) { return 0; }
+    var keys = map_keys(_git_file_cache);
+    var n = vec_len(keys);
+    var i = 0;
+    while (i < n) {
+        var k = vec_get(keys, i);
+        if (path_lstat_kind(k) < 0) {
+            var cell = map_get(_git_file_cache, k);
+            if (cell != 0) {
+                _dbc_forget(load64(cell));
+                if (load64(cell + 16) == 1) { cyr_munmap(load64(cell), load64(cell + 8)); }
+            }
+            map_delete(_git_file_cache, k);
+        }
+        i = i + 1;
+    }
     return 0;
 }
 

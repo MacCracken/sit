@@ -79,6 +79,7 @@ fn print_usage(fd) {
     _usage_line(fd, "  push <remote> [<ref>]   push HEAD's branch to a remote (fast-forward only)");
     _usage_line(fd, "  clone [--depth <n>] <url> [<dir>]  init + remote add origin + fetch + checkout");
     _usage_line(fd, "  serve <repo> [--stdio|--listen 127.0.0.1:<port>] [--tls]  sit/v1 daemon (read + push)");
+    _usage_line(fd, "  serve <dir> --repos [--listen …] [--tls]  serve every repository under <dir> at /<name>/");
     _usage_line(fd, "  commit [-S] [-m] <msg>  record staged changes as a new commit (-S to sign)");
     _usage_line(fd, "  log [--oneline] [--graph]  show commit history from HEAD");
     _usage_line(fd, "  reflog [show] [-n <count>] [<ref>]  show ref movement history (default HEAD)");

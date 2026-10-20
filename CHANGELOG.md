@@ -4,6 +4,71 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-10-20 — serving many repositories: `sit serve --repos`, base-path URLs, gc on a served repository
+
+The 1.11.0 minor: one `sit serve` for many repositories, clients that reach them by URL path, and the per-repository state that makes it work in one process. The toolchain stays at cyrius 6.7.15. Decision record: [ADR 0017](docs/adr/0017-serving-many-repositories.md).
+
+### Added — `sit serve <dir> --repos`
+
+- Serves every sit repository under `<dir>`: a request for `/<name>/sit/v1/…` goes to `<dir>/<name>`, and names may be nested (`team/beta`). Each segment must be letters, digits, `.`, `_` and `-`, not starting with `.`. That allows at most 16 segments and 1,024 bytes, and makes `..` impossible.
+- Every directory on the way must be a real directory, not a symlink, and the last must hold `.sit/HEAD`. Anything else is a 404, the same answer whether something is there or not.
+- Each repository's store handle, lock and identity is kept between its requests, for up to 64 repositories; past that the least recently used is closed. A repository removed while kept answers 404.
+- `--repos` and `--stdio` are exclusive (an `ssh://` URL names its repository by path). `--repos` needs a directory. The banner says what is served.
+
+### Added — base-path URLs
+
+- `http://` and `https://` remotes may carry a path: `http://host:port/team/beta`. Every request goes to that path followed by `/sit/v1/…`, with trailing `/` dropped. An empty, `.` or `..` segment is refused. Until now any path was "not supported".
+- `sit clone` names the checkout after the URL's last path segment, as git does: `sit clone http://127.0.0.1:8484/team/beta` → `./beta`.
+- A 404 on the refs list now says "the server has no sit repository at that URL (404)" rather than "returned non-200".
+
+### Changed — gc on a served repository (store sessions)
+
+- `sit serve` held a repository's store lock from its first request until it exited, so `sit gc` refused on a served repository. Each request is now a store session: the lock is taken for the request and given back when the response is sent.
+- On entry the store file's device and inode are compared with the ones the open handle has. A difference means a gc replaced the file, so the handle, the pack lists and the mappings of packs that are gone are dropped, and the request reads what gc left.
+- The read API (`sit_diff_path`, `sit_repo_status`) does the same per call, so gc runs while owl or thoth have the repository open.
+- Commands are unchanged: one process holds the lock until it exits. [Architecture 008](docs/architecture/008-gc-runs-alone.md).
+
+### Fixed — per-repository caches (R6)
+
+- **A second repository opened in one process was read through the first one's store and index.** `sit_repo_open` now drops the previous repository's store and index handles, store lock and pack lists. Two `.sit` repositories opened in turn reported the second one's clean files as new, with "HEAD's tree cannot be read".
+- **Pack mappings are keyed by resolved path, not repo-relative.** Two `.git` repositories with different packs of the same name (git names a pack by its object list) read each other's bytes.
+- Mappings of pack files that no longer exist are unmapped at the next store session, and their delta-base-cache entries dropped. A later mapping can reuse the address.
+
+### Security
+
+- `--repos` names are judged lexically before anything touches the filesystem, then resolved with `lstat` on every directory, so no symlink leads out of `<dir>`.
+- The integration suite sends traversal spelled every way the client would not send it (`/../`, `/team/../alpha/`, `%2e%2e`, `%2f`, `//`, a symlink) and requires a 404 for each.
+- A new fuzz target checks both path validators against independent readings and requires that random paths route nowhere under a directory that does not exist.
+- Per-request path joins are on the stack: the serve heap test caught 40 B per request from the first cut.
+
+### Performance
+
+Server CPU per request from `/proc`, minimum of 6 alternating runs of 4,000 requests, against the packed 1,600-commit fixture. Host load was ~25, so ±10 µs is noise:
+
+| | 1.10.1 | 1.11.0 |
+|---|---:|---:|
+| `GET /sit/v1/refs` | 125–127 µs | 130–132 µs (≈ +5 µs: the lock, unlock and `stat`) |
+| `GET /sit/v1/objects/<HEAD>` | 430–475 µs | 467–485 µs (within noise; with sessions disabled the same build measured 470 against 467) |
+
+### Docs
+
+- [ADR 0017](docs/adr/0017-serving-many-repositories.md) records the routing decision and the alternatives.
+- [Architecture 008](docs/architecture/008-gc-runs-alone.md) describes store sessions.
+- ADR 0016 is amended (gc on a served repository), and ADR 0009 is amended (what `sit_repo_open` drops, and the per-call lock).
+- CLAUDE.md: a rule that per-repository state is keyed by root or reset on a repository switch, and the store-lock rule now covers sessions.
+- The getting-started guide documents `--repos`, base-path URLs and gc on a served repository.
+- **Roadmap.** The 1.11.0 slot is done, and the next minor is 1.12.0 (`.git/` CLI parity). New unscheduled item: send the real `Host:` header, for a name-routing proxy in front of `--repos`.
+
+### Tests
+
+- **Unit, 616 → 650:** `test_1110_serving` covers the name and base-path rules, `wire_http_open`'s base path and request paths, a store state saved and loaded across a switch, and the base cache dropping only a forgotten mapping's entries.
+- **Integration, 574 → 600:**
+  - Section 41a clones nested and plain names, checks the derived directory and the plain 404 message, and checks that unknown names, a missing `.sit`, a symlink and a dot-name are refused. It sends eight raw traversal requests, pushes into one repository and not another, and checks that `--repos` refuses a file and `--stdio`.
+  - 41b runs gc on a served repository, then pulls, gc's again and clones.
+  - 41c, through the shipped read bundle (`repo_switch_probe.cyr`), opens two `.sit` repositories in turn, runs gc between two API calls, and reads two `.git` repositories with same-named packs.
+  - 39f now asserts gc while `sit serve` is idle.
+- **Fuzz, 22 → 23 targets:** `fuzz_serve_repo_paths` (200,000 rounds).
+
 ## [1.10.1] — 2026-10-20 — a clone from a relative path records an absolute origin
 
 ### Fixed

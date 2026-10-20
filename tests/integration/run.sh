@@ -64,6 +64,17 @@ if command -v cyrius >/dev/null 2>&1; then
   fi
 fi
 
+# 1.11.0: one process, several repositories, through the shipped READ bundle.
+REPO_PROBE=""
+REPO_PROBE_BROKEN=0
+if command -v cyrius >/dev/null 2>&1; then
+  if ( cd "$ROOT" && cyrius build tests/integration/repo_switch_probe.cyr "$WORK/repo_switch_probe" ) >"$WORK/repo_switch_probe.log" 2>&1; then
+    REPO_PROBE="$WORK/repo_switch_probe"
+  else
+    REPO_PROBE_BROKEN=1
+  fi
+fi
+
 export HOME="$WORK/home"; mkdir -p "$HOME"
 export SIT_AUTHOR_NAME="Integration Test"
 export SIT_AUTHOR_EMAIL="itest@sit.local"
@@ -2299,12 +2310,15 @@ if command -v python3 >/dev/null 2>&1; then
   gcwait 18790
   "$SIT" clone --force-absolute http://127.0.0.1:18790 gcl2 >/dev/null 2>&1; assert_eq "$?" "0" "39e: clone (http) from a packed repository"
   assert_eq "$(cd gcl2 && "$SIT" fsck 2>&1 | tail -1 | sed 's/checked [0-9]* objects, //')" "0 bad, 0 dangling" "39e: clean"
-  # 39f. A running server holds the store; gc refuses rather than replace it.
+  # 39f. Since 1.11.0 a server holds the store lock per request (a store
+  # session), not from its first request to exit: gc runs while it is idle,
+  # and its next request reads the store and pack gc left.
+  (cd "$R" && echo served >> b.txt && "$SIT" add b.txt >/dev/null && "$SIT" commit -m after-gc-served >/dev/null)
   OUT=$(cd "$R" && "$SIT" gc 2>&1); RC=$?
-  assert_eq "$RC" "1" "39f: gc refuses while sit serve has the store open"
-  assert_contains "$OUT" "another sit process" "39f: and says why"
+  assert_eq "$RC" "0" "39f: gc runs while sit serve is idle (1.11.0)"
+  "$SIT" clone --force-absolute http://127.0.0.1:18790 gcl2b >/dev/null 2>&1; assert_eq "$?" "0" "39f: the server's next clone works"
+  assert_contains "$(cd gcl2b && "$SIT" log --oneline | head -1)" "after-gc-served" "39f: and reads what gc packed"
   kill $GS 2>/dev/null; wait $GS 2>/dev/null
-  (cd "$R" && "$SIT" gc >/dev/null 2>&1); assert_eq "$?" "0" "39f: and runs once it is gone"
 fi
 cd "$R"
 if command -v flock >/dev/null 2>&1; then
@@ -2396,6 +2410,95 @@ assert_eq "$("$SIT" log --oneline | head -1 | cut -d' ' -f2)" "b" "40b: brings t
 "$SIT" checkout -b topic >/dev/null 2>&1; echo t > t.txt; "$SIT" add t.txt >/dev/null; "$SIT" commit -m t >/dev/null
 "$SIT" push origin >/dev/null 2>&1; assert_eq "$?" "0" "40b: push"
 assert_eq "$(cd "$C/src" && "$SIT" log --oneline topic | head -1 | cut -d' ' -f2)" "t" "40b: arrives"
+
+# ── 41. 1.11.0 serving many repositories; store sessions; per-repo caches ──
+hr "1.11.0 serve --repos, store sessions, R6"
+M="$WORK/s41"; mkdir -p "$M/repos/alpha" "$M/repos/team/beta" "$M/repos/notrepo" "$M/repos/.hidden" "$M/w"
+for r in alpha team/beta .hidden; do
+  (cd "$M/repos/$r" && "$SIT" init >/dev/null && echo "$r" > r.txt && "$SIT" add r.txt >/dev/null && "$SIT" commit -m "$r" >/dev/null)
+done
+ln -s alpha "$M/repos/linked"
+"$SIT" serve "$M/repos/alpha/r.txt" --repos >/dev/null 2>&1; assert_eq "$?" "1" "41a: --repos needs a directory"
+"$SIT" serve "$M/repos" --repos --stdio >/dev/null 2>&1; assert_eq "$?" "1" "41a: --repos and --stdio are exclusive"
+if command -v python3 >/dev/null 2>&1; then
+  s41wait() { for _ in 1 2 3 4 5 6 7 8 9 10; do (echo > /dev/tcp/127.0.0.1/"$1") >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
+  "$SIT" serve "$M/repos" --repos --listen 127.0.0.1:18800 > "$M/serve.out" 2>&1 & MS=$!
+  s41wait 18800
+  assert_contains "$(cat "$M/serve.out")" "serving the sit repositories under" "41a: the banner says what it serves"
+  cd "$M/w"
+  "$SIT" clone --force-absolute http://127.0.0.1:18800/alpha "$M/w/alpha" >/dev/null 2>&1; assert_eq "$?" "0" "41a: clone /alpha"
+  assert_eq "$(cat "$M/w/alpha/r.txt")" "alpha" "41a: gets alpha"
+  "$SIT" clone http://127.0.0.1:18800/team/beta/ >/dev/null 2>&1; assert_eq "$?" "0" "41a: clone a nested /team/beta/"
+  assert_eq "$(cat "$M/w/beta/r.txt" 2>/dev/null)" "team/beta" "41a: into ./beta, named by the last segment"
+  OUT=$("$SIT" clone http://127.0.0.1:18800/nope x1 2>&1); assert_contains "$OUT" "no sit repository at that URL (404)" "41a: an unknown name is a 404, said plainly"
+  OUT=$("$SIT" clone http://127.0.0.1:18800 x2 2>&1); assert_contains "$OUT" "(404)" "41a: so is no name at all"
+  OUT=$("$SIT" clone http://127.0.0.1:18800/notrepo x3 2>&1); assert_contains "$OUT" "(404)" "41a: a directory with no .sit is not served"
+  OUT=$("$SIT" clone http://127.0.0.1:18800/linked x4 2>&1); assert_contains "$OUT" "(404)" "41a: nor a symlink to a repository"
+  OUT=$("$SIT" clone http://127.0.0.1:18800/.hidden x5 2>&1); assert_contains "$OUT" "(404)" "41a: nor a name starting with '.'"
+  OUT=$("$SIT" clone http://127.0.0.1:18800/team/../alpha x6 2>&1); assert_contains "$OUT" "'..' segment" "41a: the client refuses a '..' segment"
+  # Raw requests: traversal spelled any way the client would not send it.
+  RAWS=$(python3 -I - <<'PYEOF'
+import http.client
+codes = []
+for p in ["/alpha/sit/v1/refs", "/sit/v1/refs", "/../repos/alpha/sit/v1/refs", "/team/../alpha/sit/v1/refs",
+          "/%2e%2e/alpha/sit/v1/refs", "/alpha%2f..%2falpha/sit/v1/refs", "//alpha/sit/v1/refs", "/linked/sit/v1/refs"]:
+    c = http.client.HTTPConnection("127.0.0.1", 18800, timeout=10)
+    c.request("GET", p)
+    codes.append(str(c.getresponse().status))
+    c.close()
+print(" ".join(codes))
+PYEOF
+)
+  assert_eq "$RAWS" "200 404 404 404 404 404 404 404" "41a: only a validated name under the directory is served"
+  cd "$M/w/beta"
+  "$SIT" checkout -b topic >/dev/null 2>&1; echo t > t.txt; "$SIT" add t.txt >/dev/null; "$SIT" commit -m t >/dev/null
+  "$SIT" push origin >/dev/null 2>&1; assert_eq "$?" "0" "41a: push to a served repository"
+  assert_eq "$(cd "$M/repos/team/beta" && "$SIT" log --oneline topic | head -1 | cut -d' ' -f2)" "t" "41a: lands in it, and only it"
+  assert_eq "$(cd "$M/repos/alpha" && "$SIT" log --oneline topic 2>&1 | grep -c ' t$')" "0" "41a: not in another"
+  # 41b. gc on a served repository, then the server reads what gc left.
+  (cd "$M/repos/alpha" && echo more >> r.txt && "$SIT" add r.txt >/dev/null && "$SIT" commit -m more >/dev/null)
+  (cd "$M/repos/alpha" && "$SIT" gc >/dev/null 2>&1); assert_eq "$?" "0" "41b: gc runs on a repository being served"
+  (cd "$M/w/alpha" && "$SIT" pull origin >/dev/null 2>&1); assert_eq "$?" "0" "41b: a pull after it"
+  assert_eq "$(cd "$M/w/alpha" && cat r.txt | tail -1)" "more" "41b: brings the commit gc packed"
+  (cd "$M/repos/alpha" && "$SIT" gc >/dev/null 2>&1)
+  "$SIT" clone --force-absolute http://127.0.0.1:18800/alpha "$M/w/alpha2" >/dev/null 2>&1; assert_eq "$?" "0" "41b: and a clone after a second gc"
+  assert_eq "$(cd "$M/w/alpha2" && "$SIT" fsck 2>&1 | tail -1 | sed 's/checked [0-9]* objects, //')" "0 bad, 0 dangling" "41b: clean"
+  kill $MS 2>/dev/null; wait $MS 2>/dev/null
+fi
+
+# 41c. The read API across repositories in one process (R6), and gc between
+# its calls: through 1.10.1 the second repository was read through the first
+# one's store and index, and gc refused while the process lived.
+if [ "$REPO_PROBE_BROKEN" = "1" ]; then
+  bad "41c: repo_switch_probe.cyr does not compile against dist/sit-read.cyr (see $WORK/repo_switch_probe.log)"
+fi
+if [ -n "$REPO_PROBE" ]; then
+  P41="$WORK/p41"; mkdir -p "$P41/A" "$P41/B"
+  (cd "$P41/A" && "$SIT" init >/dev/null && for f in a1 a2; do echo $f > $f.txt; "$SIT" add $f.txt >/dev/null; done && "$SIT" commit -m a >/dev/null)
+  (cd "$P41/B" && "$SIT" init >/dev/null && for f in b1 b2 b3; do echo $f > $f.txt; "$SIT" add $f.txt >/dev/null; done && "$SIT" commit -m b >/dev/null)
+  OUT=$("$REPO_PROBE" "$P41/A" "$P41/B" "$P41/A" 2>&1)
+  assert_eq "$OUT" "$P41/A 0 0 0
+$P41/B 0 0 0
+$P41/A 0 0 0" "41c: two .sit repositories in one process, each clean"
+  rm -f "$P41/go"
+  ( "$REPO_PROBE" "$P41/A" "@wait:$P41/go" "$P41/A" > "$P41/out" 2>&1 & )
+  for _ in 1 2 3 4 5 6 7 8 9 10; do grep -q WAITING "$P41/out" 2>/dev/null && break; sleep 0.2; done
+  (cd "$P41/A" && "$SIT" gc >/dev/null 2>&1); assert_eq "$?" "0" "41c: gc runs between the API's calls"
+  touch "$P41/go"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(grep -c ' 0 0 0' "$P41/out")" = "2" ] && break; sleep 0.2; done
+  assert_eq "$(grep -c ' 0 0 0' "$P41/out")" "2" "41c: and the next call reads the packed store"
+  if command -v git >/dev/null 2>&1; then
+    G41="$WORK/g41"; mkdir -p "$G41"
+    for r in GA GB; do
+      git init -q "$G41/$r"; (cd "$G41/$r" && git config user.name t && git config user.email t@e && for i in 1 2 3; do echo "$r $i" > f$i.txt; done && git add . && git commit -qm init && git gc -q)
+    done
+    PA=$(basename "$(ls "$G41"/GA/.git/objects/pack/*.pack)" .pack); PB=$(basename "$(ls "$G41"/GB/.git/objects/pack/*.pack)" .pack)
+    for ext in pack idx rev; do [ -f "$G41/GB/.git/objects/pack/$PB.$ext" ] && mv "$G41/GB/.git/objects/pack/$PB.$ext" "$G41/GB/.git/objects/pack/$PA.$ext"; done
+    OUT=$("$REPO_PROBE" "$G41/GA" "$G41/GB" 2>&1)
+    assert_eq "$OUT" "$G41/GA 0 0 0
+$G41/GB 0 0 0" "41c: two git repositories whose different packs share a name"
+  fi
+fi
 
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"

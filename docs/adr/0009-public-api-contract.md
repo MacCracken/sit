@@ -93,3 +93,10 @@ Not committing to these in v0.8.1, but flagging for v0.8.2+:
 - `sit_remote_ping(url) → caps` — query a remote's capabilities without a full clone.
 
 Each of those adds its own surface and goes through this ADR's review gate at the release that lands it.
+
+## Amendment (1.11.0) — repository switching and the store lock
+
+No signature changed. Two behaviours a consumer can observe did:
+
+- **`sit_repo_open` drops what the previous repository left cached:** its store and index handles, its store lock and its pack lists. Through 1.10.1 a second repository opened in one process was read through the first one's store and index, so its clean files came back as new. Pack mappings are keyed by resolved path, so two repositories never share one.
+- **`sit_diff_path` and `sit_repo_status` take the store lock per call** (a store session, architecture 008) and give it back before returning, instead of holding it from the first call to exit. `sit gc` can run between calls, and the next call reads the store gc left.

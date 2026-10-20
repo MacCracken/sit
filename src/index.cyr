@@ -188,6 +188,16 @@ fn get_index_db() {
     return _index_db_cached;
 }
 
+# Close the cached index handle before another repository is opened in this
+# process (sit_repo_open; 1.11.0, R6): it answered for the new one, which made
+# a second repository's clean files read as new.
+fn index_db_reset() {
+    if (_index_db_cached != 0) { patra_close(_index_db_cached); }
+    _index_db_cached = 0;
+    _index_db_failed = 0;
+    return 0;
+}
+
 # 1 when a staging index exists on disk (patra or the v0.1 plaintext file).
 fn index_files_present() {
     if (sf_exists(".sit/index.patra") == 1) { return 1; }

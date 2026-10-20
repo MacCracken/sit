@@ -2050,6 +2050,75 @@ fn test_1100_packs() {
     return 0;
 }
 
+# ── 1.11.0: serving many repositories, base paths, store state, cache purge ──
+fn test_1110_serving() {
+    test_group("serve.cyr / wire_http.cyr / object_db.cyr — --repos names, base paths, store state (v1.11.0)");
+    assert_eq(_serve_repo_name_valid("alpha", 5), 1, "a name");
+    assert_eq(_serve_repo_name_valid("team/beta", 9), 1, "a nested name");
+    assert_eq(_serve_repo_name_valid("a.b-c_D9", 8), 1, "dots, dashes, underscores inside a segment");
+    assert_eq(_serve_repo_name_valid("", 0), 0, "empty");
+    assert_eq(_serve_repo_name_valid(".hidden", 7), 0, "a segment starting with '.'");
+    assert_eq(_serve_repo_name_valid("..", 2), 0, "'..'");
+    assert_eq(_serve_repo_name_valid("a/../b", 6), 0, "a '..' segment");
+    assert_eq(_serve_repo_name_valid("a//b", 4), 0, "an empty segment");
+    assert_eq(_serve_repo_name_valid("a/", 2), 0, "a trailing '/'");
+    assert_eq(_serve_repo_name_valid("/a", 2), 0, "a leading '/'");
+    assert_eq(_serve_repo_name_valid("a%2e", 4), 0, "a percent sign");
+    assert_eq(_serve_repo_name_valid("a b", 3), 0, "a space");
+    var deep = "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q";
+    assert_eq(_serve_repo_name_valid(deep, 33), 0, "17 segments");
+    assert_eq(_serve_repo_name_valid(deep, 31), 1, "16 segments");
+    var longseg = alloc(300);
+    var i = 0;
+    while (i < 300) { store8(longseg + i, 120); i = i + 1; }
+    assert_eq(_serve_repo_name_valid(longseg, 255), 1, "a 255-byte segment");
+    assert_eq(_serve_repo_name_valid(longseg, 256), 0, "a 256-byte segment");
+
+    assert_eq(_http_base_path_valid("/foo", 4), 1, "a base path");
+    assert_eq(_http_base_path_valid("/a/b", 4), 1, "a nested base path");
+    assert_eq(_http_base_path_valid("/.x", 3), 1, "a dot-leading segment (the server decides)");
+    assert_eq(_http_base_path_valid("/a//b", 5), 0, "an empty segment");
+    assert_eq(_http_base_path_valid("/.", 2), 0, "'.'");
+    assert_eq(_http_base_path_valid("/a/../b", 7), 0, "'..'");
+    var h = wire_http_open("http://127.0.0.1:8484/repos/foo/");
+    assert(h != 0, "an http URL with a path opens");
+    assert_eq(streq(_http_remote_base(h), "/repos/foo"), 1, "its base path, trailing '/' dropped");
+    assert_eq(streq(_http_remote_path(h, "/sit/v1/refs"), "/repos/foo/sit/v1/refs"), 1, "requests go under it");
+    var h2 = wire_http_open("http://127.0.0.1:8484/");
+    assert_eq(_http_remote_base(h2), 0, "'/' alone is no base path");
+    assert_eq(streq(_http_remote_path(h2, "/sit/v1/refs"), "/sit/v1/refs"), 1, "and requests go to the root");
+    assert_eq(wire_http_open("http://127.0.0.1/a/../b"), 0, "a '..' segment is refused");
+
+    # A repository's store state survives being swapped out and back.
+    var saved_root = _repo_root;
+    var c = store_ctx_new("/tmp/sit-unit-ctx");
+    store64(c + 8, 4242);
+    store64(c + 24, 7);
+    store_ctx_load(c);
+    assert_eq(streq(_repo_root, "/tmp/sit-unit-ctx"), 1, "load makes its root the open one");
+    assert_eq(_object_db_cached, 4242, "and its handle");
+    assert_eq(_store_lock_held, 0, "with no lock held across the switch");
+    _store_id_a = 9;
+    store_ctx_save(c);
+    assert_eq(load64(c + 24), 9, "save keeps what the request changed");
+    _object_db_cached = 0;
+    _store_lock_fd = 0 - 1;
+    _store_id_a = 0;
+    _store_id_b = 0;
+    sit_set_repo_root(saved_root);
+
+    # Unmapping a pack drops its delta-base-cache entries, and only its.
+    _dbc_reset();
+    var blob = alloc(64);
+    _dbc_put(1000, 12, blob, 64, 3);
+    _dbc_put(2000, 12, blob, 64, 3);
+    _dbc_forget(1000);
+    assert_eq(_dbc_get(1000, 12), 0, "the forgotten mapping's entry is gone");
+    assert(_dbc_get(2000, 12) != 0, "another mapping's stays");
+    _dbc_reset();
+    return 0;
+}
+
 # Run every test group; exit status is the failure count.
 fn main() {
     alloc_init();
@@ -2095,6 +2164,7 @@ fn main() {
     test_176_pure();
     test_180_reflog_time();
     test_1100_packs();
+    test_1110_serving();
     return assert_summary();
 }
 

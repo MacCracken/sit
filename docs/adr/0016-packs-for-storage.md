@@ -33,7 +33,7 @@ sit already reads such files. Since 1.2.0 `git_pack.cyr` has read git packs for 
 - **Positive.** No schema change and no migration. The pack reader that gets the new duty is the most heavily fuzzed code in the tree.
 - **Negative.** A repository gc'd by 1.10.0 needs sit ≥ 1.10.0 to read its history. Older binaries do not know `.sit/packs/` and find the packed objects missing, so they fail closed: their `fsck` reports `missing` and refuses `--prune`. This also covers consumers built against an older `dist/sit-read.cyr`. gc is opt-in, so nothing changes until someone runs it.
 - **Negative.** Serving a packed repository costs a compression per object sent, because the wire carries whole objects. Level 1 keeps a clone of the packed fixture to +20% over the same history unpacked (level 6 cost 43%), and the receiver stores everything loose until its own gc. The receiver still never recompresses. The CLAUDE.md transfer rule now says this.
-- **Negative.** gc needs the store to itself, so it refuses while `sit serve` (or any sit process) has the repository open. That limitation belongs with 1.11.0's serving work.
+- **Negative.** gc needs the store to itself, so it refuses while any sit process has the repository open. (1.11.0 amendment: a server and the read API now hold the store only per request or call, so gc runs between them; see ADR 0017 and architecture 008.)
 - **Neutral.** Every gc repacks everything reachable (`repack -a -d`). Incremental packing, keeping old packs and adding a new one for recent objects, is later work if repack time ever matters. The fixture takes 5.3 s the first time (2.8 s of it reading 63 MB of rows) and 2.6 s after; git takes 0.6 s.
 
 ## Alternatives considered

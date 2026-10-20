@@ -1825,6 +1825,33 @@ fn cmd_clone() {
                 memcpy(derived, url + p, hl);
                 store8(derived + hl, 0);
             }
+            # 1.11.0: a URL with a path (`sit serve --repos`) names the
+            # repository by its last segment, as git does.
+            var pend = ulen;
+            var trimming = 1;
+            while (trimming == 1) {
+                if (pend <= host_end) { trimming = 0; }
+                else {
+                    if (load8(url + pend - 1) == 47) { pend = pend - 1; }
+                    else { trimming = 0; }
+                }
+            }
+            var pstart = pend;
+            var seeking = 1;
+            while (seeking == 1) {
+                if (pstart <= host_end) { seeking = 0; }
+                else {
+                    if (load8(url + pstart - 1) == 47) { seeking = 0; }
+                    else { pstart = pstart - 1; }
+                }
+            }
+            if (pend > pstart) {
+                if (pstart > host_end) {
+                    derived = alloc(pend - pstart + 1);
+                    memcpy(derived, url + pstart, pend - pstart);
+                    store8(derived + pend - pstart, 0);
+                }
+            }
         }
         else {
             var src_str = remote_normalize(url);

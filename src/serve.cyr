@@ -1106,6 +1106,12 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
 # request and whatever its loop allocated framing this one. Nothing in it is
 # read after the rewind: every handler has sent its response by the time it
 # returns, and the loops keep only integers (lengths, offsets) across it.
+#
+# 1.11.0: each request is a store session (object_db.cyr) — the store lock is
+# held for the request, not from the first request to exit, so `sit gc` can run
+# between requests and the next one reads what it left. Under `--repos` the
+# request's path names the repository first (`/<name>/sit/v1/…`), whose store
+# state is made the open one for the request.
 fn serve_handle_request(ctx, cfd, buf, n) {
     var a = _serve_req_alloc();
     reset_via(a);
@@ -1115,7 +1121,185 @@ fn serve_handle_request(ctx, cfd, buf, n) {
     if (path_with_query != 0) { path = sandhi_server_path_only_a(a, path_with_query); }
     if (method == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
     if (path == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
+    var rc = 0;
+    if (_serve_repos_dir == 0) {
+        store_enter();
+        rc = _serve_route(cfd, buf, n, method, path);
+        store_leave();
+        return rc;
+    }
+    var subp[8];
+    var rctx = _serve_repo_for(path, &subp);
+    if (rctx == 0) { _serve_send_status(cfd, 404, "Not Found"); return 0; }
+    store_ctx_load(rctx);
+    # A repository removed since its state was kept answers as one never served.
+    var hb[4352];
+    var hp = sit_abs_into(".sit/HEAD", &hb, 4352);
+    if (hp == 0) { _serve_send_status(cfd, 404, "Not Found"); return 0; }
+    if (path_lstat_kind(hp) != 0x8000) { _serve_send_status(cfd, 404, "Not Found"); return 0; }
+    store_enter();
+    rc = _serve_route(cfd, buf, n, method, load64(&subp));
+    store_leave();
+    store_ctx_save(rctx);
+    return rc;
+}
 
+# ── Many repositories (1.11.0) ─────────────────────────────────────
+#
+# `sit serve <dir> --repos` serves every sit repository under <dir>: a request
+# for `/<name>/sit/v1/…` goes to `<dir>/<name>`, where <name> is one or more
+# path segments. Each segment is checked before it touches the filesystem
+# (letters, digits, `.`, `_`, `-`; not starting with `.`, so never `..`), each
+# directory on the way must be a real directory (not a symlink), and the last
+# one must hold `.sit/HEAD`. Anything else is a 404, the same answer whether or
+# not something is there. A repository's store state is kept between its
+# requests, for up to SERVE_REPOS_OPEN of them; past that the least recently
+# used one is closed.
+
+var _serve_repos_dir = 0;           # the <dir> of --repos, or 0: one repository
+var _serve_repos = 0;               # name -> {store state, last use}
+var _serve_repos_tick = 0;
+var SERVE_REPOS_OPEN = 64;
+var SERVE_REPO_NAME_MAX = 1024;
+var SERVE_REPO_SEGMENTS_MAX = 16;
+
+# 1 when `len` bytes at `p` are a repository name --repos serves (see above).
+fn _serve_repo_name_valid(p, len) {
+    if (len < 1) { return 0; }
+    if (len > SERVE_REPO_NAME_MAX) { return 0; }
+    var segs = 0;
+    var seglen = 0;
+    var i = 0;
+    var ok = 1;
+    while (i <= len) {
+        var c = 47;
+        if (i < len) { c = load8(p + i) & 0xFF; }
+        if (c == 47) {
+            if (seglen == 0) { ok = 0; }
+            if (seglen > 255) { ok = 0; }
+            segs = segs + 1;
+            seglen = 0;
+        }
+        else {
+            var good = 0;
+            if (c >= 48) { if (c <= 57) { good = 1; } }
+            if (c >= 65) { if (c <= 90) { good = 1; } }
+            if (c >= 97) { if (c <= 122) { good = 1; } }
+            if (c == 95) { good = 1; }
+            if (c == 45) { good = 1; }
+            if (c == 46) {
+                if (seglen > 0) { good = 1; }        # a segment may not start with '.'
+            }
+            if (good == 0) { ok = 0; }
+            seglen = seglen + 1;
+        }
+        i = i + 1;
+    }
+    if (segs > SERVE_REPO_SEGMENTS_MAX) { ok = 0; }
+    return ok;
+}
+
+# The repository a --repos request names, made the one its store state is kept
+# for; writes the path past the name (`/sit/v1/…`) to *sub_out. 0 when the path
+# names no repository this server serves.
+fn _serve_repo_for(path, sub_out) {
+    var plen = strlen(path);
+    if (plen < 2) { return 0; }
+    if (load8(path) != 47) { return 0; }
+    # The name runs to the first "/sit/v1/" after the leading '/'.
+    var k = 0 - 1;
+    var i = 1;
+    while (i + 8 <= plen) {
+        if (k < 0) {
+            if (memeq(path + i, "/sit/v1/", 8) == 1) { k = i; }
+        }
+        i = i + 1;
+    }
+    if (k < 2) { return 0; }
+    var nlen = k - 1;
+    if (_serve_repo_name_valid(path + 1, nlen) == 0) { return 0; }
+    var name[1032];
+    memcpy(&name, path + 1, nlen);
+    store8(&name + nlen, 0);
+    if (_serve_repos == 0) { _serve_repos = map_new(); }
+    _serve_repos_tick = _serve_repos_tick + 1;
+    var cell = map_get(_serve_repos, &name);
+    if (cell == 0) {
+        var root = _serve_repo_resolve(&name, nlen);
+        if (root == 0) { return 0; }
+        if (map_size(_serve_repos) >= SERVE_REPOS_OPEN) { _serve_repos_evict(); }
+        cell = alloc_or_die(16);
+        store64(cell, store_ctx_new(root));
+        var kc = alloc_or_die(nlen + 1);
+        memcpy(kc, &name, nlen + 1);
+        map_set(_serve_repos, kc, cell);
+    }
+    store64(cell + 8, _serve_repos_tick);
+    store64(sub_out, path + k);
+    return load64(cell);
+}
+
+# `<dir>/<name>` as a heap cstring when every directory on the way is a real
+# directory and the last holds `.sit/HEAD`, else 0.
+fn _serve_repo_resolve(name, nlen) {
+    var dl = strlen(_serve_repos_dir);
+    var root = alloc_or_die(dl + 1 + nlen + 16);
+    memcpy(root, _serve_repos_dir, dl);
+    store8(root + dl, 47);
+    memcpy(root + dl + 1, name, nlen);
+    store8(root + dl + 1 + nlen, 0);
+    var i = dl + 1;
+    var ok = 1;
+    while (i <= dl + 1 + nlen) {
+        if (ok == 1) {
+            var c = load8(root + i);
+            if (c == 47) {
+                store8(root + i, 0);
+                if (path_lstat_kind(root) != 0x4000) { ok = 0; }
+                store8(root + i, 47);
+            }
+            if (c == 0) {
+                if (path_lstat_kind(root) != 0x4000) { ok = 0; }
+            }
+        }
+        i = i + 1;
+    }
+    if (ok == 0) { return 0; }
+    var rl = dl + 1 + nlen;
+    memcpy(root + rl, "/.sit", 6);
+    if (path_lstat_kind(root) != 0x4000) { return 0; }
+    memcpy(root + rl, "/.sit/HEAD", 11);
+    if (path_lstat_kind(root) != 0x8000) { return 0; }
+    store8(root + rl, 0);
+    return root;
+}
+
+# Close the least recently used repository's store state, making room.
+fn _serve_repos_evict() {
+    var keys = map_keys(_serve_repos);
+    var best = 0;
+    var best_tick = 0;
+    var i = 0;
+    while (i < vec_len(keys)) {
+        var c = map_get(_serve_repos, vec_get(keys, i));
+        if (c != 0) {
+            if (best == 0) { best = vec_get(keys, i); best_tick = load64(c + 8); }
+            else {
+                if (load64(c + 8) < best_tick) { best = vec_get(keys, i); best_tick = load64(c + 8); }
+            }
+        }
+        i = i + 1;
+    }
+    if (best == 0) { return 0; }
+    var victim = map_get(_serve_repos, best);
+    store_ctx_close(load64(victim));
+    map_delete(_serve_repos, best);
+    return 0;
+}
+
+# Route one request, by method and the path within its repository.
+fn _serve_route(cfd, buf, n, method, path) {
+    var a = _serve_req_alloc();
     if (streq(method, "GET") == 1) {
         if (streq(path, "/sit/v1/capabilities") == 1) {
             var b1 = serve_build_capabilities(a);
@@ -1595,6 +1779,13 @@ fn _serve_print_banner(addr, tls_on, auth_on) {
     if (auth_on == 1) { stdout_write("bearer)", 7); }
     else { stdout_write("none)", 5); }
     stdout_write("\n", 1);
+    if (_serve_repos_dir != 0) {
+        var rm = "serving the sit repositories under ";
+        stdout_write(rm, strlen(rm));
+        stdout_write(_serve_repos_dir, strlen(_serve_repos_dir));
+        var rm2 = " at /<name>/sit/v1/\n";
+        stdout_write(rm2, strlen(rm2));
+    }
     return 0;
 }
 
@@ -1603,8 +1794,10 @@ fn cmd_serve() {
     if (argc() < 3) {
         eprintln("usage: sit serve <repo-path> [--stdio | --listen <addr>:<port>]");
         eprintln("                 [--tls --cert <f> --key <f>] [--require-auth] [--token <path>]");
+        eprintln("       sit serve <dir> --repos [--listen …] [--tls …] [--require-auth] [--token …]");
         return 1;
     }
+    var repos_mode = 0;
     var repo_path = argv_heap(2);
     var port = SIT_SERVE_DEFAULT_PORT;
     var bind_addr = INADDR_LOOPBACK();
@@ -1621,6 +1814,11 @@ fn cmd_serve() {
         var a = argv(ai);
         if (streq(a, "--stdio") == 1) {
             stdio_mode = 1;
+            ai = ai + 1;
+            continue;
+        }
+        if (streq(a, "--repos") == 1) {
+            repos_mode = 1;
             ai = ai + 1;
             continue;
         }
@@ -1696,6 +1894,11 @@ fn cmd_serve() {
             eprintln("sit: --stdio and --listen are mutually exclusive");
             return 1;
         }
+        # An ssh:// URL names its repository by path already.
+        if (repos_mode == 1) {
+            eprintln("sit: --repos and --stdio are mutually exclusive");
+            return 1;
+        }
     }
 
     # If --require-auth: load the token before chdir'ing into the repo
@@ -1754,10 +1957,30 @@ fn cmd_serve() {
     # was still 0), so their paths stay unprefixed. On Linux repo_path is a
     # real path → reads resolve absolutely; the pre-refactor chdir semantics
     # are preserved without touching process cwd.
-    sit_set_repo_root(repo_path);
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository at given path");
-        return 1;
+    if (repos_mode == 1) {
+        # 1.11.0: each request names its repository under this directory.
+        var dst[256];
+        var dok = 0;
+        if (xstat(repo_path, &dst) == 0) {
+            if ((load32(&dst + STAT_MODE) & 0xF000) == 0x4000) { dok = 1; }
+        }
+        if (dok == 0) {
+            eprintln("sit: --repos needs a directory");
+            return 1;
+        }
+        var rpl = strlen(repo_path);
+        while (rpl > 1) {
+            if (load8(repo_path + rpl - 1) == 47) { rpl = rpl - 1; store8(repo_path + rpl, 0); }
+            else { rpl = 0; }
+        }
+        _serve_repos_dir = repo_path;
+    }
+    else {
+        sit_set_repo_root(repo_path);
+        if (sf_exists(".sit/HEAD") != 1) {
+            eprintln("sit: not a sit repository at given path");
+            return 1;
+        }
     }
 
     # In --stdio mode any chatter on stdout would land between HTTP
