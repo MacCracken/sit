@@ -366,6 +366,8 @@ fn fuzz_parse_commit_body(rounds) {
     var cap = 4096;
     var body = alloc(cap);
     var info[56];
+    var ainfo[56];
+    var fa = arena_allocator_growable(65536);
     var seed = 0xC0FFEE11;
     var i = 0;
     while (i < rounds) {
@@ -391,7 +393,24 @@ fn fuzz_parse_commit_body(rounds) {
             store8(body + 3, 104); store8(body + 4, 111); store8(body + 5, 114);
             store8(body + 6, 32);
         }
-        parse_commit_body(body, size, &info);
+        var rg = parse_commit_body(body, size, &info);
+        # 1.7.5: the arena form must agree with the global-heap form. (Compared
+        # before the zero-length call below, which clears `info`.)
+        reset_via(fa);
+        var rx = parse_commit_body_a(fa, body, size, &ainfo);
+        if (rx != rg) { println("fuzz: parse_commit_body_a disagrees on the verdict"); return 1; }
+        if (rg == 0) {
+            if (streq(load64(&ainfo), load64(&info)) == 0) { println("fuzz: parse_commit_body_a disagrees on the tree"); return 1; }
+            if (load64(&ainfo + 24) != load64(&info + 24)) { println("fuzz: parse_commit_body_a disagrees on the timestamp"); return 1; }
+            if (load64(&ainfo + 40) != load64(&info + 40)) { println("fuzz: parse_commit_body_a disagrees on msg_start"); return 1; }
+            var gp = load64(&info + 48);
+            var xp = load64(&ainfo + 48);
+            var gn = 0;
+            var xn = 0;
+            if (gp != 0) { gn = vec_len(gp); }
+            if (xp != 0) { xn = vec_len(xp); }
+            if (gn != xn) { println("fuzz: parse_commit_body_a disagrees on the parents"); return 1; }
+        }
         parse_commit_body(body, 0, &info);
         seed = seed * 2862933555 + 3037000493;
         i = i + 1;

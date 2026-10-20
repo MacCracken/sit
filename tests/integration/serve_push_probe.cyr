@@ -1,0 +1,75 @@
+# serve_push_probe.cyr — how much `sit serve` keeps per ref push.
+#
+# Built by tests/integration/run.sh against the SHIPPED bundle (dist/sit.cyr),
+# then run on a fixture repo. Calls serve_handle_request directly (cfd -1: the
+# reply is refused, which costs the same allocations as one sent) and reports
+# global bump-heap growth per request after two warm-up requests. Not part of
+# the product; lives with the tests.
+#
+# usage: serve_push_probe <repo> <tip> <tip's parent> <root commit>
+# Output:  REFUSED <bytes per push>   tip set, push its parent: the fast-forward
+#                                     check walks the parent's whole history
+#                                     and refuses (409)
+#          UPDATE <bytes per push>    root set, push the tip: the walk finds
+#                                     the root, and the ref is written
+include "dist/sit.cyr"
+
+var _spp_buf = 0;
+
+fn _spp_set(hex) {
+    var b[72];
+    memcpy(&b, hex, 64);
+    store8(&b + 64, 10);
+    return sf_write_all(".sit/refs/heads/probe", &b, 65);
+}
+
+fn _spp_push(tip) {
+    var hdr = "POST /sit/v1/refs/refs/heads/probe HTTP/1.1\r\nHost: x\r\nContent-Length: 65\r\n\r\n";
+    var hl = strlen(hdr);
+    memcpy(_spp_buf, hdr, hl);
+    memcpy(_spp_buf + hl, tip, 64);
+    store8(_spp_buf + hl + 64, 10);
+    store8(_spp_buf + hl + 65, 0);
+    serve_handle_request(0, 0 - 1, _spp_buf, hl + 65);
+    return 0;
+}
+
+fn _spp_put(label, v) {
+    var nb[24];
+    stdout_write(label, strlen(label));
+    var k = write_decimal(&nb, v);
+    stdout_write(&nb, k);
+    stdout_write("\n", 1);
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    args_init();
+    if (argc() < 5) { eprintln("usage: serve_push_probe <repo> <tip> <parent> <root>"); return 1; }
+    sit_set_repo_root(argv_heap(1));
+    var tip = argv_heap(2);
+    var parent = argv_heap(3);
+    var root = argv_heap(4);
+    _spp_buf = alloc(4096);
+
+    _spp_set(tip);
+    _spp_push(parent);
+    _spp_push(parent);
+    var u0 = alloc_used();
+    var i = 0;
+    while (i < 5) { _spp_push(parent); i = i + 1; }
+    _spp_put("REFUSED ", (alloc_used() - u0) / 5);
+
+    _spp_set(root);
+    _spp_push(tip);
+    var u1 = alloc_used();
+    var j = 0;
+    while (j < 5) { _spp_set(root); _spp_push(tip); j = j + 1; }
+    _spp_put("UPDATE ", (alloc_used() - u1) / 5);
+    stdout_flush();
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

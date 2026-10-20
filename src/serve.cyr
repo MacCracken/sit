@@ -984,7 +984,7 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
     var adisk = sit_abs_a(a, disk_path);
     if (adisk == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
     if (is_head == 1) {
-        var server_head = read_head_ref_path();
+        var server_head = read_head_ref_path_a(a);
         if (server_head != 0) {
             if (streq(server_head, rname) == 1) {
                 # Probe the on-disk ref to gate the bypass; ensure_parent_dirs

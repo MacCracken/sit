@@ -1,0 +1,5 @@
+operation,v174_cpu_ms_min,v175_cpu_ms_min,delta_pct,method
+log --oneline (2000 commits),315.8,318.2,+0.8,child user+sys CPU; min of 20 alternating runs
+checkout of 500 files there and back,559.6,557.0,-0.5,child user+sys CPU; min of 20 alternating runs
+in-process read of 320 packed blobs (depth 50),1025.3,1032.9,+0.7,child user+sys CPU; min of 20 alternating runs
+serve: 24 ref pushes over 2000 commits,4052.7,3979.7,-1.8,child user+sys CPU; min of 20 alternating runs

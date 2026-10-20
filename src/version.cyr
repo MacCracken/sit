@@ -9,4 +9,4 @@
 # slots, and a bare string literal in a function body does not.
 
 # sit's version, as reported by the /sit/v1/capabilities banner.
-fn sit_version_string() { return "1.7.4"; }
+fn sit_version_string() { return "1.7.5"; }

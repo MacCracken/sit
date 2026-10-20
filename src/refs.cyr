@@ -140,16 +140,43 @@ fn resolve_ref_name(name, out_buf) {
 #   -1  ambiguous
 #   -2  prefix too short
 fn read_head_ref_path() {
-    var pair[16];
+    return read_head_ref_path_a(0);
+}
+
+# How much of HEAD read_head_ref_path_a reads. Past "ref: " and a name of
+# VAL_REFNAME_MAX bytes nothing can validate, so a longer HEAD is refused here
+# exactly as reading it all would refuse it.
+var HEAD_READ_MAX = 1024;
+
+# read_head_ref_path with the returned name drawn from `a` (0 = the global
+# heap). 1.7.5: HEAD is read into a stack buffer, not through read_file_heap,
+# which kept the file and its joined path on the heap per call — once per ref
+# push in `sit serve`, which passes its request arena here.
+fn read_head_ref_path_a(a) {
     # Backend-aware HEAD path: ".sit/HEAD" or ".git/HEAD" (both 9 bytes; the
     # "ref: <path>" symref format is identical across backends).
     var hp[12];
     memcpy(&hp, _repo_dir(), 5);
     memcpy(&hp + 5, "HEAD", 4);
     store8(&hp + 9, 0);
-    if (read_file_heap(&hp, &pair) != 0) { return 0; }
-    var buf = load64(&pair);
-    var len = load64(&pair + 8);
+    var abuf[4352];
+    var ap = sit_abs_into(&hp, &abuf, 4352);
+    if (ap == 0) { return 0; }
+    var fd = file_open(ap, 0, 0);
+    if (fd < 0) { return 0; }
+    var hbuf[1032];                                # HEAD_READ_MAX bytes are read at most
+    var buf = &hbuf;
+    var len = 0;
+    var reading = 1;
+    while (reading == 1) {
+        if (len >= HEAD_READ_MAX) { reading = 0; }
+        else {
+            var got = file_read(fd, buf + len, HEAD_READ_MAX - len);
+            if (got <= 0) { reading = 0; }
+            else { len = len + got; }
+        }
+    }
+    file_close(fd);
 
     if (len < 5) { return 0; }
     if (memeq(buf, "ref: ", 5) == 0) { return 0; }
@@ -170,8 +197,12 @@ fn read_head_ref_path() {
 
     var ref_len = stop - 5;
     if (ref_len == 0) { return 0; }
+    if (ref_len > VAL_REFNAME_MAX) { return 0; }   # refname_valid's verdict, before the copy
 
-    var ref = alloc(ref_len + 1);
+    var ref = 0;
+    if (a == 0) { ref = alloc(ref_len + 1); }
+    else { ref = alloc_via(a, ref_len + 1); }
+    if (ref == 0) { return 0; }
     memcpy(ref, buf + 5, ref_len);
     store8(ref + ref_len, 0);
     # S-25: validate the symref TARGET before anyone builds a path out of it.

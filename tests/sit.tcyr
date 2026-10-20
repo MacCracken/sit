@@ -1738,6 +1738,57 @@ fn test_apply_delta_into() {
     return 0;
 }
 
+# 1.7.5: parse_commit_body_a on an arena gives exactly what parse_commit_body
+# gives on the global heap, and allocates nothing outside the arena.
+fn _pcb_same(body, label) {
+    var bl = strlen(body);
+    var g[56];
+    var x[56];
+    var rg = parse_commit_body(body, bl, &g);
+    var a = arena_allocator_growable(4096);
+    var u0 = alloc_used();
+    var rx = parse_commit_body_a(a, body, bl, &x);
+    assert_eq(alloc_used() - u0, 0, label);
+    assert_eq(rx, rg, label);
+    if (rg != 0) { return 0; }
+    assert_eq(streq(load64(&x), load64(&g)), 1, label);            # tree
+    assert_eq(load64(&x + 24), load64(&g + 24), label);            # author ts
+    assert_eq(load64(&x + 40), load64(&g + 40), label);            # msg_start
+    if (load64(&g + 16) != 0) { assert_eq(streq(load64(&x + 16), load64(&g + 16)), 1, label); }
+    if (load64(&g + 32) != 0) { assert_eq(streq(load64(&x + 32), load64(&g + 32)), 1, label); }
+    var gp = load64(&g + 48);
+    var xp = load64(&x + 48);
+    if (gp == 0) { assert_eq(xp, 0, label); return 0; }
+    assert_eq(vec_len(xp), vec_len(gp), label);
+    var i = 0;
+    while (i < vec_len(gp)) {
+        assert_eq(streq(vec_get(xp, i), vec_get(gp, i)), 1, label);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_parse_commit_body_a() {
+    test_group("commit.cyr — parse_commit_body_a on an arena (v1.7.5)");
+    var t = "tree 1111111111111111111111111111111111111111111111111111111111111111\n";
+    var p1 = "parent 2222222222222222222222222222222222222222222222222222222222222222\n";
+    var p2 = "parent 3333333333333333333333333333333333333333333333333333333333333333\n";
+    var au = "author A U Thor <a@example.com> 1700000000 +0100\n";
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, t); str_builder_add_cstr(sb, au); str_builder_add_cstr(sb, "\nroot\n");
+    _pcb_same(str_data(str_builder_build(sb)), "a root commit");
+    sb = str_builder_new();
+    str_builder_add_cstr(sb, t); str_builder_add_cstr(sb, p1); str_builder_add_cstr(sb, au);
+    str_builder_add_cstr(sb, "\none parent\n");
+    _pcb_same(str_data(str_builder_build(sb)), "one parent");
+    sb = str_builder_new();
+    str_builder_add_cstr(sb, t); str_builder_add_cstr(sb, p1); str_builder_add_cstr(sb, p2);
+    str_builder_add_cstr(sb, au); str_builder_add_cstr(sb, "\nmerge\n");
+    _pcb_same(str_data(str_builder_build(sb)), "a merge's two parents, in order");
+    _pcb_same("author x <y> 1 +0000\n\nno tree\n", "no tree line is still refused");
+    return 0;
+}
+
 # Run every test group; exit status is the failure count.
 fn main() {
     alloc_init();
@@ -1779,6 +1830,7 @@ fn main() {
     test_170_pure();
     test_serve_request_arena();
     test_apply_delta_into();
+    test_parse_commit_body_a();
     return assert_summary();
 }
 

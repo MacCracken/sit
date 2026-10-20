@@ -30,6 +30,27 @@ if command -v cyrius >/dev/null 2>&1; then
     GIT_PROBE_BROKEN=1
   fi
 fi
+# 1.7.5: the per-read heap probe, against the shipped READ bundle (what owl and
+# thoth link). Same rule: present but not compiling is a failure.
+READ_PROBE=""
+READ_PROBE_BROKEN=0
+if command -v cyrius >/dev/null 2>&1; then
+  if ( cd "$ROOT" && cyrius build tests/integration/read_heap_probe.cyr "$WORK/read_heap_probe" ) >"$WORK/read_heap_probe.log" 2>&1; then
+    READ_PROBE="$WORK/read_heap_probe"
+  else
+    READ_PROBE_BROKEN=1
+  fi
+fi
+# 1.7.5: the per-ref-push probe, against the shipped full bundle (dist/sit.cyr).
+PUSH_PROBE=""
+PUSH_PROBE_BROKEN=0
+if command -v cyrius >/dev/null 2>&1; then
+  if ( cd "$ROOT" && cyrius build tests/integration/serve_push_probe.cyr "$WORK/serve_push_probe" ) >"$WORK/serve_push_probe.log" 2>&1; then
+    PUSH_PROBE="$WORK/serve_push_probe"
+  else
+    PUSH_PROBE_BROKEN=1
+  fi
+fi
 
 export HOME="$WORK/home"; mkdir -p "$HOME"
 export SIT_AUTHOR_NAME="Integration Test"
@@ -1547,6 +1568,63 @@ if command -v python3 >/dev/null 2>&1; then
   rm -rf "$WORK/deep"
 else
   printf '  SKIP: python3 not installed — deep-pack corpus skipped\n'
+fi
+
+# ── 29. 1.7.5 git read mode keeps nothing per object read ───────────
+# owl and thoth read objects in-process, on a heap with no free. 1.7.4 kept
+# about 4 KB per small loose read (the compressed file and an inflate buffer
+# sit then discarded; ~69 KB for a 190 KB text file) and 672 bytes per packed
+# read (the pack-directory listing and paths). 1.7.5 keeps none of sit's; the
+# bound allows sankoch's 32 bytes per inflate, an upstream ask. The pack is
+# built without deltas so each read is exactly one inflate.
+hr "1.7.5 git read-mode heap per read"
+if [ -n "$READ_PROBE" ] && command -v git >/dev/null 2>&1; then
+  R="$WORK/rh175"; mkdir -p "$R"; cd "$R"
+  git init -q -b main 2>/dev/null || git init -q
+  i=0; while [ "$i" -lt 40 ]; do printf 'line %s of a loose blob\n' "$i" > "f$i.txt"; i=$((i+1)); done
+  git add . && git -c user.name=t -c user.email=t@t commit -qm loose
+  git rev-list --objects --all | awk 'length($1)==40 {print $1}' > "$WORK/rh175.ids"
+  read -r _ PER N <<< "$("$READ_PROBE" "$WORK/rh175.ids" | grep '^READ')"
+  assert_eq "${N:-0}" "$(wc -l < "$WORK/rh175.ids" | tr -d ' ')" "29a: every loose object reads"
+  [ "${PER:-99999}" -le 32 ] 2>/dev/null && ok || bad "29a: a loose read kept ${PER:-?} bytes (bound 32, sankoch's inflate; 1.7.4 ~4100)"
+  git repack -adfq --depth=0 --window=0 && git prune-packed
+  read -r _ PER N <<< "$("$READ_PROBE" "$WORK/rh175.ids" | grep '^READ')"
+  assert_eq "${N:-0}" "$(wc -l < "$WORK/rh175.ids" | tr -d ' ')" "29b: every packed object reads"
+  [ "${PER:-99999}" -le 32 ] 2>/dev/null && ok || bad "29b: a packed read kept ${PER:-?} bytes (bound 32; 1.7.4 ~700)"
+  read -r _ LOC <<< "$("$READ_PROBE" "$WORK/rh175.ids" | grep '^LOCATE')"
+  assert_eq "${LOC:-none}" "0" "29b: a pack lookup keeps nothing"
+elif [ "$READ_PROBE_BROKEN" = 1 ]; then
+  bad "29: read_heap_probe does not compile against dist/sit-read.cyr"
+  sed 's/^/    /' "$WORK/read_heap_probe.log"
+else
+  echo "  (skipped 29: needs cyrius and git)"
+fi
+
+# ── 30. 1.7.5 sit serve keeps nothing per ref push ─────────────────
+# A ref push runs the fast-forward check, which walks the pushed tip's history.
+# 1.7.4 kept every commit it read (~4.5 KB each: on this 300-commit fixture
+# ~1.3 MB per push, refused or not), and a client can push a long chain once and
+# refuse-push it at will. 1.7.5 walks on an arena rewound per walk. The bound
+# allows sankoch's 32 bytes per inflate (an upstream ask), one per commit walked.
+hr "1.7.5 serve heap per ref push"
+if [ -n "$PUSH_PROBE" ]; then
+  R="$WORK/sp175"; mkdir -p "$R"; cd "$R"
+  "$SIT" init >/dev/null
+  i=0; while [ "$i" -lt 300 ]; do printf '%s\n' "$i" > f.txt; "$SIT" add f.txt >/dev/null; "$SIT" commit -m "c$i" >/dev/null; i=$((i+1)); done
+  TIP=$(tr -d '\n' < .sit/refs/heads/main)
+  PAR=$("$SIT" log | awk '/^commit /{n++; if (n==2) {print $2; exit}}')
+  ROOTC=$("$SIT" log | awk '/^commit /{h=$2} END{print h}')
+  OUT=$("$PUSH_PROBE" "$R" "$TIP" "$PAR" "$ROOTC")
+  REF=$(printf '%s\n' "$OUT" | awk '/^REFUSED/{print $2}')
+  UPD=$(printf '%s\n' "$OUT" | awk '/^UPDATE/{print $2}')
+  [ "${REF:-999999}" -le 9600 ] 2>/dev/null && ok || bad "30a: a refused push over 300 commits kept ${REF:-?} bytes (bound 9600, sankoch's 32 per inflate; 1.7.4 ~1.3 MB)"
+  [ "${UPD:-999999}" -le 9600 ] 2>/dev/null && ok || bad "30b: a fast-forward update over 300 commits kept ${UPD:-?} bytes (bound 9600; 1.7.4 ~1.3 MB)"
+  assert_eq "$(tr -d '\n' < .sit/refs/heads/probe)" "$TIP" "30b: and the update landed"
+elif [ "$PUSH_PROBE_BROKEN" = 1 ]; then
+  bad "30: serve_push_probe does not compile against dist/sit.cyr"
+  sed 's/^/    /' "$WORK/serve_push_probe.log"
+else
+  echo "  (skipped 30: needs cyrius)"
 fi
 
 # ── summary ────────────────────────────────────────────────────────

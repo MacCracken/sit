@@ -171,39 +171,71 @@ fn _git_object_path(buf, hex) {
 # reused unchanged. Decompression sizing + 16 MiB ceiling + retry-on-
 # BUFFER_TOO_SMALL mirror read_object() so failure modes line up.
 # Returns 0 on success, negative on error.
+#
+# 1.7.5: the file is read into a freelist buffer freed once it is inflated, and
+# its path is built on the stack. read_file_heap kept every compressed object on
+# the heap — and the first inflate buffer too when the retry ran — once per
+# read, in-process for owl and thoth.
+var _GIT_LOOSE_MAX = 67108864;   # read_file_heap's S-06 cap, kept
+
 fn _git_read_loose(hex, out) {
     var path[96];
     _git_object_path(&path, hex);
-
-    var pair[16];
-    if (read_file_heap(&path, &pair) != 0) { return 0 - 1; }
-    var compressed = load64(&pair);
-    var blen = load64(&pair + 8);
-    if (blen <= 0) { return 0 - 2; }
+    var abuf[4352];
+    var ap = sit_abs_into(&path, &abuf, 4352);
+    if (ap == 0) { return 0 - 1; }
+    var fd = file_open(ap, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
+    syscall(SYS_LSEEK, fd, 0, SEEK_SET);
+    if (size < 0) { file_close(fd); return 0 - 1; }
+    if (size > _GIT_LOOSE_MAX) { file_close(fd); return 0 - 1; }
+    var compressed = fl_alloc(size + 1);
+    if (compressed == 0) { file_close(fd); return 0 - 1; }
+    var blen = 0;
+    var reading = 1;
+    while (reading == 1) {
+        if (blen >= size) { reading = 0; }
+        else {
+            var got = file_read(fd, compressed + blen, size - blen);
+            if (got <= 0) { reading = 0; }
+            else { blen = blen + got; }
+        }
+    }
+    file_close(fd);
+    if (blen <= 0) { fl_free(compressed); return 0 - 2; }
 
     var dec_cap = blen * 4;
     if (dec_cap < 4096) { dec_cap = 4096; }
     if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
-    var decompressed = alloc_or_die(dec_cap);
-    if (decompressed == 0) { return 0 - 3; }
+    var decompressed = fl_alloc(dec_cap);
+    if (decompressed == 0) { fl_free(compressed); return 0 - 3; }
     var dlen = zlib_decompress_with_ratio_cap(compressed, blen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
     if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
         if (dec_cap < 16 * 1024 * 1024) {
+            fl_free(decompressed);
             dec_cap = 16 * 1024 * 1024;
-            decompressed = alloc_or_die(dec_cap);
-            if (decompressed == 0) { return 0 - 3; }
+            decompressed = fl_alloc(dec_cap);
+            if (decompressed == 0) { fl_free(compressed); return 0 - 3; }
             dlen = zlib_decompress_with_ratio_cap(compressed, blen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
         }
     }
-    if (dlen <= 0) { return 0 - 4; }
+    fl_free(compressed);
+    if (dlen <= 0) { fl_free(decompressed); return 0 - 4; }
 
     var nul = 0;
-    while (nul < dlen) {
-        if (load8(decompressed + nul) == 0) { break; }
-        nul = nul + 1;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (nul >= dlen) { scanning = 0; }
+        else {
+            if (load8(decompressed + nul) == 0) { scanning = 0; }
+            else { nul = nul + 1; }
+        }
     }
-    if (nul >= dlen) { return 0 - 5; }
+    if (nul >= dlen) { fl_free(decompressed); return 0 - 5; }
 
+    # The inflated object is the caller's (freelist memory, never freed by
+    # read_object's callers, like the pack reader's results since 1.7.4).
     store64(out, decompressed);
     store64(out + 8, dlen);
     store64(out + 16, nul + 1);

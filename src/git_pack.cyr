@@ -695,52 +695,99 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
 # pack's {data, len} and the object's offset to out24 and returns 0; negative
 # when there is no pack directory (-1), `hex` is not an id (-2), or no pack
 # holds it (-3).
+#
+# 1.7.5: nothing is left on the heap. The directory is listed with
+# dir_list_into into freelist buffers freed before returning, and the paths are
+# built on the stack. sf_dir_list built a vec and a Str per entry, and each
+# .idx / .pack path was alloc'd, on every lookup: 672 bytes per object read,
+# kept for good, so ~8 MB for sit_repo_status on 12,000 files in owl or thoth.
+# The listing is redone per lookup on purpose: a long-lived consumer must see
+# the packs a later `git gc` writes.
+
+# dir_list_into's name and offset buffers for the pack directory, doubled and
+# listed again when a directory does not fit, up to _GIT_PACKDIR_TRIES times.
+var _GIT_PACKDIR_NAMES = 4096;
+var _GIT_PACKDIR_ENTRIES = 64;
+var _GIT_PACKDIR_TRIES = 16;
+# Longest pack file name kept: `pack-<64 hex>.idx` is 74 bytes. A longer name
+# is not a pack git wrote, and is skipped.
+var _GIT_PACKNAME_MAX = 255;
+
 fn _git_pack_locate(hex, out24) {
     var packdir = ".git/objects/pack";
-    # S-26: route through the sit_abs seam like every other repo path. A raw
-    # `is_dir(str_from(packdir))` is cwd-relative, so on agnos — which has no
-    # cwd, and where the root is a real absolute path — this probe looked in the
-    # wrong place and packfile reads silently degraded to "no pack directory".
-    if (is_dir(sit_abs_str(str_from(packdir))) != 1) { return 0 - 1; }
-    var entries = sf_dir_list(str_from(packdir));
-    if (entries == 0) { return 0 - 1; }
-    var n = vec_len(entries);
+    var dlen = 17;                                     # strlen(packdir)
+    # S-26: route through the sit_abs seam like every other repo path (on agnos
+    # the root is a real absolute path and there is no cwd to fall back on).
+    var abuf[4352];
+    var apath = sit_abs_into(packdir, &abuf, 4352);
+    if (apath == 0) { return 0 - 1; }
+    var pstr[16];                                      # a Str {data, len} (str.cyr's layout)
+    store64(&pstr, apath);
+    store64(&pstr + 8, strlen(apath));
+    var scratch[4096];
+    var names_cap = _GIT_PACKDIR_NAMES;
+    var max_entries = _GIT_PACKDIR_ENTRIES;
+    var names = 0;
+    var offs = 0;
+    var n = 0 - 3;
+    var tries = 0;
+    var listing = 1;
+    while (listing == 1) {
+        names = fl_alloc(names_cap);
+        offs = fl_alloc(max_entries * 8);
+        n = 0 - 5;
+        if (names != 0) {
+            if (offs != 0) {
+                n = dir_list_into(&pstr, &scratch, 4096, names, names_cap, offs, max_entries);
+            }
+        }
+        listing = 0;
+        tries = tries + 1;
+        if (tries < _GIT_PACKDIR_TRIES) {
+            if (n == 0 - 3) { names_cap = names_cap * 2; listing = 1; }
+            if (n == 0 - 4) { max_entries = max_entries * 2; listing = 1; }
+        }
+        if (listing == 1) {
+            fl_free(names);
+            fl_free(offs);
+        }
+    }
+    var rc = 0 - 3;
+    if (n < 0) { rc = 0 - 1; }                        # no pack directory, or unreadable
     var rawlen = _id_rawlen();
     var oid_raw[32];
-    if (hex_decode_into(hex, _id_hexlen(), &oid_raw) == 0) { return 0 - 2; }
-    var dlen = strlen(packdir);
-
+    if (rc == 0 - 3) {
+        if (hex_decode_into(hex, _id_hexlen(), &oid_raw) == 0) { rc = 0 - 2; }
+    }
+    var ipath[288];
+    var ppath[288];
     var i = 0;
-    var rc = 0 - 3;
-    var done = 0;
     while (i < n) {
-        if (done == 0) {
-            var s = vec_get(entries, i);
-            var sd = str_data(s);
-            var sl = str_len(s);
+        if (rc == 0 - 3) {
+            var nm = names + load64(offs + i * 8);
+            var sl = strlen(nm);
             if (sl > 4) {
-                if (memeq(sd + sl - 4, ".idx", 4) == 1) {
-                    var ipath = alloc(dlen + 1 + sl + 1);
-                    memcpy(ipath, packdir, dlen);
-                    store8(ipath + dlen, 47);
-                    memcpy(ipath + dlen + 1, sd, sl);
-                    store8(ipath + dlen + 1 + sl, 0);
-                    var offset = _git_idx_lookup(ipath, &oid_raw, rawlen);
-                    if (offset >= 0) {
-                        var nb = sl - 4;   # name minus ".idx"
-                        var ppath = alloc(dlen + 1 + nb + 5 + 1);
-                        memcpy(ppath, packdir, dlen);
-                        store8(ppath + dlen, 47);
-                        memcpy(ppath + dlen + 1, sd, nb);
-                        memcpy(ppath + dlen + 1 + nb, ".pack", 5);
-                        store8(ppath + dlen + 1 + nb + 5, 0);
-                        var pkp[16];
-                        if (_git_load_pack(ppath, &pkp) == 0) {
-                            store64(out24, load64(&pkp));
-                            store64(out24 + 8, load64(&pkp + 8));
-                            store64(out24 + 16, offset);
-                            rc = 0;
-                            done = 1;
+                if (sl <= _GIT_PACKNAME_MAX) {
+                    if (memeq(nm + sl - 4, ".idx", 4) == 1) {
+                        memcpy(&ipath, packdir, dlen);
+                        store8(&ipath + dlen, 47);
+                        memcpy(&ipath + dlen + 1, nm, sl);
+                        store8(&ipath + dlen + 1 + sl, 0);
+                        var offset = _git_idx_lookup(&ipath, &oid_raw, rawlen);
+                        if (offset >= 0) {
+                            var nb = sl - 4;   # name minus ".idx"
+                            memcpy(&ppath, packdir, dlen);
+                            store8(&ppath + dlen, 47);
+                            memcpy(&ppath + dlen + 1, nm, nb);
+                            memcpy(&ppath + dlen + 1 + nb, ".pack", 5);
+                            store8(&ppath + dlen + 1 + nb + 5, 0);
+                            var pkp[16];
+                            if (_git_load_pack(&ppath, &pkp) == 0) {
+                                store64(out24, load64(&pkp));
+                                store64(out24 + 8, load64(&pkp + 8));
+                                store64(out24 + 16, offset);
+                                rc = 0;
+                            }
                         }
                     }
                 }
@@ -748,6 +795,8 @@ fn _git_pack_locate(hex, out24) {
         }
         i = i + 1;
     }
+    if (names != 0) { fl_free(names); }
+    if (offs != 0) { fl_free(offs); }
     return rc;
 }
 

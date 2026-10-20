@@ -911,40 +911,130 @@ fn write_remote_tracking(remote, branch, hex) {
 # Return 1 if `ancestor_hex` is reachable from `desc_hex` (ff check).
 fn is_ancestor_in_db(db, ancestor_hex, desc_hex) {
     if (streq(ancestor_hex, desc_hex) == 1) { return 1; }
-    var queue = vec_new();
-    var seen = map_new();
-    var start = alloc(65);
+    var a = _wire_walk_alloc();
+    reset_via(a);                                   # the previous walk's memory
+    var queue = vec_new_a(a);
+    var seen = map_new_a(a);
+    var start = alloc_via(a, 65);
+    if (queue == 0) { return 0; }
+    if (seen == 0) { return 0; }
+    if (start == 0) { return 0; }
     memcpy(start, desc_hex, 64);
     store8(start + 64, 0);
-    vec_push(queue, start);
-    while (vec_len(queue) > 0) {
-        var cur = vec_get(queue, vec_len(queue) - 1);
-        vec_pop(queue);
-        if (map_has(seen, cur) == 1) { }
+    if (vec_push_a(a, queue, start) < 0) { return 0; }
+    var cell[16];                                   # the reused inflate buffer {ptr, cap}
+    store64(&cell, 0);
+    store64(&cell + 8, 0);
+    var found = 0;
+    var walking = 1;
+    while (walking == 1) {
+        if (vec_len(queue) == 0) { walking = 0; }
         else {
-            map_set(seen, cur, 1);
-            if (streq(cur, ancestor_hex) == 1) { return 1; }
-            var obj[24];
-            if (db_object_read_decompressed(db, cur, &obj) == 0) {
-                var buf = load64(&obj);
-                var blen = load64(&obj + 8);
-                var coff = load64(&obj + 16);
-                var info[56];
-                if (parse_commit_body(buf + coff, blen - coff, &info) == 0) {
-                    # Walk every parent edge so the FF gate doesn't falsely
-                    # report non-ancestor across a merge commit.
-                    var pv = load64(&info + 48);
-                    if (pv != 0) {
-                        var pi = 0;
-                        while (pi < vec_len(pv)) {
-                            vec_push(queue, vec_get(pv, pi));
-                            pi = pi + 1;
+            var cur = vec_get(queue, vec_len(queue) - 1);
+            vec_pop(queue);
+            if (map_has(seen, cur) == 0) {
+                if (map_set_a(a, seen, cur, 1) < 0) { walking = 0; }
+                else {
+                    if (streq(cur, ancestor_hex) == 1) { found = 1; walking = 0; }
+                    else {
+                        var body[16];
+                        if (_db_object_inflate_reuse(db, cur, &cell, &body) == 0) {
+                            var info[56];
+                            if (parse_commit_body_a(a, load64(&body), load64(&body + 8), &info) == 0) {
+                                # Walk every parent edge so the FF gate doesn't falsely
+                                # report non-ancestor across a merge commit.
+                                var pv = load64(&info + 48);
+                                if (pv != 0) {
+                                    var pi = 0;
+                                    while (pi < vec_len(pv)) {
+                                        if (vec_push_a(a, queue, vec_get(pv, pi)) < 0) { walking = 0; }
+                                        pi = pi + 1;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     }
+    if (load64(&cell) != 0) { fl_free(load64(&cell)); }
+    return found;
+}
+
+# 1.7.5: is_ancestor_in_db's walk allocates in this arena, rewound at the start
+# of each walk, and inflates every commit into one reused freelist buffer. It
+# kept each commit it read — the inflated bytes (4 KiB at least), the compressed
+# copy, the parsed parents, the queue and seen-set growth — so `sit serve`'s
+# fast-forward check kept ~4 KB per commit of a pushed history on every ref
+# push, and a client could push a long chain once and then refuse-push it over
+# and over. The arena keeps its chunks across walks, so it settles at the
+# longest walk instead of growing with every one. One walk at a time: nothing
+# here is re-entrant, and the callers (serve's ref push, push's fast-forward
+# preflight) are single-threaded.
+var WIRE_WALK_ARENA_CHUNK = 65536;
+var _wire_walk_al = 0;
+
+fn _wire_walk_alloc() {
+    if (_wire_walk_al == 0) {
+        _wire_walk_al = arena_allocator_growable(WIRE_WALK_ARENA_CHUNK);
+        if (_wire_walk_al == 0) {
+            eprintln("sit: cannot allocate the history-walk arena");
+            syscall(SYS_EXIT, 1);
+        }
+    }
+    return _wire_walk_al;
+}
+
+# Read `hex` from `db` and inflate it into the freelist buffer `cell` {ptr, cap}
+# names, replacing it with a larger one when the object needs more (the same
+# 4x / 16 MiB-retry sizing as db_object_read_both). Writes the content past the
+# framing NUL to out16 {ptr, len}; the bytes stay valid until the next call.
+# Returns 0, or negative as db_object_read_both does.
+fn _db_object_inflate_reuse(db, hex, cell, out16) {
+    var raw[24];
+    if (db_object_read_raw(db, hex, &raw) != 0) { return 0 - 1; }
+    var compressed = load64(&raw);
+    var clen = load64(&raw + 8);
+    var dec_cap = clen * 4;
+    if (dec_cap < 4096) { dec_cap = 4096; }
+    if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
+    var dlen = 0 - ERR_BUFFER_TOO_SMALL;
+    var tries = 0;
+    while (tries < 2) {
+        if (load64(cell + 8) < dec_cap) {
+            if (load64(cell) != 0) { fl_free(load64(cell)); }
+            store64(cell, fl_alloc(dec_cap));
+            store64(cell + 8, dec_cap);
+            if (load64(cell) == 0) { store64(cell + 8, 0); tries = 2; dlen = 0 - 2; }
+        }
+        if (tries < 2) {
+            dlen = zlib_decompress_with_ratio_cap(compressed, clen, load64(cell), load64(cell + 8),
+              SIT_MAX_INFLATE_RATIO);
+            tries = tries + 1;
+            if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
+                if (dec_cap < 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
+                else { tries = 2; }
+            }
+            else { tries = 2; }
+        }
+    }
+    fl_free(compressed);
+    if (dlen == 0 - 2) { return 0 - 2; }
+    if (dlen <= 0) { return 0 - 3; }
+    var buf = load64(cell);
+    var nul = 0;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (nul >= dlen) { scanning = 0; }
+        else {
+            if (load8(buf + nul) == 0) { scanning = 0; }
+            else { nul = nul + 1; }
+        }
+    }
+    if (nul >= dlen) { return 0 - 4; }
+    store64(out16, buf + nul + 1);
+    store64(out16 + 8, dlen - nul - 1);
     return 0;
 }
 

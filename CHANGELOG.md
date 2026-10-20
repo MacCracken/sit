@@ -4,6 +4,62 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.5] — 2026-10-19 — git read mode keeps nothing per object read; `sit serve`'s fast-forward check keeps nothing per push
+
+The residuals 1.7.4 measured and left on the roadmap. There is no new surface, and the toolchain stays at cyrius 6.7.15. What both paths still keep is sankoch's, 32 bytes per inflate, now an exact upstream ask (below).
+
+### Security — `sit serve`'s fast-forward check kept every commit it walked (HIGH)
+
+A ref push to `sit serve` runs `is_ancestor_in_db`, which walks the pushed tip's history looking for the current tip. Each commit it read stayed on the global heap: the inflated object (4 KiB at least), its compressed copy, the parsed tree / parent / author strings, and the queue and seen-set growth. That is about 4.5 KB per commit, on every push, refused or accepted.
+
+Without `--require-auth`, which is the default, any client that can reach the port can push. A client can push a long chain once and then send non-fast-forward ref updates at will, each one walking the whole chain.
+
+Measured through `serve_handle_request` on a 2,000-commit history:
+
+| ref push | 1.7.4 | 1.7.5 |
+|---|---:|---:|
+| refused (the pushed commit is the tip's parent: walks 1,999 commits) | 9,072,032 B | 63,968 B |
+| accepted (fast-forward from the root: walks 1,999 commits, writes the ref) | 9,073,864 B | 63,968 B |
+| no-op (the ref already names the commit) | 152 B | 0 B |
+
+The 63,968 B left is exactly 1,999 inflates × 32 B, sankoch's (below). The fix:
+- **The walk runs on an arena rewound at the start of each walk.** The arena keeps its chunks, so the server settles at its longest walk instead of growing with every push.
+- **Commits inflate into one reused freelist buffer** (`_db_object_inflate_reuse`), with the same 4× / 16 MiB-retry sizing as `db_object_read_both`.
+- **One commit parser, two allocation modes.** `parse_commit_body_a` and `parse_author_line_a` draw their strings and the parents vec from a given allocator; `parse_commit_body` / `parse_author_line` are the global-heap forms, unchanged to their callers. A unit group checks that the two agree field by field and that the arena form allocates nothing outside the arena. A differential leg in `fuzz_parse_commit_body` compares them on 200,000 inputs.
+- **The ref-write helpers build their paths on the stack.** `read_head_ref_path_a` reads HEAD into a stack buffer, bounded at 1,024 bytes; a longer HEAD fails validation either way, since no name over 255 bytes is valid. `ensure_parent_dirs`, `_sf_parent_symlink`, `sf_write_all` and `ensure_dir` use one segment buffer and `_sf_abs` (sit_abs into a stack buffer, on the heap past PATH_MAX as before), where they took a heap copy per path segment. The E1 symlink checks are unchanged in order and effect; only where the bytes live changed, which also saves a heap copy per file on every CLI write.
+
+### Fixed — git read mode keeps nothing of sit's per object read
+
+`.git/` read mode runs in-process for owl and thoth, on a heap with no free. After 1.7.4 a read still kept:
+- **For a packed object:** `_git_pack_locate` listed `.git/objects/pack` through `sf_dir_list` (a vec and a `Str` per entry) and `alloc`'d each `.idx` / `.pack` path, on every lookup. It now lists with `dir_list_into` into freelist buffers freed before it returns, and builds the paths on the stack. The listing is still redone per lookup on purpose: a long-lived consumer must see packs a later `git gc` writes.
+- **For a loose object:** `_git_read_loose` read the file through `read_file_heap`, keeping the compressed bytes and its joined path, and, when the inflate retried at 16 MiB, the first inflate buffer too. The file now goes into a freelist buffer freed once inflated, the failed buffer is freed, and the path is built on the stack.
+- **The repo-root join.** `sit_abs_into` (util.cyr) is sit_abs into a caller's buffer. `sit_abs`, `sit_abs_a` and it share one rule (`_sit_abs_len` / `_sit_abs_fill`).
+
+Bytes kept on the global heap per read, beyond the inflated object itself (which is the caller's in both versions, and on the freelist since this release), measured in-process through `read_object`:
+
+| repo | 1.7.4 | 1.7.5 |
+|---|---:|---:|
+| packed (320 blobs, depth-50 chains) | 672 B (1,048 with a repo root set) | 0 B |
+| loose, small files | 56 B (208 with a repo root set) | 0 B |
+| loose, 190 KB text files | ~68,700 B | 0 B |
+
+Each read also keeps sankoch's 32 B per inflate: 32 B for a loose object, about 1 KB for a packed object at that repo's average chain depth of 33.
+
+### Upstream — sankoch's `br_init` keeps 32 B per inflate
+
+`br_init` (`lib/sankoch.cyr`, sankoch 2.8.7 at cyrius 6.7.15) takes its 32-byte bit reader from `_sankoch_alloc` on every inflate and never frees it. It is now everything `sit serve`'s push path and git read mode still keep. A stack reader in the two decoders that own its lifetime would close it. Filed on the roadmap's upstream asks with the location.
+
+### Tests
+
+- **Unit, 514 → 543:** the `parse_commit_body_a` group. It covers a root commit, one parent, a merge's two parents in order, and a tree-less body that is still refused, each identical on an arena and keeping nothing on the global heap.
+- **Fuzz:** `fuzz_parse_commit_body` gains its arena-vs-global differential leg. Still 18 targets; the poison A/B output is identical.
+- **Integration, 341 → 349.** Two new probes are built from the shipped bundles, as `git_probe` is.
+  - **Section 29**, `read_heap_probe.cyr` against `dist/sit-read.cyr`, which is what owl and thoth link. A loose read and an undeltified packed read are bounded at 32 B, and a pack lookup at 0. 1.7.4 keeps 4,196 / 704 / 672 B there.
+  - **Section 30**, `serve_push_probe.cyr` against `dist/sit.cyr`. A refused and an accepted ref push over 300 commits are bounded at 9,600 B, sankoch's 32 B per commit walked; 1.7.4 keeps about 1.3 MB each. The section also checks that the accepted push landed.
+- **Other targets and downstream.** The aarch64 build passes `deep_pack.py` under qemu, and `--agnos` builds, DCE included. owl (cyrius 6.6.2) and thoth (6.6.6) build against the new `dist/sit-read.cyr`.
+
+**Benchmarks** ([`docs/benchmarks/2026-10-19-v1.7.5.md`](docs/benchmarks/2026-10-19-v1.7.5.md)): the memory numbers are above. The host was saturated by other builds while this was cut (load 18–40 on 16 cores), so the standard micro and head-to-head tables were not comparable and are not published; they are owed on a quiet host. The changed paths were compared instead by each run's own CPU time, minimum of 20 alternating runs. All four are flat: `log` over 2,000 commits 315.8 → 318.2 ms, `checkout` of 500 files and back 559.6 → 557.0 ms, 320 in-process packed reads 1025.3 → 1032.9 ms, 24 ref pushes over 2,000 commits 4052.7 → 3979.7 ms. Wall-clock runs had shown 5–10% against 1.7.5 in every case; that was time spent preempted.
+
 ## [1.7.4] — 2026-10-19 — resource bounds: `sit serve` keeps nothing per request; git read mode past 64 MiB and depth 64
 
 The 1.7.4 slot: the two resource bounds the 2026-10-19 audit ([`docs/audit/2026-10-19-audit.md`](docs/audit/2026-10-19-audit.md)) left open, C1's residual and D6. Working on C1 turned up a larger leak on the `--tls` path. There is no new surface, and the toolchain stays at cyrius 6.7.15.

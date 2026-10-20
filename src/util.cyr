@@ -45,22 +45,45 @@ fn sit_abs(rel) {
 # 1.7.4). `a` == 0 is sit_abs itself: the global heap, dying on OOM. Otherwise
 # 0 comes back when `a` cannot serve the bytes.
 fn sit_abs_a(a, rel) {
-    if (rel == 0) { return rel; }
-    if (load8(rel) == 47) { return rel; }            # '/'
-    if (_repo_root == 0) { return rel; }
+    var n = _sit_abs_len(rel);
+    if (n == 0) { return rel; }
+    var out = 0;
+    if (a == 0) { out = alloc_or_die(n); }
+    else {
+        out = alloc_via(a, n);
+        if (out == 0) { return 0; }
+    }
+    return _sit_abs_fill(out, rel);
+}
+
+# sit_abs into a caller's buffer of `cap` bytes: `buf` holding the joined path,
+# `rel` itself when the rules use it as given, or 0 when the join does not fit.
+# 1.7.5: for the git read path, which runs per object in-process for owl and
+# thoth and so keeps nothing on the heap.
+fn sit_abs_into(rel, buf, cap) {
+    var n = _sit_abs_len(rel);
+    if (n == 0) { return rel; }
+    if (n > cap) { return 0; }
+    return _sit_abs_fill(buf, rel);
+}
+
+# The rules above: the bytes "<root>/<rel>" + NUL needs, or 0 when `rel` is
+# used as given.
+fn _sit_abs_len(rel) {
+    if (rel == 0) { return 0; }
+    if (load8(rel) == 47) { return 0; }              # '/'
+    if (_repo_root == 0) { return 0; }
     # A "." root means "current directory" — prefixing "./" is redundant
     # and would break Linux byte-for-byte parity. Treat it as no-prefix so
     # cmd_init's explicit sit_set_repo_root(".") stays a Linux no-op.
-    if (load8(_repo_root) == 46) { if (load8(_repo_root + 1) == 0) { return rel; } }
+    if (load8(_repo_root) == 46) { if (load8(_repo_root + 1) == 0) { return 0; } }
+    return strlen(_repo_root) + 1 + strlen(rel) + 1;
+}
+
+# Write "<root>/<rel>" + NUL at `out`, sized by _sit_abs_len. Returns `out`.
+fn _sit_abs_fill(out, rel) {
     var rlen = strlen(_repo_root);
     var plen = strlen(rel);
-    # "<root>" + "/" + "<rel>" + NUL
-    var out = 0;
-    if (a == 0) { out = alloc_or_die(rlen + 1 + plen + 1); }
-    else {
-        out = alloc_via(a, rlen + 1 + plen + 1);
-        if (out == 0) { return 0; }
-    }
     memcpy(out, _repo_root, rlen);
     store8(out + rlen, 47);                          # '/'
     memcpy(out + rlen + 1, rel, plen);
@@ -191,23 +214,38 @@ fn sf_exists(p) {
 # 1 if a proper prefix of the repo-relative path `p` ("a", "a/b" for "a/b/c")
 # is a symlink. Absolute paths (HOME, cert and token files) are not checked: a
 # symlinked home directory is legitimate, and those paths are not repo content.
+#
+# 1.7.5: the prefixes and their joined paths are built on the stack. A heap
+# copy of the path, and a joined path per segment, were kept for good on every
+# write — `sit serve` pays this per ref push, a checkout per file.
 fn _sf_parent_symlink(p) {
     if (p == 0) { return 0; }
     if (load8(p) == 47) { return 0; }
     var len = strlen(p);
-    var pre = alloc_or_die(len + 1);
+    var sbuf[4096];
+    var pre = &sbuf;
+    if (len + 1 > 4096) { pre = alloc_or_die(len + 1); }   # past PATH_MAX: as before
+    var abuf[4352];
     var i = 0;
     while (i < len) {
         if (load8(p + i) == 47) {
             if (i > 0) {
                 memcpy(pre, p, i);
                 store8(pre + i, 0);
-                if (path_is_symlink(sit_abs(pre)) == 1) { return 1; }
+                if (path_is_symlink(_sf_abs(pre, &abuf)) == 1) { return 1; }
             }
         }
         i = i + 1;
     }
     return 0;
+}
+
+# sit_abs into `abuf`, a 4352-byte buffer the caller owns (on its stack), or on
+# the heap as sit_abs does when the join does not fit.
+fn _sf_abs(rel, abuf) {
+    var ap = sit_abs_into(rel, abuf, 4352);
+    if (ap == 0) { ap = sit_abs(rel); }
+    return ap;
 }
 
 # Write all `len` bytes to `fd`, looping over short writes (EINTR retried).
@@ -254,7 +292,8 @@ fn sit_write_full(fd, buf, len) {
 fn sf_write_all(p, buf, len) {
     if (load8(p) == 47) { return file_write_all(p, buf, len); }
     if (_sf_parent_symlink(p) == 1) { return 0 - 40; }          # -ELOOP
-    var ap = sit_abs(p);
+    var abuf[4352];
+    var ap = _sf_abs(p, &abuf);
     if (path_lstat_kind(ap) >= 0) { xunlink(ap); }
     var fd = file_open(ap, O_WRONLY | O_CREAT | O_EXCL, 0x1A4);
     if (fd < 0) { return fd; }
@@ -485,7 +524,8 @@ fn alloc_or_die(size) {
 # sit-owned: prefixes `path` with the repo root (sit_abs) INTERNALLY so
 # every caller (incl. ensure_parent_dirs) can pass a repo-relative path.
 fn ensure_dir(path) {
-    var r = sit_mkdir(sit_abs(path), 0x1ED);
+    var abuf[4352];
+    var r = sit_mkdir(_sf_abs(path, &abuf), 0x1ED);
     if (r == 0) { return 0; }
     if (r == 0 - 17) { return 0; }
     return r;
@@ -500,22 +540,27 @@ fn ensure_dir(path) {
 # 1.6.4: stops (-ELOOP) at a repo-relative segment that is a symlink rather than
 # creating directories beyond it. mkdir's EEXIST used to read a symlinked
 # directory as "already there", so later segments were created outside the repo.
+#
+# 1.7.5: one segment buffer on the stack (a heap copy per '/' was kept for good).
 fn ensure_parent_dirs(path) {
     var len = strlen(path);
     var abs_path = 0;
     if (len > 0) { if (load8(path) == 47) { abs_path = 1; } }
+    var sbuf[4096];
+    var segment = &sbuf;
+    if (len + 1 > 4096) { segment = alloc_or_die(len + 1); }   # past PATH_MAX: as before
+    var abuf[4352];
     var i = 0;
     var rc = 0;
     while (i < len) {
         if (rc == 0) {
             if (load8(path + i) == 47) {
                 if (i > 0) {
-                    var segment = alloc(i + 1);
                     memcpy(segment, path, i);
                     store8(segment + i, 0);
                     ensure_dir(segment);
                     if (abs_path == 0) {
-                        if (path_is_symlink(sit_abs(segment)) == 1) { rc = 0 - 40; }
+                        if (path_is_symlink(_sf_abs(segment, &abuf)) == 1) { rc = 0 - 40; }
                     }
                 }
             }

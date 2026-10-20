@@ -372,6 +372,19 @@ fn _materialize(target_hex, mode) {
 
 # Split an author/committer line into ident ("Name <email>") and timestamp; -1 if no closing '>'.
 fn parse_author_line(line, line_len, prefix_len, out) {
+    return parse_author_line_a(0, line, line_len, prefix_len, out);
+}
+
+# Allocate `n` bytes from `a`, or from the global heap (dying on OOM) when `a`
+# is 0: the two allocation modes of the `_a` parsers below.
+fn _commit_alloc(a, n) {
+    if (a == 0) { return alloc_or_die(n); }
+    return alloc_via(a, n);
+}
+
+# parse_author_line with the ident and tz strings drawn from `a` (0 = the
+# global heap). 1.7.5: see parse_commit_body_a.
+fn parse_author_line_a(a, line, line_len, prefix_len, out) {
     var p = prefix_len;
     var found_close = 0;
     while (p < line_len) {
@@ -381,7 +394,8 @@ fn parse_author_line(line, line_len, prefix_len, out) {
     if (found_close == 0) { return 0 - 1; }
 
     var ident_len = p - prefix_len + 1;
-    var ident = alloc_or_die(ident_len + 1);
+    var ident = _commit_alloc(a, ident_len + 1);
+    if (ident == 0) { return 0 - 1; }
     memcpy(ident, line + prefix_len, ident_len);
     store8(ident + ident_len, 0);
     store64(out, ident);
@@ -416,7 +430,8 @@ fn parse_author_line(line, line_len, prefix_len, out) {
     var tz_start = p;
     while (p < line_len) { p = p + 1; }
     var tz_len = p - tz_start;
-    var tz = alloc_or_die(tz_len + 1);
+    var tz = _commit_alloc(a, tz_len + 1);
+    if (tz == 0) { return 0 - 1; }
     memcpy(tz, line + tz_start, tz_len);
     store8(tz + tz_len, 0);
     store64(out + 16, tz);
@@ -479,6 +494,15 @@ fn commit_ts_clamp(ts) {
 
 # Parse a commit body's tree / parent / author / committer headers into `out` (56 bytes).
 fn parse_commit_body(body, body_len, out) {
+    return parse_commit_body_a(0, body, body_len, out);
+}
+
+# parse_commit_body with the tree / parent / author strings and the parents vec
+# drawn from `a` (0 = the global heap, dying on OOM, as parse_commit_body).
+# Returns -1 as well when `a` cannot serve them. 1.7.5: `sit serve`'s
+# fast-forward check parses a pushed history with it, on an arena it rewinds
+# per walk, so the parse has one implementation rather than a second scanner.
+fn parse_commit_body_a(a, body, body_len, out) {
     store64(out, 0);
     store64(out + 8, 0);
     store64(out + 16, 0);
@@ -509,7 +533,8 @@ fn parse_commit_body(body, body_len, out) {
                 if (line_len > 5) {
                     if (memeq(body + pos, "tree ", 5) == 1) {
                         if (line_len >= 5 + hexlen) {
-                            var t = alloc_or_die(hexlen + 1);
+                            var t = _commit_alloc(a, hexlen + 1);
+                            if (t == 0) { return 0 - 1; }
                             memcpy(t, body + pos + 5, hexlen);
                             store8(t + hexlen, 0);
                             store64(out, t);
@@ -519,7 +544,8 @@ fn parse_commit_body(body, body_len, out) {
                 if (line_len > 7) {
                     if (memeq(body + pos, "parent ", 7) == 1) {
                         if (line_len >= 7 + hexlen) {
-                            var p = alloc_or_die(hexlen + 1);
+                            var p = _commit_alloc(a, hexlen + 1);
+                            if (p == 0) { return 0 - 1; }
                             memcpy(p, body + pos + 7, hexlen);
                             store8(p + hexlen, 0);
                             store64(out + 8, p);
@@ -527,13 +553,21 @@ fn parse_commit_body(body, body_len, out) {
                             # vec at out+48 so reachability + ancestor walks follow
                             # all edges, not just the last one captured at out+8.
                             var pv = load64(out + 48);
-                            if (pv == 0) { pv = vec_new(); store64(out + 48, pv); }
-                            vec_push(pv, p);
+                            if (pv == 0) {
+                                if (a == 0) { pv = vec_new(); }
+                                else { pv = vec_new_a(a); }
+                                if (pv == 0) { return 0 - 1; }
+                                store64(out + 48, pv);
+                            }
+                            if (a == 0) { vec_push(pv, p); }
+                            else {
+                                if (vec_push_a(a, pv, p) < 0) { return 0 - 1; }
+                            }
                         }
                     }
                     if (memeq(body + pos, "author ", 7) == 1) {
                         var ao[24];
-                        if (parse_author_line(body + pos, line_len, 7, &ao) == 0) {
+                        if (parse_author_line_a(a, body + pos, line_len, 7, &ao) == 0) {
                             store64(out + 16, load64(&ao));
                             # S-25: clamp the author timestamp to a representable
                             # range before anything formats it.

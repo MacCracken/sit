@@ -1,0 +1,70 @@
+# read_heap_probe.cyr — how much one `.git/` object read keeps on the heap.
+#
+# Built by tests/integration/run.sh against the SHIPPED read bundle
+# (dist/sit-read.cyr — what owl and thoth link), then run inside a git fixture.
+# Reads every object id listed in argv(1) (one 40-hex id per line) through
+# read_object twice and reports the second pass, so one-time costs (the
+# .idx / .pack mappings, sankoch's tables) are not counted. Not part of the
+# product; lives with the tests.
+#
+# Output:  READ <bytes kept per read> <objects read>
+#          LOCATE <bytes kept per pack lookup>
+# "Kept" is global bump-heap growth. The inflated object is the caller's, on
+# the freelist, and is not counted.
+include "dist/sit-read.cyr"
+
+fn _put_num(label, v) {
+    var nb[24];
+    stdout_write(label, strlen(label));
+    var k = write_decimal(&nb, v);
+    stdout_write(&nb, k);
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    args_init();
+    if (sit_repo_open(".") == 0) { eprintln("PROBE-FAIL-OPEN"); return 1; }
+    var pair[16];
+    if (read_file_heap(argv_heap(1), &pair) != 0) { eprintln("PROBE-FAIL-IDS"); return 1; }
+    var ids = load64(&pair);
+    var n = load64(&pair + 8) / 41;
+    if (n <= 0) { eprintln("PROBE-FAIL-IDS"); return 1; }
+    var hex[48];
+    var out[24];
+    var loc[24];
+    var ok = 0;
+    var used = 0;
+    var pass = 0;
+    while (pass < 2) {
+        ok = 0;
+        var u0 = alloc_used();
+        var i = 0;
+        while (i < n) {
+            memcpy(&hex, ids + i * 41, 40);
+            store8(&hex + 40, 0);
+            if (read_object(&hex, &out) == 0) { ok = ok + 1; }
+            i = i + 1;
+        }
+        used = alloc_used() - u0;
+        pass = pass + 1;
+    }
+    _put_num("READ ", used / n);
+    _put_num(" ", ok);
+    stdout_write("\n", 1);
+    var l0 = alloc_used();
+    var j = 0;
+    while (j < n) {
+        memcpy(&hex, ids + j * 41, 40);
+        store8(&hex + 40, 0);
+        _git_pack_locate(&hex, &loc);
+        j = j + 1;
+    }
+    _put_num("LOCATE ", (alloc_used() - l0) / n);
+    stdout_write("\n", 1);
+    stdout_flush();
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);
