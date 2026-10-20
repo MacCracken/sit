@@ -31,8 +31,15 @@ fn _parent_tree_entries(commit_hex) {
     var parents = commit_parents_of(commit_hex);
     if (parents == 0) { return vec_new(); }
     if (vec_len(parents) == 0) { return vec_new(); }
-    var e = commit_tree_entries(vec_get(parents, 0));
-    if (e == 0) { return vec_new(); }
+    var p = vec_get(parents, 0);
+    var e = commit_tree_entries(p);
+    if (e == 0) {
+        # A parent that is not here at all is a shallow boundary: the commit is
+        # applied as if it were a root, as git does. A parent that is here but
+        # whose tree cannot be read is corruption (1.7.6, L8) — 0.
+        if (commit_tree_hex(p) != 0) { return 0; }
+        return vec_new();
+    }
     return e;
 }
 
@@ -92,11 +99,23 @@ fn _apply_one_commit(target_hex, invert, marker_path, verb, verb_len) {
         return 1;
     }
 
+    # 1.7.6 (L8): an unreadable tree is an error, not an empty one — as
+    # "theirs" it made the pick delete every file, as "ours" add them all back.
     var target_tree = commit_tree_entries(target_hex);
-    if (target_tree == 0) { target_tree = vec_new(); }
     var parent_tree = _parent_tree_entries(target_hex);
     var ours_entries = commit_tree_entries(head_hex);
-    if (ours_entries == 0) { ours_entries = vec_new(); }
+    if (target_tree == 0) {
+        eprintln("sit: cannot read that commit's tree (missing or corrupt objects) — nothing changed");
+        return 1;
+    }
+    if (parent_tree == 0) {
+        eprintln("sit: cannot read the parent commit's tree (missing or corrupt objects) — nothing changed");
+        return 1;
+    }
+    if (ours_entries == 0) {
+        eprintln("sit: cannot read HEAD's tree (missing or corrupt objects) — nothing changed");
+        return 1;
+    }
 
     var base_entries = parent_tree;
     var theirs_entries = target_tree;
@@ -119,7 +138,7 @@ fn _apply_one_commit(target_hex, invert, marker_path, verb, verb_len) {
         var mbuf = alloc(66);
         memcpy(mbuf, target_hex, 64);
         store8(mbuf + 64, 10);
-        if (sf_write_all(marker_path, mbuf, 65) < 0) {
+        if (sf_write_atomic(marker_path, mbuf, 65) < 0) {
             eprint3("sit: cannot record ", marker_path, "\n");
         }
 
@@ -274,7 +293,7 @@ fn stash_write_top(hex) {
     memcpy(buf, hex, 64);
     store8(buf + 64, 10);
     ensure_parent_dirs(p);
-    if (sf_write_all(p, buf, 65) < 0) { return 0 - 1; }
+    if (sf_write_atomic(p, buf, 65) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -334,6 +353,35 @@ fn _stash_push() {
     if (head_hex == 0) {
         eprintln("sit: no commits yet — nothing to stash against");
         return 1;
+    }
+    # 1.7.6 (L6): the snapshot covers index paths, and the restore below
+    # rewrites every HEAD path. A file HEAD tracks but the index does not (after
+    # `sit rm --cached`) was overwritten with HEAD's version, its edits never
+    # saved. Refuse instead while such a file differs from HEAD.
+    var hents = read_head_tree_entries();
+    var ients = parse_index();
+    if (hents != 0) {
+        var hn = vec_len(hents);
+        var hi = 0;
+        while (hi < hn) {
+            var he = vec_get(hents, hi);
+            var hp = tree_entry_name(he);
+            var staged = 0;
+            if (ients != 0) { if (index_find(ients, hp) != 0) { staged = 1; } }
+            if (staged == 0) {
+                if (path_lstat_kind(sit_abs(hp)) == 0x8000) {
+                    var dh = hash_file_as_blob(hp);
+                    var same = 0;
+                    if (dh != 0) { if (memeq(dh, tree_entry_hash(he), 64) == 1) { same = 1; } }
+                    if (same == 0) {
+                        eprint3("sit: '", hp, "' is in HEAD but not staged, and changed — nothing stashed\n");
+                        eprintln("sit:   `sit add` it, or move it aside, first");
+                        return 1;
+                    }
+                }
+            }
+            hi = hi + 1;
+        }
     }
     var tree_hex = _stash_working_tree();
     if (tree_hex == (0 - 1)) { return 1; }

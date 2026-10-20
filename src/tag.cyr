@@ -354,7 +354,9 @@ fn cmd_verify_tag() {
         var signed_name = load64(&tinfo + 8);
         var target = load64(&tinfo);
         stdout_write("good signature on tag ", 22);
-        stdout_write(signed_name, strlen(signed_name));
+        # 1.7.6 (R13): the name inside a signed tag object never passed the
+        # ref-name check — any signer can put escape bytes in it.
+        write_sanitized(STDOUT, signed_name, strlen(signed_name));
         stdout_write(" -> ", 4);
         stdout_write(target, 12);
         stdout_write(" (key ", 6);

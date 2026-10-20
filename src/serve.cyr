@@ -21,11 +21,17 @@
 
 var SIT_SERVE_DEFAULT_PORT = 8484;
 var SIT_SERVE_MAX_BODY = 16777216;  # 16 MiB — advertised in capabilities
-# v0.7.4: cap on the count field of a single POST /want body. The
-# binding constraint is sandhi's per-process HSV_REQ_BUF_SIZE = 64 KiB
-# request buffer; pinning to 512 keeps the request body ≤ 32 KiB
-# even with the full 8-byte count + 512×64-byte hashes, leaving
-# ample headroom for HTTP headers. See ADR 0006.
+# The largest whole request (headers + body) every serve loop buffers: the
+# advertised body plus 64 KiB of headers. 1.7.6 (N2): all three loops buffered
+# 64 KiB, sandhi's default, while capabilities advertised 16 MiB, so pushing any
+# object over ~64 KiB failed over http, https and ssh, and a branch holding one
+# could never be pushed again. Literal, not SIT_SERVE_MAX_BODY + 65536, so it
+# stays a static initializer.
+var SERVE_REQ_MAX = 16842752;
+# v0.7.4: cap on the count field of a single POST /want body. 512 × 64-byte
+# hashes + the 8-byte count is ~32 KiB, which fit the 64 KiB request buffer the
+# server had then; it is a protocol constant now (advertised as batch_max), not
+# a buffer bound. See ADR 0006.
 var SIT_WANT_MAX_COUNT = 512;
 
 # v0.7.6: bearer auth. ~/.sit/serve.token is the canonical path;
@@ -779,8 +785,8 @@ fn _serve_auth_ok(buf, n) {
 
 fn _serve_rehash_and_insert(cfd, hex, claimed_ty, compressed, clen) {
     # Decompress to verify framing + recompute hash. _decompress_raw_into
-    # (src/wire.cyr) handles the 4×-initial / 16 MiB-ceiling sizing
-    # mirror of db_object_read_both. raw[24] = {compressed, clen, ty}.
+    # (src/wire.cyr) inflates through obj_inflate_fl, the shared sizing.
+    # raw[24] = {compressed, clen, ty}.
     var raw[24];
     store64(&raw,      compressed);
     store64(&raw +  8, clen);
@@ -805,41 +811,18 @@ fn _serve_rehash_and_insert(cfd, hex, claimed_ty, compressed, clen) {
 # Returns the HTTP status to answer with (200 already present, 201 stored,
 # 400 rejected, 500 storage error).
 fn _serve_verify_and_insert(hex, claimed_ty, compressed, clen, deco) {
-    var dbuf = load64(deco);
-    var dlen = load64(deco + 8);
-    var coff = load64(deco + 16);
-
-    # Verify the decompressed framing's type matches the claimed ty.
-    # `coff - 1` is the index of the NUL; the type-string runs from
-    # 0 to the first space (which must be at coff - 1 - <digits>).
-    if (coff < 5) { return 400; }
-    # Single flag-guarded scan for the type/length separator.
-    var sp = 0;
-    var found_sp = 0;
-    var scan = 0;
-    while (scan < coff) {
-        if (found_sp == 0) {
-            if (load8(dbuf + scan) == 32) { found_sp = 1; sp = scan; }
-        }
-        scan = scan + 1;
+    # Framing type == claimed type, SHA-256 of the framed bytes == the id: the
+    # same check fetch makes on what it receives (1.7.6, _object_verify).
+    if (_object_verify(hex, claimed_ty, deco) != 0) { return 400; }
+    # 1.7.6 (R12): a commit every reader refuses (headers out of git's order)
+    # is not taken in — the server's own fsck would call it bad.
+    if (claimed_ty == 2) {
+        var cinfo[56];
+        var cb = load64(deco);
+        var cl = load64(deco + 8);
+        var co = load64(deco + 16);
+        if (parse_commit_body_a(_serve_req_alloc(), cb + co, cl - co, &cinfo) != 0) { return 400; }
     }
-    if (found_sp == 0) { return 400; }
-    var declared_ty = type_code_of(dbuf, sp);
-    if (declared_ty < 0) { return 400; }
-    if (declared_ty != claimed_ty) { return 400; }
-
-    # Recompute the hash over the full framed bytes (type + space +
-    # decimal-len + NUL + content) — what write_typed_object uses to
-    # compute the canonical sit hash for any new object.
-    #
-    # 1.7.4 (C1): compared as raw digests on the stack. hash_data returns its
-    # hex on the global heap, kept for every pushed object. `hex` is lowercase
-    # hex (the handler checked it), so decoding it compares the same values.
-    var actual[32];
-    var wanted[32];
-    sha256(dbuf, dlen, &actual);
-    if (hex_decode_into(hex, 64, &wanted) == 0) { return 400; }
-    if (memeq(&actual, &wanted, 32) == 0) { return 400; }
 
     # Hash matches. Insert the original compressed bytes. db_object_insert_raw
     # returns 0 on actual insert, 1 on already-present, negative on error.
@@ -988,8 +971,10 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
         if (server_head != 0) {
             if (streq(server_head, rname) == 1) {
                 # Probe the on-disk ref to gate the bypass; ensure_parent_dirs
-                # happens at write time so this read is safe pre-write.
-                if (file_exists(adisk) == 1) {
+                # happens at write time so this read is safe pre-write. 1.7.6:
+                # lstat — file_exists opens it, so an unreadable ref looked
+                # absent and a FIFO there blocked the server.
+                if (path_lstat_kind(adisk) >= 0) {
                     var msg = "refusing to update checked-out branch (denyCurrentBranch)\n";
                     _serve_send_response(cfd, 423, "Locked", "text/plain",
                       msg, strlen(msg), 0);
@@ -1031,18 +1016,31 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
     # check.
     var db = get_object_db();
     if (db == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
-    if (db_object_has(db, new_hex) == 0) {
+    # 1.7.6 (N4): and it must be something a ref can name — a commit for a
+    # branch, a commit or an annotated tag for a tag. Existence alone let a push
+    # point a branch at a blob.
+    var nty = db_object_type(db, new_hex);
+    var ty_ok = 0;
+    if (nty == 2) { ty_ok = 1; }
+    if (is_tag == 1) { if (nty == 3) { ty_ok = 1; } }
+    if (ty_ok == 0) {
         _serve_send_status(cfd, 400, "Bad Request");
         return 0;
     }
 
     # Existing tip? FF check via is_ancestor_in_db.
-    if (file_exists(adisk) == 1) {
-        # Refuse to follow a symlink on the ref file itself (S-04). 1.7.4: on
-        # the resolved path. It was handed the repo-relative one, so with the
-        # served repo anywhere but the cwd the guard looked at the wrong file
-        # (sf_write_all below refuses to write through a symlink regardless).
-        if (path_is_symlink(adisk) == 1) {
+    #
+    # 1.7.6: existence is lstat's answer. file_exists opens the file, so a ref
+    # that could not be read was "absent" — the push then created it over the
+    # old tip with no fast-forward check — and a FIFO there blocked the server.
+    var rkind = path_lstat_kind(adisk);
+    if (rkind >= 0) {
+        # Refuse to follow a symlink on the ref file itself (S-04), or to read
+        # anything but a regular file. 1.7.4: on the resolved path. It was
+        # handed the repo-relative one, so with the served repo anywhere but the
+        # cwd the guard looked at the wrong file (sf_write_atomic below refuses
+        # to write through a symlink regardless).
+        if (rkind != 0x8000) {
             _serve_send_status(cfd, 500, "Internal Server Error");
             return 0;
         }
@@ -1066,20 +1064,29 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
             _serve_send_status(cfd, 409, "Conflict");
             return 0;
         }
-        if (is_ancestor_in_db(db, cur, new_hex) == 0) {
+        # 1.7.6 (N4): the walk gets the request budget the TLS loop already
+        # gives a request (60 s); past it the push is answered 503.
+        _wire_walk_deadline_ns = clock_now_ns() + SERVE_TLS_DEADLINE_NS;
+        var anc = is_ancestor_in_db(db, cur, new_hex);
+        _wire_walk_deadline_ns = 0;
+        if (anc < 0) {
+            _serve_send_status(cfd, 503, "Service Unavailable");
+            return 0;
+        }
+        if (anc == 0) {
             _serve_send_status(cfd, 409, "Conflict");
             return 0;
         }
     }
 
-    # Write atomically (write to .tmp then rename). file_write_all
-    # already does a single write call — for sit's ref file size
-    # (65 bytes) that's atomic on every Linux fs the workflow targets.
+    # Written through `<ref>.lock` (O_EXCL), fsync, rename (1.7.6, N6): a
+    # crash leaves the old tip or the new one, never an empty ref, and a second
+    # writer racing this one is refused rather than interleaved.
     var wbuf[72];
     memcpy(&wbuf, new_hex, 64);
     store8(&wbuf + 64, 10);
     ensure_parent_dirs(disk_path);
-    if (sf_write_all(disk_path, &wbuf, 65) < 0) {
+    if (sf_write_atomic(disk_path, &wbuf, 65) < 0) {
         _serve_send_status(cfd, 500, "Internal Server Error");
         return 0;
     }
@@ -1305,15 +1312,13 @@ fn _stdio_recv_request(buf, max, start_have) {
 }
 
 fn _serve_run_stdio() {
-    # Lazily allocate the same 64 KiB request buffer sandhi's
-    # accept-loop uses, sized to HSV_REQ_BUF_SIZE so the existing
-    # body-cap math in serve_handle_request / serve_handle_want
-    # carries over unchanged.
-    var buf = alloc(HSV_REQ_BUF_SIZE);
+    # One request buffer for the session, SERVE_REQ_MAX like the other loops
+    # (pages are touched only as a request fills them).
+    var buf = alloc(SERVE_REQ_MAX);
     var carry = 0;
 
     while (1 == 1) {
-        var n = _stdio_recv_request(buf, HSV_REQ_BUF_SIZE - 1, carry);
+        var n = _stdio_recv_request(buf, SERVE_REQ_MAX - 1, carry);
         if (n <= 0) {
             stdout_flush();
             if (n < 0) { return 1; }
@@ -1333,7 +1338,7 @@ fn _serve_run_stdio() {
         # to the bytes ACTUALLY read.
         #
         # `req_end` used to be `bo + clen` unclamped and was passed straight in
-        # as `n` below. `_stdio_recv_request` returns at most HSV_REQ_BUF_SIZE-1
+        # as `n` below. `_stdio_recv_request` returns at most SERVE_REQ_MAX-1
         # bytes and never loops to complete an oversized body, so a client that
         # claimed a Content-Length larger than it sent turned every POST
         # handler's completeness check — `if (body_off + clen > n)` — into the
@@ -1384,12 +1389,10 @@ fn _serve_run_stdio() {
 # `sit serve --tls --cert <file> --key <file>`. The cert is DER, or PEM (auto-
 # decoded via sigil's pem_decode_certs); the key is PEM or DER (tls_native
 # detects). Per ADR 0007 the only TLS is tls_native (first-party Cyrius) — no
-# libssl. Read-only over TLS today: GET (capabilities/refs/objects) + POST /want
-# fit the 64 KiB request buffer. POST push bodies (up to 16 MiB) would overflow
-# it, but https push stays gated at wire_transport_check_writable so it cannot
-# reach here.
+# libssl. sit's own client pushes over http and ssh only (https push stays gated
+# at wire_transport_check_writable), but any client can POST here, so the loop
+# buffers SERVE_REQ_MAX like the others and frames requests as strictly.
 
-var SERVE_TLS_REQ_MAX = 65536;   # 64 KiB request buffer (matches sandhi's HSV cap)
 var SERVE_TLS_CONN_ARENA_CHUNK = 131072;   # one handshake's state fits; more chains a chunk
 
 # Load a certificate file as DER. Accepts PEM (decoded via pem_decode_certs) or
@@ -1412,13 +1415,30 @@ fn _serve_load_cert(path, out_pair) {
     return 0;
 }
 
-# Read a full HTTP/1.0 request off a TLS connection into buf (cap `max`). Reads
-# records until the header terminator is seen and the declared body is present,
-# or the stream ends / the cap is hit. Returns total bytes read.
-fn _serve_tls_recv_request(ctx, buf, max) {
+# Read one request off a TLS connection into buf (cap `max`). Returns its length
+# (headers + declared body) once all of it has arrived, with `*extra` set to how
+# many bytes past it were read (a pipelined request); 0 when the peer closed or
+# timed out before sending anything; or a refusal:
+#   -SERVE_TLS_INCOMPLETE  the stream ended or failed mid-request
+#   -SERVE_TLS_TOO_LARGE   the request does not fit `max`, or its Content-Length
+#                          is not representable (413)
+#   -SERVE_TLS_BAD_FRAMING Content-Length with Transfer-Encoding, or a duplicated
+#                          Content-Length / Transfer-Encoding / Host (400)
+#   -SERVE_TLS_UNSUPPORTED a Transfer-Encoding sit does not decode (501)
+#
+# 1.7.6 (N5): the same framing rules as sandhi's plain loop. Through 1.7.5 this
+# returned whatever it had read: an oversized request was dispatched truncated
+# and its remainder parsed as the next request, a chunked body was framed as
+# requests, and pipelined bytes went to the handler.
+var SERVE_TLS_INCOMPLETE = 1;
+var SERVE_TLS_TOO_LARGE = 2;
+var SERVE_TLS_BAD_FRAMING = 3;
+var SERVE_TLS_UNSUPPORTED = 4;
+
+fn _serve_tls_recv_request(ctx, buf, max, extra) {
+    store64(extra, 0);
     var used = 0;
-    var headers_end = 0 - 1;
-    var content_len = 0;
+    var need = 0 - 1;                              # request length once the headers are in
     var rgo = 1;
     while (rgo == 1) {
         if (used >= max) { rgo = 0; }
@@ -1427,25 +1447,45 @@ fn _serve_tls_recv_request(ctx, buf, max) {
             if (n <= 0) { rgo = 0; }
             else {
                 used = used + n;
-                if (headers_end < 0) {
-                    headers_end = sandhi_server_body_offset(buf, used);
-                    if (headers_end > 0) {
-                        content_len = _serve_content_length(_serve_req_alloc(), buf, used);
+                if (need < 0) {
+                    var bo = sandhi_server_body_offset(buf, used);
+                    if (bo > 0) {
+                        var bad = 0;
+                        if (sandhi_server_request_has_cl_te_conflict(buf, bo) == 1) { bad = SERVE_TLS_BAD_FRAMING; }
+                        if (sandhi_server_request_has_dup_smuggling_header(buf, bo) == 1) {
+                            bad = SERVE_TLS_BAD_FRAMING;
+                        }
+                        if (bad == 0) {
+                            if (sandhi_server_request_has_unsupported_te(buf, bo) == 1) { bad = SERVE_TLS_UNSUPPORTED; }
+                        }
+                        if (bad != 0) { return 0 - bad; }
+                        var clen = _serve_content_length(_serve_req_alloc(), buf, bo);
+                        if (clen < 0) { return 0 - SERVE_TLS_TOO_LARGE; }
+                        if (clen > max - bo) { return 0 - SERVE_TLS_TOO_LARGE; }
+                        need = bo + clen;
                     }
                 }
-                if (headers_end > 0) {
-                    if (used >= headers_end + content_len) { rgo = 0; }
+                if (need >= 0) {
+                    if (used >= need) { rgo = 0; }
                 }
             }
         }
     }
-    return used;
+    if (need < 0) {
+        if (used >= max) { return 0 - SERVE_TLS_TOO_LARGE; }   # no header block in a full buffer
+        if (used == 0) { return 0; }
+        return 0 - SERVE_TLS_INCOMPLETE;
+    }
+    if (used < need) { return 0 - SERVE_TLS_INCOMPLETE; }
+    store64(extra, used - need);
+    return need;
 }
 
-# TLS accept loop. One TLS connection per HTTP/1.0 request (Connection: close):
-# accept → fresh server ctx (re-parses creds per connection) → handshake → recv
-# request → dispatch with _serve_tls_ctx set so the response goes back over TLS →
-# close. Single-threaded/sequential like sandhi_server_run, so the global ctx is
+# TLS accept loop: accept → a server ctx in the per-connection arena → handshake
+# → serve requests on the connection (keep-alive, v0.8.9) until the client
+# closes, a deadline passes, or a request is refused → close. Each request is
+# dispatched with _serve_tls_ctx set so the response goes back over TLS.
+# Single-threaded/sequential like sandhi_server_run, so the global ctx is
 # connection-safe. cert/key DER buffers are loaded once by the caller.
 fn _serve_run_tls(listen_addr, port, cert, cert_len, key, key_len) {
     var sfd_r_t, sfd_r_v = tcp_socket();
@@ -1458,7 +1498,7 @@ fn _serve_run_tls(listen_addr, port, cert, cert_len, key, key_len) {
     if (is_err_result(sock_listen(sfd, 16)) == 1) {
         eprintln("sit: listen failed"); return 1;
     }
-    var reqbuf = alloc(SERVE_TLS_REQ_MAX);
+    var reqbuf = alloc(SERVE_REQ_MAX);
     # C1 (1.7.4): each connection's TLS state — the ctx, the handshake, the
     # transcript and key schedule, the record buffers — is built in this arena
     # and reclaimed when the connection closes. tls_native_new_server builds it
@@ -1493,10 +1533,27 @@ fn _serve_run_tls(listen_addr, port, cert, cert_len, key, key_len) {
                         # each response by exact Content-Length, so the stream
                         # stays framed across requests.
                         var alive = 1;
+                        var extra[8];
                         while (alive == 1) {
                             tls_native_set_deadline(ctx, clock_now_ns() + SERVE_TLS_DEADLINE_NS);
-                            var n = _serve_tls_recv_request(ctx, reqbuf, SERVE_TLS_REQ_MAX);
-                            if (n <= 0) { alive = 0; }
+                            var n = _serve_tls_recv_request(ctx, reqbuf, SERVE_REQ_MAX, &extra);
+                            if (n <= 0) {
+                                alive = 0;
+                                # A refused request is answered, then the connection
+                                # closes: what follows it cannot be framed.
+                                var code = 0;
+                                if (n == 0 - SERVE_TLS_TOO_LARGE) { code = 413; }
+                                if (n == 0 - SERVE_TLS_BAD_FRAMING) { code = 400; }
+                                if (n == 0 - SERVE_TLS_UNSUPPORTED) { code = 501; }
+                                if (code != 0) {
+                                    tls_native_set_deadline(ctx, clock_now_ns() + SERVE_TLS_DEADLINE_NS);
+                                    _serve_set_tls_ctx(ctx);
+                                    if (code == 413) { _serve_send_status(cfd, 413, "Payload Too Large"); }
+                                    if (code == 400) { _serve_send_status(cfd, 400, "Bad Request"); }
+                                    if (code == 501) { _serve_send_status(cfd, 501, "Not Implemented"); }   #skip-lint: HTTP 501, as sandhi answers it
+                                    _serve_set_tls_ctx(0);
+                                }
+                            }
                             else {
                                 _serve_tls_send_failed = 0;
                                 tls_native_set_deadline(ctx, clock_now_ns() + SERVE_TLS_DEADLINE_NS);
@@ -1504,6 +1561,9 @@ fn _serve_run_tls(listen_addr, port, cert, cert_len, key, key_len) {
                                 serve_handle_request(0, cfd, reqbuf, n);
                                 _serve_set_tls_ctx(0);
                                 if (_serve_tls_send_failed == 1) { alive = 0; }
+                                # Pipelined bytes are not carried over: answer this
+                                # request, then close (sit's client never pipelines).
+                                if (load64(&extra) > 0) { alive = 0; }
                             }
                         }
                     }
@@ -1752,5 +1812,11 @@ fn cmd_serve() {
         _serve_print_banner(bind_addr, 0, 0);
     }
     stdout_flush();
-    return sandhi_server_run(bind_addr, port, &serve_handle_request, 0);
+    # 1.7.6 (N2): an options struct only to raise the request cap to
+    # SERVE_REQ_MAX. Every other option keeps the default sandhi_server_run
+    # used (30 s idle, 60 s per request, no stop flag).
+    var opts = sandhi_server_options_new();
+    if (opts == 0) { eprintln("sit: cannot allocate server options"); return 1; }
+    sandhi_server_options_max_request(opts, SERVE_REQ_MAX);
+    return sandhi_server_run_opts(bind_addr, port, &serve_handle_request, 0, opts);
 }

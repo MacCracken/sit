@@ -14,7 +14,7 @@ exit 1 cleanly, not crash or hang.
 usage: deep_pack.py <path-to-sit> [workdir]
 Prints one PASS / FAIL / SKIP line per case; exits 1 on any FAIL.
 """
-import hashlib, os, shutil, struct, subprocess, sys, tempfile, zlib
+import hashlib, os, shutil, struct, subprocess, sys, tempfile, time, zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from packlib import *
@@ -239,6 +239,99 @@ def case_real_git():
            % (deep[0][0], len(past) - bad, len(past)))
 
 
+# ── 1.7.6 ────────────────────────────────────────────────────────────────────
+def case_empty_object():
+    """R3: a 0-byte blob packs to an empty zlib stream; 1.7.5 read that valid
+    inflate as a failure, so every empty file in a gc'd repo was unreadable."""
+    e = oid_of(b"blob", b"")
+    repo = write_packs(os.path.join(ROOT, "empty_obj"), {"x": [(e, 3, b"", None)]})
+    rc, out = cat(repo, e)
+    report(rc == 0 and out == b"", "empty_packed_blob", "exit=%s %dB" % (rc, len(out)))
+
+
+def case_chain_budget():
+    """R4: 4095 steps of 16 MB results is 64 GiB of work (244 s of CPU on 1.7.5). The
+    read stops at the 4 GiB chain budget instead — fast, and refused."""
+    S = 16000000
+    base = bytes(S)
+    oids = ["%040x" % (0x100000 + i) for i in range(4096)]
+    d = delta_varint(S) + delta_varint(S)
+    off = 0
+    while off < S:
+        n = min(S - off, 0xFFFF)
+        d += copy_op(off, n)
+        off += n
+    entries = [(oids[0], 3, base, None)]
+    for i in range(1, 4096):
+        entries.append((oids[i], "ofs", d, oids[i - 1]))
+    repo = write_packs(os.path.join(ROOT, "chain_budget"), {"x": entries}, level=9)
+    t = time.time()
+    rc, _ = cat(repo, oids[4095], timeout=120)
+    el = time.time() - t
+    report(rc == 1 and el < 60, "chain_output_budget", "exit=%s %.1fs" % (rc, el))
+
+
+def case_chain_past_1gib():
+    """R4 follow-up: a chain git writes legitimately — 100 steps of a 16 MB
+    result, 1.6 GB of work — must still read. The first cut of the budget
+    (1 GiB) refused it, as it refused older revisions of a 12 MB file after
+    `git repack --depth=250`."""
+    S = 16000000
+    base = bytes(S)
+    oids = ["%040x" % (0x300000 + i) for i in range(101)]
+    d = delta_varint(S) + delta_varint(S)
+    off = 0
+    while off < S:
+        n = min(S - off, 0xFFFF)
+        d += copy_op(off, n)
+        off += n
+    entries = [(oids[0], 3, base, None)]
+    for i in range(1, 101):
+        entries.append((oids[i], "ofs", d, oids[i - 1]))
+    repo = write_packs(os.path.join(ROOT, "chain_1600mib"), {"x": entries}, level=9)
+    rc, out = cat(repo, oids[100], timeout=120)
+    report(rc == 0 and out == base, "chain_100x16MB_reads", "exit=%s %dB" % (rc, len(out)))
+
+
+def case_ref_cycle_many_packs():
+    """R4: every REF link re-listed the pack directory and probed every .idx;
+    a cycle beside 1,000 filler packs cost 13 s per refused read on 1.7.5."""
+    x, y = "11" * 20, "22" * 20
+    d = delta_varint(5) + delta_varint(5) + bytes([5]) + b"abcde"
+    packs = {"x": [(x, "ref", d, y), (y, "ref", d, x)]}
+    for i in range(1000):
+        packs["f%04d" % i] = [("%040x" % (0xabc000 + i), "ref", d, "33" * 20)]
+    repo = write_packs(os.path.join(ROOT, "ref_cycle_many"), packs)
+    t = time.time()
+    rc, _ = cat(repo, x, timeout=120)
+    el = time.time() - t
+    report(rc == 1 and el < 5, "ref_cycle_1000_packs", "exit=%s %.2fs" % (rc, el))
+
+
+def case_ref_loose_base():
+    """R5: a REF_DELTA whose base is a LOOSE object — the content is right (the
+    1.7.5 leak of that base is measured by the read probe, not here)."""
+    base = b"loose base line\n" * 200
+    new = base + b"tail\n"
+    bo, no = oid_of(b"blob", base), oid_of(b"blob", new)
+    repo = write_packs(os.path.join(ROOT, "ref_loose"), {"x": [(no, "ref", delta_append(base, new), bo)]})
+    ld = os.path.join(repo, ".git", "objects", bo[:2])
+    os.makedirs(ld, exist_ok=True)
+    open(os.path.join(ld, bo[2:]), "wb").write(zlib.compress(b"blob %d\0" % len(base) + base))
+    rc, out = cat(repo, no)
+    report(rc == 0 and out == new, "ref_delta_loose_base", "exit=%s" % rc)
+
+
+def case_fifo_idx():
+    """R11: a FIFO where an .idx should be blocked the open forever."""
+    c = b"after the fifo\n"
+    o = oid_of(b"blob", c)
+    repo = write_packs(os.path.join(ROOT, "fifo_idx"), {"y": [(o, 3, c, None)]})
+    os.mkfifo(os.path.join(repo, ".git", "objects", "pack", "pack-a.idx"))
+    rc, out = cat(repo, o, timeout=20)
+    report(rc == 0 and out == c, "fifo_idx_skipped", "exit=%s" % rc)
+
+
 def main():
     shutil.rmtree(ROOT, ignore_errors=True)
     os.makedirs(ROOT)
@@ -251,6 +344,12 @@ def main():
     case_ref_cycle()
     case_big_pack()
     case_real_git()
+    case_empty_object()
+    case_chain_budget()
+    case_chain_past_1gib()
+    case_ref_cycle_many_packs()
+    case_ref_loose_base()
+    case_fifo_idx()
     if FAILS:
         print("\n%d deep-pack case(s) failed: %s" % (len(FAILS), ", ".join(FAILS)))
         return 1

@@ -17,6 +17,13 @@
 # objects of a repo repacked with `--depth=250` (git gc --aggressive's old
 # default, and still common advice) read as missing (D6, 1.7.4).
 var _PACK_DELTA_MAX_DEPTH = 4095;
+# 1.7.6 (R4): the most a single read may produce across its whole delta chain.
+# Each step is held to 16 MiB, but 4095 such steps is 64 GiB of work — a 114 KB
+# crafted pack took `sit cat-file` 244 s of CPU on 1.7.5. 4 GiB covers a
+# `git repack --depth=250` (still common advice) of a blob at sit's 16 MiB
+# object ceiling; 1 GiB, the first cut, refused the older revisions of a 12 MB
+# file repacked that way, which git reads. Past it the object reads as missing.
+var _PACK_CHAIN_MAX_OUT = 4294967296;
 # One link of a chain being resolved: the delta object's pack {data, len}, where
 # its zlib payload starts, and its declared (inflated) size.
 var _PACK_LINK = 32;
@@ -190,14 +197,24 @@ var _git_file_cache = 0;
 
 # Map `path` read-only into out_pair {addr, len}. 0, or -1 when it cannot be
 # opened, is empty, or mmap refuses.
+#
+# 1.7.6: -1 when it cannot be opened (or is not a regular file — a FIFO
+# blocked the open forever, R11), -2 when it opened but mmap refused, which is
+# the only case _git_file_cached falls back to reading. The joined path is on
+# the stack (R14): sit_abs kept ~320 B on the heap per lookup of an .idx that
+# cannot be opened, since failures are not cached.
 fn _git_file_map(path, out_pair) {
-    var fd = file_open(sit_abs(path), 0, 0);
+    var abuf[4352];
+    var ap = sit_abs_into(path, &abuf, 4352);
+    if (ap == 0) { return 0 - 1; }
+    if (path_is_regular(ap) == 0) { return 0 - 1; }
+    var fd = file_open(ap, 0, 0);
     if (fd < 0) { return 0 - 1; }
     var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
     if (size <= 0) { file_close(fd); return 0 - 1; }
     var addr = mmap_file_ro(fd, size);
     file_close(fd);                                # the mapping outlives the fd
-    if (addr == 0) { return 0 - 1; }
+    if (addr == 0) { return 0 - 2; }
     store64(out_pair, addr);
     store64(out_pair + 8, size);
     return 0;
@@ -212,7 +229,9 @@ fn _git_file_cached(path, out_pair) {
         return 0;
     }
     var pr[16];
-    if (_git_file_map(path, &pr) != 0) {
+    var mr = _git_file_map(path, &pr);
+    if (mr == 0 - 1) { return 0 - 1; }
+    if (mr != 0) {
         if (read_file_heap(path, &pr) != 0) { return 0 - 1; }
     }
     var cell = alloc_or_die(16);
@@ -367,6 +386,23 @@ fn _git_apply_delta(base, base_len, delta, delta_len, out24) {
     return 0;
 }
 
+# Copy `n` bytes, eight at a time (1.7.6, R4). Delta copy ops go through this:
+# stdlib memcpy is a byte loop (~140 MB/s), which made a deep chain of large
+# results cost minutes. The source (a base or a delta) never overlaps `dst`.
+fn _pack_copy(dst, src, n) {
+    var i = 0;
+    var w = n - 7;
+    while (i < w) {
+        store64(dst + i, load64(src + i));
+        i = i + 8;
+    }
+    while (i < n) {
+        store8(dst + i, load8(src + i));
+        i = i + 1;
+    }
+    return dst;
+}
+
 # _git_apply_delta into a caller's buffer of `out_cap` bytes. Returns the result
 # length, or negative: -1 a bad header, -2 `out_cap` below the declared size,
 # -3..-9 a bad instruction. 1.7.4 (D6): split out so a delta chain reuses two
@@ -406,7 +442,7 @@ fn _git_apply_delta_into(base, base_len, delta, delta_len, out, out_cap) {
                     else {
                         if (op_out + csize > result_size) { err = 0 - 4; }
                         else {
-                            memcpy(out + op_out, base + coff, csize);
+                            _pack_copy(out + op_out, base + coff, csize);
                             op_out = op_out + csize;
                         }
                     }
@@ -482,7 +518,12 @@ fn _pack_inflate(pdata, plen, body, size, out_len) {
     if (buf == 0) { return 0; }
     var got = zlib_decompress_with_ratio_cap(pdata + body, plen - body,
       buf, size + 16, SIT_MAX_INFLATE_RATIO);
-    if (got <= 0) { fl_free(buf); return 0; }
+    # 1.7.6 (R3): errors are negative; 0 bytes is a valid inflate (an empty
+    # file — `__init__.py`, `.gitkeep` — packs to exactly that), and was read
+    # as a failure, so every empty blob in a gc'd repo was unreadable. git
+    # requires the result to be the size the header declared; so does this.
+    if (got < 0) { fl_free(buf); return 0; }
+    if (got != size) { fl_free(buf); return 0; }
     store64(out_len, got);
     return buf;
 }
@@ -498,6 +539,7 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
     var base = 0;            # the base's bytes once found
     var base_len = 0;
     var base_owned = 0;      # 1 when `base` is a freelist buffer this read made
+    var loose_buf = 0;       # a loose base's own buffer, freed when the chain is done
     var rc = 0;
     var walking = 1;
     while (walking == 1) {
@@ -584,8 +626,12 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
                         nlinks = nlinks + 1;
                         var loose24[24];
                         if (_git_read_loose(&base_hex, &loose24) == 0) {
-                            # A loose base carries its framing; step past it. It
-                            # is the loose reader's buffer, not this read's.
+                            # A loose base carries its framing; step past it.
+                            # 1.7.6 (R5): the buffer is the loose reader's
+                            # freelist allocation, handed to this read — it was
+                            # never freed, so a 4 MiB loose base was kept on
+                            # every read through it.
+                            loose_buf = load64(&loose24);
                             base = load64(&loose24) + load64(&loose24 + 16);
                             base_len = load64(&loose24 + 8) - load64(&loose24 + 16);
                             if (base_len < 0) { rc = 0 - 18; }
@@ -617,6 +663,7 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
     var other_cap = 0;
     var dbuf = 0;
     var dcap = 0;
+    var chain_out = 0;
     var li = nlinks - 1;
     while (li >= 0) {
         if (rc == 0) {
@@ -656,6 +703,10 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
             }
             if (rc == 0) {
                 var ar = _git_apply_delta_into(base, base_len, dbuf, dlen, other, other_cap);
+                if (ar >= 0) {
+                    chain_out = chain_out + ar;
+                    if (chain_out > _PACK_CHAIN_MAX_OUT) { ar = 0 - 19; }
+                }
                 if (ar < 0) { rc = ar; }
                 else {
                     # The output becomes the next base; the old base's buffer, if
@@ -677,6 +728,7 @@ fn _git_pack_obj(pdata, plen, offset, out24) {
     }
     if (dbuf != 0) { fl_free(dbuf); }
     if (other != 0) { fl_free(other); }
+    if (loose_buf != 0) { fl_free(loose_buf); }      # never `base` by now (R5)
     fl_free(links);
     if (rc != 0) {
         if (base_owned == 1) { fl_free(base); }
@@ -713,7 +765,40 @@ var _GIT_PACKDIR_TRIES = 16;
 # is not a pack git wrote, and is skipped.
 var _GIT_PACKNAME_MAX = 255;
 
+# 1.7.6 (R4): the .idx / .pack of the last hit, tried before the directory is
+# listed. Reads cluster in one pack, and a REF_DELTA base is usually beside its
+# delta; every lookup re-listed the directory and probed every .idx, so a
+# REF chain beside 1,000 other packs cost 10 s per read. A hit is an id that
+# pack holds, so it is the right object; a miss falls through to the listing,
+# which still finds packs a later `git gc` wrote.
+var _git_last_idx = 0;
+var _git_last_pack = 0;
+
+# Forget the last hit. Called when a repo is opened: its path is repo-relative,
+# and another repo's .idx must never answer for this one's ids.
+fn _git_pack_forget_last() {
+    if (_git_last_idx != 0) { store8(_git_last_idx, 0); }
+    return 0;
+}
+
 fn _git_pack_locate(hex, out24) {
+    var have_last = 0;
+    if (_git_last_idx != 0) { if (load8(_git_last_idx) != 0) { have_last = 1; } }
+    if (have_last == 1) {
+        var qraw[32];
+        if (hex_decode_into(hex, _id_hexlen(), &qraw) != 0) {
+            var qoff = _git_idx_lookup(_git_last_idx, &qraw, _id_rawlen());
+            if (qoff >= 0) {
+                var qp[16];
+                if (_git_load_pack(_git_last_pack, &qp) == 0) {
+                    store64(out24, load64(&qp));
+                    store64(out24 + 8, load64(&qp + 8));
+                    store64(out24 + 16, qoff);
+                    return 0;
+                }
+            }
+        }
+    }
     var packdir = ".git/objects/pack";
     var dlen = 17;                                     # strlen(packdir)
     # S-26: route through the sit_abs seam like every other repo path (on agnos
@@ -787,6 +872,12 @@ fn _git_pack_locate(hex, out24) {
                                 store64(out24 + 8, load64(&pkp + 8));
                                 store64(out24 + 16, offset);
                                 rc = 0;
+                                if (_git_last_idx == 0) {
+                                    _git_last_idx = alloc_or_die(288);
+                                    _git_last_pack = alloc_or_die(288);
+                                }
+                                memcpy(_git_last_idx, &ipath, 288);
+                                memcpy(_git_last_pack, &ppath, 288);
                             }
                         }
                     }

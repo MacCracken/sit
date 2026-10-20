@@ -127,12 +127,17 @@ fn bench_patra_open_close(iters) {
     return 0;
 }
 
-# Insert `count` pseudo-random rows into an objects table so copy_objects has
-# something to walk. Uses a single open handle — this is the setup cost, not
-# part of the measured span.
-fn bench_populate_db(db, count, content_size) {
-    var content = alloc(content_size);
-    fill_pseudo_random(content, content_size);
+# Insert `count` real blob objects into an objects table so copy_objects has
+# something to copy, pushing each id onto `hashes`. Each is "blob <n>\0" plus
+# pseudo-random bytes (a different first word per object), zlib-compressed,
+# stored under its true SHA-256 — copy_objects verifies every object since
+# 1.7.6, so the made-up ids and raw bytes this used before measured a refusal.
+# Uses a single open handle — this is the setup cost, not part of the measured
+# span.
+fn bench_populate_db(db, count, content_size, hashes) {
+    var full_cap = content_size + 32;
+    var full = alloc(full_cap);
+    var cbuf = alloc(full_cap + 64 + full_cap / 10);
 
     var types[24];
     store64(&types +  0, 1);
@@ -141,16 +146,16 @@ fn bench_populate_db(db, count, content_size) {
 
     var i = 0;
     while (i < count) {
-        # Generate a deterministic 64-char hex key from i.
-        var hex = alloc(65);
-        var j = 0;
-        while (j < 64) {
-            var nibble = (i + j * 17) & 0xF;
-            if (nibble < 10) { store8(hex + j, 48 + nibble); }
-            else { store8(hex + j, 87 + nibble); }
-            j = j + 1;
-        }
-        store8(hex + 64, 0);
+        memcpy(full, "blob ", 5);
+        var dg = write_decimal(full + 5, content_size);
+        store8(full + 5 + dg, 0);
+        var ho = 5 + dg + 1;
+        fill_pseudo_random(full + ho, content_size);
+        store64(full + ho, i);                      # distinct content per object
+        var flen = ho + content_size;
+        var hex = hash_data(full, flen);
+        var clen = zlib_compress(full, flen, cbuf, full_cap + 64 + full_cap / 10);
+        vec_push(hashes, hex);
 
         var ivals[24];
         store64(&ivals + 8, 0);
@@ -159,9 +164,9 @@ fn bench_populate_db(db, count, content_size) {
         var slens[24];
         store64(&slens + 0, 64);
         var bptrs[24];
-        store64(&bptrs + 16, content);
+        store64(&bptrs + 16, cbuf);
         var blens[24];
-        store64(&blens + 16, content_size);
+        store64(&blens + 16, clen);
         patra_insert_row(db, "objects", 7, 3,
           &types, &ivals, &sptrs, &slens, &bptrs, &blens);
         i = i + 1;
@@ -169,9 +174,9 @@ fn bench_populate_db(db, count, content_size) {
     return 0;
 }
 
-# Measure the per-object copy cost of the fetch/push/clone inner loop. Matches
-# the current 3-SQL-op shape: has(dst, hex) + read_raw(src, hex) + insert_raw.
-# Setup is out of band; only the loop body is timed.
+# Measure the per-object copy cost of the fetch/push/clone inner loop:
+# has(dst, hex) + read_raw(src, hex) + verify (inflate + SHA-256, 1.7.6) +
+# insert_raw. Setup is out of band; only the loop body is timed.
 fn bench_copy_objects_per_row(count) {
     var src_path = "/tmp/sit-bench-copy-src.patra";
     var dst_path = "/tmp/sit-bench-copy-dst.patra";
@@ -181,27 +186,11 @@ fn bench_copy_objects_per_row(count) {
 
     var src_db = patra_open(src_path);
     patra_exec(src_db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
-    bench_populate_db(src_db, count, 256);
+    var hashes = vec_new();
+    bench_populate_db(src_db, count, 256, hashes);
 
     var dst_db = patra_open(dst_path);
     patra_exec(dst_db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
-
-    # Build the hashes vec the way walk_reachable_from_commit would.
-    var hashes = vec_new();
-    var i = 0;
-    while (i < count) {
-        var hex = alloc(65);
-        var j = 0;
-        while (j < 64) {
-            var nibble = (i + j * 17) & 0xF;
-            if (nibble < 10) { store8(hex + j, 48 + nibble); }
-            else { store8(hex + j, 87 + nibble); }
-            j = j + 1;
-        }
-        store8(hex + 64, 0);
-        vec_push(hashes, hex);
-        i = i + 1;
-    }
 
     # v0.7.3 changed copy_objects to (obj_src, dst_db, hashes, raw_cache).
     # The pre-v0.7.3 3-arg call here was stale — it passed a raw patra db
@@ -210,9 +199,10 @@ fn bench_copy_objects_per_row(count) {
     var raw_cache = map_new();
     var b = bench_new("copy-objects-100");
     bench_batch_start(b);
-    copy_objects(src, dst_db, hashes, raw_cache);
+    var cr = copy_objects(src, dst_db, hashes, raw_cache);
     bench_batch_stop(b, count);
     bench_report(b);
+    if (cr != count) { println("  (copy-objects-100: copied fewer objects than it was given)"); }
 
     patra_close(src_db);
     patra_close(dst_db);

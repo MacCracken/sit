@@ -75,6 +75,105 @@ fn resolve_hash(prefix, out_buf) {
     return ret;
 }
 
+# 1.7.6 (R10): the one inflate for a stored object, "<type> <len>\0<content>"
+# under zlib. It replaces seven copies of the same sizing (4x the compressed
+# size, retried at the 16 MiB ceiling), and sizes the retry from the object's
+# own header instead: a blob compressing better than 4:1 used to take a fresh
+# 16 MiB buffer per read — on the bump heap at most sites, so never returned.
+# A clone of 2,000 such 20 KB blobs peaked at 4.4 GB RSS with transparent
+# huge pages on. The result is a freelist buffer of about the object's size.
+#
+# Writes {ptr, dlen, content_off} to out24; the buffer is the caller's to
+# fl_free (or keep). Returns 0, -2 out of memory, -3 not a valid stream (or
+# past the ratio / 16 MiB caps), -4 no framing NUL.
+var _OBJ_INFLATE_MAX = 16777216;
+
+# Inflate stored object bytes into a freelist buffer sized for them (see above).
+fn obj_inflate_fl(compressed, clen, out24) {
+    var dec_cap = clen * 4;
+    if (dec_cap < 4096) { dec_cap = 4096; }
+    if (dec_cap > _OBJ_INFLATE_MAX) { dec_cap = _OBJ_INFLATE_MAX; }
+    var buf = fl_alloc(dec_cap);
+    if (buf == 0) { return 0 - 2; }
+    # Stale freelist bytes must not read as a header the inflate never wrote.
+    store64(buf, 0); store64(buf + 8, 0); store64(buf + 16, 0); store64(buf + 24, 0);
+    var dlen = zlib_decompress_with_ratio_cap(compressed, clen, buf, dec_cap, SIT_MAX_INFLATE_RATIO);
+    if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
+        if (dec_cap < _OBJ_INFLATE_MAX) {
+            # The output is written in order, so the header is in `buf`.
+            var want = obj_frame_total(buf, 32);
+            if (want > _OBJ_INFLATE_MAX) { fl_free(buf); return 0 - 3; }
+            var cap2 = want + 16;
+            if (want <= dec_cap) { cap2 = _OBJ_INFLATE_MAX; }   # header unreadable or lying
+            if (cap2 > _OBJ_INFLATE_MAX) { cap2 = _OBJ_INFLATE_MAX; }
+            fl_free(buf);
+            buf = fl_alloc(cap2);
+            if (buf == 0) { return 0 - 2; }
+            dlen = zlib_decompress_with_ratio_cap(compressed, clen, buf, cap2, SIT_MAX_INFLATE_RATIO);
+        }
+    }
+    if (dlen <= 0) { fl_free(buf); return 0 - 3; }
+    var nul = 0;
+    var scanning = 1;
+    while (scanning == 1) {
+        if (nul >= dlen) { scanning = 0; }
+        else {
+            if (load8(buf + nul) == 0) { scanning = 0; }
+            else { nul = nul + 1; }
+        }
+    }
+    if (nul >= dlen) { fl_free(buf); return 0 - 4; }
+    store64(out24, buf);
+    store64(out24 + 8, dlen);
+    store64(out24 + 16, nul + 1);
+    return 0;
+}
+
+# The whole framed length an object header at `buf` declares — "<type> <n>\0"
+# plus n — reading at most `avail` bytes; -1 when no well-formed header is there.
+fn obj_frame_total(buf, avail) {
+    var sp = 0 - 1;
+    var i = 0;
+    while (i < avail) {
+        if (sp < 0) {
+            var c = load8(buf + i) & 0xFF;
+            if (c == 32) { sp = i; }
+            else {
+                if (c < 97) { i = avail; }
+                if (c > 122) { i = avail; }
+            }
+        }
+        i = i + 1;
+    }
+    if (sp < 1) { return 0 - 1; }
+    var n = 0;
+    var j = sp + 1;
+    var digits = 0;
+    var end = 0 - 1;
+    while (j < avail) {
+        if (end < 0) {
+            var d = load8(buf + j) & 0xFF;
+            if (d == 0) { end = j; }
+            else {
+                if (d < 48) { j = avail; }
+                else {
+                    if (d > 57) { j = avail; }
+                    else {
+                        n = n * 10 + (d - 48);
+                        digits = digits + 1;
+                        if (digits > 10) { j = avail; }
+                    }
+                }
+            }
+        }
+        j = j + 1;
+    }
+    if (end < 0) { return 0 - 1; }
+    if (digits == 0) { return 0 - 1; }
+    if (digits > 10) { return 0 - 1; }
+    return end + 1 + n;
+}
+
 # Read and decompress an object by full 64-char hex hash.
 # On success, writes to out (24 bytes):
 #   out[0..8)    decompressed buffer ptr
@@ -136,45 +235,25 @@ fn read_object(hex, out) {
         return 0 - 4;
     }
 
-    var compressed = alloc_or_die(blen);
+    var compressed = fl_alloc(blen);
+    if (compressed == 0) {
+        patra_result_free(rs);
+        return 0 - 6;
+    }
     if (patra_result_read_bytes(db, rs, 0, 0, compressed) != 0) {
+        fl_free(compressed);
         patra_result_free(rs);
         return 0 - 5;
     }
     patra_result_free(rs);
 
-    # S-08 + P-06: multiplier history is 256× (pre-audit) → 16× (S-08, v0.6.0)
-    # → 4× (P-06, v0.6.9). 4× covers the typical sit object (commits, trees,
-    # source code blobs all sit at ratio ~2-3); legitimately high-ratio
-    # outliers retry at the 16 MiB ceiling. Critically, retry only on a
-    # confirmed -ERR_BUFFER_TOO_SMALL (-2) — other negative codes mean the
-    # stream is actually corrupt and more memory won't help. Fail fast.
-    var dec_cap = blen * 4;
-    if (dec_cap < 4096) { dec_cap = 4096; }
-    if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
-    var decompressed = alloc_or_die(dec_cap);
-    if (decompressed == 0) { return 0 - 6; }
-    var dlen = zlib_decompress_with_ratio_cap(compressed, blen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
-    if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
-        if (dec_cap < 16 * 1024 * 1024) {
-            dec_cap = 16 * 1024 * 1024;
-            decompressed = alloc_or_die(dec_cap);
-            if (decompressed == 0) { return 0 - 6; }
-            dlen = zlib_decompress_with_ratio_cap(compressed, blen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
-        }
-    }
-    if (dlen <= 0) { return 0 - 7; }
-
-    var nul = 0;
-    while (nul < dlen) {
-        if (load8(decompressed + nul) == 0) { break; }
-        nul = nul + 1;
-    }
-    if (nul >= dlen) { return 0 - 8; }
-
-    store64(out, decompressed);
-    store64(out + 8, dlen);
-    store64(out + 16, nul + 1);
+    # 1.7.6 (R10): obj_inflate_fl — freelist, sized from the header; the
+    # compressed copy is freed rather than kept on the bump heap per read.
+    var ir = obj_inflate_fl(compressed, blen, out);
+    fl_free(compressed);
+    if (ir == 0 - 2) { return 0 - 6; }
+    if (ir == 0 - 3) { return 0 - 7; }
+    if (ir != 0) { return 0 - 8; }
     return 0;
 }
 
@@ -453,7 +532,7 @@ fn type_code_of(type_str, type_len) {
 fn _ensure_object_index(db) {
     if (sf_exists(".sit/objects.indexed") == 1) { return 0; }
     if (patra_exec(db, "CREATE INDEX ON objects (hash)") != 0) { return 0 - 1; }
-    if (sf_write_all(".sit/objects.indexed", "1\n", 2) < 0) { return 0 - 1; }
+    if (sf_write_atomic(".sit/objects.indexed", "1\n", 2) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -535,34 +614,25 @@ fn object_db_migrate_from_loose(db) {
                         var compressed = load64(&pair);
                         var clen = load64(&pair + 8);
 
-                        # Sniff type from decompressed header for the INT column.
-                        # S-08 + P-06 (v0.6.9): 4× initial; retry at 16 MiB ceiling
-                        # only on confirmed -ERR_BUFFER_TOO_SMALL. Matches read_object.
-                        var dec_cap = clen * 4;
-                        if (dec_cap < 4096) { dec_cap = 4096; }
-                        if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
-                        var decompressed = alloc_or_die(dec_cap);
-                        var dlen = zlib_decompress_with_ratio_cap(compressed, clen,
-                          decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
-                        if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
-                            if (dec_cap < 16 * 1024 * 1024) {
-                                dec_cap = 16 * 1024 * 1024;
-                                decompressed = alloc_or_die(dec_cap);
-                                dlen = zlib_decompress_with_ratio_cap(compressed, clen,
-                                  decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
-                            }
-                        }
+                        # Sniff type from decompressed header for the INT column
+                        # (obj_inflate_fl, 1.7.6 — freed once sniffed).
+                        var sniff[24];
                         var type_code = 0;
-                        if (dlen > 5) {
-                            if (memeq(decompressed, "blob ", 5) == 1) { type_code = 0; }
-                            else {
-                                if (memeq(decompressed, "tree ", 5) == 1) { type_code = 1; }
+                        if (obj_inflate_fl(compressed, clen, &sniff) == 0) {
+                            var decompressed = load64(&sniff);
+                            var dlen = load64(&sniff + 8);
+                            if (dlen > 5) {
+                                if (memeq(decompressed, "blob ", 5) == 1) { type_code = 0; }
                                 else {
-                                    if (dlen > 7) {
-                                        if (memeq(decompressed, "commit ", 7) == 1) { type_code = 2; }
+                                    if (memeq(decompressed, "tree ", 5) == 1) { type_code = 1; }
+                                    else {
+                                        if (dlen > 7) {
+                                            if (memeq(decompressed, "commit ", 7) == 1) { type_code = 2; }
+                                        }
                                     }
                                 }
                             }
+                            fl_free(decompressed);
                         }
 
                         var types[24];
@@ -871,10 +941,17 @@ var _fsck_shallow = 0;
 # reported missing when absent (D2, 1.6.4). Reset per fsck run.
 var _fsck_optional = 0;
 
+# 1.7.6 (R12): reachable commits whose headers do not parse (no `tree` on line
+# 1, a second `tree`, a parent after other headers). Every reader refuses such
+# a commit, and the walk cannot follow its tree — so it is corruption, counted
+# toward `bad`, which also keeps `--prune` from deleting what it names.
+var _fsck_malformed = 0;
+
 # Reset fsck's missing-object list and its dedup set.
 fn fsck_missing_reset() {
     _fsck_missing = vec_new();
     _fsck_missing_seen = map_new();
+    _fsck_malformed = vec_new();
     return 0;
 }
 
@@ -924,6 +1001,9 @@ fn fsck_walk_reachable(root, seen) {
                         var t = fsck_extract_commit_tree(body, body_len);
                         if (t != 0) {
                             if (map_has(seen, t) == 0) { vec_push(queue, t); }
+                        }
+                        else {
+                            if (_fsck_malformed != 0) { vec_push(_fsck_malformed, hex); }
                         }
                         # S-27: a shallow boundary commit's parents were never
                         # fetched, so they may be absent on purpose — don't
@@ -1300,6 +1380,18 @@ fn cmd_fsck() {
             bad = bad + 1;
         }
         mi = mi + 1;
+    }
+
+    var mal = _fsck_malformed;
+    var mli = 0;
+    if (mal != 0) {
+        while (mli < vec_len(mal)) {
+            syscall(SYS_WRITE, STDERR, "malformed commit ", 17);
+            syscall(SYS_WRITE, STDERR, vec_get(mal, mli), 64);
+            syscall(SYS_WRITE, STDERR, " (header order: tree first, once; parents next)\n", 48);
+            bad = bad + 1;
+            mli = mli + 1;
+        }
     }
 
     # 1.6.4: a reachable tree with entries parse_tree had to drop (bad mode,

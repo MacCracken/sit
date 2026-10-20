@@ -31,7 +31,7 @@ default tier: `log` **2.18×**, `clone` **4.98×** — and sit is *faster* than 
 `commit`, and `fetch`. `clone`'s growth curve is still undiagnosed and tracked in the
 open; at 1,000 commits it was **60.80×**, which is the next number worth moving.
 
-**Hardening**: `1.3.6`–`1.3.9` were consumed by two security audits ([2026-08-17](docs/audit/2026-08-17-audit.md), [2026-08-18](docs/audit/2026-08-18-audit.md)) covering the `.git/` packfile reader, the wire clients, the `serve` daemon, and the merge core. Both audit backlogs are closed. Highlights, all fixed and regression-pinned: an out-of-bounds read in the packfile delta interpreter that leaked heap bytes into `cat-file` output; a three-way merge that crashed on an ordinary insert-only hunk; `ssh://` argument injection; and a `.sit/HEAD` symref that could write outside the repository.
+**Hardening**: `1.3.6`–`1.3.9` were consumed by two security audits ([2026-08-17](docs/audit/2026-08-17-audit.md), [2026-08-18](docs/audit/2026-08-18-audit.md)) covering the `.git/` packfile reader, the wire clients, the `serve` daemon, and the merge core. Both audit backlogs are closed. Highlights, all fixed and regression-pinned: an out-of-bounds read in the packfile delta interpreter that leaked heap bytes into `cat-file` output; a three-way merge that crashed on an ordinary insert-only hunk; `ssh://` argument injection; and a `.sit/HEAD` symref that could write outside the repository. Each minor line since closes with a P(-1) audit — [1.6.4](docs/audit/2026-10-19-audit.md) and [1.7.6](docs/audit/2026-10-19-1.7.6-audit.md). The 1.7.6 pass made `fetch` / `clone` verify every object against its id before storing it (a server could otherwise swap a blob under a signed commit), and closed a set of exit-0 data-loss paths in ordinary commands — octopus merge over an uncommitted edit, `reset --hard` leaving a merge behind, torn ref writes.
 
 ## Size and performance
 
@@ -95,7 +95,7 @@ cyrius fuzz tests/sit.fcyr    # 15 harnesses: hash / zlib / hex-decode / URL / s
 - [`CHANGELOG.md`](CHANGELOG.md) — shipped history (tagged releases) · [`docs/development/roadmap.md`](docs/development/roadmap.md) — what's next · [`docs/development/state.md`](docs/development/state.md) — live state snapshot
 - [`docs/adr/`](docs/adr/) — decisions, starting with [0001 — no FFI](docs/adr/0001-no-ffi-first-party-only.md)
 - [`docs/architecture/`](docs/architecture/) — non-obvious constraints that outlive the code
-- [`docs/audit/`](docs/audit/) — security audit reports, most recent [2026-08-18](docs/audit/2026-08-18-audit.md)
+- [`docs/audit/`](docs/audit/) — security audit reports, most recent [2026-10-19 (1.7.6)](docs/audit/2026-10-19-1.7.6-audit.md)
 - [`docs/examples/`](docs/examples/) — runnable examples
 
 ## Contributing & security

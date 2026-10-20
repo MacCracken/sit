@@ -63,6 +63,21 @@ fn cmd_add() {
         }
     }
 
+    # 1.7.6 (L14): the path is read, so it must not lead out of the repo. With
+    # `linkdir -> /outside`, `sit add linkdir/secret.txt` staged (and the next
+    # commit published) a file from outside the worktree; git refuses "beyond a
+    # symbolic link". A symlink itself is not followed either: sit has no
+    # symlink entries yet (git stores the link, not what it points at), and
+    # storing the target's bytes would turn the link into a copy on checkout.
+    if (_sf_parent_symlink(path) == 1) {
+        eprint3("sit: '", path, "' is beyond a symbolic link\n");
+        return 1;
+    }
+    if (path_lstat_kind(sit_abs(path)) == 0xA000) {
+        eprint3("sit: '", path, "' is a symbolic link — sit does not track symlinks yet\n");
+        return 1;
+    }
+
     var fd = sf_open(path, 0, 0);
     if (fd < 0) {
         syscall(SYS_WRITE, STDERR, "sit: cannot open '", 18);
@@ -110,7 +125,7 @@ fn cmd_add() {
     stdout_write("added ", 6);
     stdout_write(hex, 12);
     stdout_write(" ", 1);
-    stdout_write(path, path_len);
+    write_sanitized(STDOUT, path, path_len);   # 1.7.6 (R13)
     stdout_write("\n", 1);
     return 0;
 }
@@ -131,7 +146,7 @@ fn cmd_add() {
 fn _ensure_entries_index(db) {
     if (sf_exists(".sit/index.indexed") == 1) { return 0; }
     if (patra_exec(db, "CREATE INDEX ON entries (path)") != 0) { return 0 - 1; }
-    if (sf_write_all(".sit/index.indexed", "1\n", 2) < 0) { return 0 - 1; }
+    if (sf_write_atomic(".sit/index.indexed", "1\n", 2) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -330,7 +345,7 @@ fn rewrite_index(entries) {
                 if (streq(want, hex_encode(entry_hash(ce), 32)) == 0) { drop = 1; }
             }
             if (drop == 1) {
-                if (index_remove_path(cpath) != 0) { patra_rollback(db); return 0 - 1; }
+                if (_index_delete_row(db, cpath) != 0) { patra_rollback(db); return 0 - 1; }
             }
             ci = ci + 1;
         }
@@ -406,10 +421,40 @@ fn index_upsert(hash_hex, path) {
     # deleted with no replacement.
     var bytes = hex_decode(hash_hex, 64);
     if (bytes == 0) { return 0 - 1; }
+    if (strlen(path) == 0) { return 0 - 1; }
 
+    # 1.7.6 (L12): one transaction. In autocommit a failed page write inside
+    # patra's insert was not reported (the header write after it succeeded),
+    # so `sit add` printed "added" with nothing staged — and the DELETE before
+    # the INSERT was its own statement, so a refused INSERT left the path
+    # unstaged. In a transaction both statements land or neither does, and the
+    # commit reports a write that did not.
+    if (patra_begin(db) != PATRA_OK) { return 0 - 1; }
+    if (_index_delete_row(db, path) != 0) { patra_rollback(db); return 0 - 1; }
+    if (_index_insert_row(db, hash_hex, path) != 0) { patra_rollback(db); return 0 - 1; }
+    if (patra_commit(db) != PATRA_OK) { return 0 - 1; }
+    return 0;
+}
+
+# Move one staged entry from `src` to `dst` (a `sit mv`), in one transaction:
+# the old row goes and the new one arrives, or the index is unchanged.
+fn index_rename_path(src, dst, hash_hex) {
+    var db = get_index_db();
+    if (db == 0) { return 0 - 1; }
+    if (hex_decode(hash_hex, 64) == 0) { return 0 - 1; }
+    if (strlen(src) == 0) { return 0 - 1; }
+    if (strlen(dst) == 0) { return 0 - 1; }
+    if (patra_begin(db) != PATRA_OK) { return 0 - 1; }
+    if (_index_delete_row(db, src) != 0) { patra_rollback(db); return 0 - 1; }
+    if (_index_delete_row(db, dst) != 0) { patra_rollback(db); return 0 - 1; }
+    if (_index_insert_row(db, hash_hex, dst) != 0) { patra_rollback(db); return 0 - 1; }
+    if (patra_commit(db) != PATRA_OK) { return 0 - 1; }
+    return 0;
+}
+
+# DELETE the row for `path`. No transaction of its own — callers hold one.
+fn _index_delete_row(db, path) {
     var plen = strlen(path);
-    if (plen == 0) { return 0 - 1; }
-
     # `path` is external data (a working-tree filename), so it is escaped into
     # the statement rather than concatenated raw. patra_quote_str doubles each
     # embedded single quote, so the escaped form is at most 2*plen bytes.
@@ -422,7 +467,11 @@ fn index_upsert(hash_hex, path) {
     w = w + 1;
     store8(sql + w, 0);
     if (patra_exec(db, sql) != 0) { return 0 - 1; }
+    return 0;
+}
 
+# INSERT one (path, hash) row. No transaction of its own — callers hold one.
+fn _index_insert_row(db, hash_hex, path) {
     var types[16];
     store64(&types + 0, 1);
     store64(&types + 8, 1);
@@ -431,35 +480,12 @@ fn index_upsert(hash_hex, path) {
     store64(&sptrs + 0, path);
     store64(&sptrs + 8, hash_hex);
     var slens[16];
-    store64(&slens + 0, plen);
+    store64(&slens + 0, strlen(path));
     store64(&slens + 8, 64);
     var bptrs[16];
     var blens[16];
     if (patra_insert_row(db, "entries", 7, 2,
         &types, &ivals, &sptrs, &slens, &bptrs, &blens) != 0) { return 0 - 1; }
-    return 0;
-}
-
-# Remove one path from the staging index. Mirrors index_upsert's targeted
-# delete (v1.4.6) rather than going through rewrite_index, so removing a path
-# stays O(1) rows written instead of rewriting the whole table.
-fn index_remove_path(path) {
-    var db = get_index_db();
-    if (db == 0) { return 0 - 1; }
-    var plen = strlen(path);
-    if (plen == 0) { return 0 - 1; }
-
-    # `path` is external data, so it is escaped into the statement rather than
-    # concatenated raw — same reasoning as index_upsert.
-    var sql = alloc_or_die(plen + plen + 64);
-    var pfx = "DELETE FROM entries WHERE path = '";
-    var pl = strlen(pfx);
-    memcpy(sql, pfx, pl);
-    var w = pl + patra_quote_str(sql + pl, path, plen);
-    store8(sql + w, 39);
-    w = w + 1;
-    store8(sql + w, 0);
-    if (patra_exec(db, sql) != 0) { return 0 - 1; }
     return 0;
 }
 
@@ -667,6 +693,15 @@ fn cmd_reset() {
         }
         reflog_head_move(rl_old, &hex, reflog_msg_subject("reset: moving to ", target));
         conflicts_clear();      # the conflict it recorded is gone with the worktree
+        # 1.7.6 (L2): and so is the operation that was in progress, as git's
+        # `reset --hard` removes it. MERGE_HEAD survived, so after the habitual
+        # `merge` → conflict → `reset --hard HEAD`, the next commit — on this
+        # branch or, after a checkout, any other — recorded a two-parent merge
+        # of a branch none of whose content it held, and that branch could
+        # never be merged again ("already up to date").
+        if (sf_exists(".sit/MERGE_HEAD") == 1) { sf_unlink(".sit/MERGE_HEAD"); }
+        if (sf_exists(".sit/CHERRY_PICK_HEAD") == 1) { sf_unlink(".sit/CHERRY_PICK_HEAD"); }
+        if (sf_exists(".sit/REVERT_HEAD") == 1) { sf_unlink(".sit/REVERT_HEAD"); }
         stdout_write("HEAD reset --hard to ", 21);
         stdout_write(&hex, 12);
         stdout_write("\n", 1);
@@ -717,7 +752,7 @@ fn cmd_reset() {
         return 1;
     }
     stdout_write("unstaged '", 10);
-    stdout_write(path, path_len);
+    write_sanitized(STDOUT, path, path_len);   # 1.7.6 (R13)
     stdout_write("'\n", 2);
     return 0;
 }
@@ -770,6 +805,38 @@ fn cmd_rm() {
         }
     }
 
+    # 1.7.6 (L4): never delete work. Without --cached the file on disk must be
+    # exactly what HEAD has (or, for a path HEAD lacks, what is staged), and the
+    # index must agree. `sit rm` deleted a file with unstaged edits, and the edit
+    # was never hashed, so nothing could bring it back (git refuses: "has local
+    # modifications"). `sit rm --cached`, then deleting the file, does it on
+    # purpose.
+    if (cached == 0) {
+        if (path_lstat_kind(sit_abs(path)) == 0x8000) {
+            var disk_hex = hash_file_as_blob(path);
+            var want = 0;
+            if (in_head == 1) { want = tree_find_hash(head_entries, path); }
+            var ie = 0;
+            if (in_index == 1) { ie = index_find(index_entries, path); }
+            var differs = 0;
+            if (disk_hex == 0) { differs = 1; }
+            if (differs == 0) {
+                if (ie != 0) {
+                    if (memeq(hex_encode(entry_hash(ie), 32), disk_hex, 64) == 0) { differs = 1; }
+                }
+                if (want != 0) {
+                    if (memeq(want, disk_hex, 64) == 0) { differs = 1; }
+                }
+                else { if (ie != 0) { differs = 1; } }   # staged but not committed
+            }
+            if (differs == 1) {
+                eprint3("sit: '", path, "' has changes not in HEAD — nothing removed\n");
+                eprintln("sit:   to discard them, `sit rm --cached` it and delete the file yourself");
+                return 1;
+            }
+        }
+    }
+
     if (index_entries != 0) {
         var filtered = vec_new();
         var n = vec_len(index_entries);
@@ -800,7 +867,7 @@ fn cmd_rm() {
     }
 
     stdout_write("rm '", 4);
-    stdout_write(path, path_len);
+    write_sanitized(STDOUT, path, path_len);   # 1.7.6 (R13)
     stdout_write("'\n", 2);
     return 0;
 }
@@ -1376,12 +1443,13 @@ fn sf_rename(old, new) {
     # `meta -> .sit` link into .sit/refs/heads as a bogus branch.
     if (_sf_parent_symlink(old) == 1) { return 0 - 40; }
     if (_sf_parent_symlink(new) == 1) { return 0 - 40; }
-    #ifdef CYRIUS_TARGET_AGNOS
-    return syscall(SYS_RENAME, old, strlen(old), new, strlen(new));
-    #endif
-    #ifndef CYRIUS_TARGET_AGNOS
-    return sys_rename(old, new);
-    #endif
+    # 1.7.6 (K1): resolved through the repo root like every other sf_* wrapper.
+    # On Linux the CLI root is the cwd, so nothing changed there; on agnos, where
+    # the root is an absolute path and there is no cwd, `sit mv` renamed the
+    # wrong paths.
+    var ob[4352];
+    var nb[4352];
+    return _sit_rename_raw(_sf_abs(old, &ob), _sf_abs(new, &nb));
 }
 
 # `sit mv <src> <dst>` — rename in the working tree AND restage in one step.
@@ -1417,6 +1485,13 @@ fn cmd_mv() {
         eprintln("sit: source and destination are the same path");
         return 1;
     }
+    # 1.7.6 (L13): add's 255-byte column limit, checked BEFORE the rename. A
+    # longer name was renamed on disk, unstaged at the source, then refused at
+    # the destination — leaving a staged deletion the next commit recorded.
+    if (strlen(dst) > 255) {
+        eprint3("sit: '", dst, "' is longer than the 255-byte index path limit\n");
+        return 1;
+    }
     if (sf_exists(src) != 1) {
         eprintln("sit: source path does not exist");
         return 1;
@@ -1444,20 +1519,21 @@ fn cmd_mv() {
 
     # Index: drop the old path, stage the new one at the SAME blob. No rehash —
     # the content did not change, and rehashing would be both wasted work and a
-    # chance for the two paths to disagree.
-    if (index_remove_path(src) != 0) {
-        eprintln("sit: renamed on disk but failed to unstage the old path");
-        return 1;
-    }
-    if (index_upsert(hash_hex, dst) != 0) {
-        eprintln("sit: renamed on disk but failed to stage the new path");
+    # chance for the two paths to disagree. One transaction (1.7.6, L13): if it
+    # is refused the index is as it was, and the file goes back where it was.
+    if (index_rename_path(src, dst, hash_hex) != 0) {
+        if (sf_rename(dst, src) != 0) {
+            eprint3("sit: failed to update the index, and could not move the file back — it is at '", dst, "'\n");
+            return 1;
+        }
+        eprintln("sit: failed to update the index — nothing moved");
         return 1;
     }
 
     stdout_write("renamed ", 8);
-    stdout_write(src, strlen(src));
+    write_sanitized(STDOUT, src, strlen(src));   # 1.7.6 (R13)
     stdout_write(" -> ", 4);
-    stdout_write(dst, strlen(dst));
+    write_sanitized(STDOUT, dst, strlen(dst));
     stdout_write("\n", 1);
     return 0;
 }

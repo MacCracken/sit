@@ -285,22 +285,42 @@ fn _reflog_push_oid_if_valid(p, roots) {
 
 # Collect every old+new oid from a reflog buffer into `roots` (skipping the
 # all-zeros creation sentinel). Pure parse over one log file's bytes.
+#
+# 1.7.6 (R7): one pass. Each line's start was found by rescanning from byte 0,
+# so N entries cost N²/2 line scans — 75 s of `sit fsck` at 20,000 entries,
+# and reflogs never expire. Same lines as before: every LF-terminated one.
 fn _reflog_collect_oids(buf, len, roots) {
-    var count = _reflog_count_in_buf(buf, len);
-    var d = 0;
-    while (d < count) {
-        var s = _reflog_line_start(buf, len, d);
-        if (s >= 0) {
+    var s = 0;
+    var i = 0;
+    while (i < len) {
+        if (load8(buf + i) == 10) {
             if (s + 129 <= len) {
                 if (load8(buf + s + 64) == 32) {
                     _reflog_push_oid_if_valid(buf + s, roots);        # old
                     _reflog_push_oid_if_valid(buf + s + 65, roots);   # new
                 }
             }
+            s = i + 1;
         }
-        d = d + 1;
+        i = i + 1;
     }
     return 0;
+}
+
+# Start offsets of the LF-terminated lines in `buf`, in order, in one pass
+# (1.7.6, R7): line k starts at vec_get(result, k).
+fn _reflog_line_starts(buf, len) {
+    var starts = vec_new();
+    var s = 0;
+    var i = 0;
+    while (i < len) {
+        if (load8(buf + i) == 10) {
+            vec_push(starts, s);
+            s = i + 1;
+        }
+        i = i + 1;
+    }
+    return starts;
 }
 
 # ── File wrappers ──────────────
@@ -411,7 +431,8 @@ fn cmd_reflog() {
     if (read_file_heap(path, &pair) != 0) { return 0; }
     var buf = load64(&pair);
     var len = load64(&pair + 8);
-    var count = _reflog_count_in_buf(buf, len);
+    var starts = _reflog_line_starts(buf, len);       # 1.7.6 (R7): once
+    var count = vec_len(starts);
     if (count == 0) { return 0; }
 
     var label_len = strlen(ref_label);
@@ -422,7 +443,7 @@ fn cmd_reflog() {
         if (limit >= 0) { if (shown >= limit) { stop = 1; } }
         if (stop == 1) { d = count; }       # terminate (no break with vars)
         else {
-            var s = _reflog_line_start(buf, len, count - 1 - d);
+            var s = vec_get(starts, count - 1 - d);
             if (s >= 0) {
                 if (s + 77 <= len) {
                     # Display sanitization: .sit/logs is on-disk data that

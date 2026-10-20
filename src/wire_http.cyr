@@ -1125,7 +1125,9 @@ fn _wire_http_parse_refs(body, blen, out_pairs) {
                 }
                 if (j + 8 >= blen) { return 0 - 1; }
                 var hash_start = j + 8;
-                if (hash_start + 64 > blen) { return 0 - 1; }
+                # 1.7.6 (N7): `>=`, since the closing quote at hash_start + 64 is
+                # read next; `>` let that read land one byte past the body.
+                if (hash_start + 64 >= blen) { return 0 - 1; }
                 if (load8(body + hash_start + 64) != 34) { return 0 - 1; }
                 # Validate name + hash.
                 var name = alloc(nlen + 1);
@@ -1249,40 +1251,15 @@ fn http_remote_read_raw(h, hex, raw_out) {
 }
 
 # Mirror of db_object_read_both for HTTP: read raw, then decompress
-# with the same 4×-initial / 16 MiB-ceiling sizing policy so
-# walk_reachable_* sees identical failure modes regardless of
-# transport.
+# through the same obj_inflate_fl, so walk_reachable_* sees identical
+# failure modes regardless of transport.
 
 # GET one object and also inflate it (ratio- and 16 MiB-capped).
 fn http_remote_read_both(h, hex, raw_out, deco_out) {
     if (http_remote_read_raw(h, hex, raw_out) != 0) { return 0 - 1; }
     var compressed = load64(raw_out);
     var clen = load64(raw_out + 8);
-    var dec_cap = clen * 4;
-    if (dec_cap < 4096) { dec_cap = 4096; }
-    if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
-    var decompressed = alloc(dec_cap);
-    if (decompressed == 0) { return 0 - 2; }
-    var dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
-    if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
-        if (dec_cap < 16 * 1024 * 1024) {
-            dec_cap = 16 * 1024 * 1024;
-            decompressed = alloc(dec_cap);
-            if (decompressed == 0) { return 0 - 2; }
-            dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
-        }
-    }
-    if (dlen <= 0) { return 0 - 3; }
-    var nul = 0;
-    while (nul < dlen) {
-        if (load8(decompressed + nul) == 0) { break; }
-        nul = nul + 1;
-    }
-    if (nul >= dlen) { return 0 - 4; }
-    store64(deco_out,      decompressed);
-    store64(deco_out +  8, dlen);
-    store64(deco_out + 16, nul + 1);
-    return 0;
+    return obj_inflate_fl(compressed, clen, deco_out);   # 1.7.6 (R10)
 }
 
 # ── Push primitives (v0.7.6) ────────────────────────────

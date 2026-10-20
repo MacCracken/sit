@@ -4,6 +4,126 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.6] — 2026-10-19 — closing 1.7.x: fetched objects are verified, and a P(-1) audit of everything since 1.6.4
+
+The last 1.7.x patch: a full P(-1) hardening and closeout pass over 1.7.0 → 1.7.5. Four reviews (network, local writes, the untrusted read path, external advisories) and a re-read of the fixes found 45 issues, each reproduced against 1.7.5 and red/green-tested:
+- **4 HIGH:** all fixed.
+- **22 MEDIUM:** 20 fixed, 2 deferred to the minors whose surface they need.
+- **19 LOW:** all fixed.
+
+No CRITICAL. An independent review of the finished diff then found five regressions in the first cut of the fixes (a chain budget that refused real repacks, a rebase loop, a config file's mode reset, `sit show`, a symlink in the ownership test); all fixed before release. The full report is [`docs/audit/2026-10-19-1.7.6-audit.md`](docs/audit/2026-10-19-1.7.6-audit.md). The toolchain stays at cyrius 6.7.15, and there is no new surface.
+
+### Security — fetch and clone stored whatever the server sent (HIGH, N1)
+
+`copy_objects` stored each object under the id the server named without hashing it; ADR 0006 and CLAUDE.md said not to re-hash on the transfer path and left that to `fsck`. A hostile server, or a proxy in front of an honest one, could answer a blob id with other bytes: 1.7.5 cloned it (rc 0), checked it out, and `verify-commit` still said "good", since the signature covers the tree id, not the stored bytes. Now every object sit stores from elsewhere is inflated, its framing type checked against the type it was sent as, and its SHA-256 compared with its id, **before** it lands and before any ref moves. Commits and trees are verified where the walk reads them (it inflates them anyway), blobs in `copy_objects`; `sit serve` checks pushed objects with the same `_object_verify`. Nothing is recompressed: what is stored is the compressed bytes received. ADR 0006 is amended, and the CLAUDE.md rule now reads *verify everything stored from elsewhere; never recompress*.
+
+Cost, by CPU time against 1.7.5: on a 100-commit file:// clone, 77.4 ms → 87.6 ms (minimum of 21 alternating runs), of which verification is 6.6 ms — the same build with it short-circuited takes 81.0 ms. On blob-heavy content it is one SHA-256 pass over the received bytes: 500 compressible 21 KB blobs (10.5 MB) clone in 0.63 s against 0.44 s.
+
+### Security — `sit serve`
+
+- **Pushes of objects over ~64 KiB failed over every network transport (N2).** sandhi's default 64 KiB request buffer. All three loops (plain, `--tls`, `--stdio`) now take requests up to 16 MiB + 64 KiB, the object ceiling plus headers.
+- **The fast-forward check had no work bound (N4).** The walk now carries the 60 s request deadline the TLS loop already applies, and a push past it is answered 503.
+- **The `--tls` loop skipped sandhi's request-framing checks (N5).** It answers 413 / 400 / 501 like the plain loop, and closes after one request when bytes are pipelined behind it.
+- **A pushed ref must name a commit (heads) or a commit / tag object (tags)**, and a pushed commit whose headers no reader accepts is refused (R12, below).
+- **An unreadable ref file read as absent (K2):** the push then created it over the old tip with no fast-forward check, and a FIFO there blocked the server. Existence is `lstat`'s answer now; anything but a regular file is a 500.
+
+### Security — trust and credentials
+
+- **The TOFU pin store was rewritten in place, and a failed write ignored (N3).** A full disk or an interrupted write left an empty `~/.sit/known_certs`, and the next connection pinned whatever certificate it was shown. Pins are now recorded under a lock file, re-read under the lock (a racing writer's pin is seen), and renamed into place; a pin file that exists but cannot be read refuses the connection.
+- **A repo-local `.sit/config` could send any 0600 one-line file as the bearer token (X5)**, to a URL of its choosing, or turn certificate checking off. `remote.<name>.tokenFile` and `http.sslVerify` / `caBundle` / `sslCert` / `sslKey` count from `.sit/config` only when the effective user owns `.sit/` and the config itself, by `lstat` so a planted symlink does not borrow a file's owner (git's safe.directory test); otherwise `~/.sitconfig` decides, with a warning.
+- **file:// push validated neither the branch nor the remote ref (L11 / X1 / X3).** `sit push origin ../../victim/notes.txt` overwrote a file outside the remote, and a symlinked remote ref was read as "no tip" and then written through. The branch is checked with `refname_valid`, the remote ref is written root-anchored and atomically (`sf_write_atomic_at`), and a symlinked or unreadable remote ref is refused.
+
+### Fixed — data loss in ordinary commands
+
+Every one of these exited 0 on 1.7.5.
+- **Octopus merge overwrote uncommitted edits (HIGH, L1)**, an A1 regression: it never checked the tree, then told the materializer it had.
+- **`reset --hard` kept MERGE_HEAD (HIGH, L2)**, so the next commit, on any branch, recorded the abandoned merge. It clears MERGE_HEAD, CHERRY_PICK_HEAD and REVERT_HEAD, as git does, and `checkout` refuses while any of them exists.
+- **A conflicted merge wrote over an untracked file at a conflict path (L3)**, and wrote the worktree before recording the conflict (L20). Refused before anything is written; the record comes first.
+- **`sit rm` deleted a file with unstaged edits (L4).** Refused unless `--cached`.
+- **Ref writes were not atomic, and a ref that was not a commit id read as "unborn" (L5, N6).** A crash between truncate and write left an empty `refs/heads/main`; the next commit started a new root over the branch. Every ref and state file now goes through `sf_write_atomic` (`<path>.lock` with `O_EXCL`, fsync, rename; the replacement keeps the old file's permission bits), and `commit` / `pull` refuse a branch whose ref is broken.
+- **`stash` discarded a file HEAD tracks but the index does not (L6)**, after `sit rm --cached`. Refused while such a file differs from HEAD.
+- **`rebase --continue` after a non-conflict stop dropped the step's change (L7)**: an untracked file in the way stopped the rebase, and `--continue` committed the previous tree under the step's message. A stop that left no conflict and no change re-applies the step; one whose tree landed but whose ref write failed is committed; a resolution equal to HEAD's tree is skipped, not committed empty.
+- **A missing subtree read as an empty directory (L8).** `flatten_tree` dropped a subtree's failure, so checkout, reset and merge to a commit with a missing `d/` tree deleted `d/`, rewrote the index and reported "clean". The failure now propagates; merge, cherry-pick, revert, octopus, `diff <a> <b>` and `show` refuse an unreadable tree instead of treating it as empty.
+- **A clean three-way merge could move a line (L9).** An insert at the *end* of the other side's change was called disjoint (1.6.4 fixed the start), so with repeated lines (`}`, blank lines) it could land on the wrong side of a removed line: base `if x } } end`, ours adds `y` after the first brace, theirs drops a brace → "clean" `if x y } end`. It conflicts now, as in git. Differential against `git merge-file`, 400 random cases: 78 clean merges byte-identical, 0 differing. The 32 cases sit merges and git conflicts on are all edits to adjacent, distinct base lines, which sit applies both of.
+- **Re-running `sit init` moved HEAD to main (L10)** with no reflog entry. HEAD is written only by a fresh init.
+- **An index write patra failed to land was reported as success (L12).** `sit add` printed "added" with nothing staged. `index_upsert` and the new `index_rename_path` each run in one transaction, which patra reports honestly; the autocommit gap is an upstream ask.
+- **`sit mv` missed `add`'s 255-byte check and left a staged deletion (L13).** Checked before the rename; the index moves in one transaction or the file is moved back.
+- **`config` set on an unreadable config replaced the file (L15).**
+- **`commit` cleared MERGE_HEAD before moving the ref (L19)**, so a failed ref write lost the merge parent; and a failed ref write at **`rebase` start** left the worktree on upstream (L21).
+
+### Fixed — the read path (git read mode and the public API, in owl and thoth)
+
+- **`sit_repo_status` / `sit_diff_path` kept every blob and worktree file they compared (HIGH, R1).** Both are freed after the compare, `packed-refs` and a detached `.git/HEAD` are read into freelist buffers freed after the lookup, and the per-call `tree_find` map is released. 200 files × 50 KB, 10 calls:
+
+  | | 1.7.5 | 1.7.6 |
+  |---|---:|---:|
+  | `sit_repo_status`, kept per call | 10,095,656 B | 93,968 B |
+  | resident growth over 10 status calls | 202,384 KB | 80 KB |
+  | `sit_diff_path` on an unchanged file, kept per call | 110,739 B | 59,752 B |
+
+  What is left is the flattened tree, the worktree listing and the result records; an arena per API call (roadmap) would close it.
+- **`sit_diff_path` diffed unchanged files (R9)**, against its contract — about 160 B per line, so an unchanged 16 MiB file of newlines cost 2.6 GB. It returns 0.
+- **Every .sit-mode blob compressing past 4:1 took a fresh 16 MiB buffer per read (R10)**, on the bump heap at most sites. One inflate, `obj_inflate_fl`, replaces seven copies of the sizing and sizes the retry from the object's own header. 500 compressible blobs: `fsck` peak RSS 2,137 MB → 30 MB, `clone` 1,071 MB → 18 MB.
+- **Crafted delta chains cost minutes of CPU (R4).** One read may produce at most 4 GiB across its chain — git's `--depth=250` at sit's 16 MiB object ceiling — delta copies go eight bytes at a time, and the pack that answered last is asked first, so a REF chain does not re-list the pack directory per link. A 4095-step chain of 16 MB results (a 114 KB pack): 244 s of CPU on 1.7.5, refused in 1.1 s now — the one kind of object 1.7.6 reads less of, since producing it takes 64 GiB of work. A legitimate 40-step chain reads byte-identical, 5.4× faster (0.46 s of CPU against 2.48 s), and a 12 MB file with 160 revisions repacked `--depth=250` (chains to 157) reads all 161 versions byte-identical to git — the first cut of the budget, 1 GiB, refused 76 of them, which the closeout review caught. A REF cycle beside 1,000 packs: 12.9 s → 0.04 s.
+- **An empty object in a pack could not be read (R3)** — every empty file (`__init__.py`, `.gitkeep`) in a gc'd repo. A 0-byte inflate is valid; the result must equal the declared size, as git requires.
+- **A REF_DELTA with a loose base kept that base on every read (R5)**; **a refused Myers diff kept ~73 MB (R8)**; **an unopenable `.idx` kept ~320 B per read (R14).**
+- **Reading a reflog was quadratic (R7).** One pass: `fsck` or `sit reflog` over 5,000 entries 10.8 s → 0.02 s of CPU; 20,000 entries now take 0.06 s.
+- **A FIFO where a repo file was expected hung the reader (R11)** — `.git/HEAD`, an `.idx`, a loose object, `.sit/config`. `sf_exists`, read-only `sf_open`, `read_file_heap` and the git readers open only regular files (and `sf_exists` directories).
+- **Two readers disagreed on a commit's tree (R12 / X4).** HEAD's tree came from the first `tree` line, everything else from the last, so a pushed commit with two checked out one tree and diffed against the other. One rule now, git's: `tree` on line 1, once, parents straight after. Anything else is refused by every reader, by `fetch` and by `sit serve`, and `fsck` counts it bad (so `--prune` refuses while it is reachable).
+
+### Fixed — LOW
+
+- `sit add` refuses a path beyond a symlinked directory, and a symlink (L14; sit has no symlink entries yet).
+- Worktree names, diff headers, diffstat, `add` / `rm` / `mv` / branch / tag echoes and `verify-tag`'s signed name print display-safe (L16, R13).
+- `branch -D x` no longer creates `-D`; `tag -f`, `commit --amend` and `checkout -b -x` are refused as unknown options; `merge` takes `-S` anywhere and refuses unknown trailing options, still accepting and ignoring `-m <msg>` (L17).
+- An empty tree can be built: reverting a root commit works (L18).
+- `sf_rename` resolves both paths against the repo root (K1). The http refs parser's one-byte overread is closed (N7).
+
+### Changed — closeout
+
+- **One inflate (`obj_inflate_fl`)** for read_object, the wire walkers, the http reader, serve's reusable buffer, the loose-object migration and git loose objects (R10, above).
+- **`read_file_fl`**, a freelist twin of `read_file_heap`; `read_file_heap` fails on a read error instead of returning the first part of the file.
+- **`cyrius audit` passes again.** It had regressed during 1.7.x: `tests/sit.tcyr` was no longer canonically formatted, six long test lines lacked `#skip-lint`, and six test and probe functions had no doc comment. All fixed, plus this release's own.
+- **The `copy-objects-100` benchmark copies real objects.** It stored random bytes under 16 made-up ids, which verification now refuses, so it measured a refusal. It now stores real zlib blobs under their true ids and measures the verified copy: 379.9 µs per object on this host.
+- **Dead code:** `index_remove_path` is removed (its callers now use `_index_delete_row` / `index_rename_path`). The floor unreachable from `main` is the 1.6.4 one — the public `sit_*` API and its helpers (`_status_push`, `_blob_differs_from_file`, `tree_find_release`, `_git_pack_forget_last`), the `build_*commit` wrappers, the `delta.cyr` generator, `sf_mkdir` / `sf_stat` / `sf_read_all` — plus the test-facing `is_ignored` and `_git_apply_delta`.
+- `cyrius lint` is clean across `src/`.
+
+### Deferred
+
+- **git-mode status on executable files, symlinks, submodules and alternates (R2)** → 1.11.0, with `.git/` CLI parity: it needs mode-aware tree entries through the read path.
+- **A second repo opened in one process reuses the first's object store handle and pack mappings (R6)** → 1.10.0, serving many repos. The new last-pack cache is reset per `sit_repo_open`, so 1.7.6 adds no exposure.
+
+### Upstream
+
+- **patra:** `tbl_insert`, `tbl_delete`, `btree_insert` and `_bt_push_up` ignore `page_write`'s return; in autocommit a statement then reports `PATRA_OK` (L12).
+- **sankoch:** a word-wise `memcpy` (stdlib's is a byte loop, ~140 MB/s); `br_init`'s 32 B per inflate, carried from 1.7.5.
+
+### Performance — what the fixes cost
+
+DCE builds, each child's CPU time, minimum of 15 alternating runs; the host was saturated (load 12–24 on 16 cores), so the standard tables are not published. Snapshot: [`docs/benchmarks/2026-10-19-v1.7.6.md`](docs/benchmarks/2026-10-19-v1.7.6.md).
+
+| operation | 1.7.5 | 1.7.6 | Δ |
+|---|---:|---:|---:|
+| `add` ×100, one file each | 135.1 ms | 162.4 ms | +20.2% |
+| `clone`, 100 commits (file://) | 78.8 ms | 90.3 ms | +14.5% |
+| `status`, 200 files | 9.6 ms | 10.1 ms | +5.3% |
+| `commit` | 2.4 ms | 2.4 ms | +2.7% |
+| `log --oneline`, 300 commits | 48.5 ms | 49.1 ms | +1.4% |
+| `checkout` of 100 changed files, there and back | 123.8 ms | 122.9 ms | -0.7% |
+| `fsck`, 100 commits | 93.8 ms | 88.8 ms | -5.3% |
+
+- `add` pays for its index transaction (L12): ~0.27 ms of CPU and ~0.7 ms of wall per file.
+- `clone` pays for verification (N1): one SHA-256 pass over what it receives.
+- `commit` pays ~0.4 ms of wall for the fsync'd ref rename (L5); `status` a stat per path (R11).
+
+### Tests
+
+- **Unit, 543 → 566:** `test_176_pure` — header order, frame sizing, `obj_inflate_fl` on a 1000:1 object, the refs-parser bound, one-pass reflog lines, `_pack_copy` at every tail length, option-shaped names, `alloc_or_die(0)`. The 1.6.4 assertion that an end-touching insert is disjoint now asserts the overlap.
+- **Integration, 349 → 424.** Section 31 (N2, N3, N5), 32 (N1, through `swap_proxy.py`, which forwards to a real `sit serve` and swaps one object), 33 (L1–L18, R11, R12) and 34 (R1 / R9 through `api_heap_probe.cyr`, built from the shipped `dist/sit-read.cyr`; R7). `deep_pack.py` gains R3, R4, R5 and R11 cases.
+- **Fuzz, 18 → 20 targets:** `fuzz_obj_inflate` (real objects of every compression ratio, then corrupted) and `fuzz_http_refs` (truncated and mutated bodies over a poisoned tail). No crashes.
+- **Poison A/B:** the full integration suite against two poisoned builds. No redzone fired; every assertion passes under both except section 27's two RSS-growth bounds, which measure the memory reuse poison's quarantine turns off.
+- **Other targets and downstream.** The aarch64 build passes `deep_pack.py` under qemu — all 16 cases, so the unaligned word-wise delta copy is exercised there too — and `--agnos` builds. owl (cyrius 6.6.2, 7/7 of its tests) and thoth (6.6.6) build against the new `dist/sit-read.cyr`.
+
 ## [1.7.5] — 2026-10-19 — git read mode keeps nothing per object read; `sit serve`'s fast-forward check keeps nothing per push
 
 The residuals 1.7.4 measured and left on the roadmap. There is no new surface, and the toolchain stays at cyrius 6.7.15. What both paths still keep is sankoch's, 32 bytes per inflate, now an exact upstream ask (below).

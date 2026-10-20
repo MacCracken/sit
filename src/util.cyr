@@ -173,12 +173,22 @@ fn path_is_symlink(path) {
     #endif
 }
 
-# Return the file-type bits (S_IFMT-masked mode) for a path via lstat, or -1
-# if stat failed. Caller compares against 0xA000 (symlink), 0x4000 (dir),
-# 0x8000 (regular), etc. Useful for S-04's "is this a directory" and for
-# S-25's "does target already exist as something other than a dir".
+# 1 when `apath` (already joined to the repo root) names a regular file,
+# following symlinks; 0 otherwise. 1.7.6 (R11): checked before opening a file
+# sit only reads — open(2) on a FIFO blocks until a writer appears, and a
+# hostile tarball can put one wherever a repo file is expected.
+fn path_is_regular(apath) {
+    var st[256];
+    if (xstat(apath, &st) != 0) { return 0; }
+    if ((load32(&st + STAT_MODE) & 0xF000) == 0x8000) { return 1; }
+    return 0;
+}
 
-# File-type bits (S_IFMT) of `path` without following symlinks, or -1.
+# File-type bits (S_IFMT-masked mode) of `path` via lstat — without following
+# symlinks — or -1 if stat failed. Callers compare against 0xA000 (symlink),
+# 0x4000 (dir), 0x8000 (regular), etc.: S-04's "is this a directory", S-25's
+# "does the target already exist as something other than a dir", and since
+# 1.7.6 every "does it exist" (architecture 007: sf_exists means readable).
 fn path_lstat_kind(path) {
     #ifdef CYRIUS_TARGET_AGNOS
     # No lstat on agnos (see path_is_symlink): sys_stat FOLLOWS symlinks, so a
@@ -208,7 +218,26 @@ fn path_lstat_kind(path) {
 # wrapper is a transparent forward (rule 2).
 # ----------------------------------------------------------------
 fn sf_exists(p) {
-    return file_exists(sit_abs(p));
+    # 1.7.6 (R11): file_exists opens the path, and open(2) on a FIFO blocks
+    # until a writer appears — `.sit/HEAD` or `.git/HEAD` as a FIFO (a tarball
+    # can ship one) hung every command at its first probe. Only regular files
+    # and directories are opened; anything else reads as absent.
+    var abuf[4352];
+    var ap = sit_abs_into(p, &abuf, 4352);
+    if (ap == 0) { ap = sit_abs(p); }
+    if (_sf_special(ap) == 1) { return 0; }
+    return file_exists(ap);
+}
+
+# 1 when `apath` exists and is neither a regular file nor a directory (a FIFO,
+# socket or device: opening one to read can block, or reach hardware), else 0.
+fn _sf_special(apath) {
+    var st[256];
+    if (xstat(apath, &st) != 0) { return 0; }
+    var k = load32(&st + STAT_MODE) & 0xF000;
+    if (k == 0x8000) { return 0; }
+    if (k == 0x4000) { return 0; }
+    return 1;
 }
 
 # 1 if a proper prefix of the repo-relative path `p` ("a", "a/b" for "a/b/c")
@@ -302,9 +331,129 @@ fn sf_write_all(p, buf, len) {
     return written;
 }
 
-# file_open on a repo-root-relative path.
+# ── Atomic replace (1.7.6, L5) ──────────────────────────────────
+#
+# Refs and repository state (HEAD, refs/*, config, MERGE_HEAD, CONFLICTS, the
+# stash and rebase state, the shallow list) are replaced, never rewritten:
+#   1. `<path>.lock` is created O_CREAT|O_EXCL — it refuses an existing lock
+#      (another sit is writing, or one died holding it; the error names the
+#      file) and a symlink planted at the lock path,
+#   2. the bytes are written in full and fsynced,
+#   3. the lock is renamed over the path. rename replaces a symlink at the
+#      target rather than following it, and readers see the old file or the new
+#      one, never a cut.
+# Through 1.7.5 these went through sf_write_all, which removed the old file
+# before writing the new one: a failed write (disk full, quota, EIO) or a crash
+# between the two left the ref empty or missing, and an empty branch ref then
+# read as "unborn", so the next commit started a new root over the history.
+# Worktree files keep sf_write_all: an fsync per checked-out file would cost
+# more than it protects, and git does not do it either.
+
+# rename(2) on every target: agnos carries explicit lengths.
+fn _sit_rename_raw(old, new) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return syscall(SYS_RENAME, old, strlen(old), new, strlen(new));
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return sys_rename(old, new);
+    #endif
+}
+
+# Replace the file at the resolved path `ap` with `len` bytes through
+# `<ap>.lock`. Returns `len`, or a negative errno (-17 EEXIST: the lock is held).
+fn _write_replace(ap, buf, len) {
+    var al = strlen(ap);
+    var lbuf[4360];
+    var lp = &lbuf;
+    if (al + 6 > 4360) { lp = alloc_or_die(al + 6); }
+    memcpy(lp, ap, al);
+    memcpy(lp + al, ".lock", 5);
+    store8(lp + al + 5, 0);
+    var fd = file_open(lp, O_WRONLY | O_CREAT | O_EXCL, 0x1A4);
+    if (fd < 0) {
+        if (fd == 0 - 17) {
+            eprint3("sit: ", lp, " exists — another sit is writing it, or one stopped; remove it if not\n");
+        }
+        return fd;
+    }
+    # The replacement keeps the replaced file's permission bits: a 0600
+    # ~/.sitconfig must not come back 0644 (umask-filtered 0644 is only the
+    # mode of a file that did not exist).
+    #ifndef CYRIUS_TARGET_AGNOS
+    var ost[256];
+    if (xstat(ap, &ost) == 0) { syscall(SYS_FCHMOD, fd, load32(&ost + STAT_MODE) & 4095); }
+    #endif
+    var written = sit_write_full(fd, buf, len);
+    var rc = 0;
+    if (written != len) { rc = written; if (rc >= 0) { rc = 0 - 5; } }
+    if (rc == 0) { if (xfsync(fd) != 0) { rc = 0 - 5; } }
+    file_close(fd);
+    if (rc == 0) {
+        var rr = _sit_rename_raw(lp, ap);
+        if (rr != 0) { rc = rr; }
+    }
+    if (rc != 0) { xunlink(lp); return rc; }
+    return len;
+}
+
+# Atomically replace the file at `p` (repo-root-relative, or absolute) with
+# `len` bytes. A repo-relative path refuses (-ELOOP) a symlinked directory above
+# it, as sf_write_all does; an absolute (HOME-side) path is the user's to link.
+# Returns `len` or a negative errno.
+fn sf_write_atomic(p, buf, len) {
+    if (load8(p) != 47) {
+        if (_sf_parent_symlink(p) == 1) { return 0 - 40; }          # -ELOOP
+    }
+    else {
+        # A HOME-side file that is itself a symlink (a dotfile manager's link) is
+        # written through, as before: replacing it would break the user's link.
+        if (path_is_symlink(p) == 1) { return file_write_all(p, buf, len); }
+    }
+    var abuf[4352];
+    var ap = _sf_abs(p, &abuf);
+    return _write_replace(ap, buf, len);
+}
+
+# sf_write_atomic for a path `rel` inside ANOTHER repository rooted at `root`
+# (a file:// push target): no directory between `root` and the file may be a
+# symlink, and missing ones are created. `root` itself is the remote the user
+# named. Returns `len` or a negative errno. 1.7.6 (L11 / X1): pushes wrote the
+# remote's refs with a raw file_write_all, which followed a symlink planted in
+# the remote at the ref or at any directory above it.
+fn sf_write_atomic_at(root, rel, buf, len) {
+    if (load8(rel) == 47) { return 0 - 22; }                     # -EINVAL: must be relative
+    var rl = strlen(root);
+    var pl = strlen(rel);
+    var pbuf[4352];
+    var path = &pbuf;
+    if (rl + 1 + pl + 1 > 4352) { path = alloc_or_die(rl + 1 + pl + 1); }
+    memcpy(path, root, rl);
+    store8(path + rl, 47);
+    memcpy(path + rl + 1, rel, pl);
+    store8(path + rl + 1 + pl, 0);
+    # Walk each directory below the root: refuse a symlink, create what is missing.
+    var i = rl + 1;
+    while (i < rl + 1 + pl) {
+        if (load8(path + i) == 47) {
+            store8(path + i, 0);
+            var kind = path_lstat_kind(path);
+            if (kind == 0xA000) { store8(path + i, 47); return 0 - 40; }
+            if (kind < 0) { sit_mkdir(path, 0x1ED); }
+            store8(path + i, 47);
+        }
+        i = i + 1;
+    }
+    return _write_replace(path, buf, len);
+}
+
+# file_open on a repo-root-relative path. A read-only open refuses a FIFO,
+# socket or device (-6, ENXIO): see sf_exists (1.7.6, R11).
 fn sf_open(p, flags, mode) {
-    return file_open(sit_abs(p), flags, mode);
+    var abuf[4352];
+    var ap = sit_abs_into(p, &abuf, 4352);
+    if (ap == 0) { ap = sit_abs(p); }
+    if (flags == 0) { if (_sf_special(ap) == 1) { return 0 - 6; } }
+    return file_open(ap, flags, mode);
 }
 
 # file_read_all on a repo-root-relative path.
@@ -332,7 +481,9 @@ fn sf_mkdir(p, mode) {
 # existing callers stay unchanged. Wrapping them here would double-prefix.
 #
 # `sf_mkdir` and `sf_stat` currently have no in-tree caller and the 2026-08-17
-# dead-code audit deliberately KEPT them. They complete the sf_* family, and an
+# dead-code audit deliberately KEPT them; `sf_read_all` joined them in 1.7.4,
+# when `sit serve`'s ref push moved to a resolved path, and the 1.7.6 closeout
+# kept it for the same reason. They complete the sf_* family, and an
 # asymmetric family is a trap: the next person needing a prefixed stat finds no
 # wrapper and reaches for raw `xstat` / `sit_mkdir`, which is precisely the
 # unprefixed-path bug class the seam exists to prevent (and the Linux-shaped
@@ -512,6 +663,10 @@ fn stdout_flush() {
 # instead of bare alloc; reserve bare alloc for the few callers that
 # genuinely have a propagation path (read_file_heap, read_object).
 fn alloc_or_die(size) {
+    # 1.7.6 (L18): alloc(0) returns 0, which read as out-of-memory — an empty
+    # tree (revert of a root commit, a stash of all-deleted files) could not be
+    # built. A zero-byte request gets one byte.
+    if (size < 1) { size = 1; }
     var p = alloc(size);
     if (p == 0) {
         eprintln("sit: out of memory");
@@ -800,7 +955,26 @@ fn write_sanitized(fd, bytes, len) {
 # sit-owned: prefixes `path` with the repo root (sit_abs) INTERNALLY so
 # its many callers need no change.
 fn read_file_heap(path, out_pair) {
-    var fd = file_open(sit_abs(path), 0, 0);
+    return _read_whole(path, out_pair, 0);
+}
+
+# read_file_heap into a freelist buffer the caller frees with fl_free (1.7.6,
+# R1): for reads a long-lived consumer repeats — `.git/packed-refs` on every
+# HEAD lookup was kept on the bump heap each time.
+fn read_file_fl(path, out_pair) {
+    return _read_whole(path, out_pair, 1);
+}
+
+fn _read_whole(path, out_pair, use_fl) {
+    # 1.7.6 (R1 / R11): the joined path on the stack (sit_abs kept one on the
+    # heap per call when the root is absolute), and only a regular file is
+    # opened — a FIFO at `.git/HEAD` or `.git/config` (a tarball can ship one)
+    # blocked the open forever.
+    var abuf[4352];
+    var ap = sit_abs_into(path, &abuf, 4352);
+    if (ap == 0) { ap = sit_abs(path); }
+    if (path_is_regular(ap) == 0) { return 0 - 1; }
+    var fd = file_open(ap, 0, 0);
     if (fd < 0) { return 0 - 1; }
     var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
     syscall(SYS_LSEEK, fd, 0, SEEK_SET);
@@ -809,16 +983,28 @@ fn read_file_heap(path, out_pair) {
     # never exceed a few KB. Cap at 64 MiB to keep a hostile / accidentally-huge
     # file from triggering a multi-GB allocation here.
     if (size > 67108864) { file_close(fd); return 0 - 4; }
-    var buf = alloc(size + 1);
+    var buf = 0;
+    if (use_fl == 1) { buf = fl_alloc(size + 1); }
+    else { buf = alloc(size + 1); }
     if (buf == 0) { file_close(fd); return 0 - 3; }
     var total = 0;
     var rgo = 1;
+    var rerr = 0;
     while (rgo == 1) {
         var n = file_read(fd, buf + total, size - total);
-        if (n <= 0) { rgo = 0; }
-        else { total = total + n; if (total >= size) { rgo = 0; } }
+        if (n < 0) { rerr = 1; rgo = 0; }
+        else {
+            if (n == 0) { rgo = 0; }
+            else { total = total + n; if (total >= size) { rgo = 0; } }
+        }
     }
     file_close(fd);
+    # 1.7.6: a read that failed part-way is a failure, not a short file — a
+    # config or state file read as its first half is rewritten as that half.
+    if (rerr == 1) {
+        if (use_fl == 1) { fl_free(buf); }
+        return 0 - 5;
+    }
     store64(out_pair, buf);
     store64(out_pair + 8, total);
     return 0;

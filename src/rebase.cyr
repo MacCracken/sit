@@ -134,7 +134,7 @@ fn _rebase_write_todo(todo, from_index) {
         if (sf_exists(rebase_todo_path()) == 1) { return sf_unlink(rebase_todo_path()); }
         return 0;
     }
-    if (sf_write_all(rebase_todo_path(), buf, w) < 0) { return 0 - 1; }
+    if (sf_write_atomic(rebase_todo_path(), buf, w) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -309,6 +309,14 @@ fn cmd_rebase() {
             eprintln("sit: corrupt .sit/rebase-todo — 'sit rebase --abort' to restore the branch");
             return 1;
         }
+        # 1.7.6 (L7): a step can stop without a conflict — an untracked file in
+        # the way, a symlinked parent — before anything of it is applied.
+        # --continue committed the index (the previous step's tree) under its
+        # message, so the commit's change was silently dropped and an empty
+        # commit took its place. Only a conflict stop leaves these files.
+        var conflict_stop = 0;
+        if (sf_exists(".sit/CHERRY_PICK_HEAD") == 1) { conflict_stop = 1; }
+        if (sf_exists(conflicts_path()) == 1) { conflict_stop = 1; }
         # The resolution is committed FROM THE INDEX, and the worktree is then
         # rewritten to match it; an edit that was never `sit add`ed would be
         # discarded without a word. git refuses here too.
@@ -328,8 +336,9 @@ fn cmd_rebase() {
             stdout_write("rebase complete\n", 16);
             return 0;
         }
-        # The stopped commit is todo[0]; the user has resolved and staged it, so
-        # commit that resolution rather than re-applying the same conflict.
+        # The stopped commit is todo[0]. After a conflict the user has resolved
+        # and staged it, so that resolution is committed rather than the same
+        # conflict re-applied.
         var head_now = read_head_ref();
         var msg = commit_message_of(vec_get(todo, 0));
         if (msg == 0) { msg = "rebase: resolved"; }
@@ -338,6 +347,21 @@ fn cmd_rebase() {
         sort_entries(entries);
         var tree_hex = build_tree(entries, 0);
         if (tree_hex == 0) { eprintln("sit: failed to write tree"); return 1; }
+        var cur_tree = commit_tree_hex(head_now);
+        var at_head = 0;
+        if (cur_tree != 0) { if (streq(tree_hex, cur_tree) == 1) { at_head = 1; } }
+        # A stop that was no conflict and left the index at HEAD's tree applied
+        # nothing: re-apply the step. One that got as far as writing the step's
+        # tree (its ref write failed) is committed below — re-applying it would
+        # refuse the now-"dirty" tree on every --continue.
+        if (conflict_stop == 0) { if (at_head == 1) { return _rebase_run(todo, 0); } }
+        # Resolved to HEAD's tree (or already committed by hand): the step has
+        # nothing left to record, and an empty commit is not a resolution.
+        if (at_head == 1) {
+            stdout_write("nothing to commit for this step — skipped\n", 44);
+            conflicts_clear();
+            return _rebase_run(todo, 1);
+        }
         var new_hex = build_commit_signed(tree_hex, head_now, msg, 0);
         if (new_hex == 0) { eprintln("sit: failed to write commit"); return 1; }
         if (materialize_target(new_hex) != 0) {
@@ -393,7 +417,7 @@ fn cmd_rebase() {
     store8(obuf + 64, 10);
     memcpy(obuf + 65, head_ref, hrl);
     store8(obuf + 65 + hrl, 10);
-    if (sf_write_all(rebase_orig_path(), obuf, 65 + hrl + 1) < 0) {
+    if (sf_write_atomic(rebase_orig_path(), obuf, 65 + hrl + 1) < 0) {
         eprintln("sit: cannot save rebase state");
         return 1;
     }
@@ -405,7 +429,15 @@ fn cmd_rebase() {
         return 1;
     }
     if (write_head_ref(&up) != 0) {
-        eprintln("sit: failed to move the branch ref");
+        # 1.7.6: the worktree is on upstream now and the branch is not. Clearing
+        # the state there left a tree a later commit would record as reverting
+        # the branch. Put the (clean, checked above) worktree back first.
+        if (materialize_target(head_hex) != 0) {
+            eprintln("sit: failed to move the branch ref, and the working tree is still on upstream");
+            eprintln("sit:   'sit rebase --abort' to restore it");
+            return 1;
+        }
+        eprintln("sit: failed to move the branch ref — nothing changed");
         _rebase_clear_state();
         return 1;
     }

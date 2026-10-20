@@ -1,0 +1,21 @@
+operation,v175,v176,unit,method
+api sit_repo_status bump kept per call (200x50KB git),10095656,93968,bytes,api_heap_probe; 10 calls after warm-up
+api sit_repo_status resident growth over 10 calls,202384,80,KB,api_heap_probe; /proc/self/statm
+api sit_diff_path unchanged file bump kept per call,110739,59752,bytes,api_heap_probe; 10 calls after warm-up
+fsck peak RSS (500 compressible 21KB blobs),2137,30,MB,ru_maxrss; THP always
+clone peak RSS (500 compressible 21KB blobs),1071,18,MB,ru_maxrss; THP always
+clone CPU (500 compressible 21KB blobs),440,630,ms,child user+sys; min of 3
+cat-file 4095-step 16MB delta chain,244400,1090,ms,child user+sys; min of 2; 1.7.6 refuses at the 4 GiB budget
+cat-file 40-step 16MB delta chain,2480,460,ms,child user+sys; min of 3
+cat-file REF cycle beside 1000 packs,12910,40,ms,child user+sys; min of 3
+fsck reflog 5000 entries,10760,20,ms,child user+sys; single run
+reflog 5000 entries,10780,10,ms,child user+sys; single run
+add x100 one file each,135.1,162.4,ms,child user+sys; min of 15 alternating; DCE
+commit,2.4,2.4,ms,child user+sys; min of 15 alternating; DCE
+status 200 files,9.6,10.1,ms,child user+sys; min of 15 alternating; DCE
+log --oneline 300 commits,48.5,49.1,ms,child user+sys; min of 15 alternating; DCE
+checkout 100 changed files there and back,123.8,122.9,ms,child user+sys; min of 15 alternating; DCE
+clone 100 commits file,78.8,90.3,ms,child user+sys; min of 15 alternating; DCE
+fsck 100 commits,93.8,88.8,ms,child user+sys; min of 15 alternating; DCE
+add x100 wall,321.3,388.9,ms,wall; min of 15 alternating; load 20 on 16 cores
+commit wall,2.8,3.2,ms,wall; min of 15 alternating; load 20 on 16 cores

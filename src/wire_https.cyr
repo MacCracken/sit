@@ -75,9 +75,26 @@ fn _tofu_find_pin(content, content_len, host, port, out_hex64) {
     return found;
 }
 
-# Append a "<host> <port> <pin_hex>\n" line to ~/.sit/known_certs (read-modify-
-# write; the file is small). Creates ~/.sit and the file (0600) as needed.
-# Returns 0 on success, negative on failure.
+# Append a "<host> <port> <pin_hex>\n" line to ~/.sit/known_certs. Creates
+# ~/.sit and the file (0600) as needed. Returns 0 on success (or when a
+# concurrent sit recorded the same pin first), 0 - 2 when one recorded a
+# DIFFERENT pin for this host:port meanwhile, other negatives on failure.
+#
+# 1.7.6 (N3): the file was rewritten in place (O_TRUNC) with one unchecked write,
+# so a short or failed write — disk full, quota, a crash, two first contacts
+# racing on the read-modify-write — dropped every pin after the cut while sit
+# printed "pinned" and carried on; the dropped hosts then re-pinned silently on
+# their next contact, which is the impersonation TOFU exists to catch. Now:
+#   - `known_certs.lock`, created O_EXCL, serialises writers and is also the
+#     new file. A stale lock (a sit that died holding it) refuses after ~2 s and
+#     says how to clear it.
+#   - Under the lock the pins are read again, so a racing writer's pin is seen.
+#   - The new content is written in full, fsynced, then renamed over the old.
+#     Readers see the old file or the new one, never a cut.
+#   - A file that does not end in a newline gets one before the new line, so a
+#     pin is never glued onto a partial line.
+var TOFU_LOCK_TRIES = 100;     # × 20 ms
+
 fn _tofu_record_pin(host, port, pin_hex) {
     var dir = signing_home_dir();
     if (dir == 0) { return 0 - 1; }
@@ -85,10 +102,30 @@ fn _tofu_record_pin(host, port, pin_hex) {
     var path = known_certs_path();
     if (path == 0) { return 0 - 1; }
     if (path_is_symlink(path) == 1) { return 0 - 1; }   # refuse to follow a planted symlink
+    var plen = strlen(path);
+    var lockp = alloc(plen + 6);
+    if (lockp == 0) { return 0 - 1; }
+    memcpy(lockp, path, plen);
+    memcpy(lockp + plen, ".lock", 5);
+    store8(lockp + plen + 5, 0);
 
-    var host_len = strlen(host);
+    # O_EXCL also refuses a symlink planted at the lock path.
+    var fd = 0 - 1;
+    var tries = 0;
+    while (tries < TOFU_LOCK_TRIES) {
+        fd = file_open(lockp, O_WRONLY | O_CREAT | O_EXCL, 0x180);   # 0600
+        if (fd >= 0) { tries = TOFU_LOCK_TRIES; }
+        else {
+            sleep_ms(20);
+            tries = tries + 1;
+        }
+    }
+    if (fd < 0) {
+        eprint3("sit: ", lockp, " is held; if no other sit is running, remove it\n");
+        return 0 - 1;
+    }
 
-    # Existing content (absent file → treat as empty).
+    # The pins as they are now, under the lock (absent file: none yet).
     var pair[16];
     var old = 0;
     var oldlen = 0;
@@ -96,12 +133,35 @@ fn _tofu_record_pin(host, port, pin_hex) {
         old = load64(&pair);
         oldlen = load64(&pair + 8);
     }
+    else {
+        # There, but unreadable. (file_exists opens the file, so it said
+        # "absent" here — existence is lstat's answer.)
+        if (path_lstat_kind(path) >= 0) {
+            file_close(fd);
+            xunlink(lockp);
+            return 0 - 1;
+        }
+    }
+    var stored[72];
+    if (oldlen > 0) {
+        if (_tofu_find_pin(old, oldlen, host, port, &stored) == 1) {
+            file_close(fd);
+            xunlink(lockp);
+            if (memeq(&stored, pin_hex, 64) == 1) { return 0; }
+            return 0 - 2;
+        }
+    }
 
-    var line_cap = host_len + 1 + 20 + 1 + 64 + 1;      # host ' ' port ' ' hex '\n'
+    var host_len = strlen(host);
+    var line_cap = 1 + host_len + 1 + 20 + 1 + 64 + 1;  # ['\n'] host ' ' port ' ' hex '\n'
     var buf = alloc(oldlen + line_cap);
-    if (buf == 0) { return 0 - 1; }
+    if (buf == 0) { file_close(fd); xunlink(lockp); return 0 - 1; }
     var pos = 0;
-    if (oldlen > 0) { memcpy(buf, old, oldlen); pos = oldlen; }
+    if (oldlen > 0) {
+        memcpy(buf, old, oldlen);
+        pos = oldlen;
+        if (load8(old + oldlen - 1) != 10) { store8(buf + pos, 10); pos = pos + 1; }
+    }
     memcpy(buf + pos, host, host_len); pos = pos + host_len;
     store8(buf + pos, 32); pos = pos + 1;
     pos = pos + write_decimal(buf + pos, port);
@@ -109,13 +169,23 @@ fn _tofu_record_pin(host, port, pin_hex) {
     memcpy(buf + pos, pin_hex, 64); pos = pos + 64;
     store8(buf + pos, 10); pos = pos + 1;
 
-    # file_open (io.cyr) is the length-carrying bridge: sys_open(path, flags,
-    # 0x180) verbatim on Linux/macOS (0600 preserved); on agnos it strlen()s
-    # the path and maps the flags to AO_* so the known-hosts write is ABI-safe.
-    var fd = file_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0x180);   # 0600
-    if (fd < 0) { return 0 - 1; }
-    syscall(SYS_WRITE, fd, buf, pos);
-    sys_close(fd);
+    var ok = 1;
+    if (sit_write_full(fd, buf, pos) != pos) { ok = 0; }
+    if (ok == 1) { if (xfsync(fd) != 0) { ok = 0; } }
+    file_close(fd);
+    if (ok == 1) { if (sf_rename(lockp, path) != 0) { ok = 0; } }
+    if (ok == 0) {
+        xunlink(lockp);
+        return 0 - 1;
+    }
+    return 0;
+}
+
+# The pin-mismatch refusal, said once for both places that detect one.
+fn _tofu_mismatch() {
+    eprintln("sit: SECURITY: certificate pin MISMATCH for this host — refusing to connect");
+    eprintln("  a previously-pinned certificate changed; if this is intentional, remove the");
+    eprintln("  matching line from ~/.sit/known_certs and retry");
     return 0;
 }
 
@@ -142,15 +212,25 @@ fn tofu_check_pin(host, port, spki_der, der_len) {
         if (_tofu_find_pin(content, clen, host, port, &stored) == 1) {
             store8(&stored + 64, 0);
             if (streq(pin_hex, &stored) == 1) { return 1; }
-            eprintln("sit: SECURITY: certificate pin MISMATCH for this host — refusing to connect");
-            eprintln("  a previously-pinned certificate changed; if this is intentional, remove the");
-            eprintln("  matching line from ~/.sit/known_certs and retry");
+            _tofu_mismatch();
+            return 0;
+        }
+    }
+    else {
+        # 1.7.6 (N3): a pin file that exists but cannot be read is not "no pins".
+        # Treating it so trusted any certificate on first contact, and the
+        # rewrite that followed dropped every pin in it. lstat, not
+        # file_exists: that one opens the file, and so calls it absent.
+        if (path_lstat_kind(path) >= 0) {
+            eprintln("sit: cannot read ~/.sit/known_certs — refusing to connect without its pins");
             return 0;
         }
     }
 
     # No pin on record → trust-on-first-use.
-    if (_tofu_record_pin(host, port, pin_hex) != 0) {
+    var rr = _tofu_record_pin(host, port, pin_hex);
+    if (rr == 0 - 2) { _tofu_mismatch(); return 0; }   # a racing sit pinned another certificate
+    if (rr != 0) {
         eprintln("sit: cannot record certificate pin in ~/.sit/known_certs");
         return 0;
     }
@@ -188,7 +268,7 @@ fn tofu_check_pin(host, port, spki_der, der_len) {
 # read the way git reads them (case-insensitive true/yes/on/1, false/no/off/0),
 # and anything else refuses to connect rather than guess the weaker mode.
 fn _https_verify_enabled() {
-    var v = config_get("http.sslVerify");
+    var v = config_get_trusted("http.sslVerify");
     if (v == 0) { return 0; }
     var n = strlen(v);
     if (n > 8) { return 0 - 1; }
@@ -216,9 +296,9 @@ fn _https_verify_enabled() {
 # no key cannot authenticate, and offering half a credential is worse than
 # offering none because it looks configured.
 fn _https_client_cert_paths(out_key) {
-    var c = config_get("http.sslCert");
+    var c = config_get_trusted("http.sslCert");
     if (c == 0) { return 0; }
-    var k = config_get("http.sslKey");
+    var k = config_get_trusted("http.sslKey");
     if (k == 0) {
         eprintln("sit: http.sslCert is set but http.sslKey is not");
         eprintln("sit:   refusing to connect with half a client credential");
@@ -244,7 +324,7 @@ fn _https_apply_trust(ctx, host) {
 
     # CA-verifying mode. A bundle path wins over the system store, so a
     # consumer can pin a private CA without touching the machine's trust.
-    var bundle = config_get("http.caBundle");
+    var bundle = config_get_trusted("http.caBundle");
     if (bundle != 0) {
         var pair[16];
         if (read_file_heap(bundle, &pair) != 0) {

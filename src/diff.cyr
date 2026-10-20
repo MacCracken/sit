@@ -214,7 +214,9 @@ fn print_labeled_section(title, title_len, items) {
         var pth = load64(it + 8);
         stdout_write("  ", 2);
         stdout_write(lab, strlen(lab));
-        stdout_write(pth, strlen(pth));
+        # 1.7.6 (L16): worktree names are external bytes — an escape sequence
+        # in a filename reached the terminal raw (the E8 / E10 class).
+        write_sanitized(STDOUT, pth, strlen(pth));
         stdout_write("\n", 1);
         si = si + 1;
     }
@@ -231,7 +233,7 @@ fn print_name_section(title, title_len, names) {
     while (si < vec_len(names)) {
         var nm = vec_get(names, si);
         stdout_write("  ", 2);
-        stdout_write(nm, strlen(nm));
+        write_sanitized(STDOUT, nm, strlen(nm));   # 1.7.6 (L16)
         stdout_write("\n", 1);
         si = si + 1;
     }
@@ -488,7 +490,18 @@ fn myers_diff(a, b) {
         }
     }
 
-    if (found_d < 0) { fl_free(V); return 0; }
+    if (found_d < 0) {
+        # 1.7.6 (R8): the trace slices too — up to 4096 of them, ~67 MB, were
+        # kept on every refused diff (a regenerated lockfile, a line-ending
+        # change), in the API caller's process.
+        fl_free(V);
+        var fi = 0;
+        while (fi < vec_len(trace)) {
+            fl_free(vec_get(trace, fi));
+            fi = fi + 1;
+        }
+        return 0;
+    }
 
     # Backtrack: from (n,m) to the origin, emitting ops in reverse.
     var script = vec_new();
@@ -947,10 +960,12 @@ fn compute_file_diff(old_buf, old_len, new_buf, new_len) {
 
 # Print one file's unified diff (---/+++ headers, then hunks); 1 if the diff table is over its cap.
 fn print_file_diff(path, old_buf, old_len, new_buf, new_len, ctx) {
+    # 1.7.6 (R13): names are display-safe here too — U+009B / U+202E pass the
+    # tree-name byte check (they are UTF-8, not ASCII controls).
     stdout_write("--- a/", 6);
-    stdout_write(path, strlen(path));
+    write_sanitized(STDOUT, path, strlen(path));
     stdout_write("\n+++ b/", 7);
-    stdout_write(path, strlen(path));
+    write_sanitized(STDOUT, path, strlen(path));
     stdout_write("\n", 1);
 
     var annotated = compute_file_diff(old_buf, old_len, new_buf, new_len);
@@ -1014,7 +1029,7 @@ fn print_file_stat(path, old_buf, old_len, new_buf, new_len, out_pair) {
     store64(out_pair, ins);
     store64(out_pair + 8, del);
     stdout_write(" ", 1);
-    stdout_write(path, strlen(path));
+    write_sanitized(STDOUT, path, strlen(path));   # 1.7.6 (R13)
     stdout_write(" | +", 4);
     var nbuf[24];
     var d = write_decimal(&nbuf, ins);
@@ -1102,7 +1117,11 @@ fn cmd_diff() {
         memcpy(ref_a_hex, &r, 64);
         store8(ref_a_hex + 64, 0);
         tree_a_entries = commit_tree_entries(ref_a_hex);
-        if (tree_a_entries == 0) { tree_a_entries = vec_new(); }
+        # 1.7.6 (L8): an unreadable tree diffed as an empty one.
+        if (tree_a_entries == 0) {
+            eprintln("sit: cannot read that commit's tree (missing or corrupt objects)");
+            return 1;
+        }
     }
     if (ref_b != 0) {
         var r[72];
@@ -1116,7 +1135,11 @@ fn cmd_diff() {
         memcpy(ref_b_hex, &r, 64);
         store8(ref_b_hex + 64, 0);
         tree_b_entries = commit_tree_entries(ref_b_hex);
-        if (tree_b_entries == 0) { tree_b_entries = vec_new(); }
+        # 1.7.6 (L8): an unreadable tree diffed as an empty one.
+        if (tree_b_entries == 0) {
+            eprintln("sit: cannot read that commit's tree (missing or corrupt objects)");
+            return 1;
+        }
     }
 
     # Mode: tree-vs-tree (two refs given).
@@ -1383,15 +1406,31 @@ fn cmd_show() {
     print_commit_header(&hex, &info, body, body_len);
     stdout_write("\n", 1);
 
+    # 1.7.6 (L8): an unreadable tree — this commit's, or a parent that is here
+    # but whose tree is not — is an error, not a diff. Since the walk stops at
+    # the first bad subtree, ignoring it printed every later file as deleted.
     var tree_hex = load64(&info);
     var new_entries = vec_new();
-    if (tree_hex != 0) { flatten_tree_reset(); flatten_tree(tree_hex, "", new_entries); }
+    if (tree_hex != 0) {
+        flatten_tree_reset();
+        if (flatten_tree(tree_hex, "", new_entries) < 0) {
+            eprintln("sit: cannot read that commit's tree (missing or corrupt objects)");
+            return 1;
+        }
+    }
 
     var parent_hex = load64(&info + 8);
     var old_entries = vec_new();
     if (parent_hex != 0) {
         var po = commit_tree_entries(parent_hex);
         if (po != 0) { old_entries = po; }
+        else {
+            # Absent parent: a shallow boundary, shown as a root (as before).
+            if (commit_tree_hex(parent_hex) != 0) {
+                eprintln("sit: cannot read the parent commit's tree (missing or corrupt objects)");
+                return 1;
+            }
+        }
     }
 
     var tot_files = 0;

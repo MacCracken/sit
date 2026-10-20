@@ -162,6 +162,7 @@ fn read_head_ref_path_a(a) {
     var abuf[4352];
     var ap = sit_abs_into(&hp, &abuf, 4352);
     if (ap == 0) { return 0; }
+    if (_sf_special(ap) == 1) { return 0; }          # 1.7.6 (R11): not a FIFO
     var fd = file_open(ap, 0, 0);
     if (fd < 0) { return 0; }
     var hbuf[1032];                                # HEAD_READ_MAX bytes are read at most
@@ -260,6 +261,26 @@ fn read_head_ref() {
     return buf;
 }
 
+# 1 when HEAD's branch ref exists but holds no valid id — empty, short,
+# non-hex or unreadable — as opposed to an unborn branch, whose ref file does
+# not exist. read_head_ref answers 0 for both. 1.7.6 (L5): commit and pull took
+# a broken ref for an unborn branch, so the next commit started a new root over
+# the history and `fsck --prune` could then delete it; they refuse instead, as
+# git does ("reference broken").
+fn head_ref_broken() {
+    if (_repo_backend == 1) { return 0; }
+    var ref_path = read_head_ref_path();
+    if (ref_path == 0) { return 0; }
+    var ref_len = strlen(ref_path);
+    var full = alloc(5 + ref_len + 1);
+    memcpy(full, ".sit/", 5);
+    memcpy(full + 5, ref_path, ref_len);
+    store8(full + 5 + ref_len, 0);
+    if (path_lstat_kind(sit_abs(full)) < 0) { return 0; }   # absent: unborn
+    if (read_head_ref() == 0) { return 1; }
+    return 0;
+}
+
 # Write the given 64-char hex to the ref file HEAD points at.
 fn write_head_ref(hex) {
     var ref_path = read_head_ref_path();
@@ -275,7 +296,7 @@ fn write_head_ref(hex) {
     memcpy(out, hex, 64);
     store8(out + 64, 10);
     store8(out + 65, 0);
-    if (sf_write_all(full, out, 65) < 0) { return 0 - 1; }
+    if (sf_write_atomic(full, out, 65) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -328,7 +349,7 @@ fn set_head_ref(ref_path) {
     memcpy(buf + 5, ref_path, rlen);
     store8(buf + 5 + rlen, 10);
     store8(buf + total, 0);
-    if (sf_write_all(".sit/HEAD", buf, total) < 0) { return 0 - 1; }
+    if (sf_write_atomic(".sit/HEAD", buf, total) < 0) { return 0 - 1; }
     return 0;
 }
 
@@ -400,6 +421,15 @@ fn _ref_prune_empty_dirs(path, root_len) {
     return 0;
 }
 
+# 1.7.6 (L17): a name being CREATED that starts with '-' is an option sit does
+# not have — `sit branch -D feature` made a branch named "-D", `sit tag -f v1`
+# a tag named "-f". git refuses such names too. Says so and returns 1.
+fn ref_name_is_option(name) {
+    if (load8(name) != 45) { return 0; }
+    eprint3("sit: unknown option '", name, "'\n");
+    return 1;
+}
+
 # `sit tag [-a|-s] [-d <name> | <name> [-m <msg>] [<commit>]]` — list, create or delete tags.
 fn cmd_tag() {
     if (sf_exists(".sit/HEAD") != 1) {
@@ -455,7 +485,7 @@ fn cmd_tag() {
         }
         _ref_prune_empty_dirs(dpath, 14);                # ".sit/refs/tags"
         stdout_write("deleted tag '", 13);
-        stdout_write(dname, dnlen);
+        write_sanitized(STDOUT, dname, dnlen);   # 1.7.6 (R13)
         stdout_write("'\n", 2);
         return 0;
     }
@@ -482,6 +512,7 @@ fn cmd_tag() {
 
     var name = argv_heap(argi);
     var nlen = strlen(name);
+    if (ref_name_is_option(name) == 1) { return 1; }   # 1.7.6 (L17)
     # S-02: tag names follow the same ref-format grammar as branches.
     if (refname_valid(name) == 0) {
         eprintln("sit: invalid tag name (see git check-ref-format rules)");
@@ -564,13 +595,13 @@ fn cmd_tag() {
     memcpy(buf, ref_hex, 64);
     store8(buf + 64, 10);
     store8(buf + 65, 0);
-    if (sf_write_all(path, buf, 65) < 0) {
+    if (sf_write_atomic(path, buf, 65) < 0) {
         eprintln("sit: failed to write tag ref");
         return 1;
     }
 
     stdout_write("created tag '", 13);
-    stdout_write(name, nlen);
+    write_sanitized(STDOUT, name, nlen);   # 1.7.6 (R13)
     stdout_write("'\n", 2);
     return 0;
 }
@@ -653,13 +684,14 @@ fn cmd_branch() {
         _ref_prune_empty_dirs(dpath, 15);                # ".sit/refs/heads"
         _ref_prune_empty_dirs(dlog, strlen(dlog) - dnlen - 1);   # ".../logs/refs/heads"
         stdout_write("deleted branch '", 16);
-        stdout_write(dname, dnlen);
+        write_sanitized(STDOUT, dname, dnlen);   # 1.7.6 (R13)
         stdout_write("'\n", 2);
         return 0;
     }
 
     var name = argv_heap(2);
     var nlen = strlen(name);
+    if (ref_name_is_option(name) == 1) { return 1; }   # 1.7.6 (L17)
     # S-02: reject names that don't satisfy git check-ref-format rules.
     if (refname_valid(name) == 0) {
         eprintln("sit: invalid branch name (see git check-ref-format rules)");
@@ -688,7 +720,7 @@ fn cmd_branch() {
     memcpy(buf, head_hex, 64);
     store8(buf + 64, 10);
     store8(buf + 65, 0);
-    if (sf_write_all(path, buf, 65) < 0) {
+    if (sf_write_atomic(path, buf, 65) < 0) {
         eprintln("sit: failed to write branch ref");
         return 1;
     }
@@ -702,7 +734,7 @@ fn cmd_branch() {
     reflog_append(br_ref, 0, head_hex, "branch: Created from HEAD");
 
     stdout_write("created branch '", 16);
-    stdout_write(name, nlen);
+    write_sanitized(STDOUT, name, nlen);   # 1.7.6 (R13)
     stdout_write("'\n", 2);
     return 0;
 }
@@ -731,6 +763,7 @@ fn cmd_checkout() {
     }
     var target = argv_heap(arg_idx);
     var tlen = strlen(target);
+    if (create == 1) { if (ref_name_is_option(target) == 1) { return 1; } }   # 1.7.6 (L17)
 
     # S-02 for every checkout, not only -b (1.6.4, E7): `sit checkout
     # ../tags/lt` was accepted and wrote `ref: refs/heads/../tags/lt` into HEAD,
@@ -738,6 +771,21 @@ fn cmd_checkout() {
     if (refname_valid(target) == 0) {
         eprintln("sit: invalid branch name (see git check-ref-format rules)");
         return 1;
+    }
+    # 1.7.6 (L2): an operation in progress belongs to this branch. Switching away
+    # carried its MERGE_HEAD (or CHERRY_PICK_HEAD / REVERT_HEAD) along, and the
+    # next commit there recorded it. `checkout -b` stays allowed: committing an
+    # in-progress merge onto a new branch is what that is for.
+    if (create == 0) {
+        var in_prog = 0;
+        if (sf_exists(".sit/MERGE_HEAD") == 1) { in_prog = 1; }
+        if (sf_exists(".sit/CHERRY_PICK_HEAD") == 1) { in_prog = 1; }
+        if (sf_exists(".sit/REVERT_HEAD") == 1) { in_prog = 1; }
+        if (in_prog == 1) {
+            eprintln("sit: a merge, cherry-pick or revert is in progress — commit it first,");
+            eprintln("sit:   or drop it with 'sit merge --abort' / 'sit reset --hard'");
+            return 1;
+        }
     }
 
     if (create == 1) {
@@ -761,7 +809,7 @@ fn cmd_checkout() {
         memcpy(buf, head_hex, 64);
         store8(buf + 64, 10);
         store8(buf + 65, 0);
-        if (sf_write_all(new_branch, buf, 65) < 0) {
+        if (sf_write_atomic(new_branch, buf, 65) < 0) {
             eprintln("sit: failed to write branch ref");
             return 1;
         }
@@ -795,7 +843,7 @@ fn cmd_checkout() {
     if (curr != 0) {
         if (streq(curr, target) == 1) {
             stdout_write("already on '", 12);
-            stdout_write(target, tlen);
+            write_sanitized(STDOUT, target, tlen);   # 1.7.6 (R13)
             stdout_write("'\n", 2);
             return 0;
         }
@@ -863,7 +911,7 @@ fn cmd_checkout() {
     reflog_append("HEAD", co_old, target_hex, co_msg);
 
     stdout_write("switched to branch '", 20);
-    stdout_write(target, tlen);
+    write_sanitized(STDOUT, target, tlen);
     stdout_write("'\n", 2);
     return 0;
 }

@@ -1,0 +1,94 @@
+# api_heap_probe.cyr — what the public read API keeps per call (1.7.6, R1 / R9).
+#
+# Built by tests/integration/run.sh against the SHIPPED read bundle
+# (dist/sit-read.cyr — what owl and thoth link), then run inside a repo.
+# Calls sit_repo_status, then sit_diff_path(argv(1)), `argv(2)` times each
+# after one warm-up call, and reports per call:
+#
+#   STATUS <bump bytes kept> <resident KB grown over all calls>
+#   DIFF   <bump bytes kept> <resident KB grown over all calls> <1 if the result was 0>
+#
+# Resident growth catches freelist buffers that are never freed (the blob and
+# worktree copies 1.7.5 kept), which alloc_used does not see. Not part of the
+# product; lives with the tests.
+include "dist/sit-read.cyr"
+
+fn _put_num(label, v) {
+    var nb[24];
+    stdout_write(label, strlen(label));
+    var k = write_decimal(&nb, v);
+    stdout_write(&nb, k);
+    return 0;
+}
+
+# Resident set in KB, from /proc/self/statm (field 2, in pages). 0 if unreadable.
+fn _rss_kb() {
+    var fd = file_open("/proc/self/statm", 0, 0);
+    if (fd < 0) { return 0; }
+    var buf[128];
+    var n = file_read(fd, &buf, 127);
+    file_close(fd);
+    if (n <= 0) { return 0; }
+    var i = 0;
+    while (i < n) {
+        if (load8(&buf + i) == 32) { i = i + 1; n = 0 - i; }
+        else { i = i + 1; }
+    }
+    if (n >= 0) { return 0; }
+    var p = 0 - n;
+    var v = 0;
+    var going = 1;
+    while (going == 1) {
+        var d = load8(&buf + p) & 0xFF;
+        if (d < 48) { going = 0; }
+        else {
+            if (d > 57) { going = 0; }
+            else { v = v * 10 + (d - 48); p = p + 1; }
+        }
+    }
+    return v * 4;
+}
+
+# Run each API call `argv(2)` times and print what it kept.
+fn main() {
+    alloc_init();
+    args_init();
+    if (sit_repo_open(".") == 0) { eprintln("PROBE-FAIL-OPEN"); return 1; }
+    var path = argv_heap(1);
+    var calls = 0;
+    var cs = argv_heap(2);
+    var ci = 0;
+    while (load8(cs + ci) != 0) { calls = calls * 10 + (load8(cs + ci) - 48); ci = ci + 1; }
+    if (calls <= 0) { eprintln("PROBE-FAIL-ARGS"); return 1; }
+
+    sit_repo_status(0);
+    var r0 = _rss_kb();
+    var u0 = alloc_used();
+    var i = 0;
+    while (i < calls) {
+        sit_repo_status(0);
+        i = i + 1;
+    }
+    _put_num("STATUS ", (alloc_used() - u0) / calls);
+    _put_num(" ", _rss_kb() - r0);
+    stdout_write("\n", 1);
+
+    sit_diff_path(0, path);
+    r0 = _rss_kb();
+    u0 = alloc_used();
+    var zero = 1;
+    i = 0;
+    while (i < calls) {
+        if (sit_diff_path(0, path) != 0) { zero = 0; }
+        i = i + 1;
+    }
+    _put_num("DIFF ", (alloc_used() - u0) / calls);
+    _put_num(" ", _rss_kb() - r0);
+    _put_num(" ", zero);
+    stdout_write("\n", 1);
+    stdout_flush();
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

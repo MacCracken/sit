@@ -290,7 +290,7 @@ On the client, a token goes only to a remote it is bound to (1.7.0, [ADR 0014](.
 sit config remote.origin.tokenFile ~/.sit/origin.token
 ```
 
-A loopback http(s) remote (`127.0.0.1`) with no `tokenFile` uses `~/.sit/serve.token`, which is your own server's token. Any other unbound remote gets no token, and a token is never sent over plain `http://` to a non-loopback host.
+A loopback http(s) remote (`127.0.0.1`) with no `tokenFile` uses `~/.sit/serve.token`, which is your own server's token. Any other unbound remote gets no token, and a token is never sent over plain `http://` to a non-loopback host. Since 1.7.6 a `tokenFile` (and the `http.ssl*` / `http.caBundle` keys) in a repo's `.sit/config` counts only when you own both `.sit/` and that file — a `.sit/` someone else made cannot point your token at its URL; put such keys in `~/.sitconfig` for shared checkouts.
 
 ## View history
 
@@ -412,6 +412,7 @@ As of v0.8.10 the matcher is git-parity:
 - **Directory-only rules**: a trailing `/` (`build/`) matches directories, not a file of the same name.
 - **Nested ignore files**: a `.sitignore` in a subdirectory applies below it, after the rules inherited from above (so its `!` re-includes win), as git's nested `.gitignore` does.
 - `sit add <ignored>` errors out — like git, override with `-f`. `add` applies exactly the rules `status` does (since 1.7.2). `.sitignore` itself is trackable.
+- `sit add` refuses a symlink, and a path beyond a symlinked directory (1.7.6): sit has no symlink entries yet, and reading through one would commit a file from outside the worktree.
 
 Simplification vs git (documented in `src/index.cyr`): a non-segment `**` (e.g. `a**b`) still crosses `/`.
 
@@ -421,7 +422,7 @@ Simplification vs git (documented in `src/index.cyr`): a non-segment `**` (e.g. 
 
 - `sit init` — create empty repository
 - `sit add <path>` — hash, compress, and store a file as a blob object; append to staging index
-- `sit rm [--cached] <path>` — remove a tracked file from working tree + index (or just the index with `--cached`)
+- `sit rm [--cached] <path>` — remove a tracked file from working tree + index (or just the index with `--cached`). Since 1.7.6 it refuses a file whose content differs from what is staged or committed, which it would otherwise delete unrecoverably; `--cached` still works
 - `sit branch [<name>]` — list branches, or create one at HEAD
 - `sit checkout [-b] <branch>` — switch branches; `-b` creates the branch first at HEAD
 - `sit tag [<name> [<commit>]]` — list tags, or create a **lightweight** tag at HEAD (or at a given commit): a ref file holding a commit oid, which is what every tag was before 1.5.0
@@ -431,11 +432,11 @@ Simplification vs git (documented in `src/index.cyr`): a non-segment `**` (e.g. 
 - `sit describe [<commit>]` — name a commit by the nearest tag: `v1.0` if the commit *is* the tag, otherwise `v1.0-2-g<short>` (tag, commits since, abbreviated oid). "Nearest" is git's documented rule: the tag with the fewest commits in `<tag>..<commit>`, counting every parent of a merge (1.7.3). Works with either tag kind, prefers an annotated tag when two name the same commit, and sees nested names like `release/v1`
 - `sit mv <src> <dst>` — rename a **tracked** file in the working tree *and* the index in one step. Doing both together keeps the staged content identical so the commit reads as a rename rather than an unrelated delete + add; the blob is reused, not rehashed. Refuses a missing or untracked source, an existing destination, a no-op rename, and any path that fails the same validation `sit add` applies
 - `sit merge <a> <b> [<c> ...]` — **octopus merge** (1.5.2): folds N branches in and writes one commit with N+1 parents. Refuses to produce conflicts, exactly as git's octopus does — the first conflict aborts with nothing written, because a conflicted N-way merge cannot say which side a marker came from. Merge those pairwise instead
-- `sit merge <branch>` — fast-forward when possible; otherwise 3-way merge with line-level diff3. Edits on different regions of the same file auto-merge; truly overlapping edits fall back to `<<<<<<<`/`=======`/`>>>>>>>` markers, save `.sit/MERGE_HEAD`, and wait for you to resolve + `sit add` + `sit commit` (which emits a 2-parent commit). `sit merge --abort` cancels the merge and restores HEAD.
+- `sit merge <branch>` — fast-forward when possible; otherwise 3-way merge with line-level diff3. Edits on different regions of the same file auto-merge; truly overlapping edits fall back to `<<<<<<<`/`=======`/`>>>>>>>` markers, save `.sit/MERGE_HEAD`, and wait for you to resolve + `sit add` + `sit commit` (which emits a 2-parent commit). `sit merge --abort` cancels the merge and restores HEAD; so does `sit reset --hard`, which also clears the merge state (1.7.6), and `checkout` refuses until one of them, or the resolving commit, has run. `-S` signs the merge commit wherever it appears; `-m <msg>` is accepted and ignored (the message is fixed); any other option is refused.
 - `sit rebase <upstream>` — replay the commits on this branch that aren't on `<upstream>` onto it, oldest first (1.5.3). Since 1.7.3 that set is git's `<upstream>..HEAD` over every parent: commits upstream already has are not replayed, even when upstream was merged into the branch, and merge commits are dropped while the commits they brought in are replayed in order (git's default). On conflict it stops with the usual markers; resolve, `sit add`, then `sit rebase --continue`. `sit rebase --abort` restores the branch tip and working tree exactly as they were. ⚠ Rebase **rewrites history** — replayed commits get new oids; the originals stay reachable through the reflog, so `HEAD@{N}` still finds them
 - `sit cherry-pick <commit>` — apply that commit's change onto HEAD as a new commit (1.5.1). Runs the same 3-way merge `sit merge` does, with `base = the commit's parent`, `ours = HEAD`, `theirs = the commit`; conflicts write the usual markers plus `.sit/CHERRY_PICK_HEAD`, then resolve + `sit add` + `sit commit`. A pick that changes nothing reports so rather than creating an empty commit
 - `sit revert <commit>` — apply that commit's *inverse* as a new commit messaged `Revert "<original>"` (1.5.1). Identical machinery to cherry-pick with `base` and `theirs` swapped, so a revert removes what the commit added — from the working tree as well as the tree
-- `sit stash [push|list|pop|drop]` — save tracked working-tree changes and restore HEAD, then bring them back (1.5.1). Entries are real commits: `.sit/refs/stash` names the newest and each carries the previous stash as a second parent, so the stack is the object graph and `sit fsck` protects it. Only tracked files are stashed (git's default); `pop` restores the newest entry and pops it, `drop` discards without restoring
+- `sit stash [push|list|pop|drop]` — save tracked working-tree changes and restore HEAD, then bring them back (1.5.1). Entries are real commits: `.sit/refs/stash` names the newest and each carries the previous stash as a second parent, so the stack is the object graph and `sit fsck` protects it. Only tracked files are stashed (git's default), and since 1.7.6 `stash` refuses when a file HEAD tracks but the index does not (after `sit rm --cached`) has changed, since restoring HEAD would discard it; `pop` restores the newest entry and pops it, `drop` discards without restoring
 - `sit reset <path>` — unstage: rewrite the index entry for the path to HEAD's tree hash (or drop it if HEAD doesn't have it). Working tree untouched.
 - `sit reset --hard <ref>` — move the current branch's ref to `<ref>` (branch / tag / commit hex) and restore the working tree to that commit.
 - `sit config [--global] <key> [<value>]` — read/write config entries (`user.name`, `user.email`, etc). Local at `.sit/config`, global at `~/.sitconfig`

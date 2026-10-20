@@ -10,8 +10,8 @@ str
 fs
 args
 vec
-chrono
 freelist
+chrono
 mmap
 hashmap
 sigil

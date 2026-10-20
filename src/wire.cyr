@@ -105,7 +105,8 @@ fn remote_objects_open(repo_path) {
     store8(marker + rl + 21, 0);
     if (file_exists(marker) != 1) {
         if (patra_exec(db, "CREATE INDEX ON objects (hash)") == 0) {
-            file_write_all(marker, "1\n", 2);
+            # 1.7.6 (X1): never through a symlink planted in the remote.
+            sf_write_atomic_at(repo_path, ".sit/objects.indexed", "1\n", 2);
         }
     }
     return db;
@@ -169,54 +170,69 @@ fn db_object_read_raw(db, hex, out) {
     return 0;
 }
 
-# Read + decompress from an opened db. Same out-layout as read_object.
-fn db_object_read_decompressed(db, hex, out) {
-    var raw[24];
-    return db_object_read_both(db, hex, &raw, out);
-}
-
 # v0.7.5: decompress a {compressed, clen, ty} 24-byte struct into a
-# 24-byte decompressed view {ptr, dlen, content_offset_after_NUL}.
-# Same 4×-initial / 16 MiB-ceiling sizing as db_object_read_both —
-# extracted so cache-hit paths in the phased walker can decompress
-# without re-reading the compressed bytes from the transport.
+# 24-byte decompressed view {ptr, dlen, content_offset_after_NUL}, through
+# obj_inflate_fl like every stored-object inflate — extracted so cache-hit
+# paths in the phased walker can decompress without re-reading the
+# compressed bytes from the transport.
 # Returns 0 on success, negative on decompression failure / OOM.
 fn _decompress_raw_into(raw, deco_out) {
-    var compressed = load64(raw);
-    var clen = load64(raw + 8);
-    var dec_cap = clen * 4;
-    if (dec_cap < 4096) { dec_cap = 4096; }
-    if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
     # 1.6.4 (C1): freelist memory, so `sit serve`'s PUT path can release it per
     # request (it calls this on every pushed object). Callers may fl_free
-    # deco_out's buffer; the client walkers keep it, as before.
-    var decompressed = fl_alloc(dec_cap);
-    if (decompressed == 0) { return 0 - 2; }
-    var dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
-    if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
-        if (dec_cap < 16 * 1024 * 1024) {
-            fl_free(decompressed);
-            dec_cap = 16 * 1024 * 1024;
-            decompressed = fl_alloc(dec_cap);
-            if (decompressed == 0) { return 0 - 2; }
-            dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
+    # deco_out's buffer; the client walkers keep it, as before. 1.7.6 (R10):
+    # obj_inflate_fl, the shared inflate.
+    return obj_inflate_fl(load64(raw), load64(raw + 8), deco_out);
+}
+
+# Verify an inflated object: its framing type (the bytes before the space) must
+# be `claimed_ty`, and the SHA-256 of the whole framed object must be `hex`.
+# `deco` is _decompress_raw_into's {ptr, dlen, content_offset}. Returns 0, -1 for
+# bad framing or a hash mismatch, -2 for a type mismatch. The trust check for
+# every object sit stores from elsewhere: fetched (copy_objects) or pushed
+# (serve's POST /sit/v1/objects).
+fn _object_verify(hex, claimed_ty, deco) {
+    var dbuf = load64(deco);
+    var dlen = load64(deco + 8);
+    var coff = load64(deco + 16);
+    # `coff - 1` is the NUL; the type runs from 0 to the first space.
+    if (coff < 5) { return 0 - 1; }
+    var sp = 0;
+    var found_sp = 0;
+    var scan = 0;
+    while (scan < coff) {
+        if (found_sp == 0) {
+            if (load8(dbuf + scan) == 32) { found_sp = 1; sp = scan; }
         }
+        scan = scan + 1;
     }
-    if (dlen <= 0) { fl_free(decompressed); return 0 - 3; }
-    var nul = 0;
-    var scanning = 1;
-    while (scanning == 1) {
-        if (nul >= dlen) { scanning = 0; }
-        else {
-            if (load8(decompressed + nul) == 0) { scanning = 0; }
-            else { nul = nul + 1; }
-        }
-    }
-    if (nul >= dlen) { fl_free(decompressed); return 0 - 4; }
-    store64(deco_out,      decompressed);
-    store64(deco_out +  8, dlen);
-    store64(deco_out + 16, nul + 1);
+    if (found_sp == 0) { return 0 - 1; }
+    var declared_ty = type_code_of(dbuf, sp);
+    if (declared_ty < 0) { return 0 - 1; }
+    if (declared_ty != claimed_ty) { return 0 - 2; }
+    # Compared as raw digests on the stack (hash_data would return its hex on
+    # the global heap, kept per object). Decoding `hex` compares the same values
+    # whatever its case.
+    var actual[32];
+    var wanted[32];
+    sha256(dbuf, dlen, &actual);
+    if (hex_decode_into(hex, 64, &wanted) == 0) { return 0 - 1; }
+    if (memeq(&actual, &wanted, 32) == 0) { return 0 - 1; }
     return 0;
+}
+
+# _object_verify on compressed bytes: inflate them (into a freelist buffer freed
+# here), then verify. Returns 0, -1 when they do not inflate, frame or hash as
+# `hex`, -2 for a type mismatch.
+fn _object_verify_raw(hex, claimed_ty, compressed, clen) {
+    var raw[24];
+    store64(&raw, compressed);
+    store64(&raw + 8, clen);
+    store64(&raw + 16, claimed_ty);
+    var deco[24];
+    if (_decompress_raw_into(&raw, &deco) != 0) { return 0 - 1; }
+    var r = _object_verify(hex, claimed_ty, &deco);
+    fl_free(load64(&deco));
+    return r;
 }
 
 # Variant that returns BOTH the compressed bytes (raw_out, 24 bytes:
@@ -228,34 +244,9 @@ fn db_object_read_both(db, hex, raw_out, deco_out) {
     if (db_object_read_raw(db, hex, raw_out) != 0) { return 0 - 1; }
     var compressed = load64(raw_out);
     var clen = load64(raw_out + 8);
-    # S-08 + P-06 (v0.6.9): 4× initial; retry at the 16 MiB ceiling only
-    # on confirmed -ERR_BUFFER_TOO_SMALL. Matches read_object's policy so
-    # reachability walks and local reads see the same failure modes.
-    var dec_cap = clen * 4;
-    if (dec_cap < 4096) { dec_cap = 4096; }
-    if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
-    var decompressed = alloc(dec_cap);
-    if (decompressed == 0) { return 0 - 2; }
-    var dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
-    if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
-        if (dec_cap < 16 * 1024 * 1024) {
-            dec_cap = 16 * 1024 * 1024;
-            decompressed = alloc(dec_cap);
-            if (decompressed == 0) { return 0 - 2; }
-            dlen = zlib_decompress_with_ratio_cap(compressed, clen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
-        }
-    }
-    if (dlen <= 0) { return 0 - 3; }
-    var nul = 0;
-    while (nul < dlen) {
-        if (load8(decompressed + nul) == 0) { break; }
-        nul = nul + 1;
-    }
-    if (nul >= dlen) { return 0 - 4; }
-    store64(deco_out, decompressed);
-    store64(deco_out + 8, dlen);
-    store64(deco_out + 16, nul + 1);
-    return 0;
+    # 1.7.6 (R10): the shared inflate (it was a bump-heap copy of read_object's
+    # sizing). The compressed bytes stay the caller's, for the walk cache.
+    return obj_inflate_fl(compressed, clen, deco_out);
 }
 
 # Insert a pre-compressed object (hex key, type code, zlib bytes) into db.
@@ -456,6 +447,28 @@ fn _walk_cache_insert(raw_cache, hex, raw_struct_ptr) {
     var slot = alloc_or_die(24);
     memcpy(slot, raw_struct_ptr, 24);
     map_set(raw_cache, hex, slot);
+    return slot;                     # 1.7.6: the slot, so a verification can name it
+}
+
+# 1.7.6 (N1): the cache slots the walk has verified (hex → slot). The walk
+# already inflates every commit and tree to read its edges, so it verifies them
+# there, failing early, and copy_objects need not inflate them again. A slot is
+# never rewritten — a later insert for the same id (a /want frame) makes a new
+# one — so "this hex maps to this slot" names exactly the bytes that passed.
+var _wire_verified = 0;
+
+# Verify the object the walk just read (`raw` / `obj`, as obj_src_read_both
+# fills them), cache it, and record the cached slot as verified. 0, or -1 with
+# the refusal printed.
+fn _walk_verify_cache(raw_cache, hex, raw, obj) {
+    if (_object_verify(hex, load64(raw + 16), obj) != 0) {
+        eprint3("sit: the source sent content that does not hash to ", hex, " — refusing the transfer\n");
+        return 0 - 1;
+    }
+    var slot = _walk_cache_insert(raw_cache, hex, raw);
+    if (slot != 0) {
+        if (_wire_verified != 0) { map_set(_wire_verified, hex, slot); }
+    }
     return 0;
 }
 
@@ -503,6 +516,7 @@ fn walk_reachable_phased(src, root_hex, out, seen, raw_cache) {
     var trees = vec_new();
     var queue = vec_new();
     var qdepth = vec_new();
+    _wire_verified = map_new();
     var hex_copy = alloc(65);
     memcpy(hex_copy, root_hex, 64);
     store8(hex_copy + 64, 0);
@@ -535,7 +549,7 @@ fn walk_reachable_phased(src, root_hex, out, seen, raw_cache) {
             var raw[24];
             var obj[24];
             if (obj_src_read_both(src, cur, &raw, &obj) == 0) {
-                _walk_cache_insert(raw_cache, cur, &raw);
+                if (_walk_verify_cache(raw_cache, cur, &raw, &obj) != 0) { return 0 - 1; }
                 var buf = load64(&obj);
                 var blen = load64(&obj + 8);
                 var coff = load64(&obj + 16);
@@ -586,6 +600,17 @@ fn walk_reachable_phased(src, root_hex, out, seen, raw_cache) {
                         }
                     }
                 }
+                else {
+                    # 1.7.6 (R12): a commit no reader will use (header order) is
+                    # not stored; its tree could not be followed anyway. (Other
+                    # kinds — an annotated tag at a tip — stay leaves here.)
+                    if (blen >= 7) {
+                        if (memeq(buf, "commit ", 7) == 1) {
+                            eprint3("sit: malformed commit ", cur, " (header order) — refusing the transfer\n");
+                            return 0 - 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -596,7 +621,7 @@ fn walk_reachable_phased(src, root_hex, out, seen, raw_cache) {
     # Phase 3: walk each top-level tree (per-level batched recursion).
     var ti = 0;
     while (ti < vec_len(trees)) {
-        walk_reachable_tree_batched(src, vec_get(trees, ti), out, seen, raw_cache);
+        if (walk_reachable_tree_batched(src, vec_get(trees, ti), out, seen, raw_cache) != 0) { return 0 - 1; }
         ti = ti + 1;
     }
     return 0;
@@ -641,7 +666,10 @@ fn walk_reachable_tree_batched(src, tree_hex, out, seen, raw_cache) {
             return 0;
         }
     }
-    _walk_cache_insert(raw_cache, hex_copy, &raw);
+    if (_walk_verify_cache(raw_cache, hex_copy, &raw, &obj) != 0) {
+        _wire_walk_depth = _wire_walk_depth - 1;
+        return 0 - 1;
+    }
     var buf = load64(&obj);
     var blen = load64(&obj + 8);
     var coff = load64(&obj + 16);
@@ -683,11 +711,15 @@ fn walk_reachable_tree_batched(src, tree_hex, out, seen, raw_cache) {
 
     # Recurse — sub-tree reads now come from cache (when batch fired).
     var si = 0;
+    var failed = 0;
     while (si < vec_len(sub_trees)) {
-        walk_reachable_tree_batched(src, vec_get(sub_trees, si), out, seen, raw_cache);
+        if (failed == 0) {
+            if (walk_reachable_tree_batched(src, vec_get(sub_trees, si), out, seen, raw_cache) != 0) { failed = 1; }
+        }
         si = si + 1;
     }
     _wire_walk_depth = _wire_walk_depth - 1;
+    if (failed == 1) { return 0 - 1; }
     return 0;
 }
 
@@ -696,6 +728,16 @@ fn walk_reachable_tree_batched(src, tree_hex, out, seen, raw_cache) {
 # already printed) when the destination does not end up holding every object
 # in `hashes`: callers must not move a ref.
 fn copy_objects(src, dst_db, hashes, raw_cache) {
+    # 1.7.6 (N1): every object is verified before it is stored — its framing
+    # type must be the type the source claimed, and the SHA-256 of the framed
+    # bytes must be its id (_object_verify_raw). Through 1.7.5 fetch, clone and
+    # pull stored whatever bytes a server sent under whatever id it named: a
+    # hostile or MITM'd server swapped a blob behind a signed commit, the clone
+    # exited 0 and `verify-commit` still said "good", because the signature
+    # covers the tree id, not the bytes stored under it. Only fsck noticed. A
+    # mismatch now rolls the whole copy back, so no ref moves. Push copies
+    # through here too (file:// targets); the server checks pushed objects with
+    # the same function.
     var n = vec_len(hashes);
     var i = 0;
     var copied = 0;
@@ -734,11 +776,15 @@ fn copy_objects(src, dst_db, hashes, raw_cache) {
         var hex = vec_get(hashes, i);
         var raw[24];
         var got = 0;
+        var walk_ok = 0;                 # the walk verified exactly these bytes
         if (raw_cache != 0) {
             var cached = map_get(raw_cache, hex);
             if (cached != 0) {
                 memcpy(&raw, cached, 24);
                 got = 1;
+                if (_wire_verified != 0) {
+                    if (map_get(_wire_verified, hex) == cached) { walk_ok = 1; }
+                }
             }
         }
         if (got == 0) {
@@ -760,6 +806,15 @@ fn copy_objects(src, dst_db, hashes, raw_cache) {
             var compressed = load64(&raw);
             var clen = load64(&raw + 8);
             var ty = load64(&raw + 16);
+            var vr = 0;
+            if (walk_ok == 0) { vr = _object_verify_raw(hex, ty, compressed, clen); }
+            if (vr != 0) {
+                if (in_txn == 1) { patra_rollback(dst_db); }
+                var why = "sit: the source sent content that does not hash to ";
+                if (vr == 0 - 2) { why = "sit: the source sent an object of the wrong type for "; }
+                eprint3(why, hex, " — refusing the transfer\n");
+                return 0 - 1;
+            }
             var ins = db_object_insert_raw(dst_db, hex, ty, compressed, clen);
             if (ins < 0) {
                 if (in_txn == 1) { patra_rollback(dst_db); }
@@ -843,7 +898,30 @@ fn read_remote_ref(repo_path, branch) {
 }
 
 # Write `hex\n` (65 bytes) to `<repo_path>/.sit/refs/heads/<branch>`.
+# 1.7.6 (L11 / X1 / X3): through sf_write_atomic_at, which refuses a symlink
+# at any directory below the remote's root, creates missing ones (a nested
+# branch like feature/x could not be pushed), and replaces the ref through a
+# lock file. It was a raw file_write_all: a symlink planted at the ref made the
+# push overwrite its target, and an unvalidated `../` branch wrote outside the
+# remote. `branch` is validated here as well as by the callers.
 fn write_remote_ref(repo_path, branch, hex) {
+    if (refname_valid(branch) == 0) { return 0 - 1; }
+    var bl = strlen(branch);
+    var rel = alloc(16 + bl + 1);
+    memcpy(rel, ".sit/refs/heads/", 16);
+    memcpy(rel + 16, branch, bl);
+    store8(rel + 16 + bl, 0);
+    var buf[72];
+    memcpy(&buf, hex, 64);
+    store8(&buf + 64, 10);
+    return sf_write_atomic_at(repo_path, rel, &buf, 65);
+}
+
+# 1 when the remote's ref for `branch` is there but unusable: the file, or a
+# directory above it, is a symlink, or it does not hold a 64-hex id. Such a ref
+# read as "absent", so a push treated it as a new branch and skipped the
+# fast-forward and checked-out-branch checks (1.7.6, X1).
+fn _remote_ref_unsafe(repo_path, branch) {
     var rl = strlen(repo_path);
     var bl = strlen(branch);
     var p = alloc(rl + bl + 32);
@@ -851,10 +929,20 @@ fn write_remote_ref(repo_path, branch, hex) {
     memcpy(p + rl, "/.sit/refs/heads/", 17);
     memcpy(p + rl + 17, branch, bl);
     store8(p + rl + 17 + bl, 0);
-    var buf = alloc(66);
-    memcpy(buf, hex, 64);
-    store8(buf + 64, 10);
-    return file_write_all(p, buf, 65);
+    var i = rl + 1;
+    while (i < rl + 17 + bl) {
+        if (load8(p + i) == 47) {
+            store8(p + i, 0);
+            if (path_lstat_kind(p) == 0xA000) { return 1; }
+            store8(p + i, 47);
+        }
+        i = i + 1;
+    }
+    var kind = path_lstat_kind(p);
+    if (kind < 0) { return 0; }                    # absent: a new branch
+    if (kind != 0x8000) { return 1; }              # a symlink, a directory, a FIFO
+    if (read_remote_ref(repo_path, branch) == 0) { return 1; }   # not a ref
+    return 0;
 }
 
 # Write 65-byte hex to `.sit/refs/remotes/<remote>/<branch>`.
@@ -895,7 +983,7 @@ fn write_remote_tracking(remote, branch, hex) {
     var buf = alloc(66);
     memcpy(buf, hex, 64);
     store8(buf + 64, 10);
-    var wres = sf_write_all(p, buf, 65);
+    var wres = sf_write_atomic(p, buf, 65);
     if (wres >= 0) {
         var rtref = alloc(13 + rl + 1 + bl + 1);
         memcpy(rtref, "refs/remotes/", 13);
@@ -911,6 +999,7 @@ fn write_remote_tracking(remote, branch, hex) {
 # Return 1 if `ancestor_hex` is reachable from `desc_hex` (ff check).
 fn is_ancestor_in_db(db, ancestor_hex, desc_hex) {
     if (streq(ancestor_hex, desc_hex) == 1) { return 1; }
+    var visits = 0;
     var a = _wire_walk_alloc();
     reset_via(a);                                   # the previous walk's memory
     var queue = vec_new_a(a);
@@ -932,6 +1021,16 @@ fn is_ancestor_in_db(db, ancestor_hex, desc_hex) {
         else {
             var cur = vec_get(queue, vec_len(queue) - 1);
             vec_pop(queue);
+            # 1.7.6 (N4): a caller-set deadline, checked every 64 commits.
+            visits = visits + 1;
+            if (_wire_walk_deadline_ns != 0) {
+                if ((visits & 63) == 0) {
+                    if (clock_now_ns() > _wire_walk_deadline_ns) {
+                        if (load64(&cell) != 0) { fl_free(load64(&cell)); }
+                        return 0 - 1;
+                    }
+                }
+            }
             if (map_has(seen, cur) == 0) {
                 if (map_set_a(a, seen, cur, 1) < 0) { walking = 0; }
                 else {
@@ -975,6 +1074,31 @@ fn is_ancestor_in_db(db, ancestor_hex, desc_hex) {
 var WIRE_WALK_ARENA_CHUNK = 65536;
 var _wire_walk_al = 0;
 
+# 1.7.6 (N4): when non-zero, the clock_now_ns() past which is_ancestor_in_db
+# gives up and returns -1. `sit serve` sets it around its fast-forward check: a
+# refused push walks the pushed commit's whole history, so a client could push a
+# long chain once and then hold the single-threaded server for as long as that
+# history takes to read, on every request. Clients leave it 0 (no limit).
+var _wire_walk_deadline_ns = 0;
+
+# The patra type code of `hex` in `db` (0 blob, 1 tree, 2 commit, 3 tag), or -1
+# when it is absent or unreadable. `hex` must already be 64 lowercase hex.
+fn db_object_type(db, hex) {
+    var sql = fl_alloc(128);
+    if (sql == 0) { return 0 - 1; }
+    memcpy(sql, "SELECT ty FROM objects WHERE hash = '", 37);
+    memcpy(sql + 37, hex, 64);
+    memcpy(sql + 37 + 64, "'", 1);
+    store8(sql + 37 + 64 + 1, 0);
+    var rs = patra_query(db, sql);
+    fl_free(sql);
+    if (rs == 0) { return 0 - 1; }
+    var ty = 0 - 1;
+    if (patra_result_count(rs) > 0) { ty = patra_result_get_int(rs, 0, 0); }
+    patra_result_free(rs);
+    return ty;
+}
+
 fn _wire_walk_alloc() {
     if (_wire_walk_al == 0) {
         _wire_walk_al = arena_allocator_growable(WIRE_WALK_ARENA_CHUNK);
@@ -987,8 +1111,9 @@ fn _wire_walk_alloc() {
 }
 
 # Read `hex` from `db` and inflate it into the freelist buffer `cell` {ptr, cap}
-# names, replacing it with a larger one when the object needs more (the same
-# 4x / 16 MiB-retry sizing as db_object_read_both). Writes the content past the
+# names, replacing it with a larger one when the object needs more (4x the
+# compressed size first, then the size its header declares — obj_inflate_fl's
+# sizing, kept in a buffer that is reused). Writes the content past the
 # framing NUL to out16 {ptr, len}; the bytes stay valid until the next call.
 # Returns 0, or negative as db_object_read_both does.
 fn _db_object_inflate_reuse(db, hex, cell, out16) {
@@ -1009,11 +1134,20 @@ fn _db_object_inflate_reuse(db, hex, cell, out16) {
             if (load64(cell) == 0) { store64(cell + 8, 0); tries = 2; dlen = 0 - 2; }
         }
         if (tries < 2) {
-            dlen = zlib_decompress_with_ratio_cap(compressed, clen, load64(cell), load64(cell + 8),
+            var cb = load64(cell);
+            store64(cb, 0); store64(cb + 8, 0); store64(cb + 16, 0); store64(cb + 24, 0);
+            dlen = zlib_decompress_with_ratio_cap(compressed, clen, cb, load64(cell + 8),
               SIT_MAX_INFLATE_RATIO);
             tries = tries + 1;
             if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
-                if (dec_cap < 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
+                if (dec_cap < 16 * 1024 * 1024) {
+                    # 1.7.6 (R10): size the retry from the object's header, as
+                    # obj_inflate_fl does, rather than growing the cell to 16 MiB.
+                    var want = obj_frame_total(cb, 32);
+                    var next = 16 * 1024 * 1024;
+                    if (want > dec_cap) { if (want + 16 < next) { next = want + 16; } }
+                    dec_cap = next;
+                }
                 else { tries = 2; }
             }
             else { tries = 2; }
@@ -1169,6 +1303,12 @@ fn cmd_remote() {
 # the obj_src abstraction so walk_reachable_* / copy_objects don't see
 # transport-specific code paths.
 fn do_fetch(name, branch) {
+    # 1.7.6 (X3): the branch names a path in the remote (file://) and in
+    # refs/remotes; refuse a bad one before either.
+    if (refname_valid(branch) == 0) {
+        eprintln("sit: invalid branch name");
+        return 0;
+    }
     var url = remote_url(name);
     if (url == 0) {
         eprintln("sit: no such remote");
@@ -1324,12 +1464,17 @@ fn cmd_pull() {
     var tip = do_fetch(name, branch);
     if (tip == 0) { return 1; }
 
+    if (head_ref_broken() == 1) {
+        eprintln("sit: the current branch's ref is broken (not a commit id) — refusing to pull over it");
+        return 1;
+    }
     var head_hex = read_head_ref();
     if (head_hex == 0) {
         # No local commits yet — materialize the fetched tip, then adopt it as
         # HEAD. 1.6.4 (B3/B9): HEAD moved first and the materialize result was
         # ignored, so a failed or refused write still "initialized" the branch.
-        if (materialize_target_safe(tip, 1) != 0) {
+        # 1.7.6: the full preflight (0): nothing on this path ran is_dirty.
+        if (materialize_target_safe(tip, 0) != 0) {
             eprintln("sit: pull aborted — HEAD unchanged");
             return 1;
         }
@@ -1410,7 +1555,7 @@ fn _write_shallow_file(boundary) {
         off = off + 65;
         i = i + 1;
     }
-    if (sf_write_all(".sit/shallow", buf, total) < 0) {
+    if (sf_write_atomic(".sit/shallow", buf, total) < 0) {
         eprintln("sit: warning — failed to write .sit/shallow (log may error at boundary)");
     }
     return 0;
@@ -1595,7 +1740,7 @@ fn cmd_clone() {
     ensure_dir(".sit/refs");
     ensure_dir(".sit/refs/heads");
     var head = "ref: refs/heads/main\n";
-    if (sf_write_all(".sit/HEAD", head, 21) < 0) {
+    if (sf_write_atomic(".sit/HEAD", head, 21) < 0) {
         eprintln("sit: failed to write .sit/HEAD");
         return 1;
     }
@@ -1656,6 +1801,11 @@ fn cmd_push() {
     var branch = current_branch_name();
     if (argc() >= 4) { branch = argv_heap(3); }
     if (branch == 0) { branch = "main"; }
+    # 1.7.6 (X3): validated before it becomes a path in the remote.
+    if (refname_valid(branch) == 0) {
+        eprintln("sit: invalid branch name");
+        return 1;
+    }
 
     var url = remote_url(name);
     if (url == 0) {
@@ -1693,6 +1843,10 @@ fn cmd_push() {
         return 1;
     }
 
+    if (_remote_ref_unsafe(repo_path, branch) == 1) {
+        eprintln("sit: the remote's ref for this branch is a symlink or not a ref — refusing to push");
+        return 1;
+    }
     var remote_tip = read_remote_ref(repo_path, branch);
 
     # v0.8.4: denyCurrentBranch over file://. Symmetric to the
@@ -1785,7 +1939,7 @@ fn remote_bearer_token(name, loopback, out_err) {
     memcpy(key + 7, name, nl);
     memcpy(key + 7 + nl, ".tokenFile", 10);
     store8(key + 7 + nl + 10, 0);
-    var cfg = config_get(key);
+    var cfg = config_get_trusted(key);              # 1.7.6 (X5)
     if (cfg != 0) {
         var path = _expand_home_path(cfg);
         if (path == 0) {

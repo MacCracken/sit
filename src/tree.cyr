@@ -356,7 +356,15 @@ fn flatten_tree(tree_hex, prefix, out) {
             memcpy(sub_prefix + prefix_len, name, name_len);
             store8(sub_prefix + prefix_len + name_len, 47);
             store8(sub_prefix + prefix_len + name_len + 1, 0);
-            flatten_tree(hash_hex, sub_prefix, out);
+            # 1.7.6 (L8): a subtree that cannot be read (or that trips a
+            # budget) fails the whole walk. Its result was discarded, so only a
+            # bad ROOT tree failed — a missing `d/` read as an empty directory
+            # and checkout / reset / merge deleted everything under it.
+            var sr = flatten_tree(hash_hex, sub_prefix, out);
+            if (sr < 0) {
+                _tree_walk_depth = _tree_walk_depth - 1;
+                return sr;
+            }
         }
         else {
             var full_path = alloc_or_die(prefix_len + name_len + 1);
@@ -376,30 +384,26 @@ fn flatten_tree(tree_hex, prefix, out) {
     return 0;
 }
 
+var _head_tree_warned = 0;
+
 # Read HEAD → commit → tree, recursively flatten into full-path entries.
-# Returns vec or 0 if there's no HEAD commit yet.
+# Returns vec or 0 if there's no HEAD commit yet — or if HEAD's tree cannot be
+# read, which is said on stderr (once per process: the public API runs this per
+# status call inside owl / thoth): callers treat 0 as "nothing tracked", the
+# safe reading for the dirty / untracked checks.
 fn read_head_tree_entries() {
     var head_commit = read_head_ref();
     if (head_commit == 0) { return 0; }
-
-    var obj[24];
-    if (read_object(head_commit, &obj) != 0) { return 0; }
-    var buf = load64(&obj);
-    var blen = load64(&obj + 8);
-    var coff = load64(&obj + 16);
-    var body = buf + coff;
-    var body_len = blen - coff;
-
-    var hexlen = _id_hexlen();
-    if (body_len < 6 + hexlen) { return 0; }
-    if (memeq(body, "tree ", 5) == 0) { return 0; }
-    var tree_hex = alloc_or_die(hexlen + 1);
-    memcpy(tree_hex, body + 5, hexlen);
-    store8(tree_hex + hexlen, 0);
-
-    var out = vec_new();
-    flatten_tree_reset();
-    flatten_tree(tree_hex, "", out);
+    # 1.7.6 (L8): the same parse as every other tree read (parse_commit_body,
+    # the walk's failure propagated). This took any "tree " first line and
+    # ignored the walk's result.
+    var out = commit_tree_entries(head_commit);
+    if (out == 0) {
+        if (_head_tree_warned == 0) {
+            eprintln("sit: HEAD's tree cannot be read (missing or corrupt objects) — run 'sit fsck'");
+            _head_tree_warned = 1;
+        }
+    }
     return out;
 }
 
@@ -440,6 +444,30 @@ fn _tree_find_map(entries) {
     vec_push(_tree_find_keys, entries);
     vec_push(_tree_find_maps, m);
     return m;
+}
+
+# Drop `entries`' cached map (1.7.6, R1). A caller that builds a vec per call
+# and is called again and again — the public API, in owl / thoth — releases it
+# when done; otherwise every call left one more key for every later tree_find
+# to scan past.
+fn tree_find_release(entries) {
+    if (_tree_find_keys == 0) { return 0; }
+    var k = vec_len(_tree_find_keys);
+    var ki = 0;
+    var at = 0 - 1;
+    while (ki < k) {
+        if (at < 0) { if (vec_get(_tree_find_keys, ki) == entries) { at = ki; } }
+        ki = ki + 1;
+    }
+    if (at < 0) { return 0; }
+    var last = k - 1;
+    if (at != last) {
+        vec_set(_tree_find_keys, at, vec_get(_tree_find_keys, last));
+        vec_set(_tree_find_maps, at, vec_get(_tree_find_maps, last));
+    }
+    vec_pop(_tree_find_keys);
+    vec_pop(_tree_find_maps);
+    return 0;
 }
 
 # Entry named `name` in a parsed tree (hashmap-backed), or 0.

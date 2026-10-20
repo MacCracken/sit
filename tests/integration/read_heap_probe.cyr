@@ -21,6 +21,7 @@ fn _put_num(label, v) {
     return 0;
 }
 
+# Read every listed id twice and print the second pass's heap growth per read.
 fn main() {
     alloc_init();
     args_init();

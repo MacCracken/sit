@@ -43,6 +43,7 @@ fn _spp_put(label, v) {
     return 0;
 }
 
+# Push the fixture's refs through serve_handle_request and print what each kept.
 fn main() {
     alloc_init();
     args_init();

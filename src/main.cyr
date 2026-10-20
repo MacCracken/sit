@@ -27,10 +27,16 @@ fn cmd_init() {
         return 1;
     }
 
-    var head = "ref: refs/heads/main\n";
-    if (sf_write_all(".sit/HEAD", head, 21) < 0) {
-        eprintln("sit: failed to write .sit/HEAD");
-        return 1;
+    # 1.7.6 (L10): HEAD is written only by a fresh init. Re-running init over an
+    # existing repo used to point HEAD back at main from whatever branch it was
+    # on, with no reflog entry, so the next commit landed on main carrying the
+    # other branch's index — git leaves HEAD alone on reinit.
+    if (reinit == 0) {
+        var head = "ref: refs/heads/main\n";
+        if (sf_write_atomic(".sit/HEAD", head, 21) < 0) {
+            eprintln("sit: failed to write .sit/HEAD");
+            return 1;
+        }
     }
 
     if (reinit == 1) {

@@ -168,8 +168,8 @@ fn _git_object_path(buf, hex) {
 #   out[8]  = decompressed length (framing + content)
 #   out[16] = content offset (first byte past the framing NUL)
 # so every downstream reader (parse_tree, read_blob_content, commit parse) is
-# reused unchanged. Decompression sizing + 16 MiB ceiling + retry-on-
-# BUFFER_TOO_SMALL mirror read_object() so failure modes line up.
+# reused unchanged. Decompression is read_object()'s own (obj_inflate_fl,
+# 1.7.6), so failure modes line up.
 # Returns 0 on success, negative on error.
 #
 # 1.7.5: the file is read into a freelist buffer freed once it is inflated, and
@@ -184,6 +184,7 @@ fn _git_read_loose(hex, out) {
     var abuf[4352];
     var ap = sit_abs_into(&path, &abuf, 4352);
     if (ap == 0) { return 0 - 1; }
+    if (path_is_regular(ap) == 0) { return 0 - 1; }   # 1.7.6 (R11): not a FIFO
     var fd = file_open(ap, 0, 0);
     if (fd < 0) { return 0 - 1; }
     var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
@@ -205,40 +206,14 @@ fn _git_read_loose(hex, out) {
     file_close(fd);
     if (blen <= 0) { fl_free(compressed); return 0 - 2; }
 
-    var dec_cap = blen * 4;
-    if (dec_cap < 4096) { dec_cap = 4096; }
-    if (dec_cap > 16 * 1024 * 1024) { dec_cap = 16 * 1024 * 1024; }
-    var decompressed = fl_alloc(dec_cap);
-    if (decompressed == 0) { fl_free(compressed); return 0 - 3; }
-    var dlen = zlib_decompress_with_ratio_cap(compressed, blen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
-    if (dlen == 0 - ERR_BUFFER_TOO_SMALL) {
-        if (dec_cap < 16 * 1024 * 1024) {
-            fl_free(decompressed);
-            dec_cap = 16 * 1024 * 1024;
-            decompressed = fl_alloc(dec_cap);
-            if (decompressed == 0) { fl_free(compressed); return 0 - 3; }
-            dlen = zlib_decompress_with_ratio_cap(compressed, blen, decompressed, dec_cap, SIT_MAX_INFLATE_RATIO);
-        }
-    }
+    # 1.7.6 (R10): the shared inflate, sized from the object's header.
+    var ir = obj_inflate_fl(compressed, blen, out);
     fl_free(compressed);
-    if (dlen <= 0) { fl_free(decompressed); return 0 - 4; }
-
-    var nul = 0;
-    var scanning = 1;
-    while (scanning == 1) {
-        if (nul >= dlen) { scanning = 0; }
-        else {
-            if (load8(decompressed + nul) == 0) { scanning = 0; }
-            else { nul = nul + 1; }
-        }
-    }
-    if (nul >= dlen) { fl_free(decompressed); return 0 - 5; }
-
+    if (ir == 0 - 2) { return 0 - 3; }
+    if (ir == 0 - 3) { return 0 - 4; }
+    if (ir != 0) { return 0 - 5; }
     # The inflated object is the caller's (freelist memory, never freed by
     # read_object's callers, like the pack reader's results since 1.7.4).
-    store64(out, decompressed);
-    store64(out + 8, dlen);
-    store64(out + 16, nul + 1);
     return 0;
 }
 
@@ -356,8 +331,10 @@ fn _git_packed_ref_scan(buf, len, refname, out_buf) {
 # skipped (a ref name resolves to its own object, not a tag's peeled target).
 fn _git_packed_ref_lookup(refname, out_buf) {
     var pair[16];
-    if (read_file_heap(".git/packed-refs", &pair) != 0) { return 0; }
-    return _git_packed_ref_scan(load64(&pair), load64(&pair + 8), refname, out_buf);
+    if (read_file_fl(".git/packed-refs", &pair) != 0) { return 0; }
+    var r = _git_packed_ref_scan(load64(&pair), load64(&pair + 8), refname, out_buf);
+    fl_free(load64(&pair));           # 1.7.6 (R1): read per lookup, kept no longer
+    return r;
 }
 
 # git-mode read_head_ref: resolve .git/HEAD. Symref → loose ref then packed-refs;
@@ -367,15 +344,19 @@ fn _git_read_head_ref() {
     if (ref_path == 0) {
         # Detached HEAD: .git/HEAD holds a bare OID (no "ref: " prefix).
         var pair[16];
-        if (read_file_heap(".git/HEAD", &pair) != 0) { return 0; }
+        if (read_file_fl(".git/HEAD", &pair) != 0) { return 0; }
         var hb = load64(&pair);
         var hn = load64(&pair + 8);
         var hexlen = _id_hexlen();
-        if (hn < hexlen) { return 0; }
-        if (hex_prefix_valid(hb, hexlen) == 0) { return 0; }
-        var oid = alloc(hexlen + 1);
-        memcpy(oid, hb, hexlen);
-        store8(oid + hexlen, 0);
+        var oid = 0;
+        if (hn >= hexlen) {
+            if (hex_prefix_valid(hb, hexlen) == 1) {
+                oid = alloc(hexlen + 1);
+                memcpy(oid, hb, hexlen);
+                store8(oid + hexlen, 0);
+            }
+        }
+        fl_free(hb);
         return oid;
     }
     var loose = _git_read_loose_ref(ref_path);

@@ -9,7 +9,7 @@
 >
 > A slot is a plan, not a promise. When a release ships, **delete its items** (the CHANGELOG is the record) and re-slot anything that slipped. Do not leave struck-through entries behind. Upstream asks, holds and closed decisions sit at the end, outside the version slots.
 
-**Where we are:** `1.7.5`, on cyrius 6.7.15. The 1.6.x line closed with a P(-1) audit ([`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md); 16 HIGH, all fixed). 1.7.0 bound bearer tokens to remotes ([ADR 0014](../adr/0014-bearer-tokens-bound-to-remotes.md)) and refuses commits of unresolved conflicts. 1.7.1 took patra 1.16.x and makes a refused object insert or commit fail before any ref moves; 1.7.2 finished that sweep and shipped the audit's small fixes; 1.7.3 made `rebase` and `describe` walk every parent and see nested ref names; 1.7.4 bounded `sit serve` (nothing kept per read request, nor per TLS connection) and lifted git read mode's 64 MiB pack and depth-64 delta limits; 1.7.5 took the residuals 1.7.4 measured: a git-mode object read and a `sit serve` ref push keep nothing of sit's, and what each still keeps is sankoch's 32 bytes per inflate (upstream asks). **35 commands.** No 1.7.x patch is slotted; the rest is the long-standing structural and CLI work.
+**Where we are:** `1.7.6`, on cyrius 6.7.15. The 1.6.x line closed with a P(-1) audit ([`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md); 16 HIGH, all fixed). 1.7.0 bound bearer tokens to remotes ([ADR 0014](../adr/0014-bearer-tokens-bound-to-remotes.md)) and refuses commits of unresolved conflicts. 1.7.1 took patra 1.16.x and makes a refused object insert or commit fail before any ref moves; 1.7.2 finished that sweep and shipped the audit's small fixes; 1.7.3 made `rebase` and `describe` walk every parent and see nested ref names; 1.7.4 bounded `sit serve` (nothing kept per read request, nor per TLS connection) and lifted git read mode's 64 MiB pack and depth-64 delta limits; 1.7.5 took the residuals 1.7.4 measured: a git-mode object read and a `sit serve` ref push keep nothing of sit's, and what each still keeps is sankoch's 32 bytes per inflate (upstream asks). **1.7.6 closes the 1.7.x line** with a P(-1) audit of 1.7.0 → 1.7.5 ([`../audit/2026-10-19-1.7.6-audit.md`](../audit/2026-10-19-1.7.6-audit.md); 4 HIGH, all fixed): fetched objects are verified before they land, and the read path keeps no blob or file per API call. **35 commands.** Next is 1.8.0.
 
 ---
 
@@ -25,9 +25,7 @@ Each item ships under the usual test / fuzz / poison / bench gates.
 
 ## 1.7.x — patch line (no new surface)
 
-Audit ids (C1, D6, …) refer to [`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md).
-
-Nothing is slotted for the 1.7.x line.
+Closed by 1.7.6. Audit ids C1, D6, … refer to [`../audit/2026-10-19-audit.md`](../audit/2026-10-19-audit.md) (1.6.4); N, L, R, X, K ids to [`../audit/2026-10-19-1.7.6-audit.md`](../audit/2026-10-19-1.7.6-audit.md).
 
 ---
 
@@ -36,7 +34,7 @@ Nothing is slotted for the 1.7.x line.
 New behaviour on existing commands, which is minor-level surface under the tiers above.
 
 - **`stash pop` with a three-way apply (A5 follow-on).** Since 1.6.4, pop refuses once HEAD has moved past the stash's base (it used to roll every later commit back). Applying the stash onto a moved HEAD is cherry-pick of the stash commit without committing: `_apply_one_commit` minus the commit, through `_apply_conflicted_merge` on a conflict.
-- **Honour `sit merge -m <msg>`.** Accepted and ignored since the command existed; CI has passed it since v0.5.x without noticing. git uses it to set the merge commit's message. It changes commit text, so it wants its own tests. The tolerance is pinned at `merge.cyr:729`, `tests/integration/run.sh:797` and `.github/workflows/ci.yml:561`.
+- **Honour `sit merge -m <msg>`.** Accepted and ignored since the command existed; CI has passed it since v0.5.x without noticing. git uses it to set the merge commit's message. It changes commit text, so it wants its own tests. The tolerance is pinned at `merge.cyr:802` (since 1.7.6 every other trailing option is refused, L17), `tests/integration/run.sh:830` and `.github/workflows/ci.yml:561`.
 - **Reflog `expire` / `delete` and the `@{<date>}` selector.**
   - Reflog entries are unbounded, so `fsck --prune` reclaims reflog-protected objects only via `--prune-now`; expiry closes that.
   - `expire` / `delete` are new subcommands, and `@{<date>}` is new selector syntax.
@@ -64,6 +62,7 @@ A negotiated wire capability is a further step. **Ride-along: index paths over 2
 ## 1.10.0 — serving many repos (minor)
 
 - **HTTP base-path routing.** `sit serve` serves one repo at `/sit/v1/…`. Accepting `http://host/repos/foo` changes what the wire endpoint accepts and needs real routing in `serve.cyr`. It is what serving multiple repos behind one origin requires.
+- **Per-repo caches (R6).** The patra object-store handle (`get_object_db`, `object_db.cyr`) and the `.idx` / `.pack` mapping cache (`_git_file_cached`, `git_pack.cyr`, keyed by repo-relative path) live for the process, so a second `sit_repo_open` in one process — owl or thoth switching repos, or a multi-repo server — reads the first repo's objects: two .sit repos A then B showed B's clean files as `N`, and two git repos with a pack of the same name read A's pack. Close and reset both when the root or backend changes, key the mappings by absolute path, and unmap packs that leave the listing. 1.7.6 resets its new last-pack cache per open, so it adds no exposure.
 
 ## 1.11.0 — `.git/` CLI parity (minor)
 
@@ -72,6 +71,7 @@ A negotiated wire capability is a further step. **Ride-along: index paths over 2
     - `resolve_ref_name` (`refs.cyr`): `@{N}` reflog specs are `.sit`-only, because a git repo has no `.sit/logs/`.
     - `resolve_prefix` (`object_db.cyr`): short-prefix disambiguation over a git store would have to walk the loose fanout plus every pack `.idx`.
   - Slot it earlier if a consumer asks for CLI parity.
+- **git-mode status on ordinary repos (R2).** The read path applies the write path's rules: `parse_tree` keeps only 100644 / 40000 entries and drops names that fail the checkout-safety rules (`aux.c`, `con/…`, `a:b.txt` on Linux), and `objects/info/alternates` is never read. So `sit_repo_status` calls executable files, symlinks, submodule contents and every file of a `git clone --shared` repo untracked, where `git status` is clean. Keep 100755 entries, compare 120000 against the link target, skip gitlinks (and their directories in the untracked walk), apply the NTFS / `:` rules only when writing a checkout, and read alternates or report their absence as an error. Mode-aware entries are new API surface, which is why this rides with CLI parity.
 - **A delta base cache, if `log` / `diff` walks need it.** 1.7.4 resolves chains to depth 4095 without one: git stores the newest version of an object whole, and the read API reads each file's HEAD blob once, so a cache would not pay there (depth-50 repo, all 320 blobs: 459 ms, the same as 1.7.3's recursion). Walks over many versions of one file are what a cache is for, and git mode gains those with this slot. Measure them first.
 
 ## 1.12.0 — CLI parsing via cmdit (minor)
@@ -178,6 +178,7 @@ Wanted, not yet committed to a release. Each earns its own minor when its time c
 
 - **A commit-parent cache (commit-graph).** Every history walk reads each commit object afresh, about 75 µs apiece. That makes whole-ancestry walks cost about 150 ms per 2,000 commits: `find_merge_base` on every merge, `rebase`'s pending set, and `describe` when a merge lies between the commit and its nearest tag (1.7.3). git keeps a commit-graph file for the same reason. A parent table in `objects.patra`, filled on write and backfilled once, would cut the walks to table reads. Measure `merge-base` / `describe` / `rebase` on a 100k-commit fixture first.
 - **Hooks** (`pre-commit`, `pre-push`, …), if a consumer asks.
+- **An arena per public-API call (R1, rest).** Since 1.7.6 `sit_repo_status` frees every blob and file it compares; what it still keeps, ~94 KB per call on 200 files, is the flattened HEAD tree, the worktree listing and the result records, all on the bump heap. Running each call on an arena rewound at entry, as `sit serve` does per request, would close it — but the returned vec is the caller's, so the records must be copied out or the contract changed (ADR 0009). Measure with `tests/integration/api_heap_probe.cyr`.
 
 ---
 
@@ -188,6 +189,8 @@ Blocked on another repo. Per [CLAUDE.md](../../CLAUDE.md), cross-project request
 - **sankoch — DEFLATE match-finder throughput.** Targets the `add-1MB` `zlib_compress` floor (~100 ms, about 6× git and the largest single cost in `sit add`). sankoch has adopted it as its own **2.9.1** item ("the trigger has fired"). sit's pin is sankoch 2.8.7 at cyrius 6.7.15, so it arrives with the cyrius release that folds sankoch 2.9.1.
 
 - **sandhi — an allocator-taking `sandhi_server_content_length`.** It reads the header through `sandhi_server_find_header`, so the value lands on the global heap on every call. `_sandhi_server_recv_request_dl` calls it on every request with a body, so a long-running server keeps about 8 B per such request. `sit serve` parses `Content-Length` itself over its request arena since 1.7.4 (`_serve_content_length`, differential-fuzzed against sandhi's), but cannot reach the accept loop's call. An `_a` form, or an in-place scan that allocates nothing, closes both.
+- **patra — `page_write`'s return is ignored inside statements (1.7.6, L12).** `tbl_insert` (`lib/patra.cyr` 5038 / 5046 / 5052), `tbl_delete` (5544 / 5552), `btree_insert` (4258 / 4316) and `_bt_push_up` (4121 / 4151 / 4204 / 4218) at patra 1.16.x. In autocommit the header write that follows then succeeds and the statement reports `PATRA_OK` for a page that never reached the disk (reproduced with `RLIMIT_FSIZE` standing in for EIO / ENOSPC: `sit add` printed "added" and staged nothing). Inside a transaction the failure is reported, which is why sit now writes the index only in transactions; any other autocommit caller is still exposed.
+- **sankoch / stdlib — a word-wise `memcpy`.** `lib/string.cyr`'s `memcpy` is a byte loop (~140 MB/s; the `rep movsb` was removed for aarch64 alignment). 1.7.6 copies delta ops eight bytes at a time itself (`_pack_copy`, `git_pack.cyr`), which made a 40-step chain of 16 MB results 5.4× faster; every other bulk copy in sit and sankoch still pays the byte loop.
 - **sankoch — every inflate keeps 32 B: `br_init`'s bit reader.** `br_init` (`lib/sankoch.cyr`, sankoch 2.8.7 at cyrius 6.7.15) takes its 32-byte reader from `_sankoch_alloc` on every `_deflate_decompress_inner` / `_deflate_decompress_dict_inner` call and never frees it, so `zlib_decompress` and `zlib_decompress_with_ratio_cap` keep 32 B per call after warm-up (an `fl_alloc` / `fl_free` round trip keeps 0). Since 1.7.5 it is all `sit serve` and git read mode still keep:
   - `sit serve`'s fast-forward check inflates every commit it walks, so a ref push over 2,000 commits keeps 63,968 B, all of it this.
   - A git-mode read keeps 32 B per loose object and about 1 KB per packed object at an average chain depth of 33, once per inflate in the chain.
@@ -207,4 +210,4 @@ Closed by measurement. The reasoning lives where cited; they are listed here onl
 
 ---
 
-*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/), latest [`2026-10-19-v1.7.4.md`](../benchmarks/2026-10-19-v1.7.4.md). Security audit reports are in [`../audit/`](../audit/), latest [`2026-10-19-audit.md`](../audit/2026-10-19-audit.md).*
+*Process, conventions, and the per-release work loop live in [`../../CLAUDE.md`](../../CLAUDE.md). Per-release benchmark snapshots are in [`../benchmarks/`](../benchmarks/), latest [`2026-10-19-v1.7.6.md`](../benchmarks/2026-10-19-v1.7.6.md). Security audit reports are in [`../audit/`](../audit/), latest [`2026-10-19-1.7.6-audit.md`](../audit/2026-10-19-1.7.6-audit.md).*

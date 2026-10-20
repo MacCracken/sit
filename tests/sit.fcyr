@@ -400,9 +400,11 @@ fn fuzz_parse_commit_body(rounds) {
         var rx = parse_commit_body_a(fa, body, size, &ainfo);
         if (rx != rg) { println("fuzz: parse_commit_body_a disagrees on the verdict"); return 1; }
         if (rg == 0) {
-            if (streq(load64(&ainfo), load64(&info)) == 0) { println("fuzz: parse_commit_body_a disagrees on the tree"); return 1; }
-            if (load64(&ainfo + 24) != load64(&info + 24)) { println("fuzz: parse_commit_body_a disagrees on the timestamp"); return 1; }
-            if (load64(&ainfo + 40) != load64(&info + 40)) { println("fuzz: parse_commit_body_a disagrees on msg_start"); return 1; }
+            var why = 0;
+            if (streq(load64(&ainfo), load64(&info)) == 0) { why = "fuzz: parse_commit_body_a disagrees on the tree"; }
+            if (load64(&ainfo + 24) != load64(&info + 24)) { why = "fuzz: parse_commit_body_a disagrees on the time"; }
+            if (load64(&ainfo + 40) != load64(&info + 40)) { why = "fuzz: parse_commit_body_a disagrees on msg_start"; }
+            if (why != 0) { println(why); return 1; }
             var gp = load64(&info + 48);
             var xp = load64(&ainfo + 48);
             var gn = 0;
@@ -847,6 +849,7 @@ fn _fz_ofs_put(buf, n) {
     return k;
 }
 
+# git_pack.cyr — _git_pack_obj over mutated OFS_DELTA chains: no crash, right bytes when it succeeds.
 fn fuzz_pack_obj(rounds) {
     var cap = 8192;
     var pack = alloc(cap);
@@ -902,7 +905,10 @@ fn fuzz_pack_obj(rounds) {
         if (mutated == 0) {
             if (r != 0) { println("fuzz: pack_obj failed on a valid chain"); return 1; }
             if (load64(&out + 8) != 8) { println("fuzz: pack_obj rebuilt the wrong length"); return 1; }
-            if (memeq(load64(&out), "abcdefgh", 8) == 0) { println("fuzz: pack_obj rebuilt the wrong bytes"); return 1; }
+            if (memeq(load64(&out), "abcdefgh", 8) == 0) {
+                println("fuzz: pack_obj rebuilt the wrong bytes");
+                return 1;
+            }
         }
         if (r == 0) {
             if (load64(&out + 8) > 16777216) { println("fuzz: pack_obj passed the 16 MiB ceiling"); return 1; }
@@ -917,6 +923,92 @@ fn fuzz_pack_obj(rounds) {
 }
 
 # Run every bounded fuzz harness; nonzero on the first crash or invariant break.
+# 1.7.6 (R10): obj_frame_total reads at most `avail` bytes and returns -1 or a
+# length past the header it parsed; obj_inflate_fl, given a real object of any
+# compression ratio (the retry sized from the header is the new path), returns
+# exactly the framed bytes — and given garbage, fails without crashing.
+fn fuzz_obj_inflate(rounds) {
+    var raw = alloc(70000);
+    var cbuf = alloc(80000);
+    var hdr = alloc(40);
+    var seed = 11;
+    var i = 0;
+    while (i < rounds) {
+        fill_pseudo_random(hdr, 40, seed);
+        if ((i & 3) == 0) { memcpy(hdr, "blob 1", 6); }
+        var ft = obj_frame_total(hdr, 32);
+        if (ft != 0 - 1) {
+            if (ft < 4) { println("fuzz: obj_frame_total returned a length inside its own header"); return 1; }
+        }
+        # A real object: half compressible runs (ratio far past 4:1), half random.
+        var clen_c = (seed & 0xFFFF) % 60000;
+        memcpy(raw, "blob ", 5);
+        var dg = write_decimal(raw + 5, clen_c);
+        store8(raw + 5 + dg, 0);
+        var ho = 5 + dg + 1;
+        if ((i & 1) == 0) { memset(raw + ho, 65 + (seed & 7), clen_c); }
+        else { fill_pseudo_random(raw + ho, clen_c, seed); }
+        var cl = zlib_compress(raw, ho + clen_c, cbuf, 80000);
+        if (cl > 0) {
+            var o[24];
+            if (obj_inflate_fl(cbuf, cl, &o) != 0) { println("fuzz: obj_inflate_fl refused a valid object"); return 1; }
+            if (load64(&o + 8) != ho + clen_c) { println("fuzz: obj_inflate_fl length differs"); return 1; }
+            if (load64(&o + 16) != ho) { println("fuzz: obj_inflate_fl content offset differs"); return 1; }
+            if (memeq(load64(&o), raw, ho + clen_c) == 0) { println("fuzz: obj_inflate_fl bytes differ"); return 1; }
+            fl_free(load64(&o));
+            # Corrupt one byte of the stream: any verdict but a crash.
+            if (cl > 8) {
+                var at = 2 + (seed & 0x7FFF) % (cl - 2);
+                store8(cbuf + at, load8(cbuf + at) ^ 0x55);
+                var o2[24];
+                if (obj_inflate_fl(cbuf, cl, &o2) == 0) {
+                    if (load64(&o2 + 16) > load64(&o2 + 8)) {
+                        println("fuzz: obj_inflate_fl offset past its length");
+                        return 1;
+                    }
+                    fl_free(load64(&o2));
+                }
+            }
+        }
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+    return 0;
+}
+
+# 1.7.6 (N7): the http refs parser over truncated and mutated bodies — the
+# quote after a hash ending at the body's end was read one byte past it.
+fn fuzz_http_refs(rounds) {
+    var good = "{\"refs\":[{\"name\":\"refs/heads/main\",\"hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}";  #skip-lint (fixture literal)
+    var gl = strlen(good);
+    var buf = fl_alloc(256);
+    var seed = 5;
+    var i = 0;
+    while (i < rounds) {
+        var n = (seed & 0x7FFF) % (gl + 1);
+        # The body ends exactly at `n`: the fl block beyond it is poisoned, so an
+        # overread that matched a quote there would still be caught by a verdict
+        # that cannot hold (a hash with no closing quote accepted).
+        memset(buf, 34, 256);
+        memcpy(buf, good, n);
+        if ((i & 1) == 1) {
+            if (n > 0) { store8(buf + (seed & 0xFF) % n, (seed >> 8) & 0xFF); }
+        }
+        var pairs = vec_new();
+        var r = _wire_http_parse_refs(buf, n, pairs);
+        if (r == 0) {
+            if (vec_len(pairs) > 0) {
+                if (n < gl - 3) { println("fuzz: refs parser accepted a body cut inside the hash"); return 1; }
+            }
+        }
+        seed = seed * 1103515245 + 12345;
+        i = i + 1;
+    }
+    fl_free(buf);
+    return 0;
+}
+
+# Run every fuzz target; exit 1 on the first invariant broken.
 fn main() {
     alloc_init();
     println("fuzz: zlib_decompress (10000 rounds)");
@@ -955,6 +1047,10 @@ fn main() {
     if (fuzz_serve_content_length(200000) != 0) { return 1; }
     println("fuzz: pack_obj (50000 rounds)");
     if (fuzz_pack_obj(50000) != 0) { return 1; }
+    println("fuzz: obj_inflate (3000 rounds)");
+    if (fuzz_obj_inflate(3000) != 0) { return 1; }
+    println("fuzz: http_refs (200000 rounds)");
+    if (fuzz_http_refs(200000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

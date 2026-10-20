@@ -1,6 +1,6 @@
 # 0006 — Batched-want frame format
 
-**Status**: Accepted
+**Status**: Accepted (amended 1.7.6: the client verifies every object it stores — see the amendment at the end)
 **Date**: 2026-05-08
 
 ## Context
@@ -86,8 +86,8 @@ All multi-byte integers are little-endian. Sit is x86_64-first (aarch64 is also 
 
 ### Negative
 
-- **No per-frame integrity check.** A truncated TCP read mid-frame will be detected (clen vs remaining), but a flipped bit inside a payload won't. `sit fsck` is the canonical roundtrip per CLAUDE.md ("SHA-256 roundtrips belong in fsck, not the hot path") — same trust model as v0.7.3 per-object GET. TLS in v0.7.6 covers MITM.
-- **Server can lie about hashes.** A malicious server could ship `compressed_for_X` under `hash=Y`. The client persists into `objects.patra` keyed by the server's claimed hash, so `sit fsck`'s SHA-256 roundtrip catches it after clone. Documented as a fsck-time check, not a hot-path check, per the v0.7.3 trust boundary.
+- **No per-frame integrity check in the frame format.** A truncated TCP read mid-frame will be detected (clen vs remaining), but a flipped bit inside a payload won't be by the framing. *Superseded in 1.7.6:* the client verifies every object it stores (below), so a damaged payload fails the transfer instead of waiting for `sit fsck`.
+- **Server can lie about hashes.** A malicious server could ship `compressed_for_X` under `hash=Y`. Through 1.7.5 the client persisted it into `objects.patra` keyed by the server's claimed hash and only `sit fsck` caught it, after the clone had succeeded and the worktree held the content. That was the wrong trade, and 1.7.6 reverses it (amendment below).
 - **No streaming on large clones.** Each request/response is single-shot; a 100-MB response sits in 16 MiB chunks and forces the client to issue multiple POSTs. Acceptable for v0.7.4 — chunked transfer encoding becomes interesting only when individual responses exceed `WIRE_HTTP_MAX_BODY`, which a sensible client batch size avoids.
 
 ### Neutral
@@ -103,3 +103,12 @@ All multi-byte integers are little-endian. Sit is x86_64-first (aarch64 is also 
 - **Network byte order on the integers.** Rejected: every reader on x86_64 / aarch64 (the only sit targets) would pay a `bswap`. Sit is LE on disk (patra) and in memory; LE on the wire is the natural form. Documented endianness up front so future big-endian platforms (if any) know what they're paying.
 - **Per-frame magic bytes for resync.** Rejected: a partially-corrupted stream is unrecoverable — the next frame's `clen` would be wrong, the parse fails. Magic bytes don't help us resync because we have no application-level meaning beyond "next 80 + clen bytes are a frame." `sit fsck` after clone is the integrity gate.
 - **Streaming via HTTP chunked encoding.** Considered for huge responses. Deferred: not needed at v0.7.4 batch sizes (256 objects × ~5 KB = ~1.3 MiB per response). Worth revisiting if someone clones a repo with multi-MiB blobs at scale.
+
+## Amendment — 1.7.6: the client verifies what it stores
+
+**Decision.** Every object a fetch, clone or pull stores — from a `/want` frame, a per-object GET, an ssh response or a file:// source — is inflated and checked before it lands: its framing type must be the type the source claimed, and the SHA-256 of the framed bytes must be its id (`_object_verify` in `src/wire.cyr`, shared with the server's push endpoint). A mismatch rolls the copy back and fails the command before any ref moves. Frames for ids the client did not ask for are never stored, because only walked ids are copied.
+
+**Why.** The "fsck-time check" above assumed the server is trusted. It isn't always: a mirror can be compromised, plain `http://` crosses networks, and TOFU trusts the first contact. The 2026-10-19 closeout audit (`docs/audit/2026-10-19-1.7.6-audit.md`, N1) reproduced a proxy swapping one blob behind a **signed** commit: the clone exited 0, `verify-commit` said "good" (a signature covers the tree id, not the bytes stored under it), and a later fetch from the honest server kept the bad blob, because the id was "already present".
+
+**Cost.** Objects are still copied as raw compressed bytes; nothing is recompressed. The walk already inflates every commit and tree to find edges, so those are verified there, and `copy_objects` skips re-verifying exactly the cache slots the walk verified (a later insert for the same id is a new slot and is checked). Only blobs pay an extra inflate. Measured at the 1.7.6 cut by CPU time (minimum of 21 alternating runs): a 100-commit file:// clone takes 81.0 ms with verification short-circuited and 87.6 ms with it, so verification is ~6.6 ms (8%) there; on 500 compressible 21 KB blobs (10.5 MB) the clone is 0.63 s against 0.44 s for 1.7.5, roughly one SHA-256 pass over the received bytes.
+

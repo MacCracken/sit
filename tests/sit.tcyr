@@ -1299,8 +1299,17 @@ fn test_audit_164_pure() {
     var ins = _hunk3(1, 1);
     assert_eq(hunks_overlap(rep, ins), 1, "replace [1,2) vs insert at 1 overlaps");
     assert_eq(hunks_overlap(ins, rep), 1, "insert at 1 vs replace [1,2) overlaps");
-    # ...while an insert just AFTER a replace stays a clean neighbour.
-    assert_eq(hunks_overlap(rep, _hunk3(2, 2)), 0, "insert at 2 after replace [1,2) is disjoint");
+    # 1.7.6 (L9): ...and so does one at its END, in either order — with
+    # repeated lines the LCS can put that insert on either side of the removed
+    # line. (1.6.4 called this a clean neighbour.) Replaces that merely touch
+    # stay disjoint: they consume distinct base lines.
+    assert_eq(hunks_overlap(rep, _hunk3(2, 2)), 1, "insert at 2 after replace [1,2) overlaps");
+    assert_eq(hunks_overlap(_hunk3(2, 2), rep), 1, "replace [1,2) before insert at 2 overlaps");
+    assert_eq(hunks_overlap(rep, _hunk3(2, 3)), 0, "replace [1,2) vs replace [2,3) is disjoint");
+    assert_eq(hunks_overlap(rep, _hunk3(3, 3)), 0, "insert at 3, a line past replace [1,2), is disjoint");
+    var ml9[8];
+    assert_eq(three_way_line_merge("if\nx\n}\n}\nend\n", 13, "if\nx\n}\ny\n}\nend\n", 15,
+        "if\nx\n}\nend\n", 11, &ml9), 0, "L9: insert beside a dropped repeated line conflicts");
     # And the line merge itself now conflicts instead of dropping `x`.
     var ml[8];
     assert_eq(three_way_line_merge("a\nb\nc\n", 6, "a\nB\nc\n", 6, "a\nx\nb\nc\n", 8, &ml), 0,
@@ -1582,6 +1591,7 @@ fn _srv_cl_case(v, label) {
     return 0;
 }
 
+# serve.cyr — the per-request arena: Content-Length parse, ref-file reader, refs walk, heap kept (v1.7.4).
 fn test_serve_request_arena() {
     test_group("serve.cyr — request arena, refs walk, Content-Length (v1.7.4)");
 
@@ -1603,7 +1613,7 @@ fn test_serve_request_arena() {
     _srv_cl_case("2147483648", "one past it");
     _srv_cl_case("99999999999999999999999", "far past it (the i64 wrap)");
     assert_eq(_serve_content_length(_serve_req_alloc(), _srv_cl_request("2147483648"),
-      strlen(_srv_cl_request("2147483648"))), 0 - 1, "past 0x7FFFFFFF reads as -1");
+        strlen(_srv_cl_request("2147483648"))), 0 - 1, "past 0x7FFFFFFF reads as -1");
 
     # Fixture repo: two heads (one nested), a tag, and refs that must be skipped.
     sit_mkdir(_srv_root, 493);
@@ -1647,7 +1657,7 @@ fn test_serve_request_arena() {
     assert_eq(serve_read_ref_file(a, _srv_ref_with("rr", "\n", 65)), 0, "129 bytes is not a ref");
     assert_eq(serve_read_ref_file(a, _srv_ref_with("rr", "0", 1)), 0, "65 hex is not a ref");
     assert_eq(serve_read_ref_file(a, _srv_put("rr", _srv_hex, 63)), 0, "63 hex is not a ref");
-    assert_eq(serve_read_ref_file(a, _srv_put("rr", "9FCF402C5BFD0604647DD2AA5C3AAC4F7490788B46BDBE17306D987FCC876769", 64)), 0,
+    assert_eq(serve_read_ref_file(a, _srv_put("rr", "9FCF402C5BFD0604647DD2AA5C3AAC4F7490788B46BDBE17306D987FCC876769", 64)), 0,  #skip-lint (fixture literal)
       "uppercase hex is not a ref");
     assert_eq(serve_read_ref_file(a, "/tmp/sit-tcyr-serve/missing"), 0, "a missing file");
     var got = serve_read_ref_file(a, _srv_ref_with("rr", "\n", 1));
@@ -1679,7 +1689,7 @@ fn test_serve_request_arena() {
     var reqs = vec_new();
     vec_push(reqs, "GET /sit/v1/capabilities HTTP/1.1\r\nHost: x\r\n\r\n");
     vec_push(reqs, "GET /sit/v1/refs HTTP/1.1\r\nHost: x\r\n\r\n");
-    vec_push(reqs, "GET /sit/v1/objects/9fcf402c5bfd0604647dd2aa5c3aac4f7490788b46bdbe17306d987fcc876769 HTTP/1.1\r\nHost: x\r\n\r\n");
+    vec_push(reqs, "GET /sit/v1/objects/9fcf402c5bfd0604647dd2aa5c3aac4f7490788b46bdbe17306d987fcc876769 HTTP/1.1\r\nHost: x\r\n\r\n");  #skip-lint (fixture literal)
     vec_push(reqs, "GET /nope?x=1 HTTP/1.1\r\nHost: x\r\n\r\n");
     vec_push(reqs, "DELETE /sit/v1/refs HTTP/1.1\r\nHost: x\r\n\r\n");
     var ri = 0;
@@ -1768,6 +1778,7 @@ fn _pcb_same(body, label) {
     return 0;
 }
 
+# commit.cyr — parse_commit_body_a agrees with the global-heap parse and keeps nothing outside its arena.
 fn test_parse_commit_body_a() {
     test_group("commit.cyr — parse_commit_body_a on an arena (v1.7.5)");
     var t = "tree 1111111111111111111111111111111111111111111111111111111111111111\n";
@@ -1786,6 +1797,92 @@ fn test_parse_commit_body_a() {
     str_builder_add_cstr(sb, au); str_builder_add_cstr(sb, "\nmerge\n");
     _pcb_same(str_data(str_builder_build(sb)), "a merge's two parents, in order");
     _pcb_same("author x <y> 1 +0000\n\nno tree\n", "no tree line is still refused");
+    return 0;
+}
+
+# 1.7.6 P(-1) pure-function guards.
+fn test_176_pure() {
+    test_group("1.7.6 audit — header order, frame sizing, refs parser, reflog, copy");
+    var t = "tree 1111111111111111111111111111111111111111111111111111111111111111\n";
+    var t2 = "tree 4444444444444444444444444444444444444444444444444444444444444444\n";
+    var p1 = "parent 2222222222222222222222222222222222222222222222222222222222222222\n";
+    var au = "author A <a@x> 1700000000 +0000\n";
+    var info[56];
+    # R12 / X4: tree on line 1, once; parents straight after it.
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, t); str_builder_add_cstr(sb, p1); str_builder_add_cstr(sb, au);
+    str_builder_add_cstr(sb, "\nok\n");
+    var ok_body = str_data(str_builder_build(sb));
+    assert_eq(parse_commit_body(ok_body, strlen(ok_body), &info), 0, "R12: canonical header order parses");
+    sb = str_builder_new();
+    str_builder_add_cstr(sb, t); str_builder_add_cstr(sb, t2); str_builder_add_cstr(sb, au);
+    str_builder_add_cstr(sb, "\ntwo trees\n");
+    var b2 = str_data(str_builder_build(sb));
+    assert_eq(parse_commit_body(b2, strlen(b2), &info), 0 - 1, "R12: a second tree header is refused");
+    sb = str_builder_new();
+    str_builder_add_cstr(sb, p1); str_builder_add_cstr(sb, t); str_builder_add_cstr(sb, au);
+    str_builder_add_cstr(sb, "\nparent first\n");
+    var b3 = str_data(str_builder_build(sb));
+    assert_eq(parse_commit_body(b3, strlen(b3), &info), 0 - 1, "R12: a tree that is not line 1 is refused");
+    sb = str_builder_new();
+    str_builder_add_cstr(sb, t); str_builder_add_cstr(sb, au); str_builder_add_cstr(sb, p1);
+    str_builder_add_cstr(sb, "\nlate parent\n");
+    var b4 = str_data(str_builder_build(sb));
+    assert_eq(parse_commit_body(b4, strlen(b4), &info), 0 - 1, "R12: a parent after other headers is refused");
+
+    # R10: the declared size of a framed object header.
+    assert_eq(obj_frame_total("blob 5\0hello", 12), 12, "R10: frame total = header + declared length");
+    assert_eq(obj_frame_total("commit 1234\0", 12), 1246, "R10: multi-digit length");
+    var zeros[32];
+    memset(&zeros, 0, 32);
+    assert_eq(obj_frame_total(&zeros, 32), 0 - 1, "R10: an unwritten (zeroed) header is not a size");
+    assert_eq(obj_frame_total("blob \0", 6), 0 - 1, "R10: no digits is not a size");
+    assert_eq(obj_frame_total("BLOB 5\0", 7), 0 - 1, "R10: a type must be lowercase letters");
+    # obj_inflate_fl round-trips a highly compressible object past the 4x first try.
+    var raw = alloc(70016);
+    memcpy(raw, "blob 70000", 10);
+    store8(raw + 10, 0);
+    memset(raw + 11, 97, 70000);
+    var cbuf = alloc(80000);
+    var cl = zlib_compress(raw, 70011, cbuf, 80000);
+    var dz[24];
+    assert_eq(obj_inflate_fl(cbuf, cl, &dz), 0, "R10: obj_inflate_fl inflates a 1000:1 object");
+    assert_eq(load64(&dz + 8), 70011, "R10: to its exact length");
+    assert_eq(load64(&dz + 16), 11, "R10: content offset past the NUL");
+    fl_free(load64(&dz));
+
+    # N7: the refs parser refuses a hash that ends at the body's last byte.
+    var pairs = vec_new();
+    var rb = "{\"name\":\"refs/heads/main\",\"hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";  #skip-lint (fixture literal)
+    assert_eq(_wire_http_parse_refs(rb, strlen(rb), pairs), 0 - 1,
+      "N7: a hash with no closing quote in bounds is refused");
+
+    # R7: one-pass reflog line starts.
+    var lb = "a\nbb\nccc\n";
+    var st = _reflog_line_starts(lb, 9);
+    assert_eq(vec_len(st), 3, "R7: three LF-terminated lines");
+    assert_eq(vec_get(st, 2), 5, "R7: the third starts at byte 5");
+    assert_eq(vec_len(_reflog_line_starts("no newline", 10)), 0, "R7: an unterminated line is not counted");
+
+    # R4: the word-wise copy, every tail length.
+    var src = alloc(40);
+    var dst = alloc(40);
+    var k = 0;
+    while (k < 40) { store8(src + k, k + 1); k = k + 1; }
+    var n = 0;
+    var bad = 0;
+    while (n <= 20) {
+        memset(dst, 0, 40);
+        _pack_copy(dst, src + 3, n);
+        if (memeq(dst, src + 3, n) == 0) { bad = bad + 1; }
+        if (load8(dst + n) != 0) { bad = bad + 1; }
+        n = n + 1;
+    }
+    assert_eq(bad, 0, "R4: _pack_copy copies exactly n bytes for n = 0..20");
+
+    # L17 / L18.
+    assert_eq(ref_name_is_option("feature"), 0, "L17: a plain name is not an option");
+    assert(alloc_or_die(0) != 0, "L18: alloc_or_die(0) returns memory");
     return 0;
 }
 
@@ -1831,6 +1928,7 @@ fn main() {
     test_serve_request_arena();
     test_apply_delta_into();
     test_parse_commit_body_a();
+    test_176_pure();
     return assert_summary();
 }
 
