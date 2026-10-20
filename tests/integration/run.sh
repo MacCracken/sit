@@ -2365,6 +2365,38 @@ if [ -n "$API_PROBE" ]; then
   assert_contains "$OUT" "DIFF" "39j: and diffs a packed blob"
 fi
 
+# ── 40. 1.10.1 a clone from a relative path records an absolute origin ──
+# The path is relative to where clone ran, but every later command runs at the
+# clone's root: `origin = ../src` named nothing from there, so fetch / pull /
+# push failed ("cannot open remote object db") on every release through 1.10.0.
+hr "1.10.1 relative clone origin"
+C="$WORK/c40"; mkdir -p "$C/src" "$C/sub/deeper"; cd "$C/src"
+"$SIT" init >/dev/null; echo a > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m a >/dev/null
+SRCP=$(cd "$C/src" && pwd -P)
+cd "$C/sub"
+"$SIT" clone ../src r1 >/dev/null 2>&1; assert_eq "$?" "0" "40a: clone ../src"
+assert_eq "$(cd r1 && "$SIT" remote list | cut -f2)" "$SRCP" "40a: records the absolute path"
+"$SIT" clone ../src/ r2 >/dev/null 2>&1
+assert_eq "$(cd r2 && "$SIT" remote list | cut -f2)" "$SRCP" "40a: a trailing slash is dropped"
+"$SIT" clone ./.././src r3 >/dev/null 2>&1
+assert_eq "$(cd r3 && "$SIT" remote list | cut -f2)" "$SRCP" "40a: leading ./ and ../ segments resolve against the cwd"
+"$SIT" clone file://../src r4 >/dev/null 2>&1
+assert_eq "$(cd r4 && "$SIT" remote list | cut -f2)" "file://$SRCP" "40a: file:// keeps its scheme"
+(cd deeper && "$SIT" clone ../../src r5 >/dev/null 2>&1)
+assert_eq "$(cd deeper/r5 && "$SIT" remote list | cut -f2)" "$SRCP" "40a: from two levels down"
+(cd "$C" && "$SIT" clone ./src r6 >/dev/null 2>&1)
+assert_eq "$(cd "$C/r6" && "$SIT" remote list | cut -f2)" "$SRCP" "40a: ./src"
+(cd / && "$SIT" clone --force-absolute "$C/src" "$C/r7" >/dev/null 2>&1)
+assert_eq "$(cd "$C/r7" && "$SIT" remote list | cut -f2)" "$C/src" "40a: an absolute path is kept as typed"
+cd "$C/src"; echo b >> a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m b >/dev/null
+cd "$C/sub/r1"
+"$SIT" fetch origin >/dev/null 2>&1; assert_eq "$?" "0" "40b: fetch from inside the clone"
+"$SIT" pull origin >/dev/null 2>&1; assert_eq "$?" "0" "40b: pull"
+assert_eq "$("$SIT" log --oneline | head -1 | cut -d' ' -f2)" "b" "40b: brings the new commit"
+"$SIT" checkout -b topic >/dev/null 2>&1; echo t > t.txt; "$SIT" add t.txt >/dev/null; "$SIT" commit -m t >/dev/null
+"$SIT" push origin >/dev/null 2>&1; assert_eq "$?" "0" "40b: push"
+assert_eq "$(cd "$C/src" && "$SIT" log --oneline topic | head -1 | cut -d' ' -f2)" "t" "40b: arrives"
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

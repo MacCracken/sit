@@ -4,6 +4,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.10.1] — 2026-10-20 — a clone from a relative path records an absolute origin
+
+### Fixed
+
+- **`sit clone ../src dst` left a clone that could not fetch, pull or push.** Clone stored `remote.origin.url` exactly as typed. A relative path is relative to the directory clone ran in, but every later command runs at the clone's root (sit does not search upward, ADR 0003). From there `../src` named another directory, and `fetch` / `pull` / `push origin` failed with "cannot open remote object db". Every release through 1.10.0 did this. Clone now records the absolute path, as git does (`_clone_origin_url`, `src/wire.cyr`):
+  - Leading `.` and `..` segments are applied to the working directory. getcwd returns it free of symlinks, so that is exact.
+  - From the first other segment on, the path is kept as typed. A `link/..` means the parent of wherever `link` points, which no lexical rule can know.
+  - Trailing slashes are dropped, and `file://` keeps its scheme.
+  - An absolute path, or any network URL, is recorded unchanged.
+  - The clone itself reads from the path as before. A remote added with `sit remote add` is unchanged: it is typed at the repository's root, so a relative path there already means what it says.
+
+### Tests
+
+- **Integration, 561 → 574:** section 40 clones by `../src`, `../src/`, `./.././src`, `file://../src`, from two levels down, by `./src` and by an absolute path, checks the recorded origin for each, then fetches, pulls and pushes from inside the clone. On the 1.10.0 source, 11 of its 13 assertions fail.
+- Section 39's push into a packed repository went through a remote added by absolute path to avoid this bug; it is left as it is, as a test of `remote add`.
+
 ## [1.10.0] — 2026-10-20 — storage: packs and `sit gc`
 
 The 1.10.0 minor. Reachable history moves into git-format packs written by the new `sit gc`. The 1,600-commit benchmark history goes from **62.8 MiB to 875 KiB**, smaller than git's own store for the same history in the same object format. The patra schema is unchanged, the wire format is unchanged, and the toolchain stays at cyrius 6.7.15. Decision record: [ADR 0016](docs/adr/0016-packs-for-storage.md).
