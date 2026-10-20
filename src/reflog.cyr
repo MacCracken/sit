@@ -169,12 +169,14 @@ fn _reflog_nth_in_buf(buf, len, n, out) {
     var target = c - 1 - n;
     var s = _reflog_line_start(buf, len, target);
     if (s < 0) { return 0; }
-    # Layout: old(64) SP new(64) SP ... — need new-oid at [s+65, s+129).
-    if (s + 129 > len) { return 0; }
-    if (load8(buf + s + 64) != 32) { return 0; }
-    if (hex_prefix_valid(buf + s + 65, 64) == 0) { return 0; }
-    memcpy(out, buf + s + 65, 64);
-    store8(out + 64, 0);
+    # Layout: old(H) SP new(H) SP ... — the new oid at [s+H+1, s+2H+1). H is the
+    # open backend's id width: 64, or 40 in a SHA-1 `.git/` (1.12.0).
+    var h = _id_hexlen();
+    if (s + 2 * h + 1 > len) { return 0; }
+    if (load8(buf + s + h) != 32) { return 0; }
+    if (hex_prefix_valid(buf + s + h + 1, h) == 0) { return 0; }
+    memcpy(out, buf + s + h + 1, h);
+    store8(out + h, 0);
     return 1;
 }
 
@@ -268,17 +270,18 @@ fn _reflog_spec_parse(name, out) {
 # unless it's invalid hex or the all-zeros creation sentinel. Used by fsck
 # to treat reflog entries as reachability roots (prune grace).
 fn _reflog_push_oid_if_valid(p, roots) {
-    if (hex_prefix_valid(p, 64) == 0) { return 0; }
+    var h = _id_hexlen();
+    if (hex_prefix_valid(p, h) == 0) { return 0; }
     var allzero = 1;
     var k = 0;
-    while (k < 64) {
-        if (load8(p + k) != 48) { allzero = 0; k = 64; }
+    while (k < h) {
+        if (load8(p + k) != 48) { allzero = 0; k = h; }
         else { k = k + 1; }
     }
     if (allzero == 1) { return 0; }
-    var hex = alloc(65);
-    memcpy(hex, p, 64);
-    store8(hex + 64, 0);
+    var hex = alloc(h + 1);
+    memcpy(hex, p, h);
+    store8(hex + h, 0);
     vec_push(roots, hex);
     return 0;
 }
@@ -290,14 +293,15 @@ fn _reflog_push_oid_if_valid(p, roots) {
 # so N entries cost N²/2 line scans — 75 s of `sit fsck` at 20,000 entries,
 # and reflogs never expire. Same lines as before: every LF-terminated one.
 fn _reflog_collect_oids(buf, len, roots) {
+    var h = _id_hexlen();
     var s = 0;
     var i = 0;
     while (i < len) {
         if (load8(buf + i) == 10) {
-            if (s + 129 <= len) {
-                if (load8(buf + s + 64) == 32) {
-                    _reflog_push_oid_if_valid(buf + s, roots);        # old
-                    _reflog_push_oid_if_valid(buf + s + 65, roots);   # new
+            if (s + 2 * h + 1 <= len) {
+                if (load8(buf + s + h) == 32) {
+                    _reflog_push_oid_if_valid(buf + s, roots);          # old
+                    _reflog_push_oid_if_valid(buf + s + h + 1, roots);  # new
                 }
             }
             s = i + 1;
@@ -325,12 +329,15 @@ fn _reflog_line_starts(buf, len) {
 
 # ── File wrappers ──────────────
 
-# ".sit/logs/<refpath>" as a heap cstring. refpath is e.g. "HEAD" or
-# "refs/heads/main" or "refs/remotes/origin/main".
+# "<.sit or .git>/logs/<refpath>" as a heap cstring. refpath is e.g. "HEAD" or
+# "refs/heads/main" or "refs/remotes/origin/main". 1.12.0: a `.git/`
+# repository's reflog (the same line format, at its id width) is read, never
+# written — sit writes nothing in one.
 fn reflog_log_path(refpath) {
     var rl = strlen(refpath);
     var p = alloc(10 + rl + 1);
-    memcpy(p, ".sit/logs/", 10);
+    memcpy(p, _repo_dir(), 5);
+    memcpy(p + 5, "logs/", 5);
     memcpy(p + 10, refpath, rl);
     store8(p + 10 + rl, 0);
     return p;
@@ -397,16 +404,25 @@ fn _reflog_log_refpath_for(label) {
 #   <short-new-oid> <ref>@{N}: <message>
 # Defaults to HEAD. Silent (exit 0) when the ref has no log yet.
 fn cmd_reflog() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    # 1.12.0: a `.git/` repository too, read-only.
+    if (cli_read_repo() < 0) { return 1; }
 
     # 1.8.0: `expire` and `delete` subcommands; `show` is the listing's name
     # (git's), and a bare `sit reflog [<ref>]` still lists.
     var ai = 2;
     if (argc() > 2) {
         var sub = argv(2);
+        # 1.12.0: they rewrite a log, and sit writes nothing in a `.git/` repository.
+        var writes = 0;
+        if (streq(sub, "expire") == 1) { writes = 1; }
+        if (streq(sub, "delete") == 1) { writes = 1; }
+        if (writes == 1) {
+            if (_repo_backend == 1) {
+                eprintln("sit: reflog expire / delete write the log, and sit only reads a .git/ repository");
+                eprintln("sit:   (use git reflog there)");
+                return 1;
+            }
+        }
         if (streq(sub, "expire") == 1) { return _reflog_cmd_expire(); }
         if (streq(sub, "delete") == 1) { return _reflog_cmd_delete(); }
         if (streq(sub, "show") == 1) { ai = 3; }
@@ -452,15 +468,16 @@ fn cmd_reflog() {
         if (stop == 1) { d = count; }       # terminate (no break with vars)
         else {
             var s = vec_get(starts, count - 1 - d);
+            var hw = _id_hexlen();
             if (s >= 0) {
-                if (s + 77 <= len) {
+                if (s + hw + 13 <= len) {
                     # Display sanitization: .sit/logs is on-disk data that
                     # could be corrupt or hand-crafted, so scrub control bytes
                     # (terminal-escape injection) out of the echoed oid + msg
                     # before they hit the terminal. Sanitize into a buffer so
                     # the buffered stdout ordering is preserved (S-21 class).
                     var oidbuf[16];
-                    _reflog_san_into(&oidbuf, buf + s + 65, 12);
+                    _reflog_san_into(&oidbuf, buf + s + hw + 1, 12);
                     stdout_write(&oidbuf, 12);          # short new-oid
                     stdout_write(" ", 1);
                     stdout_write(ref_label, label_len);
@@ -704,28 +721,29 @@ fn _reflog_at_time_in_buf(buf, len, t, out) {
         }
         i = i - 1;
     }
-    var off = 65;                                   # the new oid
+    var h = _id_hexlen();                           # 64, or 40 in a SHA-1 .git/
+    var off = h + 1;                                # the new oid
     var at = 0;
     if (found >= 0) { at = vec_get(starts, found); }
     else { off = 0; }                               # before the log: the old oid
-    if (at + 129 > len) { return 0; }
-    if (load8(buf + at + 64) != 32) { return 0; }
-    if (hex_prefix_valid(buf + at + off, 64) == 0) { return 0; }
+    if (at + 2 * h + 1 > len) { return 0; }
+    if (load8(buf + at + h) != 32) { return 0; }
+    if (hex_prefix_valid(buf + at + off, h) == 0) { return 0; }
     var zero = 1;
     var z = 0;
-    while (z < 64) {
+    while (z < h) {
         if (load8(buf + at + off + z) != 48) { zero = 0; }
         z = z + 1;
     }
     if (zero == 1) {
-        off = 65;
-        if (hex_prefix_valid(buf + at + off, 64) == 0) { return 0; }
+        off = h + 1;
+        if (hex_prefix_valid(buf + at + off, h) == 0) { return 0; }
     }
     if (found < 0) {
         eprintln("sit: warning: the reflog does not go back that far; using its oldest entry");
     }
-    memcpy(out, buf + at + off, 64);
-    store8(out + 64, 0);
+    memcpy(out, buf + at + off, h);
+    store8(out + h, 0);
     return 1;
 }
 

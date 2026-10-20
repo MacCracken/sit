@@ -261,9 +261,21 @@ fn parse_tree(body, body_len) {
                     prev_len = name_len;
                     prev_tree = is_tree;
                     var kept = 0;
+                    # 1.12.0 (R2): a `.git/` tree is read as git wrote it
+                    # (validate.cyr); sit's own keep the checkout rules.
+                    var mode_ok = 0;
+                    var name_ok = 0;
+                    if (_repo_backend == 1) {
+                        mode_ok = git_tree_mode_readable(mode);
+                        name_ok = git_tree_name_readable(name);
+                    }
+                    else {
+                        mode_ok = tree_entry_mode_valid(mode);
+                        name_ok = tree_entry_name_valid(name);
+                    }
                     if (in_order == 1) {
-                        if (tree_entry_mode_valid(mode) == 1) {
-                            if (tree_entry_name_valid(name) == 1) {
+                        if (mode_ok == 1) {
+                            if (name_ok == 1) {
                                 var hash_hex = hex_encode(body + nu + 1, rawlen);
                                 var e = alloc_or_die(24);
                                 store64(e, mode);

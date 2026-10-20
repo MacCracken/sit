@@ -117,6 +117,34 @@ fn list_working_walk(prefix, fs_path, out, patterns) {
             memcpy(rel_path + prefix_len, sdata, slen);
             store8(rel_path + rel_path_len, 0);
             if (is_ignored_kind(rel_path, patterns, child_is_dir) == 1) { skip = 1; }
+            # 1.12.0 (R2): in a `.git/` repository a submodule's directory is not
+            # this repository's, and an untracked directory holding a `.git` is a
+            # nested repository, which git lists as one entry, "dir/".
+            if (skip == 0) {
+                if (child_is_dir == 1) {
+                    if (_walk_skip_dirs != 0) {
+                        if (map_has(_walk_skip_dirs, rel_path) == 1) { skip = 1; }
+                    }
+                    if (skip == 0) {
+                        if (_repo_backend == 1) {
+                            var gb[4352];
+                            var gl = strlen(child_fs);
+                            if (gl + 6 < 4352) {
+                                memcpy(&gb, child_fs, gl);
+                                memcpy(&gb + gl, "/.git", 6);
+                                if (path_lstat_kind(sit_abs(&gb)) >= 0) {
+                                    var nested = alloc(rel_path_len + 2);
+                                    memcpy(nested, rel_path, rel_path_len);
+                                    store8(nested + rel_path_len, 47);
+                                    store8(nested + rel_path_len + 1, 0);
+                                    vec_push(out, nested);
+                                    skip = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if (skip == 0) {
@@ -184,12 +212,228 @@ fn list_working_walk(prefix, fs_path, out, patterns) {
     return 0;
 }
 
+# Directories the walk does not enter (1.12.0): the paths of a `.git/` HEAD's
+# gitlinks (submodules), whose files belong to another repository. A map of
+# repo-relative paths, or 0.
+var _walk_skip_dirs = 0;
+
 # Every non-ignored worktree file, as repo-relative paths.
 fn list_working_files() {
     var files = vec_new();
     var patterns = load_sitignore();
     list_working_walk("", ".", files, patterns);
     return files;
+}
+
+# ── HEAD against the worktree (1.12.0) ─────────────────────────────
+#
+# The records sit_repo_status returns for either backend, and `sit status`
+# prints for a `.git/` repository (whose index sit does not read): {path, kind},
+# kind 1 modified, 2 new (untracked), 3 deleted. Shared so the library and the
+# command can never disagree.
+#
+# Mode-aware (R2): a symlink (120000) is compared by its target, as git stores
+# it; a regular file whose place holds a symlink or a directory is modified; on
+# a `.git/` repository the executable bit is compared too (git's core.fileMode),
+# while a sit repository records no such bit. A gitlink (160000, a submodule)
+# names a commit of another repository: it is neither compared nor walked into.
+
+# Push one {path, kind} status record.
+fn _status_push(vec, path, kind) {
+    var rec = alloc(16);
+    store64(rec, path);
+    store64(rec + 8, kind);
+    vec_push(vec, rec);
+    return 0;
+}
+
+# Byte-compare a HEAD blob (named by id `hex`) against working file `path`.
+# Returns 1 if they differ (or either can't be read), 0 if identical. Uses a
+# content compare rather than a re-hash so it needs no hash primitive — which
+# is what lets it work on a git SHA-1 repo without a first-party SHA-1.
+#
+# 1.7.6 (R1): both buffers are freed before returning. The blob (a freelist
+# buffer from either backend) and a heap copy of the worktree file were kept
+# per file per call — about 10 MB per sit_repo_status on 200 files of 50 KB, in
+# the consumer's process, for as long as it ran.
+fn _status_blob_differs(hex, path) {
+    var obj[24];
+    if (read_object(hex, &obj) != 0) { return 1; }
+    var ob = load64(&obj) + load64(&obj + 16);
+    var ol = load64(&obj + 8) - load64(&obj + 16);
+    var wp[16];
+    if (read_file_fl(path, &wp) != 0) { fl_free(load64(&obj)); return 1; }
+    var nb = load64(&wp);
+    var nl = load64(&wp + 8);
+    var differ = 0;
+    if (ol != nl) { differ = 1; }
+    else { if (memeq(ob, nb, ol) == 0) { differ = 1; } }
+    fl_free(nb);
+    fl_free(load64(&obj));
+    return differ;
+}
+
+# 1 when the symlink at the resolved path `ap` points somewhere other than the
+# blob `hex` says (git stores a link's target as its blob), or either is unreadable.
+fn _status_link_differs(hex, ap) {
+    var obj[24];
+    if (read_object(hex, &obj) != 0) { return 1; }
+    var ob = load64(&obj) + load64(&obj + 16);
+    var ol = load64(&obj + 8) - load64(&obj + 16);
+    var lb[4096];
+    var n = xreadlink(ap, &lb, 4096);
+    var differ = 1;
+    if (n >= 0) {
+        if (n == ol) {
+            if (memeq(&lb, ob, ol) == 1) { differ = 0; }
+        }
+    }
+    fl_free(load64(&obj));
+    return differ;
+}
+
+# How the worktree compares with HEAD's entry `e` at `path`: 0 unchanged,
+# 1 modified, 3 deleted.
+fn _status_entry_state(e, path) {
+    var ab[4352];
+    var ap = sit_abs_into(path, &ab, 4352);
+    if (ap == 0) { return 1; }
+    var m = path_lstat_mode(ap);
+    if (m < 0) { return 3; }
+    var kind = m & 0xF000;
+    var mode = tree_entry_mode(e);
+    if (streq(mode, "120000") == 1) {
+        if (kind != 0xA000) { return 1; }
+        return _status_link_differs(tree_entry_hash(e), ap);
+    }
+    if (kind != 0x8000) { return 1; }
+    if (_repo_backend == 1) {
+        var tree_x = 0;
+        if (streq(mode, "100755") == 1) { tree_x = 1; }
+        var work_x = 0;
+        if ((m & 64) != 0) { work_x = 1; }               # S_IXUSR, as git checks
+        if (tree_x != work_x) { return 1; }
+    }
+    return _status_blob_differs(tree_entry_hash(e), path);
+}
+
+# HEAD-against-worktree status records for the open repository (see above).
+fn compute_status_records() {
+    var out = vec_new();
+    var head_entries = read_head_tree_entries();
+    var gitlinks = 0;
+    if (head_entries != 0) {
+        var hn = vec_len(head_entries);
+        var i = 0;
+        while (i < hn) {
+            var he = vec_get(head_entries, i);
+            var path = tree_entry_name(he);
+            if (streq(tree_entry_mode(he), "160000") == 1) {
+                if (gitlinks == 0) { gitlinks = map_new(); }
+                map_set(gitlinks, path, 1);
+            }
+            else {
+                var st = _status_entry_state(he, path);
+                if (st != 0) { _status_push(out, path, st); }
+            }
+            i = i + 1;
+        }
+    }
+    _walk_skip_dirs = gitlinks;
+    var work_files = list_working_files();
+    _walk_skip_dirs = 0;
+    var wn = vec_len(work_files);
+    var j = 0;
+    while (j < wn) {
+        var wf = vec_get(work_files, j);
+        var tracked = 0;
+        if (head_entries != 0) {
+            if (tree_find(head_entries, wf) != 0) { tracked = 1; }
+        }
+        if (tracked == 0) { _status_push(out, wf, 2); }
+        j = j + 1;
+    }
+    if (head_entries != 0) { tree_find_release(head_entries); }   # 1.7.6 (R1)
+    return out;
+}
+
+# The worktree's side of `path` for a diff: a symlink's target, or the file's
+# bytes, at out16 {ptr, len}. 0, or -1 when it cannot be read.
+fn _diff_worktree_side(path, out16) {
+    var ab[4352];
+    var ap = sit_abs_into(path, &ab, 4352);
+    if (ap == 0) { return 0 - 1; }
+    if (path_lstat_kind(ap) == 0xA000) {
+        var lb = alloc(4096);
+        var n = xreadlink(ap, lb, 4096);
+        if (n < 0) { return 0 - 1; }
+        store64(out16, lb);
+        store64(out16 + 8, n);
+        return 0;
+    }
+    return read_file_heap(path, out16);
+}
+
+# `sit diff [<commit>]` on a `.git/` repository: each file of `entries` (a
+# flattened tree) the worktree changed or deleted, against its blob. Gitlinks
+# are another repository's.
+fn _diff_worktree_git(entries, ctx) {
+    var n = vec_len(entries);
+    var i = 0;
+    while (i < n) {
+        var e = vec_get(entries, i);
+        var path = tree_entry_name(e);
+        if (streq(tree_entry_mode(e), "160000") == 0) {
+            var st = _status_entry_state(e, path);
+            if (st != 0) {
+                var hp[16];
+                if (read_blob_content(tree_entry_hash(e), &hp) == 0) {
+                    if (st == 3) { print_file_diff(path, load64(&hp), load64(&hp + 8), 0, 0, ctx); }
+                    else {
+                        var wp[16];
+                        if (_diff_worktree_side(path, &wp) == 0) {
+                            print_file_diff(path, load64(&hp), load64(&hp + 8),
+                              load64(&wp), load64(&wp + 8), ctx);
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# `sit status` on a `.git/` repository (1.12.0): HEAD against the worktree.
+# git's index is not read, so a change staged with `git add` shows as a change.
+fn _cmd_status_git() {
+    var recs = compute_status_records();
+    var branch = current_branch_name();
+    stdout_write("On branch ", 10);
+    if (branch != 0) { write_sanitized(STDOUT, branch, strlen(branch)); }
+    else             { stdout_write("(detached)", 10); }
+    stdout_write("\n", 1);
+    if (read_head_ref() == 0) { stdout_write("No commits yet\n", 15); }
+    var note = "(a .git/ repository, read-only: HEAD against the working tree; git's index is not read)\n";
+    stdout_write(note, strlen(note));
+    var changed = vec_new();
+    var untracked = vec_new();
+    var i = 0;
+    while (i < vec_len(recs)) {
+        var r = vec_get(recs, i);
+        var k = load64(r + 8);
+        if (k == 1) { push_status_item(changed, "modified:  ", load64(r)); }
+        if (k == 3) { push_status_item(changed, "deleted:   ", load64(r)); }
+        if (k == 2) { vec_push(untracked, load64(r)); }
+        i = i + 1;
+    }
+    var any = 0;
+    if (print_labeled_section("Changes since HEAD:", 19, changed) == 1) { any = 1; }
+    if (print_name_section("Untracked files:", 16, untracked) == 1) { any = 1; }
+    if (any == 0) {
+        stdout_write("\nnothing to commit, working tree clean\n", 39);
+    }
+    return 0;
 }
 
 # A "status item" is a 16-byte (label_ptr, path_ptr) pair.
@@ -242,10 +486,10 @@ fn print_name_section(title, title_len, names) {
 
 # `sit status` — branch, staged / unstaged changes and untracked files.
 fn cmd_status() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    # 1.12.0: a `.git/` repository too, read-only.
+    var backend = cli_read_repo();
+    if (backend < 0) { return 1; }
+    if (backend == 1) { return _cmd_status_git(); }
 
     var head_entries = read_head_tree_entries();
     var index_entries = parse_index();
@@ -1056,10 +1300,8 @@ fn read_blob_content(hex, out_pair) {
 
 # `sit diff [--staged|HEAD] [-U<N>]` — unstaged, staged or working-vs-HEAD diffs.
 fn cmd_diff() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    # 1.12.0: a `.git/` repository too, read-only.
+    if (cli_read_repo() < 0) { return 1; }
 
     # Scan args: --staged flag, -U<N> context width (default 3), optional 1-2 positional refs.
     var staged = 0;
@@ -1113,9 +1355,7 @@ fn cmd_diff() {
             syscall(SYS_WRITE, STDERR, "'\n", 2);
             return 1;
         }
-        var ref_a_hex = alloc(65);
-        memcpy(ref_a_hex, &r, 64);
-        store8(ref_a_hex + 64, 0);
+        var ref_a_hex = _id_dup(&r);
         tree_a_entries = commit_tree_entries(ref_a_hex);
         # 1.7.6 (L8): an unreadable tree diffed as an empty one.
         if (tree_a_entries == 0) {
@@ -1131,9 +1371,7 @@ fn cmd_diff() {
             syscall(SYS_WRITE, STDERR, "'\n", 2);
             return 1;
         }
-        var ref_b_hex = alloc(65);
-        memcpy(ref_b_hex, &r, 64);
-        store8(ref_b_hex + 64, 0);
+        var ref_b_hex = _id_dup(&r);
         tree_b_entries = commit_tree_entries(ref_b_hex);
         # 1.7.6 (L8): an unreadable tree diffed as an empty one.
         if (tree_b_entries == 0) {
@@ -1188,6 +1426,20 @@ fn cmd_diff() {
             i = i + 1;
         }
         return 0;
+    }
+
+    # 1.12.0: a `.git/` repository has no index sit reads. `sit diff` and
+    # `sit diff <commit>` compare that commit (HEAD by default) with the
+    # worktree, mode-aware as status is, and leave untracked files out, as
+    # `git diff HEAD` does.
+    if (_repo_backend == 1) {
+        if (staged == 1) {
+            eprintln("sit: --staged needs git's index, which sit does not read in a .git/ repository");
+            return 1;
+        }
+        if (tree_a_entries == 0) { tree_a_entries = read_head_tree_entries(); }
+        if (tree_a_entries == 0) { return 0; }
+        return _diff_worktree_git(tree_a_entries, ctx);
     }
 
     # Mode: working-vs-ref (one ref given).
@@ -1334,10 +1586,8 @@ fn cmd_diff() {
 
 # Load a commit's tree and return its flattened entries. Returns 0 on error.
 fn cmd_show() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    # 1.12.0: a `.git/` repository too, read-only.
+    if (cli_read_repo() < 0) { return 1; }
 
     var stat_mode = 0;
     var hash_arg = 0;
@@ -1376,8 +1626,8 @@ fn cmd_show() {
             eprintln("sit: no commits yet");
             return 0;
         }
-        memcpy(&hex, head, 64);
-        store8(&hex + 64, 0);
+        memcpy(&hex, head, _id_hexlen());
+        store8(&hex + _id_hexlen(), 0);
     }
     else {
         var rr = resolve_commit_hash(hash_arg, &hex);

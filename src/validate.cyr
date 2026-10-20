@@ -471,6 +471,56 @@ fn tree_entry_mode_valid(mode) {
     return 0;
 }
 
+# ── Reading a `.git/` tree (1.12.0, R2) ───────────────────
+#
+# sit's own trees hold only what sit can check out safely (the two validators
+# above). A `.git/` repository is only ever READ — sit writes no checkout of it
+# — so its trees are read as git wrote them: executables, symlinks and
+# submodules kept, and names that would only be unsafe to WRITE on some
+# filesystem (`aux.c`, `a:b`, a trailing dot) kept too. Dropping them made
+# `sit status` call every such file untracked where `git status` is clean.
+
+# 1 for a mode git writes in a tree: file, executable, symlink, gitlink, tree
+# (and 100664, which old git wrote for group-writable files).
+fn git_tree_mode_readable(mode) {
+    if (mode == 0) { return 0; }
+    if (streq(mode, "100644") == 1) { return 1; }
+    if (streq(mode, "100755") == 1) { return 1; }
+    if (streq(mode, "100664") == 1) { return 1; }
+    if (streq(mode, "120000") == 1) { return 1; }
+    if (streq(mode, "160000") == 1) { return 1; }
+    if (streq(mode, "40000") == 1) { return 1; }
+    return 0;
+}
+
+# 1 for a name a reader can join onto a path: not empty, `.`, `..` or `.git`
+# (git's fsck refuses those too), and no '/' (a NUL cannot occur: it ends it).
+fn git_tree_name_readable(name) {
+    if (name == 0) { return 0; }
+    var len = strlen(name);
+    if (len == 0) { return 0; }
+    if (len > VAL_TREE_NAME_MAX) { return 0; }
+    if (len == 1) { if (load8(name) == 46) { return 0; } }
+    if (len == 2) {
+        if (load8(name) == 46) { if (load8(name + 1) == 46) { return 0; } }
+    }
+    var i = 0;
+    while (i < len) {
+        if (load8(name + i) == 47) { return 0; }
+        i = i + 1;
+    }
+    if (len == 4) {
+        if (load8(name) == 46) {
+            if ((load8(name + 1) & 0xDF) == 71) {
+                if ((load8(name + 2) & 0xDF) == 73) {
+                    if ((load8(name + 3) & 0xDF) == 84) { return 0; }
+                }
+            }
+        }
+    }
+    return 1;
+}
+
 # ── Config key / value (S-05) ────────────────────────────
 #
 # Reject control chars (includes \n, \r, \0), cap lengths, and for the key

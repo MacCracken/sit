@@ -4,6 +4,62 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-10-20 — `.git/` CLI parity: status, log, diff, show, reflog, `@{N}`, short ids
+
+The 1.12.0 minor. The read-only commands work on an existing git repository (SHA-1 or SHA-256), checked against git itself, and git trees are read as git wrote them. sit still writes nothing in a git repository. The toolchain stays at cyrius 6.7.15. Amendments to [ADR 0011](docs/adr/0011-git-read-mode.md) and [ADR 0009](docs/adr/0009-public-api-contract.md).
+
+### Added — read-only commands on a `.git/` repository
+
+`status`, `log`, `diff`, `show`, `reflog` and `cat-file` open a git repository when there is no `.sit/` (`cli_read_repo`). Through 1.11 only `cat-file` and the library did.
+
+- **`sit status`** compares HEAD against the working tree. It shares `compute_status_records` with `sit_repo_status`, so the command and the library never disagree. git's index is not read: a change staged with `git add` shows as a change, and the output says so.
+- **`sit diff [<commit>]`** compares that commit, HEAD by default, with the working tree. Untracked files are left out, as `git diff HEAD` does. `--staged` is refused, because it needs git's index.
+- **`sit log`** (with `--graph`), **`sit show`** and **`sit reflog`** read git's history and logs at the repository's id width. `reflog expire` / `delete` are refused.
+- **`<ref>@{N}` and `@{<time>}`** are read from `.git/logs/`, which has the same line format at the repository's width.
+- **Short ids** are resolved over loose objects and every pack index, alternates included.
+
+### Fixed — reading git trees as git wrote them (R2)
+
+The read path applied the checkout rules, so `sit_repo_status` (owl, thoth) called many files untracked where `git status` is clean:
+- `parse_tree` kept only `100644` / `40000`, so executables, symlinks and every submodule's files read as untracked.
+- It dropped names that are only unsafe to *write* on some filesystem (`aux.c`, `a:b.txt`, a trailing dot).
+- `objects/info/alternates` was never read, so every file of a `git clone --shared` read as untracked.
+
+In a `.git/` repository:
+- Every mode git writes is kept, and only names no reader can use are dropped: empty, `.`, `..`, `.git` in any case, or containing `/`.
+- A symlink is compared by its target. A file replaced by a symlink or a directory is modified, and so is a flipped executable bit (git's `core.fileMode`).
+- A gitlink is neither compared nor walked into. An untracked directory holding a `.git` is listed once, as `dir/`.
+- Alternates are followed for loose objects, packs and short ids, chained as git chains them, up to 6 directories. A missing one is said once and skipped.
+
+sit's own trees keep the strict rules. The mode-aware compare reaches `sit_repo_status` for both backends: a symlink or a directory where a sit-tracked file was is modified.
+
+### Fixed — object ids at the repository's width
+
+The read commands copied a fixed 64 bytes per id (`_id_dup` now copies `_id_hexlen()`). On a SHA-1 id that read past the 41-byte string. `sit log` printed 24 stray bytes after every commit id, and the graph's parent copies carried garbage.
+
+### Docs
+
+- ADR 0011 is amended (the CLI, R2, alternates) and ADR 0009 is amended (`sit_repo_status` reads modes).
+- CLAUDE.md: a rule that sit writes nothing in a `.git/` repository and that read paths take id widths from `_id_hexlen()`.
+- The guide's git read-mode entry lists the commands and their limits, and the README notes 1.11.0 and 1.12.0.
+- **Roadmap.** The 1.12.0 slot is done, and no minor is slotted after it. New unscheduled item: git's index in read mode, which would give `.git/` repositories sit's staged / unstaged split.
+
+### Tests
+
+- **Unit, 650 → 681:** `test_1120_git_parity` covers the readable-mode and name rules, `parse_tree` keeping a `.git/` tree's executable, gitlink and symlink at both id widths while a sit tree keeps only the plain file, `_id_dup`, and reflog `@{N}` / `@{<time>}` at width 40 (and refusing it at 64).
+- **Integration, 600 → 668:** section 42 runs in a SHA-1 and a SHA-256 repository with an executable, a symlink, a submodule, odd names and a packed part, against git:
+  - status clean, and after a mode flip, a link retarget, an edit, a deletion, untracked files and a nested repository
+  - `diff` hunks against `git diff`
+  - `log` against `git rev-list`, `show --stat` against `--numstat`, and `show`'s hunks
+  - `HEAD@{0,1,3}`, `<branch>@{1}` and `reflog`, against `git rev-parse`
+  - short ids of loose and packed commits and blobs
+  - a `--shared` clone with no objects of its own, and a missing alternate
+  - nothing written: no `.sit/`, seven write commands refused, git's status untouched
+  - the library's status clean on the same repository
+- **Fuzz:** `fuzz_parse_tree` seeds every mode git writes, and checks that what each backend keeps passes that backend's rules.
+
+No performance claim: the changes are on correctness paths. Status now does one `lstat` per tracked file where it opened it.
+
 ## [1.11.0] — 2026-10-20 — serving many repositories: `sit serve --repos`, base-path URLs, gc on a served repository
 
 The 1.11.0 minor: one `sit serve` for many repositories, clients that reach them by URL path, and the per-repository state that makes it work in one process. The toolchain stays at cyrius 6.7.15. Decision record: [ADR 0017](docs/adr/0017-serving-many-repositories.md).

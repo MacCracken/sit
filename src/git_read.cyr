@@ -145,21 +145,6 @@ fn _git_detect_hash_algo() {
     return found;
 }
 
-# --- Loose-object path -------------------------------------------------------
-# .git/objects/<xx>/<rest> — the id split mirrors object_path()'s .sit layout,
-# but the tail is _id_hexlen()-2 chars (38 for SHA-1, 62 for SHA-256) instead
-# of a fixed 62. `buf` must hold at least 13 + 2 + 1 + 62 + 1 = 79 bytes.
-fn _git_object_path(buf, hex) {
-    memcpy(buf, ".git/objects/", 13);
-    store8(buf + 13, load8(hex));
-    store8(buf + 14, load8(hex + 1));
-    store8(buf + 15, 47);
-    var rest = _id_hexlen() - 2;
-    memcpy(buf + 16, hex + 2, rest);
-    store8(buf + 16 + rest, 0);
-    return 16 + rest;
-}
-
 # --- Loose-object read -------------------------------------------------------
 # Reads .git/objects/<xx>/<rest>, zlib-inflates the whole file (git loose
 # objects are one RFC-1950 zlib stream of "<type> <len>\0<content>"), and
@@ -179,8 +164,31 @@ fn _git_object_path(buf, hex) {
 var _GIT_LOOSE_MAX = 67108864;   # read_file_heap's S-06 cap, kept
 
 fn _git_read_loose(hex, out) {
-    var path[96];
-    _git_object_path(&path, hex);
+    # 1.12.0 (R2): this repository's objects, then each alternate's.
+    var dirs = _git_object_dirs();
+    var rc = 0 - 1;
+    var i = 0;
+    while (i < vec_len(dirs)) {
+        if (rc != 0) { rc = _git_read_loose_in(vec_get(dirs, i), hex, out); }
+        i = i + 1;
+    }
+    return rc;
+}
+
+# _git_read_loose in the objects directory `objdir` (".git/objects", or an
+# alternate's): reads <objdir>/<xx>/<rest>.
+fn _git_read_loose_in(objdir, hex, out) {
+    var dl = strlen(objdir);
+    var hl = _id_hexlen();
+    if (dl + hl + 3 > 4096) { return 0 - 1; }
+    var path[4096];
+    memcpy(&path, objdir, dl);
+    store8(&path + dl, 47);
+    store8(&path + dl + 1, load8(hex));
+    store8(&path + dl + 2, load8(hex + 1));
+    store8(&path + dl + 3, 47);
+    memcpy(&path + dl + 4, hex + 2, hl - 2);
+    store8(&path + dl + 4 + hl - 2, 0);
     var abuf[4352];
     var ap = sit_abs_into(&path, &abuf, 4352);
     if (ap == 0) { return 0 - 1; }
@@ -217,6 +225,111 @@ fn _git_read_loose(hex, out) {
     return 0;
 }
 
+# --- Alternates (1.12.0, R2) ----------------------------------------------------
+# `.git/objects/info/alternates` names further object directories, one per line
+# (`#` comments; a relative path is relative to the objects directory holding
+# the file). `git clone --shared` and `--reference` make one, and the repository
+# then stores nothing those directories hold — so every such object read as
+# missing, and every file of the clone as untracked. Followed as git follows
+# them: each alternate's own alternates too, at most _GIT_ALT_MAX directories.
+# A listed directory that does not exist is said once, on stderr, and skipped.
+# Like git, sit then reads objects from wherever the repository points.
+
+var _GIT_ALT_MAX = 6;
+var _git_objdirs = 0;          # this repository's objects directories, listed once
+
+# Forget the listed objects directories (a repository is being opened).
+fn _git_objdirs_reset() {
+    _git_objdirs = 0;
+    return 0;
+}
+
+# The objects directories of the open `.git/` repository: ".git/objects" first,
+# then its alternates (see above), as heap cstrings.
+fn _git_object_dirs() {
+    if (_git_objdirs != 0) { return _git_objdirs; }
+    var v = vec_new();
+    vec_push(v, ".git/objects");
+    var i = 0;
+    while (i < vec_len(v)) {
+        if (vec_len(v) < _GIT_ALT_MAX) { _git_alt_load(vec_get(v, i), v); }
+        i = i + 1;
+    }
+    _git_objdirs = v;
+    return v;
+}
+
+# Append the alternates `objdir/info/alternates` lists to `v`, skipping ones
+# already there, stopping at _GIT_ALT_MAX.
+fn _git_alt_load(objdir, v) {
+    var dl = strlen(objdir);
+    var ap = alloc_or_die(dl + 18);
+    memcpy(ap, objdir, dl);
+    memcpy(ap + dl, "/info/alternates", 17);
+    var pair[16];
+    if (read_file_heap(ap, &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+    var s = 0;
+    var i = 0;
+    while (i <= len) {
+        var eol = 0;
+        if (i == len) { eol = 1; }
+        else { if (load8(buf + i) == 10) { eol = 1; } }
+        if (eol == 1) {
+            var e = i;
+            if (e > s) { if (load8(buf + e - 1) == 13) { e = e - 1; } }
+            var keep = 1;
+            if (e <= s) { keep = 0; }
+            if (keep == 1) { if (load8(buf + s) == 35) { keep = 0; } }   # '#'
+            if (keep == 1) {
+                if (vec_len(v) >= _GIT_ALT_MAX) { keep = 0; }
+            }
+            if (keep == 1) {
+                var ll = e - s;
+                var p = 0;
+                if (load8(buf + s) == 47) {
+                    p = alloc_or_die(ll + 1);
+                    memcpy(p, buf + s, ll);
+                    store8(p + ll, 0);
+                }
+                else {
+                    p = alloc_or_die(dl + 1 + ll + 1);
+                    memcpy(p, objdir, dl);
+                    store8(p + dl, 47);
+                    memcpy(p + dl + 1, buf + s, ll);
+                    store8(p + dl + 1 + ll, 0);
+                }
+                var dup = 0;
+                var k = 0;
+                while (k < vec_len(v)) {
+                    if (streq(vec_get(v, k), p) == 1) { dup = 1; }
+                    k = k + 1;
+                }
+                if (dup == 0) {
+                    var st[256];
+                    var ok = 0;
+                    var pb[4352];
+                    var pa = sit_abs_into(p, &pb, 4352);
+                    if (pa != 0) {
+                        if (xstat(pa, &st) == 0) {
+                            if ((load32(&st + STAT_MODE) & 0xF000) == 0x4000) { ok = 1; }
+                        }
+                    }
+                    if (ok == 1) { vec_push(v, p); }
+                    else {
+                        var miss = " does not exist; its objects read as missing\n";
+                        eprint3("sit: warning: alternate object directory ", p, miss);
+                    }
+                }
+            }
+            s = i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 # --- Backend detection -------------------------------------------------------
 # Probe order: .sit/ wins over .git/ so a repo that is somehow both stays
 # sit-native (sit never writes .git/). Sets the process-globals and returns the
@@ -233,6 +346,27 @@ fn _detect_repo_backend() {
         return 1;
     }
     return 0 - 1;
+}
+
+# A heap copy of the object id at `hex`, as many hex digits as the open
+# backend's ids have (64, or 40 for a SHA-1 `.git/`). 1.12.0: the read commands
+# copied a fixed 64, which on a SHA-1 id read past its 41-byte string.
+fn _id_dup(hex) {
+    var n = _id_hexlen();
+    var c = alloc_or_die(n + 1);
+    memcpy(c, hex, n);
+    store8(c + n, 0);
+    return c;
+}
+
+# The repository a read-only command works on (1.12.0, `.git/` CLI parity):
+# `.sit/` as ever, else an existing `.git/` repository read through this seam.
+# 0 (sit) or 1 (git); -1 when there is neither, which is said. Commands that
+# write keep their `.sit/HEAD` gate — sit never writes a `.git/` repository.
+fn cli_read_repo() {
+    var b = _detect_repo_backend();
+    if (b < 0) { eprintln("sit: not a sit repository (run 'sit init')"); }
+    return b;
 }
 
 # --- Ref backend -------------------------------------------------------------

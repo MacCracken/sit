@@ -100,3 +100,11 @@ No signature changed. Two behaviours a consumer can observe did:
 
 - **`sit_repo_open` drops what the previous repository left cached:** its store and index handles, its store lock and its pack lists. Through 1.10.1 a second repository opened in one process was read through the first one's store and index, so its clean files came back as new. Pack mappings are keyed by resolved path, so two repositories never share one.
 - **`sit_diff_path` and `sit_repo_status` take the store lock per call** (a store session, architecture 008) and give it back before returning, instead of holding it from the first call to exit. `sit gc` can run between calls, and the next call reads the store gc left.
+
+## Amendment (1.12.0) — `sit_repo_status` reads modes
+
+No signature changed. `sit_repo_status` is now `compute_status_records` (`diff.cyr`), the same records `sit status` prints for a `.git/` repository.
+
+- It is mode-aware. A symlink is compared by its target. A file replaced by a symlink or a directory is modified. In a `.git/` repository a flipped executable bit counts too.
+- A gitlink (submodule) is skipped, its directory is not walked, and an untracked nested repository is one `dir/` record.
+- In a `.git/` repository, executables, symlinks, submodule contents, NTFS-reserved names and the files of a `git clone --shared` clone no longer come back as untracked: ADR 0011's 1.12.0 amendment.

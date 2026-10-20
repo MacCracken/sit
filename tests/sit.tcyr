@@ -2119,6 +2119,93 @@ fn test_1110_serving() {
     return 0;
 }
 
+# A tree entry "<mode> <name>\0" + `rawlen` id bytes at `p`; returns its length.
+fn _t1120_entry(p, mode, name, rawlen) {
+    var ml = strlen(mode);
+    var nl = strlen(name);
+    memcpy(p, mode, ml);
+    store8(p + ml, 32);
+    memcpy(p + ml + 1, name, nl);
+    store8(p + ml + 1 + nl, 0);
+    var i = 0;
+    while (i < rawlen) { store8(p + ml + 2 + nl + i, 0xAB); i = i + 1; }
+    return ml + 2 + nl + rawlen;
+}
+
+# ── 1.12.0: .git/ CLI parity — readable trees, reflog widths, id copies ──
+fn test_1120_git_parity() {
+    test_group("validate.cyr / tree.cyr / reflog.cyr — a .git/ read as git wrote it (v1.12.0)");
+    assert_eq(git_tree_mode_readable("100644"), 1, "a file");
+    assert_eq(git_tree_mode_readable("100755"), 1, "an executable");
+    assert_eq(git_tree_mode_readable("100664"), 1, "old git's group-writable file");
+    assert_eq(git_tree_mode_readable("120000"), 1, "a symlink");
+    assert_eq(git_tree_mode_readable("160000"), 1, "a gitlink");
+    assert_eq(git_tree_mode_readable("40000"), 1, "a tree");
+    assert_eq(git_tree_mode_readable("100600"), 0, "not a mode git writes");
+    assert_eq(git_tree_name_readable("aux.c"), 1, "a name only unsafe to write on NTFS");
+    assert_eq(git_tree_name_readable("a:b.txt"), 1, "a colon");
+    assert_eq(git_tree_name_readable("trail."), 1, "a trailing dot");
+    assert_eq(git_tree_name_readable(".gitignore"), 1, "a dot-name that is not .git");
+    assert_eq(git_tree_name_readable(".git"), 0, "'.git'");
+    assert_eq(git_tree_name_readable(".GiT"), 0, "'.git' in any case");
+    assert_eq(git_tree_name_readable(".."), 0, "'..'");
+    assert_eq(git_tree_name_readable("a/b"), 0, "a '/'");
+    assert_eq(git_tree_name_readable(""), 0, "empty");
+
+    # One tree body, read as a SHA-1 .git/ tree and as a sit tree.
+    var body = alloc(512);
+    var pos = 0;
+    pos = pos + _t1120_entry(body + pos, "100644", "a.txt", 20);
+    pos = pos + _t1120_entry(body + pos, "100755", "run.sh", 20);
+    pos = pos + _t1120_entry(body + pos, "160000", "sub", 20);
+    pos = pos + _t1120_entry(body + pos, "120000", "zlink", 20);
+    _repo_backend = 1;
+    _git_hash_algo = 0;
+    var gt = parse_tree(body, pos);
+    assert_eq(vec_len(gt), 4, "a .git/ tree keeps its executable, gitlink and symlink");
+    assert_eq(streq(tree_entry_mode(vec_get(gt, 1)), "100755"), 1, "with their modes");
+    assert_eq(_id_hexlen(), 40, "SHA-1 ids are 40 hex");
+    var full = "0123456789abcdef0123456789abcdef01234567 tail";
+    var d = _id_dup(full);
+    assert_eq(strlen(d), 40, "_id_dup copies the backend's width");
+    # Reflog lines at width 40: "<old> <new> name <e> ts +0000\tmsg".
+    var lg = alloc(400);
+    var z40 = "0000000000000000000000000000000000000000";
+    var a40 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var b40 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    var l1 = " T <t@e> 1700000000 +0000\tcommit: one\n";
+    var l2 = " T <t@e> 1700000100 +0000\tcommit: two\n";
+    var lp = 0;
+    memcpy(lg + lp, z40, 40); lp = lp + 40; store8(lg + lp, 32); lp = lp + 1;
+    memcpy(lg + lp, a40, 40); lp = lp + 40; memcpy(lg + lp, l1, strlen(l1)); lp = lp + strlen(l1);
+    memcpy(lg + lp, a40, 40); lp = lp + 40; store8(lg + lp, 32); lp = lp + 1;
+    memcpy(lg + lp, b40, 40); lp = lp + 40; memcpy(lg + lp, l2, strlen(l2)); lp = lp + strlen(l2);
+    var o[72];
+    assert_eq(_reflog_nth_in_buf(lg, lp, 0, &o), 1, "@{0} in a SHA-1 reflog");
+    assert_eq(memeq(&o, b40, 40), 1, "is the newest entry's new id");
+    assert_eq(strlen(&o), 40, "40 hex long");
+    assert_eq(_reflog_nth_in_buf(lg, lp, 1, &o), 1, "@{1}");
+    assert_eq(memeq(&o, a40, 40), 1, "is the one before");
+    assert_eq(_reflog_at_time_in_buf(lg, lp, 1700000050, &o), 1, "@{<time>} at width 40");
+    assert_eq(memeq(&o, a40, 40), 1, "names the value then");
+    # The same entries at 32-byte ids: a SHA-256 .git/ keeps all four, sit one.
+    var body32 = alloc(512);
+    var p32 = 0;
+    p32 = p32 + _t1120_entry(body32 + p32, "100644", "a.txt", 32);
+    p32 = p32 + _t1120_entry(body32 + p32, "100755", "run.sh", 32);
+    p32 = p32 + _t1120_entry(body32 + p32, "160000", "sub", 32);
+    p32 = p32 + _t1120_entry(body32 + p32, "120000", "zlink", 32);
+    _git_hash_algo = 1;
+    assert_eq(vec_len(parse_tree(body32, p32)), 4, "a SHA-256 .git/ tree keeps all four");
+    _git_hash_algo = 0;
+    _repo_backend = 0;
+    var st = parse_tree(body32, p32);
+    assert_eq(vec_len(st), 1, "a sit tree keeps only what sit can check out");
+    assert_eq(streq(tree_entry_name(vec_get(st, 0)), "a.txt"), 1, "the plain file");
+    assert_eq(_reflog_nth_in_buf(lg, lp, 0, &o), 0, "a SHA-1 reflog does not parse at sit's width");
+    return 0;
+}
+
 # Run every test group; exit status is the failure count.
 fn main() {
     alloc_init();
@@ -2165,6 +2252,7 @@ fn main() {
     test_180_reflog_time();
     test_1100_packs();
     test_1110_serving();
+    test_1120_git_parity();
     return assert_summary();
 }
 

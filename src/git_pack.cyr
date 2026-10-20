@@ -973,6 +973,7 @@ var _git_last_pack = 0;
 # and another repo's .idx must never answer for this one's ids.
 fn _git_pack_forget_last() {
     if (_git_last_idx != 0) { store8(_git_last_idx, 0); }
+    _git_objdirs_reset();                 # 1.12.0: and the alternates listed
     return 0;
 }
 
@@ -994,8 +995,35 @@ fn _git_pack_locate(hex, out24) {
             }
         }
     }
-    var packdir = ".git/objects/pack";
-    var dlen = 17;                                     # strlen(packdir)
+    # 1.12.0 (R2): every objects directory — this repository's, then each
+    # alternate's (git_read.cyr).
+    var dirs = _git_object_dirs();
+    var rc = 0 - 1;
+    var i = 0;
+    while (i < vec_len(dirs)) {
+        if (rc != 0) {
+            var r = _git_pack_locate_in(vec_get(dirs, i), hex, out24);
+            if (r == 0) { rc = 0; }
+            else {
+                if (r == 0 - 2) { rc = 0 - 2; }
+                else { if (rc == 0 - 1) { rc = r; } }
+            }
+        }
+        i = i + 1;
+    }
+    return rc;
+}
+
+# _git_pack_locate over one objects directory's `pack/`: 0 with out24 set, -1
+# when it has no pack directory, -2 when `hex` is not an id, -3 when no pack there holds it.
+fn _git_pack_locate_in(objdir, hex, out24) {
+    var odl = strlen(objdir);
+    if (odl + 6 + _GIT_PACKNAME_MAX + 8 > 4352) { return 0 - 1; }
+    var pdbuf[4352];
+    memcpy(&pdbuf, objdir, odl);
+    memcpy(&pdbuf + odl, "/pack", 6);
+    var packdir = &pdbuf;
+    var dlen = odl + 5;
     # S-26: route through the sit_abs seam like every other repo path (on agnos
     # the root is a real absolute path and there is no cwd to fall back on).
     var abuf[4352];
@@ -1039,8 +1067,8 @@ fn _git_pack_locate(hex, out24) {
     if (rc == 0 - 3) {
         if (hex_decode_into(hex, _id_hexlen(), &oid_raw) == 0) { rc = 0 - 2; }
     }
-    var ipath[288];
-    var ppath[288];
+    var ipath[4352];
+    var ppath[4352];
     var i = 0;
     while (i < n) {
         if (rc == 0 - 3) {
@@ -1068,11 +1096,11 @@ fn _git_pack_locate(hex, out24) {
                                 store64(out24 + 16, offset);
                                 rc = 0;
                                 if (_git_last_idx == 0) {
-                                    _git_last_idx = alloc_or_die(288);
-                                    _git_last_pack = alloc_or_die(288);
+                                    _git_last_idx = alloc_or_die(4352);
+                                    _git_last_pack = alloc_or_die(4352);
                                 }
-                                memcpy(_git_last_idx, &ipath, 288);
-                                memcpy(_git_last_pack, &ppath, 288);
+                                memcpy(_git_last_idx, &ipath, dlen + 1 + sl + 1);
+                                memcpy(_git_last_pack, &ppath, dlen + 1 + nb + 6);
                             }
                         }
                     }
@@ -1084,6 +1112,121 @@ fn _git_pack_locate(hex, out24) {
     if (names != 0) { fl_free(names); }
     if (offs != 0) { fl_free(offs); }
     return rc;
+}
+
+# --- Short ids (1.12.0) ------------------------------------------------------
+# resolve_hash's `.git/` half: how many objects have an id starting with a
+# prefix, over every objects directory's loose fanout and pack indexes.
+
+# Note one matching id: the first is kept in `out`, a second distinct one makes
+# the count 2. `st` holds the count.
+fn _git_prefix_note(st, hex, out) {
+    var hl = _id_hexlen();
+    if (load64(st) == 0) {
+        memcpy(out, hex, hl);
+        store8(out + hl, 0);
+        store64(st, 1);
+        return 0;
+    }
+    if (load64(st) == 1) {
+        if (memeq(out, hex, hl) == 0) { store64(st, 2); }
+    }
+    return 0;
+}
+
+# Scan one .idx for ids starting with `prefix` (validated hex, `plen` >= 2).
+fn _git_idx_prefix(idx_path, prefix, plen, st, out) {
+    var pr[16];
+    if (_git_file_cached(idx_path, &pr) != 0) { return 0; }
+    var d = load64(&pr);
+    var len = load64(&pr + 8);
+    var rawlen = _id_rawlen();
+    if (len < 1032) { return 0; }
+    if ((load8(d) & 0xFF) != 255) { return 0; }
+    if (memeq(d + 1, "tOc", 3) == 0) { return 0; }
+    if (_be32(d + 4) != 2) { return 0; }
+    var n = _be32(d + 8 + 255 * 4);
+    if (n < 0) { return 0; }
+    if (n > (len - 1032) / (rawlen + 8)) { return 0; }
+    var hb[2];
+    var b0 = 0;
+    if (hex_decode_into(prefix, 2, &hb) == 0) { return 0; }
+    b0 = load8(&hb) & 0xFF;
+    var lo = 0;
+    if (b0 > 0) { lo = _be32(d + 8 + (b0 - 1) * 4); }
+    var hi = _be32(d + 8 + b0 * 4);
+    if (hi > n) { hi = n; }
+    var hx[72];
+    var k = lo;
+    while (k < hi) {
+        if (load64(st) < 2) {
+            _hex_into(d + 1032 + k * rawlen, rawlen, &hx);
+            if (memeq(&hx, prefix, plen) == 1) { _git_prefix_note(st, &hx, out); }
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+# Count the objects whose id starts with `prefix` (`plen` hex digits, at least
+# 4, validated) in the open `.git/` repository and its alternates, up to 2
+# distinct; the first one's id is written to `out`.
+fn _git_resolve_prefix(prefix, plen, out) {
+    var st[8];
+    store64(&st, 0);
+    var hl = _id_hexlen();
+    var dirs = _git_object_dirs();
+    var di = 0;
+    while (di < vec_len(dirs)) {
+        var dir = vec_get(dirs, di);
+        var dl = strlen(dir);
+        # Loose: <dir>/<xx>/<rest>.
+        var fan = alloc_or_die(dl + 4);
+        memcpy(fan, dir, dl);
+        store8(fan + dl, 47);
+        store8(fan + dl + 1, load8(prefix));
+        store8(fan + dl + 2, load8(prefix + 1));
+        store8(fan + dl + 3, 0);
+        var names = sf_dir_list(str_from(fan));
+        var i = 0;
+        while (i < vec_len(names)) {
+            var ns = vec_get(names, i);
+            if (str_len(ns) == hl - 2) {
+                if (memeq(str_data(ns), prefix + 2, plen - 2) == 1) {
+                    var cand[72];
+                    store8(&cand, load8(prefix));
+                    store8(&cand + 1, load8(prefix + 1));
+                    memcpy(&cand + 2, str_data(ns), hl - 2);
+                    store8(&cand + hl, 0);
+                    if (hex_prefix_valid(&cand, hl) == 1) { _git_prefix_note(&st, &cand, out); }
+                }
+            }
+            i = i + 1;
+        }
+        # Packs: <dir>/pack/*.idx.
+        var pd = alloc_or_die(dl + 6);
+        memcpy(pd, dir, dl);
+        memcpy(pd + dl, "/pack", 6);
+        var packs = sf_dir_list(str_from(pd));
+        var j = 0;
+        while (j < vec_len(packs)) {
+            var ps = vec_get(packs, j);
+            var pl = str_len(ps);
+            if (pl > 4) {
+                if (memeq(str_data(ps) + pl - 4, ".idx", 4) == 1) {
+                    var ip = alloc_or_die(dl + 6 + pl + 1);
+                    memcpy(ip, pd, dl + 5);
+                    store8(ip + dl + 5, 47);
+                    memcpy(ip + dl + 6, str_data(ps), pl);
+                    store8(ip + dl + 6 + pl, 0);
+                    _git_idx_prefix(ip, prefix, plen, &st, out);
+                }
+            }
+            j = j + 1;
+        }
+        di = di + 1;
+    }
+    return load64(&st);
 }
 
 # Look up `hex` across every .git/objects/pack/*.idx; on a hit, reconstruct the

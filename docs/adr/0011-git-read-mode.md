@@ -43,3 +43,17 @@ Module structure: `src/git_read.cyr` (backend detection, width helpers, loose-ob
 - **A separate `.git`-only reader that does not share the public API.** Rejected: it pushes a two-backend branch into every consumer. The storage seam keeps callers storage-agnostic — the reason `sit_diff_path` needed no new consumer code at all.
 - **Depend on sankoch for a git-delta primitive.** The 1.1.0 roadmap framed the packfile half as blocked on this. Rejected as unnecessary: git's OFS/REF delta is a git-specific copy/insert stream, ~40 lines of interpreter that belong in sit; the only real dependency (zlib inflate for packed streams) was already available. This unblocked the packfile half a full minor early.
 - **Compute SHA-1 to verify objects on read.** Deferred, not rejected: sigil has no general-purpose SHA-1 (its `sha1` refs are TPM-only), and read-mode provably never needs it. Wiring a first-party SHA-1 is a separate, verification-only decision.
+
+## Amendment (1.12.0) — the CLI, and reading trees as git wrote them
+
+Read-mode was the library's alone through 1.11; every command checked for `.sit/HEAD`. Since 1.12.0 the read-only commands open a `.git/` repository too (`cli_read_repo`, `git_read.cyr`). Commands that write keep their gate, so sit still writes nothing in a git repository. Integration 42h checks that no `.sit/` appears and that git sees the repository untouched.
+
+- **`status`** compares HEAD against the worktree (`compute_status_records`, shared with `sit_repo_status`). sit does not read git's index (DIRC), so a change staged with `git add` shows as a change, and the output says so.
+- **`diff [<commit>]`** compares the commit, HEAD by default, against the worktree. `--staged` is refused. `log`, `show` and `reflog` read git's history and logs, `reflog expire` / `delete` are refused, and `cat-file` and every revision argument take `<ref>@{N}` / `@{<time>}` from `.git/logs/` and short ids from loose objects and every pack index.
+- **Ids are the repository's width** (`_id_hexlen()`, `_id_dup`). The commands copied a fixed 64, which on a SHA-1 id read past its 41-byte string.
+
+R2, reading trees as git wrote them:
+
+- In a `.git/` repository `parse_tree` keeps every mode git writes (100644, 100755, 100664, 120000, 160000, 40000). It drops only names no reader can use (empty, `.`, `..`, `.git` in any case, a `/`), so the checkout-safety rules (NTFS names, `:`, trailing dots) no longer apply to a repository sit never checks out. sit's own trees keep the strict rules.
+- Status compares a symlink by its target. A file replaced by a symlink or a directory counts as modified, and in a `.git/` repository so does a flipped executable bit (git's `core.fileMode`). A gitlink is neither compared nor walked into, and an untracked directory holding a `.git` is listed once, as `dir/`.
+- `objects/info/alternates` is followed for loose objects, packs and short ids, chained as git chains them, up to 6 directories. A listed directory that does not exist is reported once and skipped. Like git, sit reads objects from wherever the repository points.

@@ -2500,6 +2500,74 @@ $G41/GB 0 0 0" "41c: two git repositories whose different packs share a name"
   fi
 fi
 
+# ── 42. 1.12.0 .git/ CLI parity: status, log, show, diff, @{N}, short ids ──
+# Read-only commands work on an existing git repository; each is checked against
+# git itself, in SHA-1 and SHA-256 repositories. R2: executables, symlinks,
+# submodules, names only unsafe to write, and alternates read as git reads them.
+hr "1.12.0 .git/ CLI parity"
+if command -v git >/dev/null 2>&1; then
+  # sit status as porcelain codes (M / D / N:path), for comparing with git's.
+  sitcodes() { "$SIT" status | awk '/^  modified:/ {print "M:" $2} /^  deleted:/ {print "D:" $2} /^Untracked files:/ {u=1; next} u && /^  / {sub(/^  /,""); print "N:" $0}' | sort; }
+  gitcodes() { git status --porcelain --untracked-files=all | awk '{c=substr($0,1,2); p=substr($0,4); if (c=="??") print "N:" p; else if (c ~ /D/) print "D:" p; else print "M:" p}' | sort; }
+  hunks() { awk 'p == 0 && /^@@/ {p = 1} p && /^(@@|[-+ ])/ && !/^(---|\+\+\+) / {print}'; }
+  for FMT in sha1 sha256; do
+    G="$WORK/g42-$FMT"; rm -rf "$G" "$WORK/g42sub-$FMT"
+    if ! git init -q --object-format=$FMT "$G" 2>/dev/null; then echo "  (skipped 42 $FMT: git cannot make it)"; continue; fi
+    git init -q --object-format=$FMT "$WORK/g42sub-$FMT"
+    (cd "$WORK/g42sub-$FMT" && git config user.name t && git config user.email t@e && echo s > s.txt && git add . && git commit -qm s)
+    cd "$G"; git config user.name t; git config user.email t@e
+    printf 'one\ntwo\nthree\n' > a.txt; mkdir -p d; echo deep > d/x.txt; git add .; git commit -qm c1
+    printf 'one\nTWO\nthree\n' > a.txt; echo '#!/bin/sh' > run.sh; chmod +x run.sh; git add .; git commit -qm c2
+    ln -s a.txt link; echo a > aux.c; echo b > 'a:b.txt'; echo c > 'trail.'; git add .; git commit -qm c3
+    git gc -q
+    git -c protocol.file.allow=always submodule add -q "$WORK/g42sub-$FMT" sub 2>/dev/null; git commit -qm c4
+    echo more >> a.txt; git commit -qam c5
+    assert_contains "$("$SIT" status)" "nothing to commit, working tree clean" "42a $FMT: status is clean with an executable, a symlink, a submodule and odd names"
+    assert_eq "$(sitcodes)" "$(gitcodes)" "42a $FMT: and agrees with git"
+    chmod -x run.sh; ln -sfn d/x.txt link; echo zz >> d/x.txt; rm aux.c; echo u > new.txt
+    mkdir -p nd; echo n > nd/f; mkdir nested; git -C nested init -q; echo q > nested/q
+    assert_eq "$(sitcodes)" "$(gitcodes)" "42b $FMT: changes (mode, link target, content, deletion, untracked, a nested repository) as git sees them"
+    assert_eq "$("$SIT" diff | hunks)" "$(git diff | hunks)" "42b $FMT: sit diff's hunks are git diff's"
+    "$SIT" diff --staged >/dev/null 2>&1; assert_eq "$?" "1" "42b $FMT: --staged is refused (git's index is not read)"
+    git checkout -q -- . 2>/dev/null; chmod +x run.sh; rm -rf nested nd new.txt
+    assert_eq "$("$SIT" log --oneline | cut -c1-12)" "$(git rev-list HEAD | cut -c1-12)" "42c $FMT: log walks git's history"
+    assert_eq "$("$SIT" log -n 1 | head -1)" "commit $(git rev-parse HEAD)" "42c $FMT: with full ids at the repository's width"
+    SH=$("$SIT" show --stat HEAD 2>/dev/null | awk -F' [|] ' '/ [|] / {gsub(/^ +/,"",$1); split($2,a," "); print substr(a[1],2) " " substr(a[2],2) " " $1}')
+    assert_eq "$SH" "$(git show --numstat --format= HEAD | awk '{print $1 " " $2 " " $3}')" "42d $FMT: show --stat counts what git's --numstat counts"
+    assert_eq "$("$SIT" show HEAD | hunks)" "$(git show --format= HEAD | hunks)" "42d $FMT: show's hunks are git's"
+    for n in 0 1 3; do
+      assert_eq "$("$SIT" log -n 1 "HEAD@{$n}" | head -1)" "commit $(git rev-parse "HEAD@{$n}")" "42e $FMT: HEAD@{$n} from .git/logs"
+    done
+    BR=$(git symbolic-ref --short HEAD)
+    assert_eq "$("$SIT" log -n 1 "$BR@{1}" | head -1)" "commit $(git rev-parse "$BR@{1}")" "42e $FMT: <branch>@{1}"
+    assert_eq "$("$SIT" reflog -n 3 | cut -c1-12)" "$(git rev-parse HEAD@{0} HEAD@{1} HEAD@{2} | cut -c1-12)" "42e $FMT: sit reflog lists git's"
+    "$SIT" reflog expire --all >/dev/null 2>&1; assert_eq "$?" "1" "42e $FMT: reflog expire is refused"
+    for rev in HEAD HEAD~4 HEAD:a.txt HEAD~4:a.txt; do
+      full=$(git rev-parse "$rev")
+      assert_eq "$("$SIT" cat-file "${full:0:7}" | head -2)" "$(git cat-file -p "$full" | head -2)" "42f $FMT: short id of $rev (loose or packed)"
+    done
+    "$SIT" cat-file 0000000 >/dev/null 2>&1; assert_eq "$?" "1" "42f $FMT: an id nothing has"
+    S42="$WORK/g42sh-$FMT"; rm -rf "$S42"; git clone -q --shared "$G" "$S42"
+    LOCAL=$(find "$S42/.git/objects" -type f ! -path '*/info/*' | wc -l | tr -d ' ')
+    assert_eq "$LOCAL" "0" "42g $FMT: a --shared clone keeps no objects of its own"
+    cd "$S42"
+    assert_eq "$(sitcodes)" "$(gitcodes)" "42g $FMT: and its status reads them through alternates"
+    assert_eq "$("$SIT" log --oneline | wc -l | tr -d ' ')" "5" "42g $FMT: as does its log"
+    echo /nonexistent/objects >> .git/objects/info/alternates
+    assert_contains "$("$SIT" log --oneline 2>&1 >/dev/null)" "alternate object directory /nonexistent/objects does not exist" "42g $FMT: a missing alternate is said"
+    cd "$G"
+    for c in status log diff reflog show; do "$SIT" $c >/dev/null 2>&1; done
+    assert_eq "$(ls -a | grep -c '^\.sit$')" "0" "42h $FMT: reading writes nothing (.sit/ never appears)"
+    for c in "add a.txt" "commit -m x" "branch b2" "tag t1" "gc" "fsck" "stash"; do
+      "$SIT" $c >/dev/null 2>&1; assert_eq "$?" "1" "42h $FMT: sit $c refuses a .git/ repository"
+    done
+    assert_eq "$(git status --porcelain)" "" "42h $FMT: and git still sees it untouched"
+    if [ -n "$GIT_PROBE" ]; then
+      assert_eq "$("$GIT_PROBE" 2>&1 | grep -c '^STATUS ')" "0" "42i $FMT: the library's status is clean too (R2)"
+    fi
+  done
+fi
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

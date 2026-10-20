@@ -189,41 +189,6 @@ fn sit_repo_branch(repo) {
     return text_sanitized(name, strlen(name), &n);
 }
 
-# A status record is a 16-byte {path_ptr, kind} pair. Internal builder.
-fn _status_push(vec, path, kind) {
-    var rec = alloc(16);
-    store64(rec, path);
-    store64(rec + 8, kind);
-    vec_push(vec, rec);
-    return 0;
-}
-
-# Byte-compare a HEAD blob (named by id `hex`) against working file `path`.
-# Returns 1 if they differ (or either can't be read), 0 if identical. Uses a
-# content compare rather than a re-hash so it needs no hash primitive — which
-# is what lets it work on a git SHA-1 repo without a first-party SHA-1.
-#
-# 1.7.6 (R1): both buffers are freed before returning. The blob (a freelist
-# buffer from either backend) and a heap copy of the worktree file were kept
-# per file per call — about 10 MB per sit_repo_status on 200 files of 50 KB, in
-# the consumer's process, for as long as it ran.
-fn _blob_differs_from_file(hex, path) {
-    var obj[24];
-    if (read_object(hex, &obj) != 0) { return 1; }
-    var ob = load64(&obj) + load64(&obj + 16);
-    var ol = load64(&obj + 8) - load64(&obj + 16);
-    var wp[16];
-    if (read_file_fl(path, &wp) != 0) { fl_free(load64(&obj)); return 1; }
-    var nb = load64(&wp);
-    var nl = load64(&wp + 8);
-    var differ = 0;
-    if (ol != nl) { differ = 1; }
-    else { if (memeq(ob, nb, ol) == 0) { differ = 1; } }
-    fl_free(nb);
-    fl_free(load64(&obj));
-    return differ;
-}
-
 # Per-file HEAD-vs-working-tree status for the open repo. Returns a vec of
 # opaque status records — read each with sit_status_path / sit_status_kind.
 # Kinds: 1 = modified, 2 = new (untracked), 3 = deleted. Unmodified files are
@@ -239,45 +204,10 @@ fn sit_repo_status(repo) {
     return out;
 }
 
-# sit_repo_status's body, inside a store session.
+# sit_repo_status's body, inside a store session: the records `sit status`
+# prints for a `.git/` repository (compute_status_records, diff.cyr, 1.12.0).
 fn _sit_repo_status_in() {
-    var out = vec_new();
-    var head_entries = read_head_tree_entries();
-    var work_files = list_working_files();
-
-    # Tracked files: deleted (gone from disk) or modified (content differs).
-    if (head_entries != 0) {
-        var hn = vec_len(head_entries);
-        var i = 0;
-        while (i < hn) {
-            var he = vec_get(head_entries, i);
-            var path = tree_entry_name(he);
-            if (sf_exists(path) != 1) {
-                _status_push(out, path, 3);
-            }
-            else {
-                if (_blob_differs_from_file(tree_entry_hash(he), path) == 1) {
-                    _status_push(out, path, 1);
-                }
-            }
-            i = i + 1;
-        }
-    }
-
-    # Working files absent from HEAD are new (untracked).
-    var wn = vec_len(work_files);
-    var j = 0;
-    while (j < wn) {
-        var wf = vec_get(work_files, j);
-        var tracked = 0;
-        if (head_entries != 0) {
-            if (tree_find(head_entries, wf) != 0) { tracked = 1; }
-        }
-        if (tracked == 0) { _status_push(out, wf, 2); }
-        j = j + 1;
-    }
-    if (head_entries != 0) { tree_find_release(head_entries); }   # 1.7.6 (R1)
-    return out;
+    return compute_status_records();
 }
 
 # Accessors on a status record (mirror the ann_* pattern; opaque layout).

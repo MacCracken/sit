@@ -483,7 +483,17 @@ Simplification vs git (documented in `src/index.cyr`): a non-segment `**` (e.g. 
 - `sit owl-file <hash>` — view object through owl (falls back to raw output when owl isn't installed)
 - `sit --help` / `-h` — the command list, on stdout (exit 0); `sit --version` / `-V` — `sit <version>` (1.9.0)
 - `sit completions <bash|zsh|fish>` — print a shell completion script for sit's commands (1.9.0). For example `sit completions bash > ~/.local/share/bash-completion/completions/sit`, `sit completions zsh > ~/.zfunc/_sit` (with `~/.zfunc` on `fpath`), or `sit completions fish > ~/.config/fish/completions/sit.fish`
-- **Read an existing git repository (read-only, 1.2.0)** — point sit at a directory with a `.git/` (no `.sit/`) and it transparently opens the git store: `sit cat-file` / `sit owl-file` read git objects — loose *and* packed (packfiles decoded via `.idx` v2 binary search + a first-party OFS/REF delta interpreter), SHA-1 or SHA-256, refs resolved from `HEAD` / `refs/` / `packed-refs`. The `dist/sit.cyr` **library API** (`sit_diff_path`, `sit_repo_branch`, `sit_repo_status`) additionally reports branch / status / diff for consumers like owl + thoth. Read-only — no `.git/` write-back; sit stays `.sit/`-native for its own repos. Modules `src/git_read.cyr` + `src/git_pack.cyr`; see [ADR 0011](../adr/0011-git-read-mode.md).
+- **Read an existing git repository (read-only, 1.2.0)** — point sit at a directory with a `.git/` (no `.sit/`) and it transparently opens the git store: `sit cat-file` / `sit owl-file` read git objects — loose *and* packed (packfiles decoded via `.idx` v2 binary search + a first-party OFS/REF delta interpreter), SHA-1 or SHA-256, refs resolved from `HEAD` / `refs/` / `packed-refs`. The `dist/sit.cyr` **library API** (`sit_diff_path`, `sit_repo_branch`, `sit_repo_status`) additionally reports branch / status / diff for consumers like owl + thoth.
+
+  Since 1.12.0 the read-only **commands** work there too:
+  - `sit status` compares HEAD against the working tree; git's index is not read, so a change staged with `git add` shows as a change.
+  - `sit diff [<commit>]` compares that commit, HEAD by default, against the working tree (`--staged` is refused).
+  - `sit log [--graph]`, `sit show`, and `sit reflog` (listing only).
+  - Every revision argument takes `<ref>@{N}` / `@{<time>}` from `.git/logs/` and short ids from loose objects and pack indexes.
+
+  Trees are read as git wrote them: executables, symlinks (compared by target) and submodules (skipped) count as git counts them, as do names like `aux.c` or `a:b.txt` that sit refuses to *write*. `objects/info/alternates` is followed, so a `git clone --shared` reads fine.
+
+  Read-only: commands that write (`add`, `commit`, `branch`, `gc`, `reflog expire`, …) refuse a `.git/` repository, and sit stays `.sit/`-native for its own repos. Modules `src/git_read.cyr` + `src/git_pack.cyr`; see [ADR 0011](../adr/0011-git-read-mode.md).
 
 ## What doesn't yet
 

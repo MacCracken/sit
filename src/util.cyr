@@ -206,6 +206,21 @@ fn path_lstat_kind(path) {
     #endif
 }
 
+# The full mode bits (type and permissions) of `path` via lstat, or -1. 1.12.0:
+# status on a `.git/` repository compares the executable bit, as git does.
+fn path_lstat_mode(path) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var abuf[128];
+    if (sys_stat(path, strlen(path), &abuf) < 0) { return 0 - 1; }
+    return load32(&abuf + STAT_MODE) & 0xFFFF;
+    #else
+    var stbuf[144];
+    var rc = syscall(262, VAL_AT_FDCWD, path, &stbuf, VAL_AT_SYMLINK_NOFOLLOW);
+    if (rc < 0) { return 0 - 1; }
+    return load32(&stbuf + STAT_MODE) & 0xFFFF;
+    #endif
+}
+
 # ----------------------------------------------------------------
 # sit-owned FS wrappers (sf_*). Every repo FS access funnels through
 # one of these so the prefixing lives in a single place. The inner

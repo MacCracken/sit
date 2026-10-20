@@ -111,10 +111,7 @@ fn is_ancestor(ancestor_hex, descendant_hex) {
 
     var queue = vec_new();
     var seen = map_new();
-    var start = alloc(65);
-    memcpy(start, descendant_hex, 64);
-    store8(start + 64, 0);
-    vec_push(queue, start);
+    vec_push(queue, _id_dup(descendant_hex));
 
     while (vec_len(queue) > 0) {
         var cur = vec_get(queue, vec_len(queue) - 1);
@@ -631,7 +628,7 @@ fn parse_commit_body_a(a, body, body_len, out) {
 # Print the "commit <hex> / Author: / Date: / [Signature: ...] / blank / message" block.
 fn print_commit_header(commit_hex, info, body, body_len) {
     stdout_write("commit ", 7);
-    stdout_write(commit_hex, 64);
+    stdout_write(commit_hex, _id_hexlen());
     stdout_write("\n", 1);
 
     var pk[32];
@@ -744,10 +741,7 @@ fn _graph_build_node(hex) {
     if (pv != 0) {
         var i = 0;
         while (i < vec_len(pv)) {
-            var c = alloc_or_die(65);
-            memcpy(c, vec_get(pv, i), 64);
-            store8(c + 64, 0);
-            vec_push(mine, c);
+            vec_push(mine, _id_dup(vec_get(pv, i)));
             i = i + 1;
         }
     }
@@ -888,10 +882,7 @@ fn print_graph(start_hex, limit) {
 
     # Pass 1: BFS the full DAG, building one node per reachable commit.
     var queue = vec_new();
-    var sc = alloc_or_die(65);
-    memcpy(sc, start_hex, 64);
-    store8(sc + 64, 0);
-    vec_push(queue, sc);
+    vec_push(queue, _id_dup(start_hex));
     while (vec_len(queue) > 0) {
         var h = vec_get(queue, vec_len(queue) - 1);
         vec_pop(queue);
@@ -933,10 +924,7 @@ fn print_graph(start_hex, limit) {
     # Emission: lanes carry the commit each column awaits. Pick the
     # ready lane (pending==0) with the newest timestamp each step.
     var lanes = vec_new();
-    var lc = alloc_or_die(65);
-    memcpy(lc, start_hex, 64);
-    store8(lc + 64, 0);
-    vec_push(lanes, lc);
+    vec_push(lanes, _id_dup(start_hex));
     var shown = 0;
     var cont = 1;
     while (cont == 1) {
@@ -1011,10 +999,8 @@ fn print_graph(start_hex, limit) {
 
 # `sit log [--oneline] [--graph]` — commit history from HEAD.
 fn cmd_log() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    # 1.12.0: a `.git/` repository too, read-only.
+    if (cli_read_repo() < 0) { return 1; }
 
     # argv scan: --oneline, --graph, -n <count>, and an optional positional <ref>.
     var oneline = 0;
@@ -1058,9 +1044,7 @@ fn cmd_log() {
             syscall(SYS_WRITE, STDERR, "'\n", 2);
             return 1;
         }
-        current_hex = alloc_or_die(65);
-        memcpy(current_hex, &resolved, 64);
-        store8(current_hex + 64, 0);
+        current_hex = _id_dup(&resolved);
     }
     else {
         current_hex = read_head_ref();

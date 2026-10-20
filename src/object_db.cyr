@@ -35,10 +35,16 @@ fn resolve_hash(prefix, out_buf) {
     # Try as a ref name first (HEAD, tags, branches)
     if (resolve_ref_name(prefix, out_buf) == 1) { return 1; }
 
-    # git mode (roadmap 1.2.0): objects live on the loose/pack filesystem, not
-    # patra. Short-prefix disambiguation over loose fanout + pack .idx is a later
-    # enhancement — a git object must be named by full oid or a ref for now (roadmap: `.git/` CLI parity).
-    if (_repo_backend == 1) { return 0; }
+    # git mode: objects live in loose files and packs, not patra. 1.12.0: a
+    # short id is looked up there too — loose fanout and every pack index, this
+    # repository's and its alternates' (_git_resolve_prefix, git_pack.cyr).
+    if (_repo_backend == 1) {
+        if (plen < 4) { return 0 - 2; }
+        if (hex_prefix_valid(prefix, plen) == 0) { return 0; }
+        var gc = _git_resolve_prefix(prefix, plen, out_buf);
+        if (gc > 1) { return 0 - 1; }
+        return gc;
+    }
 
     if (plen < 4) { return 0 - 2; }
 

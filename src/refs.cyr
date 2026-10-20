@@ -65,8 +65,12 @@ fn _reflog_spec_refpath(base) {
 # Resolve a ref name (HEAD, <ref>@{N}, or a name under refs/) to 64-hex in `out_buf`; 1 on success.
 fn resolve_ref_name(name, out_buf) {
     # Storage seam (roadmap 1.2.0): a .git/ repo resolves refs from .git/HEAD,
-    # .git/refs/, and .git/packed-refs. @{N} reflog specs are .sit-only for now (roadmap: `.git/` CLI parity).
-    if (_repo_backend == 1) { return _git_resolve_ref_name(name, out_buf); }
+    # .git/refs/, and .git/packed-refs. 1.12.0: and `<ref>@{N}` / `@{<time>}`
+    # from .git/logs/, which has the same line format at the repo's id width.
+    if (_repo_backend == 1) {
+        if (resolve_reflog_spec(name, out_buf) == 1) { return 1; }
+        return _git_resolve_ref_name(name, out_buf);
+    }
 
     # Reflog selector <ref>@{N} takes precedence over plain-name lookup.
     if (resolve_reflog_spec(name, out_buf) == 1) { return 1; }

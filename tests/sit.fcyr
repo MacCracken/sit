@@ -359,12 +359,15 @@ fn fuzz_parse_tree(rounds) {
         var w = 0;
         var e = 0;
         while (e < 3) {
-            store8(body + w, 49); w = w + 1;      # '1'
-            store8(body + w, 48); w = w + 1;      # '0'
-            store8(body + w, 48); w = w + 1;      # '0'
-            store8(body + w, 54); w = w + 1;      # '6'
-            store8(body + w, 52); w = w + 1;      # '4'
-            store8(body + w, 52); w = w + 1;      # '4'
+            # 1.12.0: every mode git writes, so a .git/ backend's accept path
+            # sees executables, symlinks and gitlinks, and sit's drops them.
+            var msel = ((seed >> (e * 5 + 9)) & 0x7) % 5;
+            var mode = "100644";
+            if (msel == 1) { mode = "100755"; }
+            if (msel == 2) { mode = "120000"; }
+            if (msel == 3) { mode = "160000"; }
+            if (msel == 4) { mode = "100664"; }
+            memcpy(body + w, mode, 6); w = w + 6;
             store8(body + w, 32); w = w + 1;      # ' '
             var nlen = ((seed >> (e * 3)) & 0x07) + 1;   # 1..8 byte name
             var k = 0;
@@ -390,7 +393,29 @@ fn fuzz_parse_tree(rounds) {
         }
 
         tree_dropped_reset();
-        parse_tree(body, w);
+        var kept = parse_tree(body, w);
+        # What a backend keeps passes that backend's rules (1.12.0).
+        var ki = 0;
+        while (ki < vec_len(kept)) {
+            var ke = vec_get(kept, ki);
+            var km = tree_entry_mode(ke);
+            var kn = tree_entry_name(ke);
+            if (_repo_backend == 1) {
+                if (git_tree_mode_readable(km) == 0) {
+                    println("fuzz: a .git/ tree kept a mode git does not write");
+                    return 1;
+                }
+                if (git_tree_name_readable(kn) == 0) { println("fuzz: a .git/ tree kept an unusable name"); return 1; }
+            }
+            else {
+                if (tree_entry_mode_valid(km) == 0) {
+                    println("fuzz: a sit tree kept a mode sit cannot check out");
+                    return 1;
+                }
+                if (tree_entry_name_valid(kn) == 0) { println("fuzz: a sit tree kept an unsafe name"); return 1; }
+            }
+            ki = ki + 1;
+        }
 
         # Truncation at every prefix length is the classic tree-parser bug:
         # a record header that promises more bytes than the body holds.
