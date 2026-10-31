@@ -90,9 +90,10 @@ The full report is [`docs/audit/2026-10-20-1.12.2-audit.md`](docs/audit/2026-10-
   - reflogs past 64 MiB (L5);
   - a lower tree-expansion ceiling for status (G4).
 - **1.13.0:** upper-case hex ids (G7) and bare `@{N}` (G8), with the resolver work. **1.15.1:** gc's per-commit memory (P9), a depth-aware delta base cache (P10), and one object per pack (P6's remainder).
-- **Upstream asks**, on sit's roadmap and not yet filed:
-  - patra: free the WAL path `patra_open` keeps, about 4.4 KB per reopen under `--repos` (S5); open its files `O_CLOEXEC` (P7);
-  - cmdit: completion scripts that keep file names whole (L11).
+- **S5, `--repos`'s ~4.4 KB per store reopen:** 4,112 B of it is sit calling `patra_init()` on every open, against patra's "once, before use". That fix is roadmapped for 1.13.2. The other 136 B is the WAL path `patra_open` keeps.
+- **Upstream asks, filed 2026-10-20:**
+  - patra, two issues in its `docs/development/issues/`: the WAL path `patra_open` keeps, and `O_CLOEXEC` on its descriptors (P7);
+  - cmdit, on its roadmap: completion scripts that keep file names whole, and fish file completion (L11).
 
 ### Docs
 
