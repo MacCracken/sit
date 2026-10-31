@@ -1,0 +1,47 @@
+operation,v1123,v1130,unit,method
+add x100 (one file each) (cpu),112.2,112.9,ms,ab1130: min of 9 alternating runs per child CPU; load 7-10
+add of 1000 paths (cpu),586.6,279.5,ms,ab1130: min of 9 alternating runs per child CPU; load 7-10
+commit (cpu),1.4,1.4,ms,ab1130: min of 9 alternating runs per child CPU; load 7-10
+"status, 200 files (cpu)",6.0,5.9,ms,ab1130: min of 9 alternating runs per child CPU; load 7-10
+"log --oneline, 300 commits (cpu)",26.4,26.8,ms,ab1130: min of 9 alternating runs per child CPU; load 7-10
+"checkout 100 changed files, there and back (cpu)",42.0,42.2,ms,ab1130: min of 9 alternating runs per child CPU; load 7-10
+"clone, 100 commits (cpu)",43.1,42.9,ms,ab1130: min of 9 alternating runs per child CPU; load 7-10
+"fsck, 100 commits (cpu)",36.9,36.7,ms,ab1130: min of 9 alternating runs per child CPU; load 7-10
+"add 10000 new files, ext4 (wall)",64861,7804,ms,one run each on ext4 (SSD) after sync; load 10-11; git add . new: 583 ms
+"add 10000 files again, unchanged, ext4 (wall)",69826,933,ms,one run each on ext4 (SSD) after sync; load 10-11; git add . new: 583 ms
+"add 10000 files, all modified, ext4 (wall)",92118,15251,ms,one run each on ext4 (SSD) after sync; load 10-11; git add . new: 583 ms
+"log --oneline, 3000 commits (wall)",,113,ms,git fast-import fixture after git gc; git log --first-parent -- path: 11 ms
+"log --oneline -- . , 3000 commits (wall)",,113,ms,git fast-import fixture after git gc; git log --first-parent -- path: 11 ms
+"log --oneline -- docs (depth 1), 3000 commits (wall)",,134,ms,git fast-import fixture after git gc; git log --first-parent -- path: 11 ms
+"log --oneline -- src/m3/f1.txt (depth 3), 3000 commits (wall)",,163,ms,git fast-import fixture after git gc; git log --first-parent -- path: 11 ms
+sha256-64B,0.858,0.887,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+sha256-1024B,4.306,4.413,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+sha256-65536B,246.487,271.326,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+zlib-compress-1024B,163.886,212.653,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+zlib-compress-65536B,1534.000,1587.000,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+zlib-decompress-1024B,12.229,15.420,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+zlib-decompress-65536B,548.043,576.633,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+patra-open-close,32.537,32.414,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+copy-objects-100,197.157,201.539,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+commit-parse+iso8601,2.097,1.592,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+ed25519-sign,3113.000,3152.000,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+ed25519-verify,9286.000,9355.000,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+refname_valid-good,0.358,0.394,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+tree_entry_name_valid-good,0.142,0.093,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+tree_flat_path_valid-good,1.205,0.911,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+hex_prefix_valid-64char,0.239,0.398,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+lcs-diff-100x100,450.578,628.527,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+lcs-diff-1000x1000,58167.000,53604.000,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+lcs-diff-4000x4000,770641.000,751992.000,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+is_ignored-10pat,13.954,14.028,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+is_ignored-50pat,69.591,70.931,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+is_ignored-200pat,277.597,275.996,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+blob-hash-1024B,6.505,7.267,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+blob-hash-65536B,444.458,435.154,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+blob-hash-1048576B,8132.000,7733.000,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+delta-tree-100,38.075,45.011,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+delta-tree-2000,455.098,758.396,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+pack-chain-10-cold,1057.000,896.179,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+pack-chain-10-warm,43.668,41.059,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+pack-chain-50-cold,3819.000,2887.000,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)
+pack-chain-50-warm,31.104,42.937,us,min of 3 alternating runs of both bench binaries from one directory; load 10-12 (noise; see the snapshot)

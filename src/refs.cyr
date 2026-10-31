@@ -13,28 +13,94 @@
 # logs/refs/remotes/<base> (tags aren't logged). Called from resolve_ref_name
 # in REVISION context — distinct from refname_valid, which rejects '@{' in
 # ref-NAME context (so x@{0} never becomes a ref file).
+#
+# 1.13.0 (G8), as git reads them: a bare "@{…}" is the current branch's log
+# (HEAD's when HEAD is detached), whether or not that log exists yet; "@{0}" of
+# a log with no entries is the ref's own value; and "@{N}" of a log of exactly
+# N entries is the oldest entry's old value (_reflog_nth_in_buf).
 fn resolve_reflog_spec(name, out_buf) {
+    var bare = 0;
+    var pname = name;
+    if (load8(name) == 64) {
+        if (load8(name + 1) == 123) {
+            # Parsed as HEAD's selector would be; the log is chosen below.
+            bare = 1;
+            var nl = strlen(name);
+            pname = alloc(nl + 5);
+            memcpy(pname, "HEAD", 4);
+            memcpy(pname + 4, name, nl);
+            store8(pname + 4 + nl, 0);
+        }
+    }
     var spec[24];
     var blen = 0;
     var num = 0;
     var when = 0 - 1;
-    if (_reflog_spec_parse(name, &spec) == 1) {
+    if (_reflog_spec_parse(pname, &spec) == 1) {
         blen = load64(&spec + 8);
         num = load64(&spec + 16);
     }
     else {
         var ds[16];
-        if (_reflog_date_spec_parse(name, clock_epoch_secs(), &ds) == 0) { return 0; }
+        if (_reflog_date_spec_parse(pname, clock_epoch_secs(), &ds) == 0) { return 0; }
         blen = load64(&ds);
         when = load64(&ds + 8);
     }
-    var base = alloc(blen + 1);
-    memcpy(base, name, blen);
-    store8(base + blen, 0);
-    var refpath = _reflog_spec_refpath(base);
+    var refpath = 0;
+    if (bare == 1) {
+        refpath = read_head_ref_path();
+        if (refpath == 0) { refpath = "HEAD"; }
+    }
+    else {
+        var base = alloc(blen + 1);
+        memcpy(base, pname, blen);
+        store8(base + blen, 0);
+        refpath = _reflog_spec_refpath(base);
+    }
     if (refpath == 0) { return 0; }
     if (when >= 0) { return reflog_read_at_time(refpath, when, out_buf); }
-    return reflog_read_nth(refpath, num, out_buf);
+    if (reflog_read_nth(refpath, num, out_buf) == 1) { return 1; }
+    if (num == 0) {
+        if (reflog_entry_count(refpath) == 0) { return _ref_value_at(refpath, out_buf); }
+    }
+    return 0;
+}
+
+# The value of the ref at `refpath` — "HEAD", or a full name under refs/ that
+# the caller has validated — as hex + NUL in out_buf. 1, or 0 when it has none.
+fn _ref_value_at(refpath, out_buf) {
+    if (streq(refpath, "HEAD") == 1) {
+        var h = read_head_ref();
+        if (h == 0) { return 0; }
+        var hl = _id_hexlen();
+        memcpy(out_buf, h, hl);
+        store8(out_buf + hl, 0);
+        return 1;
+    }
+    if (_repo_backend == 1) { return _git_try_full_ref(refpath, out_buf); }
+    var rl = strlen(refpath);
+    var full = alloc(5 + rl + 1);
+    memcpy(full, ".sit/", 5);
+    memcpy(full + 5, refpath, rl);
+    store8(full + 5 + rl, 0);
+    return _sit_ref_file_hex(full, out_buf);
+}
+
+# The sit ref file at `path` (repo-relative) as 64 hex + NUL in out_buf: 1, or 0
+# when it is absent, unreadable or short. S-11: the first 64 bytes must be hex,
+# so a garbage or hostile ref reads as no ref rather than flowing on as a hash.
+fn _sit_ref_file_hex(path, out_buf) {
+    if (sf_exists(path) != 1) { return 0; }
+    var fd = sf_open(path, 0, 0);
+    if (fd < 0) { return 0; }
+    var buf = alloc(80);
+    var n = file_read(fd, buf, 80);
+    file_close(fd);
+    if (n < 64) { return 0; }
+    if (hex_prefix_valid(buf, 64) == 0) { return 0; }
+    memcpy(out_buf, buf, 64);
+    store8(out_buf + 64, 0);
+    return 1;
 }
 
 # The log refpath a selector's base names — "HEAD", or the branch or
@@ -84,71 +150,266 @@ fn resolve_ref_name(name, out_buf) {
 
     var name_len = strlen(name);
 
+    # S-11: each ref file is read through _sit_ref_file_hex, which takes only
+    # 64 hex bytes, so a garbage or attacker-crafted ref is "no such ref".
     var tag_path = alloc(15 + name_len + 1);
     memcpy(tag_path, ".sit/refs/tags/", 15);
     memcpy(tag_path + 15, name, name_len);
     store8(tag_path + 15 + name_len, 0);
-    # S-11: all three ref-file readers below validate that the first 64 bytes
-    # are actual hex before accepting. A garbage or attacker-crafted ref is
-    # treated as "no such ref" rather than flowed through as a "hash".
-    if (sf_exists(tag_path) == 1) {
-        var tfd = sf_open(tag_path, 0, 0);
-        if (tfd >= 0) {
-            var tbuf = alloc(80);
-            var tn = file_read(tfd, tbuf, 80);
-            file_close(tfd);
-            if (tn >= 64) {
-                if (hex_prefix_valid(tbuf, 64) == 1) {
-                    memcpy(out_buf, tbuf, 64);
-                    store8(out_buf + 64, 0);
-                    return 1;
-                }
-            }
-        }
-    }
+    if (_sit_ref_file_hex(tag_path, out_buf) == 1) { return 1; }
 
     var head_path = alloc(16 + name_len + 1);
     memcpy(head_path, ".sit/refs/heads/", 16);
     memcpy(head_path + 16, name, name_len);
     store8(head_path + 16 + name_len, 0);
-    if (sf_exists(head_path) == 1) {
-        var hfd = sf_open(head_path, 0, 0);
-        if (hfd >= 0) {
-            var hbuf = alloc(80);
-            var hn = file_read(hfd, hbuf, 80);
-            file_close(hfd);
-            if (hn >= 64) {
-                if (hex_prefix_valid(hbuf, 64) == 1) {
-                    memcpy(out_buf, hbuf, 64);
-                    store8(out_buf + 64, 0);
-                    return 1;
-                }
-            }
-        }
-    }
+    if (_sit_ref_file_hex(head_path, out_buf) == 1) { return 1; }
 
     # Remote-tracking ref (e.g. "origin/main" → .sit/refs/remotes/origin/main)
     var rem_path = alloc(18 + name_len + 1);
     memcpy(rem_path, ".sit/refs/remotes/", 18);
     memcpy(rem_path + 18, name, name_len);
     store8(rem_path + 18 + name_len, 0);
-    if (sf_exists(rem_path) == 1) {
-        var rfd = sf_open(rem_path, 0, 0);
-        if (rfd >= 0) {
-            var rbuf = alloc(80);
-            var rn = file_read(rfd, rbuf, 80);
-            file_close(rfd);
-            if (rn >= 64) {
-                if (hex_prefix_valid(rbuf, 64) == 1) {
-                    memcpy(out_buf, rbuf, 64);
-                    store8(out_buf + 64, 0);
-                    return 1;
+    if (_sit_ref_file_hex(rem_path, out_buf) == 1) { return 1; }
+
+    return 0;
+}
+
+# ── Revision syntax (1.13.0) ───
+#
+# git's `<rev>~<n>`, `<rev>^<n>` and `<rev>:<path>` (gitrevisions(7)), read in
+# resolve_hash for every command that names an object, on both backends.
+# `~<n>` follows n first parents; `^<n>` is the n-th parent and `^0` the commit
+# itself; a bare `~` or `^` is 1; the suffixes apply left to right
+# (`HEAD~2^2~1`), each to a commit (an annotated tag is peeled first). `:`
+# splits at its first occurrence outside `{…}` (a reflog time can hold one) and
+# names the blob or tree at the path in the commit's tree, or in a tree; an
+# empty path is the tree itself. A ref name cannot hold `~`, `^` or `:`
+# (refname_valid), so the syntax never shadows a ref.
+#
+# Not read, and refused as any unknown revision is: `^{<type>}`, `:/<text>`,
+# `:<path>` (the index), and `@` alone.
+
+# Offset of the first byte equal to c1 or c2 in s[0..n) outside `{…}`, or -1.
+fn _rev_find(s, n, c1, c2) {
+    var depth = 0;
+    var at = 0 - 1;
+    var i = 0;
+    while (i < n) {
+        if (at < 0) {
+            var c = load8(s + i);
+            if (c == 123) { depth = depth + 1; }
+            else {
+                if (c == 125) {
+                    if (depth > 0) { depth = depth - 1; }
+                }
+                else {
+                    if (depth == 0) {
+                        if (c == c1) { at = i; }
+                        if (c == c2) { at = i; }
+                    }
                 }
             }
         }
+        i = i + 1;
     }
+    return at;
+}
 
+# 1 when `spec` uses `~`, `^` or `:` revision syntax.
+fn rev_has_syntax(spec) {
+    var n = strlen(spec);
+    if (_rev_find(spec, n, 58, 58) >= 0) { return 1; }
+    if (_rev_find(spec, n, 126, 94) >= 0) { return 1; }
     return 0;
+}
+
+# A heap cstring of s[0..n).
+fn _rev_substr(s, n) {
+    var c = alloc(n + 1);
+    memcpy(c, s, n);
+    store8(c + n, 0);
+    return c;
+}
+
+# `hex` with annotated tags peeled, when that is a commit: its id, or 0.
+fn _rev_peel_commit(hex) {
+    var cur = peel_tag(hex);
+    if (cur == 0) { return 0; }
+    var obj[24];
+    var k = read_object_kind(cur, &obj);
+    if (k < 0) { return 0; }
+    fl_free(load64(&obj));
+    if (k != 1) { return 0; }
+    return cur;
+}
+
+# The tree `hex` names, peeling tags and commits: its id, or 0 for a blob or an
+# unreadable object.
+fn _rev_peel_tree(hex) {
+    var cur = peel_tag(hex);
+    if (cur == 0) { return 0; }
+    var obj[24];
+    var k = read_object_kind(cur, &obj);
+    if (k < 0) { return 0; }
+    var buf = load64(&obj);
+    if (k == 2) { fl_free(buf); return cur; }
+    if (k != 1) { fl_free(buf); return 0; }
+    var coff = load64(&obj + 16);
+    var info[56];
+    var pr = parse_commit_body(buf + coff, load64(&obj + 8) - coff, &info);
+    fl_free(buf);
+    if (pr != 0) { return 0; }
+    return load64(&info);
+}
+
+# The n-th parent (n >= 1) of the commit `hex`, or 0 when `hex` is not a
+# readable commit or has fewer parents.
+fn _rev_parent(hex, n) {
+    var obj[24];
+    var k = read_object_kind(hex, &obj);
+    if (k < 0) { return 0; }
+    var buf = load64(&obj);
+    if (k != 1) { fl_free(buf); return 0; }
+    var coff = load64(&obj + 16);
+    var info[56];
+    var pr = parse_commit_body(buf + coff, load64(&obj + 8) - coff, &info);
+    fl_free(buf);
+    if (pr != 0) { return 0; }
+    var pv = load64(&info + 48);
+    if (pv == 0) { return 0; }
+    if (n > vec_len(pv)) { return 0; }
+    return vec_get(pv, n - 1);
+}
+
+# A path that starts with "./" or "../" is relative to the working directory,
+# which for sit is always the worktree's root: normalized as git's
+# normalize_path_copy does ('.' and empty components dropped, '..' taking one
+# back, a trailing '/' kept). Writes {ptr, len} to out16; 1, or 0 when '..'
+# climbs above the root. Any other path is taken as written.
+fn _rev_path_norm(path, plen, out16) {
+    store64(out16, path);
+    store64(out16 + 8, plen);
+    var rel = 0;
+    if (plen >= 2) { if (memeq(path, "./", 2) == 1) { rel = 1; } }
+    if (plen >= 3) { if (memeq(path, "../", 3) == 1) { rel = 1; } }
+    if (rel == 0) { return 1; }
+    var out = alloc(plen + 1);
+    var o = 0;
+    var ok = 1;
+    var p = 0;
+    while (p < plen) {
+        var q = p;
+        while (q < plen) {
+            if (load8(path + q) == 47) { break; }
+            q = q + 1;
+        }
+        var cl = q - p;
+        var skip = 0;
+        if (cl == 0) { skip = 1; }
+        if (cl == 1) { if (load8(path + p) == 46) { skip = 1; } }
+        if (cl == 2) {
+            if (memeq(path + p, "..", 2) == 1) {
+                skip = 1;
+                if (o == 0) { ok = 0; }
+                else {
+                    # Back over the last component and its separator.
+                    o = o - 1;
+                    while (o > 0) {
+                        if (load8(out + o - 1) == 47) { break; }
+                        o = o - 1;
+                    }
+                }
+            }
+        }
+        if (skip == 0) {
+            memcpy(out + o, path + p, cl);
+            o = o + cl;
+            store8(out + o, 47);
+            o = o + 1;
+        }
+        p = q + 1;
+    }
+    if (ok == 0) { return 0; }
+    # Each kept component left a '/'; keep it only where the path had one.
+    if (o > 0) {
+        if (load8(path + plen - 1) != 47) { o = o - 1; }
+    }
+    store64(out16, out);
+    store64(out16 + 8, o);
+    return 1;
+}
+
+# resolve_hash for a spec with revision syntax: same returns (1, 0, and the
+# base's -1 ambiguous / -2 too short).
+fn rev_resolve(spec, out_buf) {
+    var n = strlen(spec);
+    var colon = _rev_find(spec, n, 58, 58);
+    if (colon >= 0) {
+        if (colon == 0) { return 0; }
+        var cr = resolve_hash(_rev_substr(spec, colon), out_buf);
+        if (cr != 1) { return cr; }
+        var tree = _rev_peel_tree(out_buf);
+        if (tree == 0) { return 0; }
+        var np[16];
+        if (_rev_path_norm(spec + colon + 1, n - colon - 1, &np) == 0) { return 0; }
+        if (tree_path_find(tree, load64(&np), load64(&np + 8), out_buf) > 0) { return 1; }
+        return 0;
+    }
+    var op = _rev_find(spec, n, 126, 94);
+    if (op <= 0) { return 0; }
+    var br = resolve_hash(_rev_substr(spec, op), out_buf);
+    if (br != 1) { return br; }
+    var cur = _id_dup(out_buf);
+    var steps = 0;
+    var i = op;
+    while (i < n) {
+        var c = load8(spec + i);
+        var j = i + 1;
+        var num = 0;
+        var nd = 0;
+        var digits = 1;
+        while (digits == 1) {
+            if (j >= n) { digits = 0; }
+            else {
+                var d = load8(spec + j);
+                if (d < 48) { digits = 0; }
+                else {
+                    if (d > 57) { digits = 0; }
+                    else { num = num * 10 + (d - 48); nd = nd + 1; j = j + 1; }
+                }
+            }
+        }
+        if (nd == 0) { num = 1; }
+        # git refuses a count past INT_MAX; nine digits cannot wrap here.
+        if (nd > 9) { cur = 0; }
+        if (c != 126) { if (c != 94) { cur = 0; } }
+        if (cur != 0) { cur = _rev_peel_commit(cur); }
+        if (cur != 0) {
+            if (c == 94) {
+                if (num > 0) { cur = _rev_parent(cur, num); }
+            }
+            else {
+                # S-25's bound on a walk: a hand-made store can hold a cycle.
+                steps = steps + num;
+                if (steps > SIT_MAX_COMMIT_WALK) { cur = 0; }
+                var k = 0;
+                while (k < num) {
+                    if (cur == 0) { k = num; }
+                    else {
+                        cur = _rev_parent(cur, 1);
+                        k = k + 1;
+                    }
+                }
+            }
+        }
+        if (cur == 0) { i = n; }
+        else { i = j; }
+    }
+    if (cur == 0) { return 0; }
+    var hl = _id_hexlen();
+    memcpy(out_buf, cur, hl);
+    store8(out_buf + hl, 0);
+    return 1;
 }
 
 # Resolve a reference: either a symbolic name (HEAD, tag, branch) or a hex hash

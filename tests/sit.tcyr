@@ -2268,6 +2268,54 @@ fn test_1122_closeout() {
 }
 
 # Run every test group; exit status is the failure count.
+# 1.13.0: revision syntax — the pure parts (rev_resolve's walk is exercised
+# against git in the integration suite, section 45).
+fn test_1130_revisions() {
+    test_group("1.13.0 revision syntax");
+    assert_eq(_rev_find("HEAD~1", 6, 126, 94), 4, "~ found");
+    assert_eq(_rev_find("HEAD^2~1", 8, 126, 94), 4, "the first suffix");
+    assert_eq(_rev_find("HEAD@{1}~1", 10, 126, 94), 8, "after a reflog selector");
+    assert_eq(_rev_find("main@{2026-10-01 10:00}", 23, 58, 58), 0 - 1, "a colon inside braces is not a path");
+    assert_eq(_rev_find("main@{1}:a:b", 12, 58, 58), 8, "the first colon outside them is");
+    assert_eq(rev_has_syntax("HEAD"), 0, "HEAD has none");
+    assert_eq(rev_has_syntax("HEAD@{2 days ago}"), 0, "nor a time selector");
+    assert_eq(rev_has_syntax("v1:a.txt"), 1, "a path has");
+    assert_eq(rev_has_syntax("abcd^"), 1, "a parent suffix has");
+    var np[16];
+    assert_eq(_rev_path_norm("a/b", 3, &np), 1, "a plain path is taken as written");
+    assert_eq(load64(&np + 8), 3, "unchanged");
+    assert_eq(_rev_path_norm("./a.txt", 7, &np), 1, "./ is the root");
+    assert_eq(load64(&np + 8), 5, "./a.txt is a.txt");
+    assert_eq(memeq(load64(&np), "a.txt", 5), 1, "a.txt");
+    assert_eq(_rev_path_norm("./d//e/../f/", 12, &np), 1, "collapses // and ..");
+    assert_eq(load64(&np + 8), 4, "keeps the trailing slash");
+    assert_eq(memeq(load64(&np), "d/f/", 4), 1, "d/f/");
+    assert_eq(_rev_path_norm("./", 2, &np), 1, "./ alone");
+    assert_eq(load64(&np + 8), 0, "is the tree itself");
+    assert_eq(_rev_path_norm("../a", 4, &np), 0, ".. above the root is refused");
+    assert_eq(_rev_path_norm("./d/../../a", 11, &np), 0, "however it gets there");
+    assert_eq(streq(hex_fold_lower("12FA6b", 6), "12fa6b"), 1, "upper-case hex folds");
+    var same = "abc";
+    assert_eq(hex_fold_lower(same, 3), same, "lower case is returned as is");
+    assert_eq(streq(hex_fold_lower("XYZ", 3), "XYZ"), 1, "and other letters are left to the validators");
+    # git's read_ref_at: @{N} of a log of N entries is the oldest entry's old id.
+    var A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    var C = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    var lg = alloc(1024);
+    var p = 0;
+    p = p + reflog_format_line(lg + p, A, B, "n", "e", 1, "expired before this");
+    p = p + reflog_format_line(lg + p, B, C, "n", "e", 2, "commit");
+    var o[72];
+    assert_eq(_reflog_nth_in_buf(lg, p, 2, &o), 1, "@{2} of two entries");
+    assert_streq(&o, A, "is what the ref held before the log");
+    assert_eq(_reflog_nth_in_buf(lg, p, 3, &o), 0, "@{3} is past it");
+    var z = alloc(512);
+    var zp = reflog_format_line(z, 0, A, "n", "e", 1, "created");
+    assert_eq(_reflog_nth_in_buf(z, zp, 1, &o), 0, "a creation entry's zeros are no id");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_sigil_hash_known_answer();
@@ -2315,6 +2363,7 @@ fn main() {
     test_1110_serving();
     test_1120_git_parity();
     test_1122_closeout();
+    test_1130_revisions();
     return assert_summary();
 }
 

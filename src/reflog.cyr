@@ -144,11 +144,18 @@ fn _reflog_line_start(buf, len, idx) {
 # entry n moves ago into out (65 bytes, nul-terminated). n == 0 is the last
 # (current) entry. Returns 1 on success, 0 if n is out of range or the
 # target line is malformed. Never reads past `len`.
+#
+# 1.13.0 (G8): n equal to the number of entries is the OLDEST entry's old oid,
+# as git's read_ref_at gives it — what the ref held before the log began, which
+# `reflog expire` leaves behind — unless that is the creation zeros.
 fn _reflog_nth_in_buf(buf, len, n, out) {
     if (n < 0) { return 0; }
     var c = _reflog_count_in_buf(buf, len);
-    if (n >= c) { return 0; }
+    if (n > c) { return 0; }
+    if (c == 0) { return 0; }
     var target = c - 1 - n;
+    var field = 1;                   # the new oid; the old one for n == c
+    if (n == c) { target = 0; field = 0; }
     var s = _reflog_line_start(buf, len, target);
     if (s < 0) { return 0; }
     # Layout: old(H) SP new(H) SP ... — the new oid at [s+H+1, s+2H+1). H is the
@@ -156,8 +163,18 @@ fn _reflog_nth_in_buf(buf, len, n, out) {
     var h = _id_hexlen();
     if (s + 2 * h + 1 > len) { return 0; }
     if (load8(buf + s + h) != 32) { return 0; }
-    if (hex_prefix_valid(buf + s + h + 1, h) == 0) { return 0; }
-    memcpy(out, buf + s + h + 1, h);
+    var at = buf + s + field * (h + 1);
+    if (hex_prefix_valid(at, h) == 0) { return 0; }
+    if (field == 0) {
+        var zero = 1;
+        var k = 0;
+        while (k < h) {
+            if (load8(at + k) != 48) { zero = 0; k = h; }
+            else { k = k + 1; }
+        }
+        if (zero == 1) { return 0; }
+    }
+    memcpy(out, at, h);
     store8(out + h, 0);
     return 1;
 }
@@ -359,6 +376,16 @@ fn reflog_read_nth(refpath, n, out) {
     var buf = load64(&pair);
     var len = load64(&pair + 8);
     return _reflog_nth_in_buf(buf, len, n, out);
+}
+
+# The number of entries in the log at refpath: 0 when there is no log, -1 when
+# one exists but cannot be read (so a caller never takes it for empty).
+fn reflog_entry_count(refpath) {
+    var path = reflog_log_path(refpath);
+    if (path_lstat_kind(sit_abs(path)) < 0) { return 0; }
+    var pair[16];
+    if (read_file_heap(path, &pair) != 0) { return 0 - 1; }
+    return _reflog_count_in_buf(load64(&pair), load64(&pair + 8));
 }
 
 # ── `sit reflog` command ───────

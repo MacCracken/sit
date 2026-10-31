@@ -1025,41 +1025,255 @@ fn print_graph(start_hex, limit) {
     return 0;
 }
 
-# `sit log [--oneline] [--graph]` — commit history from HEAD.
+# ── `log [<rev>] [--] <path>…` (1.13.0) ──
+#
+# Paths limit log to the commits that change them: those whose entry at a path
+# (a file's blob, a directory's tree, or none) differs from their first
+# parent's — `git log --first-parent -- <path>`, without rename following. A
+# root commit, or a shallow boundary, is compared with nothing. A path is
+# literal and covers what is under it; a pattern is refused rather than matched
+# as nothing. Each commit reads one tree per path component (tree_path_find),
+# not its whole tree.
+#
+# Arguments are read as git reads them: before `--`, the first may be the
+# revision and the rest must be paths in the working tree; one that is both a
+# revision and a path is ambiguous. After `--` every argument is a path.
+
+fn _log_usage() {
+    eprintln("usage: sit log [--oneline] [--graph] [-n <count>] [<rev>] [[--] <path>...]");
+    return 1;
+}
+
+# 1 when `path` names something in the working tree (lstat's question).
+fn _log_in_worktree(path) {
+    if (path_lstat_kind(sit_abs(path)) < 0) { return 0; }
+    return 1;
+}
+
+# 1 when `path` holds a pattern byte (`*`, `?`, `[`) git would match with.
+fn _log_path_is_pattern(path) {
+    var n = strlen(path);
+    var i = 0;
+    while (i < n) {
+        var c = load8(path + i);
+        if (c == 42) { return 1; }
+        if (c == 63) { return 1; }
+        if (c == 91) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# `path` as a tree path, a heap cstring: leading "./" and trailing '/' dropped,
+# and "." the whole tree (""). 0 when it is not a path inside the repository:
+# empty, absolute, too long, or with an empty, '.' or '..' component.
+fn _log_path_norm(path) {
+    var n = strlen(path);
+    if (n == 0) { return 0; }
+    if (n > VAL_TREE_PATH_MAX) { return 0; }
+    if (load8(path) == 47) { return 0; }
+    var s = 0;
+    var going = 1;
+    while (going == 1) {
+        going = 0;
+        if (n - s >= 2) {
+            if (memeq(path + s, "./", 2) == 1) { s = s + 2; going = 1; }
+        }
+    }
+    if (n - s == 1) { if (load8(path + s) == 46) { s = n; } }
+    var e = n;
+    going = 1;
+    while (going == 1) {
+        going = 0;
+        if (e > s) {
+            if (load8(path + e - 1) == 47) { e = e - 1; going = 1; }
+        }
+    }
+    var cs = s;
+    var i = s;
+    while (i <= e) {
+        var at_end = 0;
+        if (i == e) { at_end = 1; }
+        else { if (load8(path + i) == 47) { at_end = 1; } }
+        if (at_end == 1) {
+            if (e > s) {
+                var cl = i - cs;
+                if (cl == 0) { return 0; }
+                if (cl == 1) { if (load8(path + cs) == 46) { return 0; } }
+                if (cl == 2) { if (memeq(path + cs, "..", 2) == 1) { return 0; } }
+            }
+            cs = i + 1;
+        }
+        i = i + 1;
+    }
+    var out = alloc(e - s + 1);
+    memcpy(out, path + s, e - s);
+    store8(out + e - s, 0);
+    return out;
+}
+
+# The entries at each of `paths` in the tree `tree_hex`, into ids: 72 bytes a
+# path, the id + NUL (a leading NUL for none) and the entry's kind at byte 71.
+# 0, or -1 when a tree cannot be read.
+fn _log_path_ids(tree_hex, paths, ids) {
+    var n = vec_len(paths);
+    var i = 0;
+    while (i < n) {
+        var p = vec_get(paths, i);
+        var slot = ids + i * 72;
+        store8(slot, 0);
+        var k = tree_path_find(tree_hex, p, strlen(p), slot);
+        if (k < 0) { return 0 - 1; }
+        if (k == 0) { store8(slot, 0); }
+        store8(slot + 71, k);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# 1 when the tree `hex` holds no entries. Such a tree holds no path either, so
+# git's comparison takes it as nothing there: a root commit with an empty tree
+# changes nothing under `.`.
+fn _log_tree_empty(hex) {
+    var obj[24];
+    var k = read_object_kind(hex, &obj);
+    if (k < 0) { return 0; }
+    var empty = 0;
+    if (k == 2) {
+        if (load64(&obj + 8) == load64(&obj + 16)) { empty = 1; }
+    }
+    fl_free(load64(&obj));
+    return empty;
+}
+
+# 1 when any path's entry differs between two _log_path_ids results.
+fn _log_ids_differ(a, b, n) {
+    var hl = _id_hexlen();
+    var i = 0;
+    while (i < n) {
+        var x = a + i * 72;
+        var y = b + i * 72;
+        var xa = 0;
+        var ya = 0;
+        if (load8(x) == 0) { xa = 1; }
+        if (load8(y) == 0) { ya = 1; }
+        if (xa == 0) { if (ya == 0) { if (memeq(x, y, hl) == 0) { return 1; } } }
+        if (xa != ya) {
+            # One side has the entry. An empty tree there is no change.
+            var there = x;
+            if (xa == 1) { there = y; }
+            if (load8(there + 71) != 2) { return 1; }
+            if (_log_tree_empty(there) == 0) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# `sit log [--oneline] [--graph] [-n <count>] [<rev>] [[--] <path>...]` — commit
+# history from HEAD (or <rev>), first parents only; with paths, the commits
+# that change them.
 fn cmd_log() {
     # 1.12.0: a `.git/` repository too, read-only.
     if (cli_read_repo() < 0) { return 1; }
 
-    # argv scan: --oneline, --graph, -n <count>, and an optional positional <ref>.
+    # argv scan: --oneline, --graph, -n <count>, `--`, and positionals.
     var oneline = 0;
     var graph = 0;
     var limit = 0 - 1;
     var start_ref = 0;
+    var pos = vec_new();
+    var paths = vec_new();
+    var dashdash = 0;
     var ai = 2;
     while (ai < argc()) {
         var a = argv(ai);
-        if (streq(a, "--oneline") == 1) { oneline = 1; ai = ai + 1; }
+        if (dashdash == 1) { vec_push(paths, argv_heap(ai)); ai = ai + 1; }
         else {
-            if (streq(a, "--graph") == 1) { graph = 1; ai = ai + 1; }
+            if (streq(a, "--") == 1) { dashdash = 1; ai = ai + 1; }
             else {
-                if (streq(a, "-n") == 1) {
-                    if (ai + 1 >= argc()) {
-                        eprintln("sit: -n requires a number");
-                        return 1;
-                    }
-                    limit = atoi(argv(ai + 1));
-                    ai = ai + 2;
-                }
+                if (streq(a, "--oneline") == 1) { oneline = 1; ai = ai + 1; }
                 else {
-                    if (start_ref != 0) {
-                        eprintln("usage: sit log [--oneline] [--graph] [-n <count>] [<ref>]");
-                        return 1;
+                    if (streq(a, "--graph") == 1) { graph = 1; ai = ai + 1; }
+                    else {
+                        if (streq(a, "-n") == 1) {
+                            if (ai + 1 >= argc()) {
+                                eprintln("sit: -n requires a number");
+                                return 1;
+                            }
+                            limit = atoi(argv(ai + 1));
+                            ai = ai + 2;
+                        }
+                        else {
+                            vec_push(pos, argv_heap(ai));
+                            ai = ai + 1;
+                        }
                     }
-                    start_ref = argv_heap(ai);
-                    ai = ai + 1;
                 }
             }
         }
+    }
+
+    # Which positionals are the revision and which are paths.
+    var npos = vec_len(pos);
+    var pk = 0;
+    if (dashdash == 1) {
+        if (npos > 1) { return _log_usage(); }
+    }
+    if (npos > 0) {
+        var p0 = vec_get(pos, 0);
+        var probe[72];
+        var is_rev = 0;
+        if (resolve_hash(p0, &probe) == 1) { is_rev = 1; }
+        if (dashdash == 1) { is_rev = 1; }
+        if (is_rev == 1) {
+            if (dashdash == 0) {
+                if (_log_in_worktree(p0) == 1) {
+                    eprint3("sit: '", p0, "' is both a revision and a path in the working tree\n");
+                    eprintln("sit:   (put '--' before the paths: sit log [<rev>] -- <path>...)");
+                    return 1;
+                }
+            }
+            start_ref = p0;
+            pk = 1;
+        }
+    }
+    while (pk < npos) {
+        var pa = vec_get(pos, pk);
+        if (_log_in_worktree(pa) == 0) {
+            var pr2[72];
+            if (resolve_hash(pa, &pr2) == 1) { return _log_usage(); }
+            # 1.12.x said "cannot resolve" here, and a typo'd revision still does.
+            if (pk == 0) {
+                eprint3("sit: cannot resolve '", pa, "' (not a revision, nor a path in the working tree)\n");
+            }
+            else {
+                eprint3("sit: '", pa, "' is not a path in the working tree\n");
+            }
+            eprintln("sit:   (put '--' before a path the working tree does not have)");
+            return 1;
+        }
+        vec_push(paths, pa);
+        pk = pk + 1;
+    }
+    var npaths = vec_len(paths);
+    var pi = 0;
+    while (pi < npaths) {
+        var raw = vec_get(paths, pi);
+        if (_log_path_is_pattern(raw) == 1) {
+            eprint3("sit: '", raw, "' is a pattern; log takes file and directory paths\n");
+            return 1;
+        }
+        var norm = _log_path_norm(raw);
+        if (norm == 0) {
+            eprint3("sit: '", raw, "' is not a path in the repository\n");
+            return 1;
+        }
+        vec_set(paths, pi, norm);
+        pi = pi + 1;
+    }
+    if (npaths > 0) {
+        if (graph == 1) { eprintln("sit: --graph does not take paths"); return 1; }
     }
 
     var current_hex = 0;
@@ -1104,6 +1318,21 @@ fn cmd_log() {
     # walk then never terminates. `limit` only bounds this when the user passed
     # `-n`; the default walk was unbounded.
     var walked = 0;
+    # With paths: the entries at them in this commit and in its first parent,
+    # swapped as the walk steps (so each commit's trees are read once).
+    var cur_ids = 0;
+    var par_ids = 0;
+    var have_cur = 0;
+    # The parent, once read for its tree, is the next commit the walk reads.
+    var next_obj = 0;
+    var next_info = 0;
+    var have_next = 0;
+    if (npaths > 0) {
+        cur_ids = alloc_or_die(npaths * 72);
+        par_ids = alloc_or_die(npaths * 72);
+        next_obj = alloc_or_die(24);
+        next_info = alloc_or_die(56);
+    }
     while (current_hex != 0) {
         if (limit >= 0) {
             if (shown >= limit) { current_hex = 0; }
@@ -1116,9 +1345,22 @@ fn cmd_log() {
         if (current_hex == 0) { return 0; }
 
         var obj[24];
-        if (read_object(current_hex, &obj) != 0) {
-            eprintln("sit: cannot read commit object");
-            return 1;
+        var info[56];
+        if (have_next == 1) {
+            memcpy(&obj, next_obj, 24);
+            memcpy(&info, next_info, 56);
+            have_next = 0;
+        }
+        else {
+            if (read_object(current_hex, &obj) != 0) {
+                eprintln("sit: cannot read commit object");
+                return 1;
+            }
+            if (parse_commit_body(load64(&obj) + load64(&obj + 16),
+                load64(&obj + 8) - load64(&obj + 16), &info) != 0) {
+                eprintln("sit: malformed commit");
+                return 1;
+            }
         }
         var buf = load64(&obj);
         var blen = load64(&obj + 8);
@@ -1126,23 +1368,61 @@ fn cmd_log() {
         var body = buf + coff;
         var body_len = blen - coff;
 
-        var info[56];
-        if (parse_commit_body(body, body_len, &info) != 0) {
-            eprintln("sit: malformed commit");
-            return 1;
+        var boundary = map_has(shallow, current_hex);
+        var show = 1;
+        if (npaths > 0) {
+            var tree = load64(&info);
+            if (tree == 0) { eprintln("sit: malformed commit"); return 1; }
+            if (have_cur == 0) {
+                if (_log_path_ids(tree, paths, cur_ids) != 0) {
+                    eprintln("sit: cannot read a tree (missing or corrupt objects)");
+                    return 1;
+                }
+            }
+            var parent = load64(&info + 8);
+            if (boundary == 1) { parent = 0; }
+            if (parent == 0) {
+                var z = 0;
+                while (z < npaths) { store8(par_ids + z * 72, 0); z = z + 1; }
+            }
+            else {
+                if (read_object(parent, next_obj) != 0) { eprintln("sit: cannot read commit object"); return 1; }
+                if (parse_commit_body(load64(next_obj) + load64(next_obj + 16),
+                    load64(next_obj + 8) - load64(next_obj + 16), next_info) != 0) {
+                    eprintln("sit: malformed commit");
+                    return 1;
+                }
+                have_next = 1;
+                var ptree = load64(next_info);
+                if (ptree == 0) { eprintln("sit: malformed commit"); return 1; }
+                if (streq(ptree, tree) == 1) { memcpy(par_ids, cur_ids, npaths * 72); }
+                else {
+                    if (_log_path_ids(ptree, paths, par_ids) != 0) {
+                        eprintln("sit: cannot read a tree (missing or corrupt objects)");
+                        return 1;
+                    }
+                }
+            }
+            show = _log_ids_differ(cur_ids, par_ids, npaths);
+            var sw = cur_ids;
+            cur_ids = par_ids;
+            par_ids = sw;
+            have_cur = 1;
         }
 
-        if (oneline == 1) {
-            print_commit_oneline(current_hex, body, body_len, load64(&info + 40));
-        }
-        else {
-            if (first == 0) { stdout_write("\n", 1); }
-            first = 0;
-            print_commit_header(current_hex, &info, body, body_len);
+        if (show == 1) {
+            if (oneline == 1) {
+                print_commit_oneline(current_hex, body, body_len, load64(&info + 40));
+            }
+            else {
+                if (first == 0) { stdout_write("\n", 1); }
+                first = 0;
+                print_commit_header(current_hex, &info, body, body_len);
+            }
+            shown = shown + 1;
         }
 
-        shown = shown + 1;
-        if (map_has(shallow, current_hex) == 1) {
+        if (boundary == 1) {
             current_hex = 0;
         }
         else {

@@ -4,6 +4,152 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.13.0] — 2026-10-30 — git's revisions, `log -- <path>`, and `sit add .`
+
+The 1.13.0 minor: the gaps a git user hits on day one. Each new form is checked against git itself, in SHA-1 and SHA-256 repositories, loose and packed. The toolchain stays at cyrius 6.7.18. New: [ADR 0018](docs/adr/0018-object-writes-in-batches.md) and [architecture 009](docs/architecture/009-patra-delete-scans-wal-syncs-per-page.md).
+
+### Added — revision syntax, wherever a commit or an object is named
+
+Read once, in `resolve_hash` (`rev_resolve`, `refs.cyr`), so `log`, `show`, `diff`, `reset`, `merge`, `merge-base`, `cherry-pick`, `revert`, `rebase`, `tag`, `describe`, `cat-file`, `owl-file` and `verify-commit` all take it, on both backends:
+- **`<rev>~<n>`**: n first parents back. A bare `~` is `~1`.
+- **`<rev>^<n>`**: the n-th parent of a merge. A bare `^` is `^1`, and `^0` is the commit itself.
+- Suffixes chain left to right (`HEAD~2^2~1`), each applied to a commit, so an annotated tag is peeled first.
+- **`<rev>:<path>`**: the blob or tree at that path in the revision's tree, or in a tree.
+  - `HEAD:` is the tree itself.
+  - One trailing `/` is allowed after a directory; an empty component (`a//b`, a leading `/`) matches nothing.
+  - A path starting with `./` or `../` is normalized as git does. sit always runs at the worktree's root, so `./` is the root.
+- `:` splits at its first occurrence outside `{…}`, so `main@{2026-10-01 10:00}:a.txt` works.
+- A ref name cannot hold `~`, `^` or `:` (`refname_valid`), so the syntax never shadows a ref.
+- A count is at most nine digits, and a `~` walk is bounded like `log`'s (`SIT_MAX_COMMIT_WALK`).
+- **Upper-case ids (G7).** `sit cat-file 12FA6B69` finds the object, as git folds case. A ref is still looked up under the name as typed, first.
+- **A bare `@{N}` (G8)** reads the current branch's log, or HEAD's when HEAD is detached, as git does; the log need not exist for `@{0}`. The roadmap said HEAD's log; git uses the branch's, and the differential follows git. Also as git reads them:
+  - `<ref>@{0}` of an empty log is the ref's own value;
+  - `<ref>@{N}` of a log of exactly N entries is the oldest entry's old value (what `reflog expire` leaves behind), unless that is the creation zeros.
+
+Not read, and refused as any unknown revision is: `^{<type>}`, `@` alone, `:<path>` (the index), `:/<text>` and `^-<n>`. They are listed under "On request" on the roadmap.
+
+### Added — `sit log [<rev>] [--] <path>...`
+
+Paths limit `log` to the commits that change them against their first parent: those whose entry at a path (a file's blob, a directory's tree, or none) differs from the parent's. That is what `git log --first-parent -- <path>` lists, without following renames.
+- **Matching:**
+  - A directory covers what is under it, and `.` covers the whole tree.
+  - An empty tree counts as nothing there, as in git.
+  - A root commit or a shallow boundary is compared with nothing.
+  - A pattern (`*`, `?`, `[`) is refused rather than matched as nothing, and so is a path that leaves the repository.
+- **Arguments are read as git reads them:**
+  - Before `--`, the first argument may be the revision, and the rest must be paths in the working tree.
+  - A name that is both a revision and a path is refused as ambiguous.
+  - After `--`, every argument is a path, so `sit log -- deleted.txt` works.
+  - `--graph` takes no paths.
+- **Cost.** Each commit reads one tree per path component (`tree_path_find`, `tree.cyr`), never its whole tree, and the parent's commit object is read once, for both its tree and the next step. On a 3,000-commit history:
+  - `log --oneline -- .` costs what `log --oneline` does (113 ms);
+  - a path three levels deep costs 163 ms.
+
+Through 1.12.3 a path was read as a ref: `sit log a.txt` said "cannot resolve 'a.txt'".
+
+### Added — `sit add <dir>` and `sit add .`
+
+A directory, or `.` for the whole worktree, is staged as git 2's `git add <dir>` stages it:
+- every file under it that the working-tree walk keeps (`.sitignore`, nested files and `!` re-includes applied; every file with `-f`);
+- every tracked file under it that is still a file, even when it is ignored;
+- the removal of tracked files under it that are gone, printed as `removed <path>`.
+
+The roadmap asked only for the files. Without the removals, `sit add . && sit commit` would keep files the user had deleted.
+
+An ignored directory is refused (`-f` overrides). A symlink, a name sit cannot track, or a file past 16 MiB under the directory fails the add, with each one named before "nothing was staged". Since 1.12.1 the explicit-path form stopped at the first such path; now it names them all too. The output is in path order.
+
+### Changed — `sit add` of many files
+
+10,000 small files, on an SSD (ext4) at load 10–11:
+
+| | 1.12.3 | 1.13.0 |
+|---|---:|---:|
+| new files | 64.9 s | 7.8 s |
+| re-added unchanged | 69.8 s | 0.93 s |
+| all modified | 92.1 s | 15.3 s |
+
+`git add .` takes 0.58 s for the new-file case. A one-file add is unchanged: 112.2 → 112.9 ms of CPU over 100 runs. Three changes:
+- **The blobs are written as one batch** ([ADR 0018](docs/adr/0018-object-writes-in-batches.md)). Each object insert was its own autocommit statement with its own `fdatasync`, about 5 ms per file. The store now runs in patra's BATCH mode (one sync per 64 statements), and `object_db_batch_end` syncs the batch and is checked before the index transaction begins. A failed sync stages nothing, so the index never names an object not known to be on disk.
+- **Staging is no longer quadratic** (`index_stage`). patra's `DELETE … WHERE path = '…'` scans the table even with the path index ([architecture 009](docs/architecture/009-patra-delete-scans-wal-syncs-per-page.md)). One delete per path made N files cost O(N²): at 4,000 new files, 3.0 s of a 3.8 s add went on deleting rows that did not exist. Past 24 paths:
+  - the index is read once;
+  - a path staged at the same id is left alone, and a new one is only inserted;
+  - the rows that do go are deleted 24 to a statement.
+
+  Up to 24 paths are deleted in one statement and reinserted without reading the index, which keeps the one-file add as fast as before.
+- **A stored object is not compressed again** (`write_typed_object`). The existence test ran after the compression, so every object write, an unchanged file's included, compressed its bytes only to discard them.
+
+The rest of a large add is patra's: inside the index transaction its WAL syncs once per page touched (about 1,660 for 10,000 rows), 3.7 s of a 6.3 s add under load 17. That cost and the scanning `DELETE` are listed as upstream asks, not yet filed on patra.
+
+### Fixed
+
+- **An annotated tag in a `.git/` repository named no commit.**
+  - `sit log v1` said "cannot resolve 'v1'" for a loose tag and "'v1' does not name a commit" for a packed one; `diff` and `show` failed the same way.
+  - `peel_tag` copied a fixed 64 hex digits and recognised a tag by its `tag ` framing, which a SHA-1 id and a packed object (stored unframed) both miss. `parse_tag_body` required 64 hex digits too.
+  - Both now work at the repository's id width, and take the type from the new `read_object_kind`, which reads a git pack entry's type.
+  - `resolve_commit_hash` copied 64 bytes from a 41-byte SHA-1 id; it copies the width now.
+
+### Tests
+
+- **Unit, 704 → 732** (`test_1130_revisions`):
+  - the splitter outside braces;
+  - the relative-path normalizer, `..` past the root refused;
+  - the hex fold;
+  - git's oldest-entry `@{N}` rule, the creation zeros excepted.
+- **Integration, 734 → 844:**
+  - **45**: the revision forms on a sit repository (parents, paths, tags, upper-case ids, bare `@{N}`, the empty-log and oldest-entry rules). Then in SHA-1 and SHA-256 git repositories, loose and after `git gc`, 49 revisions are compared with `git rev-parse` by object content; `log <annotated tag>` works; and the forms not read are refused.
+  - **46**: path-limited log on a sit repository, the argument rules, and a shallow boundary. Then 14 path-limited logs against `git log --first-parent` over a random 40-commit history with merges, deletions and a file that becomes a directory, in both formats, loose and packed.
+  - **47**: `add .` and `add <dir>`:
+    - nested ignore rules and re-includes;
+    - an unchanged directory writing no object;
+    - removals and the ignored-directory rules;
+    - symlinks, untrackable names, the 16 MiB ceiling and an unreadable file;
+    - 40 files with changes, removals and additions together (the index-read path);
+    - the paths and blob contents `git add .` stages in a SHA-256 repository.
+  - **43b** now expects a directory to be staged.
+- **Fuzz, 24 → 25 harnesses.** `fuzz_rev_syntax` (300,000 rounds) checks the splitter, the normalizer and the hex fold over inputs weighted toward the syntax's bytes. `fuzz_reflog_index` now checks that the oldest-entry branch writes an id.
+- **Beyond the suite** (scratch harnesses, not kept):
+  - 1,500 random revisions per object format against `git rev-parse`, and 800 more after the `:path` lookup moved onto `tree_path_find`, with no mismatch;
+  - 42 path-limited logs × 4 random histories × 2 formats against `git log --first-parent`, with no mismatch.
+- All of it passes plain and under `CYRIUS_POISON`, with identical poison A/B fuzz output. The integration suite was also run against a poisoned build. It shows no overwrite; its two serve RSS bounds (27a, 27c) fail there identically on a poisoned 1.12.3, from the allocator's redzones.
+- **Downstream:**
+  - owl builds against the 1.13.0 read bundle on its 6.6.2 pin and passes its 7 tests.
+  - thoth builds on 6.6.6, `--agnos` too, with its two renames. Its suite gives the same results as with the 1.12.3 bundle; its one failure is its own check that the vendored copy is 1.6.2.
+  - Both show the same four undefined-placeholder warnings as before, and no new duplicate definition.
+  - sit builds for `--agnos`.
+
+### Docs
+
+- ADR 0018 (the batched object writes) and architecture 009 (patra's scanning `DELETE` and per-page WAL syncs). The `entries(path)` index comment no longer claims it makes the delete targeted.
+- **The guide:**
+  - a **Revisions** entry;
+  - `log`'s paths and argument rules;
+  - `add`'s directories;
+  - `cat-file <rev>`.
+- `sit --help` lists the revision forms, and `log` and `add` describe the new arguments. The README notes 1.13.0.
+- **The roadmap:**
+  - The 1.13.0 slot is gone.
+  - 1.13.1 notes that `blame` should move onto `tree_path_find` (it flattens a whole tree per commit).
+  - "On request" lists the revision forms left out.
+  - Two upstream asks are added on patra, not yet filed there: the scanning `DELETE` / `UPDATE`, and the per-page WAL sync.
+  - Its line pins are re-checked.
+
+### Performance
+
+DCE builds of the same tree, 1.12.3 against 1.13.0. Snapshot and CSV: [`docs/benchmarks/2026-10-30-v1.13.0.md`](docs/benchmarks/2026-10-30-v1.13.0.md).
+
+| operation, CPU ms (min of 9 alternating runs, load 7–10) | 1.12.3 | 1.13.0 |
+|---|---:|---:|
+| add ×100 (one file each) | 112.2 | 112.9 (+0.6%) |
+| add of 1,000 paths | 586.6 | 279.5 (−52.3%) |
+| commit | 1.4 | 1.4 (−2.1%) |
+| status, 200 files | 6.0 | 5.9 (−0.9%) |
+| log --oneline, 300 commits | 26.4 | 26.8 (+1.5%) |
+| checkout 100 changed files, there and back | 42.0 | 42.2 (+0.4%) |
+| clone, 100 commits | 43.1 | 42.9 (−0.4%) |
+| fsck, 100 commits | 36.9 | 36.7 (−0.6%) |
+
+The micro-benchmarks support no claim this time. At load 10–12, alternating runs of the two builds' binaries from one directory moved rows by −34% … +67% in both directions, unchanged code included (`delta-tree-2000` +67%, `hex_prefix_valid` +67%, `tree_entry_name_valid` −35%). The long rows agree within ±2%: ed25519 sign and verify, `is_ignored`, `patra-open-close`. The CSV records them with that caveat.
+
 ## [1.12.3] — 2026-10-30 — cyrius 6.7.18 and cmdit 1.5.0: three upstream asks arrive
 
 A toolchain and dependency refresh. cyrius goes from 6.7.15 to 6.7.18 and cmdit from 1.4.0 to 1.5.0. sit's source is unchanged except the generated version string. Three of the asks the 1.12.2 audit filed upstream arrive with the refresh:

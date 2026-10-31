@@ -24,18 +24,13 @@ Each item ships under the usual test / fuzz / poison / bench gates.
 
 ## 1.13.x — everyday revisions and paths
 
-Gaps every git user hits on day one, all verified at 1.12.0. The commands exist; the syntax around them does not.
-
-### 1.13.0 — revision syntax, path-limited log, adding directories
-
-- **`<rev>~<n>`, `<rev>^<n>` and `<rev>:<path>`.** None resolve today: `sit log HEAD~1` says "cannot resolve", and `sit cat-file HEAD:a.txt` says "no object matches". Parse them once in the resolver every command uses (`resolve_commit_hash` / `resolve_hash`), on both backends (a `.git/` repository reads the same syntax). `~` follows first parents and `^<n>` the n-th parent. `:` resolves a path in the commit's tree to the blob or tree id. Fuzz the parser; differential against `git rev-parse` in both object formats.
-- **`sit log [<rev>] [--] <path>…`.** Today a path is read as a ref ("cannot resolve 'a.txt'"). Show the commits whose tree changes a given path, against their first parent (git's default, without rename following). It shares the tree walk `blame` already does.
-- **`sit add <dir>` and `sit add .`.** A directory is refused ("is a directory — name its files", 1.12.1). Walk it with `list_working_walk` (so `.sitignore` applies, and `-f` overrides it), then stage the files as one `sit add` of several paths does (1.12.1). The index update is what a whole tree will feel: `index_upsert_many` deletes and inserts one row per path. 10,000 small files take 55 s against git's 3.4 s, measured at 1.12.1 under load; argument scanning and memory were fixed in 1.12.2 (audit L10). Measure it on a quiet host, then batch it.
-- **Upper-case hex ids, and bare `@{N}`.** `sit cat-file 12FA6B69` matches nothing, where git folds case (audit G7). Bare `@{N}` (HEAD's log), and `<branch>@{N}` when the branch's log is empty (git falls back to the ref), do not resolve (G8). Both fail closed today; they belong with the resolver work above.
+Gaps every git user hits on day one, verified at 1.12.0. 1.13.0 shipped the syntax (revisions, path-limited log, directory adds); the patches finish the arc.
 
 ### 1.13.1 — the remaining read commands on `.git/`
 
-`sit blame`, `sit describe` and `sit merge-base` are read-only but still refuse a `.git/` repository (rc 1, verified at 1.12.0). Open them through `cli_read_repo` as 1.12.0 opened status / log / diff. They need the 1.12.0 width fixes (`_id_dup`) on their own paths, plus a differential against `git blame --porcelain`, `git describe` and `git merge-base` in both object formats.
+`sit blame`, `sit describe` and `sit merge-base` are read-only but still refuse a `.git/` repository (rc 1, verified at 1.12.0). Open them through `cli_read_repo` as 1.12.0 opened status / log / diff. They need the 1.12.0 width fixes (`_id_dup`) on their own paths, plus a differential against `git blame --porcelain`, `git describe` and `git merge-base` in both object formats. 1.13.0's resolver already reads git's revisions on both backends, so they take `HEAD~3` the moment they open.
+
+`blame` finds its one path by flattening each commit's whole tree (`_blame_content_at` → `commit_tree_entries`), which is O(files) per commit. 1.13.0's `tree_path_find` reads one tree per path component and is what `log -- <path>` uses; move blame onto it while the command is open, and measure it on a large tree.
 
 ### 1.13.2 — hardening carried from the 1.12.2 audit
 
@@ -121,17 +116,18 @@ Wanted, but each waits for a consumer or a decision before it takes an arc.
 
 - **`sit fsck` on a `.git/` repository.** It refuses one (verified at 1.12.0). Checking integrity there means hashing SHA-1, which [ADR 0011](../adr/0011-git-read-mode.md) deferred: sigil has no general-purpose SHA-1. A decision first (a first-party SHA-1 for verification only), then the command.
 - **Hooks** (`pre-commit`, `pre-push`, …), if a consumer asks.
+- **The revision forms 1.13.0 left out**, if wanted: `<rev>^{<type>}` / `^{}` (peel to a type), `@` alone (HEAD), `:<path>` (the index's entry: sit's index, not git's, until 1.14.0 reads `.git/index`), `:/<text>` (a message search), and `<rev>^-<n>` (a range, which sit has no command for). Each is refused today, never guessed; the differential in integration section 45 lists them as refused.
 - **Per-command parsing through cmdit (ADR 0015's step 2), only if wanted.** 1.9.0 dispatches the top level through cmdit; each `cmd_*` still reads its own arguments by position. Moving them onto cmdit handles would give per-command `--help` and uniform flag errors, at the cost of changing how 35 commands read their arguments. The calls must stay in `src/main.cyr` or a new `src/cli.cyr` outside both `[lib]` profiles (the bundles ship every `cmd_*`). What is hand-rolled today:
 
   - **Fixed-index flags.** `cmd_*` read `argv(n)` by fixed index, and most flags count only at `argv(2)`:
   
     | flag | location |
     |---|---|
-        | `rm --cached` | `index.cyr:851` |
-    | `reset --hard` | `index.cyr:740` |
-    | `checkout -b` | `refs.cyr:775` |
-    | `branch -d` | `refs.cyr:657` |
-    | `tag -d` / `-a` / `-s` | `refs.cyr:477,519,521` |
+        | `rm --cached` | `index.cyr:1211` |
+    | `reset --hard` | `index.cyr:1100` |
+    | `checkout -b` | `refs.cyr:1036` |
+    | `branch -d` | `refs.cyr:918` |
+    | `tag -d` / `-a` / `-s` | `refs.cyr:738,780,782` |
     | `merge --abort` | `merge.cyr:666`; `-S` / `-m <msg>` are scanned anywhere (`cmd_merge`'s argument loop) |
     | `rebase --abort` / `--continue` | `rebase.cyr:257,292` |
     | `config --global` | `config.cyr:360` |
@@ -140,18 +136,18 @@ Wanted, but each waits for a consumer or a decision before it takes an arc.
   
     | command | function | notes |
     |---|---|---|
-    | `log` | `cmd_log`, `commit.cyr:1029` | |
-    | `commit -S` / `-m` | `cmd_commit`, `commit.cyr:1180` | with no message, a merge's saved `-m` (`MERGE_MSG`) |
-    | `reflog -n` | `cmd_reflog`, `reflog.cyr:390` | a missing value is ignored; `show` / `expire` / `delete` sub-commands |
-    | `fsck --prune` / `--prune-now` | `cmd_fsck`, `object_db.cyr:2012` | everything else is ignored |
+    | `log` | `cmd_log`, `commit.cyr:1176` | `--` and paths since 1.13.0 |
+    | `commit -S` / `-m` | `cmd_commit`, `commit.cyr:1460` | with no message, a merge's saved `-m` (`MERGE_MSG`) |
+    | `reflog -n` | `cmd_reflog`, `reflog.cyr:417` | a missing value is ignored; `show` / `expire` / `delete` sub-commands |
+    | `fsck --prune` / `--prune-now` | `cmd_fsck`, `object_db.cyr:2103` | everything else is ignored |
     | `clone` | `cmd_clone`, `wire.cyr:1829` | |
-    | `serve` | `cmd_serve`, `serve.cyr:1858` | `<repo>` fixed at `argv(2)` |
+    | `serve` | `cmd_serve`, `serve.cyr:1874` | `<repo>` fixed at `argv(2)` |
     | `diff` / `show` | `diff.cyr:1303,1610` | |
   - **Sub-commands:**
     - `stash push | list | pop | drop` (default push): `cmd_stash`, `history.cyr:609`.
     - `key generate | show`: `cmd_key`, `sign.cyr:293`.
     - `remote add | list | remove` (default list): `cmd_remote`, `wire.cyr:1372`.
-    - `reflog [show] | expire | delete` (default show): `cmd_reflog`, `reflog.cyr:390`.
+    - `reflog [show] | expire | delete` (default show): `cmd_reflog`, `reflog.cyr:417`.
     - The `getenv` reads (`SIT_AUTHOR_*`, `SIT_OWL`, `HOME`, …) are not flag fallbacks and stay.
 
   The plan:
@@ -170,7 +166,7 @@ Wanted, but each waits for a consumer or a decision before it takes an arc.
     - Keep diff/show hand-rolled, or strip `-U*` before `cmdit_parse_verb`.
     - cmdit's roadmap already records sit's `-U<N>` as demand for an opt-in "attached short value" (its won't-ship-without-cause list).
   - **Caller-side rules (not gaps):**
-    - serve's `--stdio` / `--listen` and `--tls` / `--stdio` exclusions, and `--tls` needing `--cert` / `--key` (`serve.cyr:1956-2006`)
+    - serve's `--stdio` / `--listen` and `--tls` / `--stdio` exclusions, and `--tls` needing `--cert` / `--key` (`serve.cyr:1975-2022`)
     - `merge` taking `-S` / `-m <msg>` before or after its branches, and `add` taking `-f` anywhere (1.12.1)
     - config's `--list` / `--unset` / `<key>` exclusivity
   - **Decide, don't drift:**
@@ -188,6 +184,8 @@ Blocked on another repo. Per [CLAUDE.md](../../CLAUDE.md), each belongs on the *
 - **sankoch — DEFLATE match-finder throughput.** Targets the `add-1MB` `zlib_compress` floor (~100 ms, about 6× git and the largest single cost in `sit add`). **On sankoch's roadmap** as its 2.9.1 item (checked at 2.8.9); it reaches sit with the cyrius release that folds that sankoch (1.15.2, above).
 - **patra — `page_write`'s return is ignored inside statements (L12).** `tbl_insert`, `tbl_delete`, `btree_insert` and `_bt_push_up` discard it, so in autocommit a page that never reached the disk is reported as `PATRA_OK` (reproduced with `RLIMIT_FSIZE` standing in for EIO / ENOSPC: `sit add` printed "added" and staged nothing). Inside a transaction the failure is reported, which is why sit writes the index only in transactions. **On patra's own roadmap** (its "Open — patra's own" list, found there at 1.16.2).
 - **patra — `patra_open` keeps its WAL path on the bump heap (S5, patra's part).** Each open keeps the path's length plus 5 bytes, which `patra_close` cannot return: 136 B per open for a 124-byte path, measured on the 1.16.5 fold. It is patra's own 2026-08-18 security review's S3 hygiene item, which was never tracked. **Filed on patra** as `docs/development/issues/2026-10-20-patra-open-keeps-its-wal-path.md`, indexed in its roadmap's open backlog (2026-10-20, checked at 1.16.6). The rest of S5 is sit's own (1.13.2, above).
+- **patra — `DELETE` / `UPDATE … WHERE <indexed column> = <value>` scan the table.** `tbl_delete` walks every data page; the B-tree is maintained but not used to find the rows (its `SELECT` uses it). 4,000 single-row deletes over 4,000 rows: 2,084 ms, against 108 ms for the same `SELECT`s. sit batches its deletes 24 to a statement (`index_stage`, 1.13.0), so this bounds it rather than blocks it: an add of 10,000 modified files still spends seconds deleting. [Architecture 009](../architecture/009-patra-delete-scans-wal-syncs-per-page.md). **Not yet filed on patra** (its roadmap has the related "WAL dedup scan is O(n²)" and index-page reclamation items, not this; checked at 1.16.6).
+- **patra — a transaction's WAL syncs once per page it touches.** `wal_log_page` `fdatasync`s every before-image as it writes it, a freshly allocated page's included, so a transaction costs about one sync per page: 10,000 index rows (1,660 pages of 256-byte `STR` columns) took 3.6 s of a 7.8 s `sit add .` on an SSD (git: 0.6 s). A transaction whose before-images are synced together, before the first data page reaches the disk, would make it one sync. [Architecture 009](../architecture/009-patra-delete-scans-wal-syncs-per-page.md). **Not yet filed on patra** (checked at 1.16.6).
 - **patra — open its files `O_CLOEXEC` (P7).** No patra open passes it, so children sit spawns (owl, ssh) inherit `objects.patra` read-write: `0500002` in their `/proc/self/fdinfo`, on the 1.12.2 build. **Filed on patra** as `docs/development/issues/2026-10-20-patra-descriptors-not-close-on-exec.md` (2026-10-20, checked at 1.16.6).
 
 ## On hold — keep sandhi

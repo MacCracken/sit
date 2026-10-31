@@ -14,6 +14,12 @@
 # the blobs are written and all of them staged in one index transaction, so a
 # write that fails part-way stages none either. `-f` may come anywhere. A path
 # given twice is staged once.
+#
+# 1.13.0: a directory (`.` for the whole worktree) is staged as git 2's `add
+# <dir>` stages it (_add_expand_dir): the files under it, and the removal of
+# the tracked ones that are gone. Every path that cannot be staged is named
+# before "nothing was staged", not only the first. The blobs are written as one
+# batch (object_db_batch_begin), made durable before the index names them.
 fn cmd_add() {
     var forced = 0;
     var raw = vec_new();
@@ -44,40 +50,73 @@ fn cmd_add() {
         return 1;
     }
     var paths = vec_new();
+    var removed = vec_new();
     var seen = map_new();
+    var refused = 0;
+    var tracked = 0;
     var i = 0;
     while (i < vec_len(raw)) {
-        var p = _add_check(vec_get(raw, i), forced);
-        if (p == 0) {
-            if (vec_len(raw) > 1) { eprintln("sit: nothing was staged"); }
-            return 1;
+        var arg = vec_get(raw, i);
+        var dir = _add_dir_arg(arg);
+        if (dir != 0) {
+            if (tracked == 0) { tracked = parse_index(); if (tracked == 0) { tracked = vec_new(); } }
+            refused = refused + _add_expand_dir(dir, forced, tracked, paths, removed, seen);
         }
-        if (map_has(seen, p) == 0) {
-            map_set(seen, p, 1);
-            vec_push(paths, p);
+        else {
+            var p = _add_check(arg, forced, 0);
+            if (p == 0) { refused = refused + 1; }
+            else {
+                if (map_has(seen, p) == 0) {
+                    map_set(seen, p, 1);
+                    vec_push(paths, p);
+                }
+            }
         }
         i = i + 1;
+    }
+    if (refused > 0) {
+        if (vec_len(raw) > 1) { eprintln("sit: nothing was staged"); }
+        else {
+            if (vec_len(paths) > 0) { eprintln("sit: nothing was staged"); }
+            else { if (vec_len(removed) > 0) { eprintln("sit: nothing was staged"); } }
+        }
+        return 1;
     }
     var hexes = vec_new();
+    if (object_db_batch_begin() != 0) {
+        eprintln("sit: cannot open the object store");
+        return 1;
+    }
     i = 0;
+    var wrote = 0;
     while (i < vec_len(paths)) {
-        var path = vec_get(paths, i);
-        var cp[16];
-        if (_add_read(path, &cp) != 0) {
-            if (vec_len(paths) > 1) { eprintln("sit: nothing was staged"); }
-            return 1;
+        if (wrote == 0) {
+            var path = vec_get(paths, i);
+            var cp[16];
+            if (_add_read(path, &cp) != 0) { wrote = 0 - 1; }
+            else {
+                var hex = write_blob_object(load64(&cp), load64(&cp + 8));
+                fl_free(load64(&cp));                  # 1.12.2 (L10): one file held at a time
+                if (hex == 0) {
+                    eprintln("sit: failed to write object");
+                    wrote = 0 - 1;
+                }
+                else { vec_push(hexes, hex); }
+            }
         }
-        var hex = write_blob_object(load64(&cp), load64(&cp + 8));
-        fl_free(load64(&cp));                  # 1.12.2 (L10): one file held at a time
-        if (hex == 0) {
-            eprintln("sit: failed to write object");
-            if (vec_len(paths) > 1) { eprintln("sit: nothing was staged"); }
-            return 1;
-        }
-        vec_push(hexes, hex);
         i = i + 1;
     }
-    if (index_upsert_many(hexes, paths) != 0) {
+    # The batch ends, and must have reached the disk, before the index names it.
+    var synced = object_db_batch_end();
+    if (wrote != 0) {
+        if (vec_len(paths) > 1) { eprintln("sit: nothing was staged"); }
+        return 1;
+    }
+    if (synced != 0) {
+        eprintln("sit: the object store could not be synced — nothing was staged");
+        return 1;
+    }
+    if (index_stage(hexes, paths, removed) != 0) {
         eprintln("sit: failed to update index");
         return 1;
     }
@@ -91,13 +130,191 @@ fn cmd_add() {
         stdout_write("\n", 1);
         i = i + 1;
     }
+    i = 0;
+    while (i < vec_len(removed)) {
+        var rp = vec_get(removed, i);
+        stdout_write("removed ", 8);
+        write_sanitized(STDOUT, rp, strlen(rp));
+        stdout_write("\n", 1);
+        i = i + 1;
+    }
     return 0;
+}
+
+# A directory argument of `sit add`, as a repo-relative path: "" for the
+# worktree's root (`.`, `./`), else without "./" prefixes or a trailing '/'.
+# 0 when `raw` does not name a directory sit may walk — it is then checked as
+# a file, and _add_check says why it cannot be staged.
+fn _add_dir_arg(raw) {
+    var n = strlen(raw);
+    var s = 0;
+    var going = 1;
+    while (going == 1) {
+        going = 0;
+        if (n - s >= 2) {
+            if (memeq(raw + s, "./", 2) == 1) { s = s + 2; going = 1; }
+        }
+    }
+    if (n - s == 0) {
+        if (s > 0) { return ""; }
+        return 0;
+    }
+    if (n - s == 1) { if (load8(raw + s) == 46) { return ""; } }
+    var e = n;
+    going = 1;
+    while (going == 1) {
+        going = 0;
+        if (e > s + 1) {
+            if (load8(raw + e - 1) == 47) { e = e - 1; going = 1; }
+        }
+    }
+    var d = alloc(e - s + 1);
+    memcpy(d, raw + s, e - s);
+    store8(d + e - s, 0);
+    if (tree_flat_path_valid(d) == 0) { return 0; }
+    if (_sf_parent_symlink(d) == 1) { return 0; }
+    if (path_lstat_kind(sit_abs(d)) != 0x4000) { return 0; }
+    return d;
+}
+
+# The ignore rules in force inside the directory `dir` ("" the root), as the
+# working-tree walk holds them on entering it: the root rules, then each
+# ancestor's own ignore file, scoped to it, and dir's own. 0 for none, and -1
+# when `dir` or one above it is itself ignored (is_ignored_scoped, for a dir).
+fn _add_dir_patterns(dir) {
+    var patterns = load_sitignore();
+    var ig_name = _ignore_filename();
+    var ig_nlen = strlen(ig_name);
+    var dl = strlen(dir);
+    if (dl == 0) { return patterns; }
+    var i = 0;
+    while (i <= dl) {
+        var at_end = 0;
+        if (i == dl) { at_end = 1; }
+        else { if (load8(dir + i) == 47) { at_end = 1; } }
+        if (at_end == 1) {
+            var anc = alloc(i + ig_nlen + 2);
+            memcpy(anc, dir, i);
+            store8(anc + i, 0);
+            if (is_ignored_kind(anc, patterns, 1) == 1) { return 0 - 1; }
+            store8(anc + i, 47);
+            memcpy(anc + i + 1, ig_name, ig_nlen);
+            store8(anc + i + 1 + ig_nlen, 0);
+            if (sf_exists(anc) == 1) {
+                var scoped = vec_new();
+                if (patterns != 0) {
+                    var k = 0;
+                    while (k < vec_len(patterns)) {
+                        vec_push(scoped, vec_get(patterns, k));
+                        k = k + 1;
+                    }
+                }
+                var scope = alloc(i + 2);
+                memcpy(scope, dir, i);
+                store8(scope + i, 47);
+                store8(scope + i + 1, 0);
+                _parse_ignore_file(anc, scoped, scope);
+                patterns = scoped;
+            }
+        }
+        i = i + 1;
+    }
+    return patterns;
+}
+
+# Collect what `sit add <dir>` stages, as git 2's `add <dir>` does: every file
+# under `dir` the working-tree walk keeps (every file, with -f), and every
+# tracked file under it that is still one, ignored or not; a tracked path gone
+# from the worktree goes into `removed`. Each file passes _add_check's tests
+# but the ignore rules, which the walk applied. `tracked` is the parsed index.
+# Returns how many paths were refused (each said).
+fn _add_expand_dir(dir, forced, tracked, paths, removed, seen) {
+    var patterns = 0;
+    if (forced == 0) {
+        patterns = _add_dir_patterns(dir);
+        if (patterns == 0 - 1) {
+            eprint3("sit: '", dir, "' matches a .sitignore pattern (use -f to override)\n");
+            return 1;
+        }
+    }
+    var dl = strlen(dir);
+    var prefix = "";
+    var fs = ".";
+    if (dl > 0) {
+        prefix = alloc(dl + 2);
+        memcpy(prefix, dir, dl);
+        store8(prefix + dl, 47);
+        store8(prefix + dl + 1, 0);
+        fs = alloc(dl + 3);
+        memcpy(fs, "./", 2);
+        memcpy(fs + 2, dir, dl + 1);
+    }
+    var files = vec_new();
+    list_working_walk(prefix, fs, files, patterns);
+    vec_sort_by(files, &strcmp_cstr);          # directory order is the filesystem's
+    var walked = map_new();
+    var refused = 0;
+    var i = 0;
+    while (i < vec_len(files)) {
+        var f = vec_get(files, i);
+        map_set(walked, f, 1);
+        var p = _add_check(f, forced, 1);
+        if (p == 0) { refused = refused + 1; }
+        else {
+            if (map_has(seen, p) == 0) {
+                map_set(seen, p, 1);
+                vec_push(paths, p);
+            }
+        }
+        i = i + 1;
+    }
+    # Tracked files under dir that the walk did not list: ignored ones are still
+    # updated, and ones the worktree no longer has as files are unstaged.
+    var pl = strlen(prefix);
+    i = 0;
+    while (i < vec_len(tracked)) {
+        var tp = entry_path(vec_get(tracked, i));
+        var under = 0;
+        if (pl == 0) { under = 1; }
+        else {
+            if (strlen(tp) > pl) { if (memeq(tp, prefix, pl) == 1) { under = 1; } }
+        }
+        if (under == 1) {
+            if (map_has(walked, tp) == 0) {
+                if (map_has(seen, tp) == 0) {
+                    var kind = 0 - 1;
+                    if (_sf_parent_symlink(tp) == 0) { kind = path_lstat_kind(sit_abs(tp)); }
+                    if (kind == 0x8000) {
+                        var tq = _add_check(tp, 1, 1);
+                        if (tq == 0) { refused = refused + 1; }
+                        else { map_set(seen, tq, 1); vec_push(paths, tq); }
+                    }
+                    else {
+                        if (kind == 0xA000) {
+                            eprint3("sit: '", tp, "' is a symbolic link — sit does not track symlinks yet\n");
+                            refused = refused + 1;
+                        }
+                        else {
+                            map_set(seen, tp, 1);
+                            vec_push(removed, tp);
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return refused;
 }
 
 # Check one path `sit add` was given: normalised (leading "./" dropped) and
 # returned when sit can stage it, else 0 after saying why. Reads nothing but
 # its size.
-fn _add_check(path, forced) {
+#
+# 1.13.0: `walked` 1 for a path the working-tree walk produced, which has passed
+# the ignore rules already (and must not be tested against them twice: a
+# tracked file under an ignored directory is still staged).
+fn _add_check(path, forced, walked) {
     # 1.6.4 (B1): normalise and validate before anything is staged. `sit add
     # ./a.txt` used to stage the literal "./a.txt", which build_tree turned into
     # a `.` subtree that every reader drops — the file never reached a clone,
@@ -124,12 +341,12 @@ fn _add_check(path, forced) {
         return 0;
     }
     if (forced == 0) {
-        if (is_ignored_scoped(path) == 1) {
+        if (walked == 0) { if (is_ignored_scoped(path) == 1) {
             syscall(SYS_WRITE, STDERR, "sit: '", 6);
             syscall(SYS_WRITE, STDERR, path, path_len);
             syscall(SYS_WRITE, STDERR, "' matches a .sitignore pattern (use -f to override)\n", 52);
             return 0;
-        }
+        } }
     }
     # 1.7.6 (L14): the path is read, so it must not lead out of the repo. With
     # `linkdir -> /outside`, `sit add linkdir/secret.txt` staged (and the next
@@ -144,11 +361,13 @@ fn _add_check(path, forced) {
     var kind = path_lstat_kind(sit_abs(path));
     if (kind == 0xA000) {
         eprint3("sit: '", path, "' is a symbolic link — sit does not track symlinks yet\n");
+        if (walked == 1) { eprintln("sit:   (name it in .sitignore to add the rest of its directory)"); }
         return 0;
     }
     # A directory opens for reading on Linux, and what lseek then reports
-    # depends on the filesystem; refuse it by kind. Adding a directory's files
-    # is roadmapped (1.13.0).
+    # depends on the filesystem; refuse it by kind. A directory argument is
+    # walked by cmd_add before this (1.13.0); one reaching here is not one sit
+    # can walk (a symlinked parent, an invalid name), and was refused above.
     if (kind == 0x4000) {
         eprint3("sit: '", path, "' is a directory — name its files\n");
         return 0;
@@ -212,10 +431,10 @@ fn _add_read(path, out16) {
     return 0;
 }
 
-# v1.4.6 — index on entries(path), the precondition for _index_delete_row's
-# targeted `DELETE ... WHERE path = ?`. Without it that delete degrades to a
-# full scan and staging N files stays O(N^2) in time even though it is now
-# O(N) in rows written.
+# v1.4.6 — index on entries(path). It was meant to make _index_delete_row's
+# `DELETE ... WHERE path = ?` targeted; patra's SELECT uses it, but its DELETE
+# and UPDATE scan the table regardless (architecture 009), which is why
+# index_stage batches its deletes (1.13.0).
 #
 # Same one-shot shape as _ensure_object_index (object_db.cyr): CREATE INDEX
 # rebuilds the tree over every existing row, so it must run once, not per
@@ -493,23 +712,164 @@ fn rewrite_index(entries) {
 # insert never leaves a path unstaged, and patra_commit reports a page write
 # that did not land (1.7.6, L12: in autocommit it was not).
 fn index_upsert_many(hexes, paths) {
+    return index_stage(hexes, paths, 0);
+}
+
+# index_upsert_many, also unstaging every path in `removed` (a vec, or 0) in the
+# same transaction (1.13.0: `sit add <dir>` takes a deleted file's removal).
+#
+# 1.13.0: batched. patra answers `DELETE … WHERE path = '…'` by scanning the
+# table, path index or not (its SELECT uses the index), so a delete per path
+# made staging N files into an N-entry index O(N²): 4,000 new files spent 3 s
+# of a 3.8 s add here. Past _INDEX_DEL_BATCH paths the index is read once; a
+# path already staged at the same id is left alone, a new one is only inserted,
+# and the rows that do go are deleted _INDEX_DEL_BATCH to a statement,
+# OR-joined (patra takes 32 conditions and 128 tokens to one). Up to that many,
+# reading the whole index costs more than it saves (a one-file add went from
+# 1.2 to 1.5 ms), so their rows are deleted in one statement and inserted.
+var _INDEX_DEL_BATCH = 24;
+
+fn index_stage(hexes, paths, removed) {
     var db = get_index_db();
     if (db == 0) { return 0 - 1; }
     var n = vec_len(paths);
     var i = 0;
     while (i < n) {
-        if (hex_decode(vec_get(hexes, i), 64) == 0) { return 0 - 1; }
+        if (hex_prefix_valid(vec_get(hexes, i), 64) == 0) { return 0 - 1; }
         if (strlen(vec_get(paths, i)) == 0) { return 0 - 1; }
         i = i + 1;
     }
-    if (patra_begin(db) != PATRA_OK) { return 0 - 1; }
+    var nrem = 0;
+    if (removed != 0) { nrem = vec_len(removed); }
+    var gone = vec_new();
+    var add_hex = vec_new();
+    var add_path = vec_new();
+    # A few paths go as they did through 1.12.3, without reading the index:
+    # each row is deleted (one statement for the lot) and inserted again.
+    var current = 0;
+    if (n + nrem > _INDEX_DEL_BATCH) {
+        current = _index_current_map(db);
+        if (current == 0) { return 0 - 1; }
+    }
+    else {
+        i = 0;
+        while (i < n) {
+            vec_push(gone, vec_get(paths, i));
+            vec_push(add_hex, vec_get(hexes, i));
+            vec_push(add_path, vec_get(paths, i));
+            i = i + 1;
+        }
+        i = 0;
+        while (i < nrem) { vec_push(gone, vec_get(removed, i)); i = i + 1; }
+        n = 0;
+        removed = 0;
+    }
     i = 0;
     while (i < n) {
-        if (_index_delete_row(db, vec_get(paths, i)) != 0) { patra_rollback(db); return 0 - 1; }
-        if (_index_insert_row(db, vec_get(hexes, i), vec_get(paths, i)) != 0) { patra_rollback(db); return 0 - 1; }
+        var p = vec_get(paths, i);
+        var h = vec_get(hexes, i);
+        var had = map_get(current, p);
+        if (had == 0) {
+            vec_push(add_hex, h);
+            vec_push(add_path, p);
+        }
+        else {
+            if (memeq(had, h, 64) == 0) {
+                vec_push(gone, p);
+                vec_push(add_hex, h);
+                vec_push(add_path, p);
+            }
+        }
+        i = i + 1;
+    }
+    if (removed != 0) {
+        i = 0;
+        while (i < vec_len(removed)) {
+            var rp = vec_get(removed, i);
+            if (map_get(current, rp) != 0) { vec_push(gone, rp); }
+            i = i + 1;
+        }
+    }
+    if (vec_len(gone) == 0) {
+        if (vec_len(add_path) == 0) { return 0; }
+    }
+    if (patra_begin(db) != PATRA_OK) { return 0 - 1; }
+    i = 0;
+    var ng = vec_len(gone);
+    while (i < ng) {
+        var k = ng - i;
+        if (k > _INDEX_DEL_BATCH) { k = _INDEX_DEL_BATCH; }
+        if (_index_delete_rows(db, gone, i, k) != 0) { patra_rollback(db); return 0 - 1; }
+        i = i + k;
+    }
+    i = 0;
+    while (i < vec_len(add_path)) {
+        if (_index_insert_row(db, vec_get(add_hex, i), vec_get(add_path, i)) != 0) {
+            patra_rollback(db);
+            return 0 - 1;
+        }
         i = i + 1;
     }
     if (patra_commit(db) != PATRA_OK) { return 0 - 1; }
+    return 0;
+}
+
+# The staged paths, as a map from path to its 64-hex id, read in one query; 0
+# when the index cannot be read (so a caller never takes that for empty).
+fn _index_current_map(db) {
+    var m = map_new();
+    var rs = patra_query(db, "SELECT path, hash_hex FROM entries");
+    if (rs == 0) { return 0; }
+    var count = patra_result_count(rs);
+    var i = 0;
+    while (i < count) {
+        var plen = patra_result_get_str_len(rs, i, 0);
+        var hs = patra_result_get_str(rs, i, 1);
+        if (plen > 0) {
+            var p = alloc_or_die(plen + 1);
+            memcpy(p, patra_result_get_str(rs, i, 0), plen);
+            store8(p + plen, 0);
+            var h = alloc_or_die(65);
+            store8(h, 0);
+            if (hs != 0) {
+                if (hex_prefix_valid(hs, 64) == 1) { memcpy(h, hs, 64); store8(h + 64, 0); }
+            }
+            # A row with a damaged id compares unequal to every id, so it is replaced.
+            if (load8(h) == 0) { memset(h, 120, 64); store8(h + 64, 0); }
+            map_set(m, p, h);
+        }
+        i = i + 1;
+    }
+    patra_result_free(rs);
+    return m;
+}
+
+# DELETE the rows for paths[from .. from+k) in one statement. No transaction of
+# its own — callers hold one.
+fn _index_delete_rows(db, paths, from, k) {
+    var cap = 64;
+    var j = 0;
+    while (j < k) {
+        cap = cap + 2 * strlen(vec_get(paths, from + j)) + 16;
+        j = j + 1;
+    }
+    var sql = alloc_or_die(cap);
+    var pfx = "DELETE FROM entries WHERE ";
+    var w = strlen(pfx);
+    memcpy(sql, pfx, w);
+    j = 0;
+    while (j < k) {
+        var p = vec_get(paths, from + j);
+        if (j > 0) { memcpy(sql + w, " OR ", 4); w = w + 4; }
+        memcpy(sql + w, "path = '", 8);
+        w = w + 8;
+        w = w + patra_quote_str(sql + w, p, strlen(p));
+        store8(sql + w, 39);
+        w = w + 1;
+        j = j + 1;
+    }
+    store8(sql + w, 0);
+    if (patra_exec(db, sql) != 0) { return 0 - 1; }
     return 0;
 }
 

@@ -2599,7 +2599,7 @@ assert_eq "$(objcount)" "$NOBJ0" "43a: and no object was written"
 OUT=$("$SIT" add b.txt x.log 2>&1); RC=$?
 assert_eq "$RC" "1" "43b: an ignored path among others fails the command"
 assert_eq "$(staged)" "0" "43b: staging none of them"
-"$SIT" add d >/dev/null 2>&1; assert_eq "$?" "1" "43b: a directory is refused, by kind"
+"$SIT" add d >/dev/null 2>&1; assert_eq "$?" "0" "43b: a directory stages its files (1.13.0; refused by kind through 1.12.3)"
 OUT=$("$SIT" add a.txt b.txt ./a.txt d/c.txt .sitignore 2>&1); RC=$?
 assert_eq "$RC" "0" "43c: several good paths"
 assert_eq "$(printf '%s\n' "$OUT" | grep -c '^added ')" "4" "43c: each staged once (a path given twice is one)"
@@ -2783,6 +2783,257 @@ assert_eq "$(ls .sit/packs | grep -c '\.pack$')" "1" "44o: a .pack with no .idx 
 cp .sit/packs/pack-*.idx ".sit/packs/pack-$(printf 'cd%.0s' $(seq 1 32)).idx"
 "$SIT" gc >/dev/null 2>&1
 assert_eq "$(ls .sit/packs | grep -c '\.idx$')" "1" "44o: and so is an .idx with no .pack (K6)"
+
+# ── 45. 1.13.0 revision syntax: <rev>~<n>, <rev>^<n>, <rev>:<path> ──
+# Read once in resolve_hash, so every command that names an object takes them,
+# on both backends. Also G7 (an id in upper case) and G8 (a bare @{N} is the
+# current branch's log; @{0} of an empty log is the ref; @{N} of a log of N
+# entries is what the ref held before it) — each as git reads it.
+hr "1.13.0 revision syntax"
+R="$WORK/rev45"; mkdir -p "$R"; cd "$R"; "$SIT" init >/dev/null
+printf 'one\n' > a.txt; mkdir -p d/e; echo deep > d/e/f.txt; "$SIT" add a.txt d/e/f.txt >/dev/null; "$SIT" commit -m c1 >/dev/null
+"$SIT" tag -a v1 -m rel >/dev/null
+printf 'two\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c2 >/dev/null
+"$SIT" checkout -b side >/dev/null 2>&1; echo s > s.txt; "$SIT" add s.txt >/dev/null; "$SIT" commit -m s1 >/dev/null
+"$SIT" checkout main >/dev/null 2>&1; printf 'three\n' > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c3 >/dev/null
+"$SIT" merge side >/dev/null 2>&1
+rid() { "$SIT" log -n 1 "$1" 2>/dev/null | head -1 | cut -d' ' -f2; }
+C1=$("$SIT" log | awk '/^commit /{print $2}' | sed -n 4p); C2=$("$SIT" log | awk '/^commit /{print $2}' | sed -n 3p)
+C3=$("$SIT" log | awk '/^commit /{print $2}' | sed -n 2p); S1=$(rid side); M=$(rid HEAD)
+assert_eq "$(rid 'HEAD~1')" "$C3" "45a: HEAD~1 is the first parent"
+assert_eq "$(rid 'HEAD^')" "$C3" "45a: as is HEAD^"
+assert_eq "$(rid 'HEAD~3')" "$C1" "45a: HEAD~3 three first parents back"
+assert_eq "$(rid 'HEAD^2')" "$S1" "45a: HEAD^2 is the merged branch"
+assert_eq "$(rid 'HEAD^2~1')" "$C2" "45a: suffixes chain left to right"
+assert_eq "$(rid 'HEAD^0')" "$M" "45a: ^0 is the commit itself"
+for bad in 'HEAD~4' 'HEAD^3' 'HEAD~1x' '~1' 'HEAD~1234567890'; do
+  "$SIT" log -n 1 "$bad" >/dev/null 2>&1; assert_eq "$?" "1" "45a: $bad does not resolve"
+done
+assert_eq "$("$SIT" cat-file 'HEAD~1:a.txt')" "three" "45b: <rev>:<path> names the blob"
+assert_eq "$("$SIT" cat-file 'HEAD~2:a.txt')" "two" "45b: in that commit's tree"
+assert_eq "$("$SIT" cat-file 'HEAD:d/e/f.txt')" "deep" "45b: through subdirectories"
+assert_eq "$("$SIT" cat-file 'HEAD:./a.txt')" "three" "45b: ./ is the root"
+assert_eq "$("$SIT" cat-file 'HEAD^2:s.txt')" "s" "45b: after a suffix"
+"$SIT" cat-file 'HEAD:d/' >/dev/null 2>&1; assert_eq "$?" "0" "45b: a tree, with its slash"
+for bad in 'HEAD:nope' 'HEAD:d//e' 'HEAD:/a.txt' 'HEAD:a.txt/' 'HEAD:../a.txt' ':a.txt'; do
+  "$SIT" cat-file "$bad" >/dev/null 2>&1; assert_eq "$?" "1" "45b: $bad does not resolve"
+done
+"$SIT" log -n 1 'HEAD:a.txt' >/dev/null 2>&1; assert_eq "$?" "1" "45b: a blob is not a commit to log"
+assert_eq "$(rid 'v1~0')" "$C1" "45c: an annotated tag peels to its commit"
+assert_eq "$("$SIT" cat-file 'v1:a.txt')" "one" "45c: and to its tree"
+assert_contains "$("$SIT" diff 'HEAD~2' 'HEAD~1')" "+three" "45c: diff takes them"
+assert_contains "$("$SIT" show 'HEAD~1')" "c3" "45c: and show"
+U=$(echo "$M" | cut -c1-12 | tr a-f A-F)
+assert_eq "$(rid "$U")" "$M" "45d (G7): an upper-case short id"
+assert_eq "$(rid "$(echo "$M" | tr a-f A-F)")" "$M" "45d (G7): and a full one"
+"$SIT" checkout side >/dev/null 2>&1; "$SIT" checkout main >/dev/null 2>&1
+assert_eq "$(rid 'HEAD@{1}')" "$S1" "45e (G8): HEAD@{1} is where HEAD was (side)"
+assert_eq "$(rid '@{1}')" "$C3" "45e (G8): a bare @{1} is the current branch's log"
+assert_eq "$(rid '@{1}~1')" "$C2" "45e: and takes suffixes"
+"$SIT" branch e >/dev/null; : > .sit/logs/refs/heads/e
+assert_eq "$(rid 'e@{0}')" "$M" "45e (G8): @{0} of an empty log is the ref"
+"$SIT" log -n 1 'e@{1}' >/dev/null 2>&1; assert_eq "$?" "1" "45e: @{1} of it is not"
+N=$(wc -l < .sit/logs/refs/heads/main | tr -d ' ')
+"$SIT" reflog delete "main@{$((N-1))}" >/dev/null
+assert_eq "$(rid "main@{$((N-1))}")" "$C1" "45e: @{N} of a log of N entries is what the ref held before it"
+if command -v git >/dev/null 2>&1; then
+  for FMT in sha1 sha256; do
+    G="$WORK/g45-$FMT"; rm -rf "$G"
+    if ! git init -q -b main --object-format=$FMT "$G" 2>/dev/null; then echo "  (skipped 45 $FMT: git cannot make it)"; continue; fi
+    cd "$G"; git config user.name t; git config user.email t@e
+    printf 'one\n' > a.txt; mkdir -p d/e; echo deep > d/e/f.txt; echo x > 'a:b.txt'; git add .; git commit -qm c1
+    git tag -a v1 -m rel; git tag light; printf 'two\n' > a.txt; git commit -qam c2
+    git checkout -qb side; echo s > s.txt; git add s.txt; git commit -qm s1
+    git checkout -q main; printf 'three\n' > a.txt; git commit -qam c3
+    git checkout -qb other; echo o > o.txt; git add o.txt; git commit -qm o1; git checkout -q main
+    git merge -q --no-ff side other -m octopus >/dev/null 2>&1
+    git tag -a v2 -m two; git tag -a v2b -m 'a tag of a tag' v2
+    git checkout -q side; git checkout -q main
+    H=$(git rev-parse HEAD); T=$(git rev-parse HEAD:d)
+    for pass in loose packed; do
+      [ $pass = packed ] && git gc -q --prune=now
+      CHK=0; MIS=""
+      for s in HEAD^ HEAD^2 HEAD^3 HEAD^4 HEAD^0 HEAD~ HEAD~0 HEAD~3 HEAD~4 HEAD^^ HEAD~01 HEAD^2~1 HEAD^3^ \
+               HEAD: HEAD:a.txt HEAD:d/ HEAD:d// HEAD:d//e HEAD:d/e/f.txt HEAD:d/e/f.txt/ HEAD:./a.txt HEAD:./ HEAD:. \
+               HEAD:/a.txt HEAD:./d/../a.txt HEAD:../a.txt HEAD:nope HEAD:a:b.txt HEAD~1:a.txt HEAD^2:s.txt \
+               v1~0 v1~1 v1:a.txt v2^2 v2b~1 v2b:a.txt light:a.txt "$T:e/f.txt" "$T~1" "${H:0:10}^2" \
+               "$(echo "${H:0:10}" | tr a-f A-F)~1" '@{0}' '@{1}' 'HEAD@{1}' 'HEAD@{1}~1' 'main@{1}^2' 'side@{1}' '~1' 'HEAD~1x'; do
+        CHK=$((CHK+1))
+        gid=$(git rev-parse --verify -q "$s" 2>/dev/null)
+        sout=$("$SIT" cat-file "$s" 2>/dev/null | cksum); src=$("$SIT" cat-file "$s" >/dev/null 2>&1; echo $?)
+        if [ -z "$gid" ]; then [ "$src" = "0" ] && MIS="$MIS [$s: git refuses]"
+        else
+          [ "$src" = "0" ] || MIS="$MIS [$s: sit refuses]"
+          [ "$src" = "0" ] && [ "$sout" != "$(git cat-file "$(git cat-file -t "$gid")" "$gid" | cksum)" ] && MIS="$MIS [$s: another object]"
+        fi
+      done
+      assert_eq "${MIS:-none}" "none" "45f $FMT $pass: $CHK revisions resolve as git rev-parse resolves them"
+      assert_eq "$("$SIT" log --oneline v1 | cut -c1-12)" "$(git rev-parse v1^0 | cut -c1-12)" "45f $FMT $pass: log names an annotated tag (1.12.0 could not)"
+    done
+    for s in 'HEAD^{tree}' '@' ':a.txt'; do
+      "$SIT" cat-file "$s" >/dev/null 2>&1; assert_eq "$?" "1" "45g $FMT: $s (not read) is refused, not guessed"
+    done
+  done
+fi
+
+# ── 46. 1.13.0 `sit log [<rev>] [--] <path>...` ─────────────────────
+# Paths limit log to the commits that change them against their first parent —
+# git log --first-parent -- <path>. Through 1.12.3 a path was read as a ref.
+hr "1.13.0 log -- <path>"
+R="$WORK/log46"; mkdir -p "$R"; cd "$R"; "$SIT" init >/dev/null
+echo 1 > a.txt; mkdir -p d/e; echo x > d/e/f.txt; echo k > k.txt; "$SIT" add a.txt d/e/f.txt k.txt >/dev/null; "$SIT" commit -m c1 >/dev/null
+echo 2 > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m c2 >/dev/null
+echo y >> d/e/f.txt; "$SIT" add d/e/f.txt >/dev/null; "$SIT" commit -m c3 >/dev/null
+"$SIT" rm k.txt >/dev/null; "$SIT" commit -m c4 >/dev/null
+"$SIT" checkout -b side >/dev/null 2>&1; echo 3 > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m s1 >/dev/null
+"$SIT" checkout main >/dev/null 2>&1; echo z > z.txt; "$SIT" add z.txt >/dev/null; "$SIT" commit -m c5 >/dev/null
+"$SIT" merge side >/dev/null 2>&1
+msgs() { "$SIT" log --oneline "$@" 2>/dev/null | cut -d' ' -f2- | tr '\n' ' '; }
+assert_eq "$(msgs a.txt)" "Merge branch 'side' c2 c1 " "46a: a file's commits, a merge that changes it against its first parent among them"
+assert_eq "$(msgs -- d)" "c3 c1 " "46a: a directory covers what is under it"
+assert_eq "$(msgs -- d/e/f.txt d/)" "c3 c1 " "46a: and the same file and directory together once each"
+assert_eq "$(msgs -- k.txt)" "c4 c1 " "46a: a deleted file, after --"
+assert_eq "$(msgs HEAD~1 -- a.txt)" "c2 c1 " "46a: from a revision"
+assert_eq "$(msgs -n 1 a.txt)" "Merge branch 'side' " "46a: -n counts what is shown"
+assert_eq "$(msgs ./a.txt)" "Merge branch 'side' c2 c1 " "46a: ./ names the root"
+assert_eq "$("$SIT" log --oneline | wc -l | tr -d ' ')" "6" "46a: without paths, every first-parent commit as before"
+"$SIT" log k.txt >/dev/null 2>&1; assert_eq "$?" "1" "46b: a path not in the working tree needs --"
+assert_contains "$("$SIT" log k.txt 2>&1)" "put '--' before" "46b: and says so"
+"$SIT" log nope >/dev/null 2>&1; assert_eq "$?" "1" "46b: a typo is neither"
+"$SIT" branch a.txt >/dev/null 2>&1
+assert_contains "$("$SIT" log a.txt 2>&1)" "both a revision and a path" "46b: a name that is both is ambiguous, as in git"
+assert_eq "$(msgs a.txt -- d)" "c3 c1 " "46b: and -- settles it"
+"$SIT" branch -d a.txt >/dev/null 2>&1
+assert_contains "$("$SIT" log -- '*.txt' 2>&1)" "is a pattern" "46b: a pattern is refused, not matched as nothing"
+assert_contains "$("$SIT" log -- ../x 2>&1)" "not a path in the repository" "46b: as is a path outside it"
+"$SIT" log --graph -- a.txt >/dev/null 2>&1; assert_eq "$?" "1" "46b: --graph does not take paths"
+"$SIT" log HEAD side >/dev/null 2>&1; assert_eq "$?" "1" "46b: two revisions is still a usage error"
+cd "$WORK"; rm -rf log46c; "$SIT" clone --depth 2 "file://$R" log46c >/dev/null 2>&1; cd log46c
+assert_eq "$(msgs -- d)" "c5 " "46c: a shallow boundary is compared with nothing (it shows what it holds)"
+if command -v git >/dev/null 2>&1; then
+  for FMT in sha1 sha256; do
+    G="$WORK/g46-$FMT"; rm -rf "$G"
+    if ! git init -q -b main --object-format=$FMT "$G" 2>/dev/null; then echo "  (skipped 46 $FMT)"; continue; fi
+    cd "$G"; git config user.name t; git config user.email t@e
+    RANDOM=46; files="a.txt b.txt d/x.txt d/y.txt d/e/z.txt top/k.txt q"
+    for i in $(seq 1 40); do
+      f=$(echo $files | tr ' ' '\n' | sed -n "$((RANDOM % 7 + 1))p")
+      case $((RANDOM % 6)) in
+        0) git rm -rq --ignore-unmatch "$f" >/dev/null 2>&1 ;;
+        *) mkdir -p "$(dirname "$f")"; [ -d "$f" ] && rm -rf "$f"; echo "$i $RANDOM" >> "$f" ;;
+      esac
+      [ $i = 20 ] && { rm -f q; mkdir -p q; echo inq > q/inside; }
+      git add -A >/dev/null 2>&1; git commit -qm "c$i" --allow-empty
+      if [ $((i % 13)) = 0 ]; then
+        git checkout -qb "br$i"; echo "s$i" >> d/x.txt; git add -A; git commit -qm "s$i"
+        git checkout -q main; echo "m$i" >> b.txt; git add -A; git commit -qm "m$i"; git merge -q --no-ff "br$i" -m "merge $i" >/dev/null 2>&1
+      fi
+    done
+    for pass in loose packed; do
+      [ $pass = packed ] && git gc -q --prune=now
+      MIS=""; CHK=0
+      for args in "-- a.txt" "-- d" "-- d/" "-- d/x.txt" "-- d/e" "-- top" "-- q" "-- q/inside" "-- ." "-- nope" "-- a.txt d/e" "HEAD~3 -- d" "-n 2 -- d" "br13 -- d/x.txt"; do
+        CHK=$((CHK+1))
+        [ "$(git log --first-parent --format=%H $args | cut -c1-12)" = "$("$SIT" log --oneline $args 2>/dev/null | cut -c1-12)" ] || MIS="$MIS [$args]"
+      done
+      assert_eq "${MIS:-none}" "none" "46d $FMT $pass: $CHK path-limited logs list git log --first-parent's commits"
+    done
+  done
+fi
+
+# ── 47. 1.13.0 `sit add <dir>` and `sit add .` ─────────────────────
+# A directory is staged as git 2's `add <dir>` stages it: what the walk keeps
+# (-f: everything), tracked files under it even when ignored, and the removal of
+# tracked files that are gone. Anything that cannot be staged is named, and then
+# nothing is. Blobs are written as one batch, synced before the index names them.
+hr "1.13.0 add <dir>"
+A="$WORK/add47"; mkdir -p "$A"; cd "$A"; "$SIT" init >/dev/null
+mkdir -p d/e build lib empty; echo a > a.txt; echo b > d/b.txt; echo c > d/e/c.txt; echo o > build/o.o; echo l > lib/l.txt
+printf 'build/\n*.log\n' > .sitignore; echo x > d/x.log; printf '!keep.log\n' > d/.sitignore; echo k > d/keep.log
+newfiles() { "$SIT" status | awk '/new file:/ {print $3}' | sort | tr '\n' ' '; }
+OUT=$("$SIT" add . 2>&1); RC=$?
+assert_eq "$RC" "0" "47a: add . stages the worktree"
+assert_eq "$(newfiles)" ".sitignore a.txt d/.sitignore d/b.txt d/e/c.txt d/keep.log lib/l.txt " "47a: what the walk keeps — nested rules and a ! re-include applied"
+assert_eq "$(printf '%s\n' "$OUT" | awk '{print $3}' | tr '\n' ' ')" ".sitignore a.txt d/.sitignore d/b.txt d/e/c.txt d/keep.log lib/l.txt " "47a: named in order"
+"$SIT" commit -m one >/dev/null
+N0=$(objcount)
+OUT=$("$SIT" add d 2>&1); RC=$?
+assert_eq "$RC" "0" "47b: add of an unchanged directory"
+assert_eq "$(objcount)" "$N0" "47b: writes no object"
+assert_eq "$("$SIT" status | tail -1)" "nothing to commit, working tree clean" "47b: and stages no change"
+rm d/b.txt; echo c2 > d/e/c.txt; echo n > d/new.txt
+OUT=$("$SIT" add d/ 2>&1)
+assert_contains "$OUT" "removed d/b.txt" "47c: a tracked file gone from the worktree is unstaged"
+ST=$("$SIT" status)
+assert_contains "$ST" "deleted:   d/b.txt" "47c: as a deletion"
+assert_contains "$ST" "modified:  d/e/c.txt" "47c: a change is staged"
+assert_contains "$ST" "new file:  d/new.txt" "47c: and a new file"
+"$SIT" commit -m two >/dev/null
+OUT=$("$SIT" add build 2>&1); RC=$?
+assert_eq "$RC" "1" "47d: an ignored directory is refused"
+assert_contains "$OUT" "matches a .sitignore pattern (use -f" "47d: with the way past it"
+"$SIT" add -f build >/dev/null; assert_contains "$("$SIT" status)" "new file:  build/o.o" "47d: -f stages it"
+"$SIT" commit -m three >/dev/null; echo o2 > build/o.o
+"$SIT" add . >/dev/null; assert_contains "$("$SIT" status)" "modified:  build/o.o" "47d: a tracked file under an ignored directory is still updated (git's rule)"
+"$SIT" commit -m four >/dev/null
+OUT=$("$SIT" add empty 2>&1); RC=$?
+assert_eq "$RC$OUT" "0" "47e: an empty directory stages nothing, quietly"
+"$SIT" add d/e/.. >/dev/null 2>&1; assert_eq "$?" "1" "47e: a path with .. is still refused"
+ln -s ../a.txt lib/link; echo m > lib/more.txt
+OUT=$("$SIT" add lib 2>&1); RC=$?
+assert_eq "$RC" "1" "47f: a symlink under the directory fails the add"
+assert_contains "$OUT" "'lib/link' is a symbolic link" "47f: naming it"
+assert_contains "$OUT" "name it in .sitignore" "47f: and the way past it"
+assert_contains "$OUT" "nothing was staged" "47f: staging none of the rest"
+assert_eq "$("$SIT" status | grep -c 'new file:')" "0" "47f: lib/more.txt included"
+rm lib/link; echo y > 'lib/a:b.txt'; head -c 17000000 /dev/zero > lib/big.bin
+OUT=$("$SIT" add lib 2>&1)
+assert_contains "$OUT" "'lib/a:b.txt' is not a path sit can track" "47g: every refusal is named — a name sit cannot track"
+assert_contains "$OUT" "'lib/big.bin' is too large" "47g: and a file past the blob ceiling, in the same run"
+rm 'lib/a:b.txt' lib/big.bin
+if [ "$(id -u)" != "0" ]; then
+  echo s > lib/secret.txt; chmod 000 lib/secret.txt; NB=$(objcount)
+  "$SIT" add lib >/dev/null 2>&1; assert_eq "$?" "1" "47g: an unreadable file fails the add"
+  assert_eq "$(objcount)" "$NB" "47g: before any object is written"
+  chmod 644 lib/secret.txt; rm lib/secret.txt
+fi
+"$SIT" add lib >/dev/null; assert_contains "$("$SIT" status)" "new file:  lib/more.txt" "47h: and with them gone, it stages"
+# 47j: past 24 paths the index is read once and only what changed is written.
+B="$WORK/add47j"; mkdir -p "$B/m"; cd "$B"; "$SIT" init >/dev/null
+for i in $(seq 1 40); do echo "v1 $i" > "m/f$i.txt"; done
+"$SIT" add . >/dev/null; "$SIT" commit -m base >/dev/null
+for i in $(seq 1 10); do echo "v2 $i" > "m/f$i.txt"; done
+for i in $(seq 11 15); do rm "m/f$i.txt"; done
+for i in 41 42 43; do echo "new $i" > "m/f$i.txt"; done
+NB=$(objcount)
+OUT=$("$SIT" add m); RC=$?
+assert_eq "$RC" "0" "47j: 38 paths and 5 removals in one add"
+assert_eq "$(objcount)" "$((NB + 13))" "47j: a blob for each changed or new file only"
+ST=$("$SIT" status)
+assert_eq "$(printf '%s\n' "$ST" | grep -c 'modified:')" "10" "47j: ten modified"
+assert_eq "$(printf '%s\n' "$ST" | grep -c 'deleted:')" "5" "47j: five deleted"
+assert_eq "$(printf '%s\n' "$ST" | grep -c 'new file:')" "3" "47j: three new"
+assert_eq "$(printf '%s\n' "$OUT" | grep -c '^removed ')" "5" "47j: the removals named"
+"$SIT" commit -m next >/dev/null
+assert_eq "$("$SIT" status | tail -1)" "nothing to commit, working tree clean" "47j: and committed, the index matches the worktree"
+assert_eq "$("$SIT" cat-file HEAD:m/f3.txt)" "v2 3" "47j: with the new content"
+if command -v git >/dev/null 2>&1; then
+  G="$WORK/g47"; rm -rf "$G"; mkdir -p "$G"; cd "$G"
+  if git init -q --object-format=sha256 . 2>/dev/null; then
+    mkdir -p s/t u/v w; for i in 1 2 3; do echo "$i" > "s/f$i.txt"; echo "$i" > "u/v/g$i.c"; done
+    echo z > w/z.tmp; echo keep > w/keep.tmp; echo top > top.txt
+    printf '*.tmp\n!keep.tmp\nu/v/g2.c\n' > ign; cp ign .gitignore; cp ign .sitignore; rm ign
+    S47="$WORK/s47"; rm -rf "$S47"; cp -r "$G" "$S47"; rm -rf "$S47/.git"
+    git add .; GL=$(git ls-files | sort)
+    cd "$S47"; "$SIT" init >/dev/null
+    SL=$("$SIT" add . | awk '{print $3}' | sort)
+    assert_eq "$SL" "$GL" "47i: add . stages the paths git add . stages (both ignore files are in both trees)"
+    "$SIT" commit -m x >/dev/null
+    for p in s/f1.txt u/v/g3.c w/keep.tmp; do
+      assert_eq "$("$SIT" cat-file "HEAD:$p" | cksum)" "$(git -C "$G" cat-file blob ":$p" | cksum)" "47i: $p stored as git stores it"
+    done
+  fi
+fi
 
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"

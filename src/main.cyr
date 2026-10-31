@@ -53,7 +53,7 @@ fn print_usage(fd) {
     _usage_line(fd, "");
     _usage_line(fd, "commands:");
     _usage_line(fd, "  init                    create an empty sit repository");
-    _usage_line(fd, "  add [-f] <path>...      hash and stage files (all of them, or none)");
+    _usage_line(fd, "  add [-f] <path>...      stage files, or every file under a directory (all, or none)");
     _usage_line(fd, "  rm [--cached] <path>    remove a tracked file from working tree and index");
     _usage_line(fd, "  mv <src> <dst>          rename a tracked file in the working tree and index");
     _usage_line(fd, "  branch [-d <name>|<name>]  list / create / delete branch (-d deletes)");
@@ -81,20 +81,24 @@ fn print_usage(fd) {
     _usage_line(fd, "  serve <repo> [--stdio|--listen 127.0.0.1:<port>] [--tls]  sit/v1 daemon (read + push)");
     _usage_line(fd, "  serve <dir> --repos [--listen …] [--tls]  serve every repository under <dir> at /<name>/");
     _usage_line(fd, "  commit [-S] [-m] <msg>  record staged changes as a new commit (-S to sign)");
-    _usage_line(fd, "  log [--oneline] [--graph]  show commit history from HEAD");
+    _usage_line(fd, "  log [--oneline] [--graph] [-n <count>] [<rev>] [[--] <path>...]  show history (with paths: what changed them)");
     _usage_line(fd, "  reflog [show] [-n <count>] [<ref>]  show ref movement history (default HEAD)");
     _usage_line(fd, "  reflog expire [--expire=<when>] (--all | <ref>...) | reflog delete <ref>@{N}");
     _usage_line(fd, "  status                  show working tree status");
     _usage_line(fd, "  diff [--staged|HEAD]    show unstaged / staged / working-vs-HEAD diffs");
     _usage_line(fd, "  show [--stat] [<hash>]  show a single commit (full diff or per-file stat)");
     _usage_line(fd, "  blame <path>            show the commit that last touched each line");
-    _usage_line(fd, "  cat-file <hash>         emit object content to stdout (plumbing)");
+    _usage_line(fd, "  cat-file <rev>          emit object content to stdout (plumbing)");
     _usage_line(fd, "  owl-file <hash>         view object through owl (bat-like viewer)");
     _usage_line(fd, "  completions <bash|zsh|fish>  print a shell completion script for sit");
     _usage_line(fd, "");
     _usage_line(fd, "options:");
     _usage_line(fd, "  -h, --help              print this list (to stdout)");
     _usage_line(fd, "  -V, --version           print sit's version");
+    _usage_line(fd, "");
+    _usage_line(fd, "revisions (wherever a command takes a commit or an object):");
+    _usage_line(fd, "  <id> (4+ hex digits), HEAD, <branch>, <tag>, <ref>@{N}, @{N}, <ref>@{<time>}");
+    _usage_line(fd, "  <rev>~<n> (n first parents back), <rev>^<n> (n-th parent), <rev>:<path> (in its tree)");
     return 0;
 }
 
@@ -117,7 +121,7 @@ fn _usage_line(fd, s) {
 fn _sit_cli() {
     var h = cmdit_new("sit");
     cmdit_verb(h, "init", "create an empty sit repository");
-    cmdit_verb(h, "add", "hash and stage files (all of them, or none)");
+    cmdit_verb(h, "add", "stage files, or every file under a directory (all, or none)");
     cmdit_verb(h, "rm", "remove a tracked file from working tree and index");
     cmdit_verb(h, "mv", "rename a tracked file in the working tree and index");
     cmdit_verb(h, "branch", "list / create / delete branch (-d deletes)");
@@ -144,7 +148,7 @@ fn _sit_cli() {
     cmdit_verb(h, "clone", "init + remote add origin + fetch + checkout");
     cmdit_verb(h, "serve", "sit/v1 daemon (read + push)");
     cmdit_verb(h, "commit", "record staged changes as a new commit (-S to sign)");
-    cmdit_verb(h, "log", "show commit history from HEAD");
+    cmdit_verb(h, "log", "show history (with paths: what changed them)");
     cmdit_verb(h, "reflog", "show ref movement history (default HEAD)");
     cmdit_verb(h, "status", "show working tree status");
     cmdit_verb(h, "diff", "show unstaged / staged / working-vs-HEAD diffs");
