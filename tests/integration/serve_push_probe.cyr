@@ -12,6 +12,9 @@
 #                                     and refuses (409)
 #          UPDATE <bytes per push>    root set, push the tip: the walk finds
 #                                     the root, and the ref is written
+#          BODYREQ <bytes per 100>    a request with a body through the framing
+#                                     calls sandhi's accept loop makes on it
+#                                     (1.12.3)
 include "dist/sit.cyr"
 
 var _spp_buf = 0;
@@ -31,6 +34,18 @@ fn _spp_push(tip) {
     store8(_spp_buf + hl + 64, 10);
     store8(_spp_buf + hl + 65, 0);
     serve_handle_request(0, 0 - 1, _spp_buf, hl + 65);
+    return 0;
+}
+
+# The framing calls sandhi's accept loop makes on a request with a body: its
+# receive reads Content-Length, then three smuggling guards run, and sit's
+# --tls loop calls those guards itself. Through sandhi 1.13.1 (cyrius 6.7.15,
+# sit 1.12.2) they copied header values onto the global heap, 16 B per request.
+fn _spp_framing(buf, n) {
+    sandhi_server_content_length(buf, n);
+    sandhi_server_request_has_cl_te_conflict(buf, n);
+    sandhi_server_request_has_dup_smuggling_header(buf, n);
+    sandhi_server_request_has_unsupported_te(buf, n);
     return 0;
 }
 
@@ -68,6 +83,18 @@ fn main() {
     var j = 0;
     while (j < 5) { _spp_set(root); _spp_push(tip); j = j + 1; }
     _spp_put("UPDATE ", (alloc_used() - u1) / 5);
+
+    # A total over 100 requests, so a few bytes kept now and then still show.
+    var body = "POST /sit/v1/objects/0 HTTP/1.1\r\nHost: x\r\nContent-Length: 64\r\n\r\n";
+    var bl = strlen(body);
+    memcpy(_spp_buf, body, bl);
+    memset(_spp_buf + bl, 120, 64);
+    _spp_framing(_spp_buf, bl + 64);
+    _spp_framing(_spp_buf, bl + 64);
+    var u2 = alloc_used();
+    var k = 0;
+    while (k < 100) { _spp_framing(_spp_buf, bl + 64); k = k + 1; }
+    _spp_put("BODYREQ ", alloc_used() - u2);
     stdout_flush();
     return 0;
 }

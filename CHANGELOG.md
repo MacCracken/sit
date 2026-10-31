@@ -4,6 +4,93 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.12.3] — 2026-10-30 — cyrius 6.7.18 and cmdit 1.5.0: three upstream asks arrive
+
+A toolchain and dependency refresh. cyrius goes from 6.7.15 to 6.7.18 and cmdit from 1.4.0 to 1.5.0. sit's source is unchanged except the generated version string. Three of the asks the 1.12.2 audit filed upstream arrive with the refresh:
+- sankoch's bit reader: a git-mode read and a ref push now keep nothing;
+- sandhi's `Content-Length` copy: a request with a body now keeps nothing in the accept loop;
+- cmdit's completion scripts (L11): file names now complete whole.
+
+The folds that touch sit's data path were A/B'd against 1.12.2, and so was the compressed output itself. No on-disk change, no new surface.
+
+### Changed
+
+- **cyrius 6.7.15 → 6.7.18.** The folded layers:
+
+  | layer | 6.7.15 | 6.7.18 |
+  |---|---|---|
+  | sankoch | 2.8.7 | 2.8.9 |
+  | patra | 1.16.5 | 1.16.6 |
+  | sigil | 3.13.12 | 3.13.15 |
+  | sandhi | 1.13.1 | 1.13.7 |
+  | bayan | 1.9.0 | 1.11.1 |
+  | sakshi | 2.5.10 | 2.5.10 (unchanged) |
+- **cmdit 1.4.0 → 1.5.0.** It is still the one git dependency. `cyrius.lock` was re-pinned from scratch, since `cyrius deps` keeps an old commit pin beside a new one.
+
+### Fixed — through the dependencies
+
+- **A git-mode read kept 32 B per object, and a ref push 32 B per commit it walked.** sankoch's batch inflate took its 32-byte bit reader from a heap that never frees, on every call. sankoch 2.8.9 keeps the reader on the decoder's stack, and batch deflate's 40-byte writer too. Measured with the integration probes, 1.12.2 against 1.12.3:
+  - a loose or packed read in git mode, per object: 32 → 0 B;
+  - a refused or accepted ref push over 300 commits: 9,568 → 0 B.
+- **`sit serve` kept 16 B per request with a body.** sandhi's accept loop read `Content-Length` through a copy onto the global heap, and so did the CL+TE guard that sit's `--tls` loop also calls. sandhi 1.13.2 reads both values in place. Measured both ways, 1.12.2 against 1.12.3:
+  - the framing calls the accept loop makes on such a request, 100 times in the push probe: 1,600 → 0 B;
+  - one plain `sit serve` under 200,000 `POST /sit/v1/objects/…` requests with a 64-byte body (each refused with 400), RSS growth: 2,048 → 0 KB.
+- **Shell completion split file names and fish completed none (L11).** The bash script built `COMPREPLY` from an unquoted `$(compgen -f …)`, so `my file.txt` came back as `my` and `file.txt`. fish's global `-f` turned file completion off after every command, though 1.9.0 promised "command names, then files". cmdit 1.5.0 reads one candidate per line and turns files back on after a command.
+
+### Security — through the toolchain
+
+6.7.18 fixes 13 advisories, CYRIUS-2026-0038 to 0050. These reach sit:
+- **CYRIUS-2026-0042: nameConstraints were ignored in X.509 chain verification.** With `http.sslVerify` on (1.6.0, opt-in), a name-constrained intermediate CA chaining to a trusted root could issue a leaf for any host, and sit's https client accepted it. TOFU, the default, never consults a CA chain.
+- **Native TLS hardening, on both of sit's TLS paths** (`sit serve --tls` and the https client):
+  - a flood of KeyUpdate records from the peer is now refused;
+  - abandoned traffic secrets are zeroed;
+  - `x509_parse_into` no longer over-reads one byte of a peer's certificate.
+
+The rest are off sit's path. sit serves on one thread, so it never shares a ChaCha20-Poly1305 lane (0040). It calls no async DNS (0038), `ws_*` (0043), `http_get` (0049), `file_write_atomic` (0047), bayan PDF (0045) or HPACK (0044).
+
+### Verified — the data path
+
+Every object passes through sankoch's batch deflate on write and its batch inflate on read, and 2.8.9 changed both. So this was proven, not inferred from the changelog:
+- **`zlib_compress` output is byte-identical** under sankoch 2.8.7 and 2.8.9, for five inputs from 6 B to 5 MiB. Two of them are compressible and cross the 1 MiB block boundary, the shape of the 1.3.5 corruption. Every input round-trips under each.
+- **Each build reads what the other wrote.** The same five files were committed by a 1.12.2 build and by a 1.12.3 build. Each repository was read by both builds, loose and again after `sit gc`: 40 of 40 reads byte-exact, and `fsck` clean in all eight runs.
+- **patra 1.16.6** refuses a negative BYTES / TEXT length at the write, and a stored negative length now reads as -1 and `PATRA_ERR_PAGE`. sit never writes one, and `db_object_read_raw` already treats both answers as a failed read. No format change.
+- **sigil 3.13.15** pools its crypto lanes and enforces nameConstraints. sit's surface is `hash_data`, the hex helpers, `ed25519_*`, `pem_decode_certs` and `tls_native_*`. It is unchanged in arity, and the signed-commit, http and https smokes pass.
+
+### Tests
+
+- **Integration, 731 → 734.**
+  - **38g** asserts that bash completes `my file.txt` as one candidate, and that the fish script completes files after a command. Both fail on 1.12.2.
+  - **Sections 29 and 30 now bound the probes at 0 B**, down from sankoch's 32 B per inflate (29) and 9,600 B per push (30).
+  - **30c** runs a request with a body through sandhi's framing calls in `serve_push_probe.cyr`, and asserts it keeps nothing. Built at 6.7.15, the probe measures 1,600 B over 100 requests.
+- **Unit 704, fuzz 24 harnesses, unchanged.** All pass, plain and under `CYRIUS_POISON`, with identical poison A/B output.
+- **Downstream:**
+  - owl builds against the 1.12.3 read bundle on its own cyrius 6.6.2 pin and passes its 7 unit tests.
+  - thoth builds on 6.6.6, `--agnos` too, with its two vendoring renames.
+  - Both give the same four undefined-placeholder warnings and output size as against 1.12.2's bundle.
+  - sit itself builds for `--agnos`.
+
+### Docs
+
+- **The roadmap drops the three upstream asks that shipped:** sankoch's bit reader, sandhi's `content_length`, and cmdit's completion scripts. 1.15.2 now waits only on sankoch 2.9.1's match-finder, gated on byte-identical output as this release was.
+- **The guide** says what completion completes, file names whole.
+
+### Performance
+
+DCE builds of the same source, 1.12.2 at cyrius 6.7.15 against 1.12.3 at 6.7.18. Snapshot and CSV: [`docs/benchmarks/2026-10-30-v1.12.3.md`](docs/benchmarks/2026-10-30-v1.12.3.md).
+
+| operation, CPU ms (min of 9 alternating runs, load 3–6) | 1.12.2 | 1.12.3 |
+|---|---:|---:|
+| add ×100 | 104.2 | 102.5 (−1.7%) |
+| commit | 1.2 | 1.2 (−0.8%) |
+| status, 200 files | 5.2 | 5.1 (−1.6%) |
+| log --oneline, 300 commits | 22.9 | 22.9 (0.0%) |
+| checkout 100 files, there and back | 38.2 | 37.9 (−0.9%) |
+| clone, 100 commits | 36.4 | 36.7 (+1.0%) |
+| fsck, 100 commits | 31.0 | 31.7 (+2.1%) |
+
+- **No operation moved beyond ±2.1%.** This table's fixture differs from 1.12.2's, so compare its columns with each other, not with that table.
+- **Micro-benchmarks:** the zlib rows are 0.6–3.6% faster. Every row above 1 µs is within ±4%, except `pack-chain-50-warm` (+6.6%). The sub-microsecond validators moved by −8% … +9%, near the 1.3 µs timer floor.
+
 ## [1.12.2] — 2026-10-20 — closing 1.12.x: a P(-1) audit of everything since 1.7.6
 
 The last 1.12.x patch: the P(-1) hardening and closeout pass that 1.8.0 through 1.12.0 shipped without. Five independent reviews covered the new surfaces: packs, gc and the store lock; serving and URLs; the 1.8–1.12 local write paths; the `.git/` read path; and external advisories. Two more findings came from the closeout's own refactor. Each of the 38 was reproduced against 1.12.1:

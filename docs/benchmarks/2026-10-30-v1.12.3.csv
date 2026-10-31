@@ -1,0 +1,43 @@
+operation,v1122,v1123,unit,method
+add x100 (one file each) (cpu),104.2,102.5,ms,ab1123: min of 9 alternating runs per child CPU; load 3-6
+commit (cpu),1.2,1.2,ms,ab1123: min of 9 alternating runs per child CPU; load 3-6
+"status, 200 files (cpu)",5.2,5.1,ms,ab1123: min of 9 alternating runs per child CPU; load 3-6
+"log --oneline, 300 commits (cpu)",22.9,22.9,ms,ab1123: min of 9 alternating runs per child CPU; load 3-6
+"checkout 100 changed files, there and back (cpu)",38.2,37.9,ms,ab1123: min of 9 alternating runs per child CPU; load 3-6
+"clone, 100 commits (cpu)",36.4,36.7,ms,ab1123: min of 9 alternating runs per child CPU; load 3-6
+"fsck, 100 commits (cpu)",31.0,31.7,ms,ab1123: min of 9 alternating runs per child CPU; load 3-6
+git-mode read heap kept per object,32,0,B,read_heap_probe (integration 29)
+ref push over 300 commits heap kept,9568,0,B,serve_push_probe (integration 30)
+framing calls on a request with a body heap kept over 100,1600,0,B,serve_push_probe BODYREQ (integration 30c)
+serve RSS growth over 200000 POSTs with body,2048,0,KB,post_load over sit serve --listen
+sha256-64B,0.765,0.794,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+sha256-1024B,3.474,3.590,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+sha256-65536B,190.073,191.406,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+zlib-compress-1024B,128.184,123.570,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+zlib-compress-65536B,1052.000,1038.000,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+zlib-decompress-1024B,9.774,9.559,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+zlib-decompress-65536B,348.534,346.355,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+patra-open-close,29.444,27.659,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+copy-objects-100,168.070,174.685,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+commit-parse+iso8601,1.338,1.396,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+ed25519-sign,1824.000,1845.000,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+ed25519-verify,5459.000,5468.000,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+refname_valid-good,0.266,0.289,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+tree_entry_name_valid-good,0.090,0.083,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+tree_flat_path_valid-good,0.644,0.688,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+hex_prefix_valid-64char,0.206,0.201,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+lcs-diff-100x100,370.713,364.993,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+lcs-diff-1000x1000,32299.000,32766.000,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+lcs-diff-4000x4000,452348.000,451093.000,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+is_ignored-10pat,7.785,7.468,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+is_ignored-50pat,38.630,37.094,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+is_ignored-200pat,155.419,149.191,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+blob-hash-1024B,5.392,5.465,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+blob-hash-65536B,300.935,309.693,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+blob-hash-1048576B,4744.000,4809.000,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+delta-tree-100,22.659,22.364,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+delta-tree-2000,385.519,378.611,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+pack-chain-10-cold,629.353,636.977,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+pack-chain-10-warm,25.719,25.969,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+pack-chain-50-cold,2126.000,2092.000,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs
+pack-chain-50-warm,24.380,25.993,us,cyrius bench tests/sit.bcyr: min of 2 alternating runs

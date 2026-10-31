@@ -1598,9 +1598,10 @@ fi
 # owl and thoth read objects in-process, on a heap with no free. 1.7.4 kept
 # about 4 KB per small loose read (the compressed file and an inflate buffer
 # sit then discarded; ~69 KB for a 190 KB text file) and 672 bytes per packed
-# read (the pack-directory listing and paths). 1.7.5 keeps none of sit's; the
-# bound allows sankoch's 32 bytes per inflate, an upstream ask. The pack is
-# built without deltas so each read is exactly one inflate.
+# read (the pack-directory listing and paths). 1.7.5 keeps none of sit's.
+# Through 1.12.2 sankoch kept 32 bytes per inflate (its bit reader); sankoch
+# 2.8.9, folded by cyrius 6.7.18, keeps none, so since 1.12.3 the bound is 0.
+# The pack is built without deltas so each read is exactly one inflate.
 hr "1.7.5 git read-mode heap per read"
 if [ -n "$READ_PROBE" ] && command -v git >/dev/null 2>&1; then
   R="$WORK/rh175"; mkdir -p "$R"; cd "$R"
@@ -1610,11 +1611,11 @@ if [ -n "$READ_PROBE" ] && command -v git >/dev/null 2>&1; then
   git rev-list --objects --all | awk 'length($1)==40 {print $1}' > "$WORK/rh175.ids"
   read -r _ PER N <<< "$("$READ_PROBE" "$WORK/rh175.ids" | grep '^READ')"
   assert_eq "${N:-0}" "$(wc -l < "$WORK/rh175.ids" | tr -d ' ')" "29a: every loose object reads"
-  [ "${PER:-99999}" -le 32 ] 2>/dev/null && ok || bad "29a: a loose read kept ${PER:-?} bytes (bound 32, sankoch's inflate; 1.7.4 ~4100)"
+  [ "${PER:-99999}" -le 0 ] 2>/dev/null && ok || bad "29a: a loose read kept ${PER:-?} bytes (bound 0; 1.12.2 32, sankoch's inflate; 1.7.4 ~4100)"
   git repack -adfq --depth=0 --window=0 && git prune-packed
   read -r _ PER N <<< "$("$READ_PROBE" "$WORK/rh175.ids" | grep '^READ')"
   assert_eq "${N:-0}" "$(wc -l < "$WORK/rh175.ids" | tr -d ' ')" "29b: every packed object reads"
-  [ "${PER:-99999}" -le 32 ] 2>/dev/null && ok || bad "29b: a packed read kept ${PER:-?} bytes (bound 32; 1.7.4 ~700)"
+  [ "${PER:-99999}" -le 0 ] 2>/dev/null && ok || bad "29b: a packed read kept ${PER:-?} bytes (bound 0; 1.12.2 32; 1.7.4 ~700)"
   read -r _ LOC <<< "$("$READ_PROBE" "$WORK/rh175.ids" | grep '^LOCATE')"
   assert_eq "${LOC:-none}" "0" "29b: a pack lookup keeps nothing"
 elif [ "$READ_PROBE_BROKEN" = 1 ]; then
@@ -1628,8 +1629,11 @@ fi
 # A ref push runs the fast-forward check, which walks the pushed tip's history.
 # 1.7.4 kept every commit it read (~4.5 KB each: on this 300-commit fixture
 # ~1.3 MB per push, refused or not), and a client can push a long chain once and
-# refuse-push it at will. 1.7.5 walks on an arena rewound per walk. The bound
-# allows sankoch's 32 bytes per inflate (an upstream ask), one per commit walked.
+# refuse-push it at will. 1.7.5 walks on an arena rewound per walk. Through
+# 1.12.2 sankoch kept 32 bytes per inflate, one per commit walked (9,568 here);
+# since 1.12.3 (sankoch 2.8.9) the bound is 0. 30c runs a request with a body
+# through the framing calls sandhi's accept loop makes on it, which kept 16 B
+# per request through 1.12.2 (sandhi 1.13.1; 1.13.2 reads in place).
 hr "1.7.5 serve heap per ref push"
 if [ -n "$PUSH_PROBE" ]; then
   R="$WORK/sp175"; mkdir -p "$R"; cd "$R"
@@ -1641,9 +1645,11 @@ if [ -n "$PUSH_PROBE" ]; then
   OUT=$("$PUSH_PROBE" "$R" "$TIP" "$PAR" "$ROOTC")
   REF=$(printf '%s\n' "$OUT" | awk '/^REFUSED/{print $2}')
   UPD=$(printf '%s\n' "$OUT" | awk '/^UPDATE/{print $2}')
-  [ "${REF:-999999}" -le 9600 ] 2>/dev/null && ok || bad "30a: a refused push over 300 commits kept ${REF:-?} bytes (bound 9600, sankoch's 32 per inflate; 1.7.4 ~1.3 MB)"
-  [ "${UPD:-999999}" -le 9600 ] 2>/dev/null && ok || bad "30b: a fast-forward update over 300 commits kept ${UPD:-?} bytes (bound 9600; 1.7.4 ~1.3 MB)"
+  [ "${REF:-999999}" -le 0 ] 2>/dev/null && ok || bad "30a: a refused push over 300 commits kept ${REF:-?} bytes (bound 0; 1.12.2 9,568, sankoch's 32 per inflate; 1.7.4 ~1.3 MB)"
+  [ "${UPD:-999999}" -le 0 ] 2>/dev/null && ok || bad "30b: a fast-forward update over 300 commits kept ${UPD:-?} bytes (bound 0; 1.12.2 9,568; 1.7.4 ~1.3 MB)"
   assert_eq "$(tr -d '\n' < .sit/refs/heads/probe)" "$TIP" "30b: and the update landed"
+  BODY=$(printf '%s\n' "$OUT" | awk '/^BODYREQ/{print $2}')
+  assert_eq "${BODY:-none}" "0" "30c: 100 requests with a body keep nothing in sandhi's framing reads (1.12.2: 1,600 B)"
 elif [ "$PUSH_PROBE_BROKEN" = 1 ]; then
   bad "30: serve_push_probe does not compile against dist/sit.cyr"
   sed 's/^/    /' "$WORK/serve_push_probe.log"
@@ -2201,6 +2207,14 @@ fi
 if command -v fish >/dev/null 2>&1; then
   "$SIT" completions fish > "$R/sit.fish"; fish -n "$R/sit.fish"; assert_eq "$?" "0" "38e: the fish script parses"
 fi
+# 38g (L11, closed by cmdit 1.5.0 in 1.12.3): a file name is one candidate. The
+# 1.12.2 bash script word-split `my file.txt` into `my` and `file.txt`, and fish
+# completed no file after a command.
+mkdir -p "$R/l11c"; : > "$R/l11c/my file.txt"
+L11C=$(cd "$R/l11c" && bash -c 'source "$1"; fn=$(complete -p sit | sed -E "s/.*-F ([^ ]+) .*/\1/")
+  COMP_WORDS=(sit add my); COMP_CWORD=2; "$fn" sit my add; printf "%s|" "${#COMPREPLY[@]}" "${COMPREPLY[@]}"' _ "$R/sit.bash")
+assert_eq "$L11C" "1|my file.txt|" "38g: bash completes a name with a space as one candidate"
+assert_contains "$("$SIT" completions fish)" "complete -c sit -n 'not __fish_use_subcommand' -F" "38g: fish completes files after a command"
 # 38f: the usage table, the verb table and the completions cannot drift — every
 # command the table lists completes, and every completed command is listed.
 TABLE=$("$SIT" --help | sed -n '/^commands:/,/^$/p' | awk 'NR>1 && /^  [a-z]/{print $1}' | sort -u | tr '\n' ' ')
