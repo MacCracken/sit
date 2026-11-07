@@ -404,8 +404,7 @@ fn _store_leaves(dir, head) {
 
 # 1 when the store `dir` is a symlink that does not stay in this directory: its
 # text may not climb, and no component of it may be a further link, which is
-# what a chain or `.git -> hop/.git` with `hop` linked out comes to. On AGNOS
-# path_is_symlink cannot see a link, so this is the accepted no-op it is there.
+# what a chain or `.git -> hop/.git` with `hop` linked out comes to.
 fn _store_link_leaves(dir) {
     var ab[4352];
     var ap = _sf_abs(dir, &ab);

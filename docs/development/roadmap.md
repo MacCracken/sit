@@ -26,7 +26,7 @@ Each item ships under the usual test / fuzz / poison / bench gates.
 
 Gaps every git user hits on day one, verified at 1.12.0. 1.13.0 shipped the syntax (revisions, path-limited log, directory adds); the patches finish the arc.
 
-### 1.13.3 — hardening carried from the 1.12.2 audit
+### 1.13.4 — hardening carried from the 1.12.2 audit
 
 What [the 1.12.2 audit](../audit/2026-10-20-1.12.2-audit.md) left partly fixed:
 - **`--repos` resolution relative to a directory descriptor (S3).** Since 1.12.2 a kept repository is re-checked on every request, but a swap between that check and the opens still races: about 60 of 300 rounds in the reviewer's racer, when every request re-resolved. Open `<dir>` once, walk each name segment with `openat(…, O_NOFOLLOW | O_DIRECTORY)`, and open the store, the lock and the refs relative to the repository's descriptor. The stdlib's `openat` surface has to be checked against owl's toolchain first, since `serve.cyr` is in `[lib]`.
@@ -37,7 +37,7 @@ What [the 1.12.2 audit](../audit/2026-10-20-1.12.2-audit.md) left partly fixed:
 What 1.13.1's refusal left open ([ADR 0003](../adr/0003-no-upward-repo-discovery.md)'s amendment):
 - **Links below a real store.** A `.git/` directory with `refs` and `objects` linked out reads the other repository, and `sit status` lists its tracked paths as `deleted:`, as git does (verified at 1.13.1). The name on `On branch` stays the directory's own, so a prompt shows nothing of it but a dirty marker. `git-new-workdir` makes this shape and `objects/info/alternates` reaches as far on purpose (ADR 0011), so this needs a decision before a refusal.
 
-### 1.13.4 — closeout P(-1) over 1.13.x
+### 1.13.5 — closeout P(-1) over 1.13.x
 
 ---
 

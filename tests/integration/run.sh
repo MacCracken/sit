@@ -52,6 +52,16 @@ if command -v cyrius >/dev/null 2>&1; then
   fi
 fi
 
+# 1.13.3: the AGNOS build, for section 53. Same rule.
+AGNOS_BUILT=""
+if command -v cyrius >/dev/null 2>&1; then
+  if ( cd "$ROOT" && cyrius build --agnos src/main.cyr "$WORK/sit_agnos" ) >"$WORK/sit_agnos.log" 2>&1; then
+    AGNOS_BUILT=1
+  else
+    AGNOS_BUILT=0
+  fi
+fi
+
 # 1.7.6: the public-API probe (sit_repo_status / sit_diff_path), against the
 # shipped READ bundle. Same rule.
 API_PROBE=""
@@ -3473,6 +3483,22 @@ if command -v git >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
 else
   echo "  (skipped 52: needs git and python3)"
 fi
+
+# ── 53: the AGNOS arm of the lstat helpers ──
+# No host can run this arm: the AGNOS kernel is what answers, and mirshi has no
+# lstat#102. thoth's `scripts/agnos-run.sh --hostile` runs it there, with a planted
+# `.git` link, a linked HEAD and a retargeted tracked link. This keeps the arm from
+# drifting back to the following stat#33, and keeps it building.
+hr "53: symlink guards on AGNOS use lstat#102"
+BUNDLE="$ROOT/dist/sit-read.cyr"
+assert_eq "$(grep -c 'sys_lstat(path, n, &abuf)' "$BUNDLE")" "1" "53: the read bundle asks lstat#102"
+assert_eq "$(sed -n '/^fn path_is_symlink/,/^}/p;/^fn path_lstat_kind/,/^}/p;/^fn path_lstat_mode/,/^}/p' "$BUNDLE" | grep -c 'sys_stat(')" "0" "53: no guard falls back to the following stat itself"
+assert_eq "$(sed -n '/^#ifdef CYRIUS_TARGET_MACOS$/,/^#endif$/p' "$BUNDLE" | grep -c 'var VAL_AT_SYMLINK_NOFOLLOW = 32;')" "1" "53: Darwin gets its own at values"
+case "$AGNOS_BUILT" in
+  1) ok ;;
+  0) bad "53: sit builds --agnos" ;;
+  *) echo "  (skipped 53's build: needs cyrius)" ;;
+esac
 
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"

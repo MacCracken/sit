@@ -4,6 +4,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.13.3] — 2026-11-06 — sit sees a symlink on AGNOS and macOS
+
+A security patch, found by thoth's hostile pass on a real AGNOS guest and its suite on a real Mac. Nothing changes on Linux, in the on-disk format, the wire protocol or the public API. The toolchain stays at cyrius 6.7.18, and cmdit 1.5.0 is the latest.
+
+### Security
+
+- **Every symlink guard in sit was off on AGNOS (MEDIUM).** `path_is_symlink`, `path_lstat_kind` and `path_lstat_mode` used the symlink-following `stat#33`, on the belief that AGNOS had no lstat. It has had `lstat#102` since agnos 1.56.53. So on AGNOS 1.13.1's and 1.13.2's fixes did nothing: `.git -> ../v/.git` printed the other repository's branch and status, a linked HEAD was followed, `sit_diff_path` read through a tracked link, and the `sf_*` wrappers wrote through planted links. All three now ask lstat.
+- **A FAT or exFAT volume stays readable.** `lstat#102` is ext2-only and answers -1 there, so the helpers fall back to `stat#33`, where no link can exist. Without that, a repository on such a volume would read as absent.
+- **Every symlink guard in sit was off on macOS too (MEDIUM).** The lstat helpers passed Linux's `AT_FDCWD` (-100) and `AT_SYMLINK_NOFOLLOW` (256) to Darwin's `fstatat64`, which wants -2 and 0x20. Every call failed with EBADF, and `path_is_symlink` read that as "not a link". `path_is_absent` read it as "something is there", and `path_lstat_kind` as absent. Each target now has its own values, in one place.
+
+### Verified
+
+- On a real guest, through thoth 0.55.3's hostile pass, agnos 1.57.17: a `.git` link out of the directory is refused, a linked HEAD is refused, a tracked link's diff shows its target, and an honest repository at `$PWD` still reads. With the lstat call reverted, the same scenarios leak.
+- On a real Mac, Apple Silicon: thoth 0.55.3's suite refuses a `.git` link out of the directory, which 1.13.2's read bundle did not. sit's own 816 unit tests pass there, and `sit status` refuses the link.
+- **Integration section 53.** The read bundle asks `lstat#102`, no guard falls back to the following stat itself, Darwin gets its own `at` values, and sit builds `--agnos`. A host cannot run the AGNOS arm: mirshi has no `lstat#102`.
+
 ## [1.13.2] — 2026-11-06 — the read API says why, `.gitattributes`, and the last read commands on `.git/`
 
 Closes the five issues owl's P(-1) audit filed against sit on 1.13.0, and the roadmap's 1.13.2 slot. Nothing changes in the on-disk format or the wire protocol, and no existing public signature or return shape changes. The toolchain stays at cyrius 6.7.18. New: `src/git_attr.cyr`. ADR 0009 and ADR 0011 gain amendments, and [the audit note](docs/audit/2026-11-06-1.13.2-audit.md) records the findings.
