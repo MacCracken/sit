@@ -2290,6 +2290,121 @@ fn test_1131_link_text() {
 }
 
 # Run every test group; exit status is the failure count.
+# A line of an attribute file against `path`: the state of `slot` afterwards.
+fn _ga_try(line, path, blen, slot) {
+    var st[48];
+    _ga_macros_begin();
+    _ga_macros_in(line, strlen(line));
+    _ga_state_begin(&st);
+    var plen = strlen(path);
+    var bn = 0;
+    var i = 0;
+    while (i < plen) {
+        if (load8(path + i) == 47) { bn = i + 1; }
+        i = i + 1;
+    }
+    _ga_scan(line, strlen(line), blen, path, plen, bn, &st);
+    _ga_state_end(&st);
+    return load64(&st + slot * 8);
+}
+
+# 1.13.2: `.gitattributes` patterns, states, macros and conversions, as git reads
+# them. gitattr_diff.py holds them against git itself.
+fn test_1132_gitattr() {
+    test_group("1.13.2 gitattributes");
+    # Patterns, as git's path_matches reads them.
+    assert_eq(_ga_try("*.bat text\n", "run.bat", 0, GA_TEXT), GAV_SET, "a suffix at the root");
+    assert_eq(_ga_try("*.bat text\n", "a/b/run.bat", 0, GA_TEXT), GAV_SET, "at any depth");
+    assert_eq(_ga_try("a/*.bat text\n", "a/run.bat", 0, GA_TEXT), GAV_SET, "a path");
+    assert_eq(_ga_try("a/*.bat text\n", "a/b/run.bat", 0, GA_TEXT), GAV_UNSPEC, "`*` stops at a slash");
+    assert_eq(_ga_try("/run.bat text\n", "run.bat", 0, GA_TEXT), GAV_SET, "anchored");
+    assert_eq(_ga_try("/run.bat text\n", "a/run.bat", 0, GA_TEXT), GAV_UNSPEC, "anchored, not below");
+    assert_eq(_ga_try("/run.bat text\n", "a/run.bat", 1, GA_TEXT), GAV_SET, "anchored to its file's directory");
+    assert_eq(_ga_try("b/x text\n", "a/b/x", 1, GA_TEXT), GAV_SET, "a path from its file's directory");
+    assert_eq(_ga_try("a/** text\n", "a/b/c", 0, GA_TEXT), GAV_SET, "`/**`");
+    assert_eq(_ga_try("**/c text\n", "a/b/c", 0, GA_TEXT), GAV_SET, "`**/`");
+    assert_eq(_ga_try("a text\n", "a/b", 0, GA_TEXT), GAV_UNSPEC, "attributes do not reach below a directory");
+    assert_eq(_ga_try("a/b text\n", "a/b/c", 0, GA_TEXT), GAV_UNSPEC, "nor does a path pattern");
+    assert_eq(_ga_try("a/ text\n", "a/b", 0, GA_TEXT), GAV_UNSPEC, "a directory pattern matches no file");
+    assert_eq(_ga_try("b/ text\n", "b", 0, GA_TEXT), GAV_UNSPEC, "nor one of its name");
+    assert_eq(_ga_try("!*.bat text\n", "run.bat", 0, GA_TEXT), GAV_UNSPEC, "a negative pattern is ignored");
+    assert_eq(_ga_try("\\!x text\n", "!x", 0, GA_TEXT), GAV_SET, "an escaped `!`");
+    assert_eq(_ga_try("# x text\n", "#", 0, GA_TEXT), GAV_UNSPEC, "a comment");
+    assert_eq(_ga_try("\\#x text\n", "#x", 0, GA_TEXT), GAV_SET, "an escaped `#`");
+    assert_eq(_ga_try("\"a b\" text\n", "a b", 0, GA_TEXT), GAV_SET, "a quoted pattern");
+    assert_eq(_ga_try("\"a\\tb\" text\n", "a\tb", 0, GA_TEXT), GAV_SET, "a quoted escape");
+    assert_eq(_ga_try("\"\\141\" text\n", "a", 0, GA_TEXT), GAV_SET, "an octal escape");
+    assert_eq(_ga_try("\"a text\n", "\"a", 0, GA_TEXT), GAV_SET, "an unterminated quote is a byte");
+    assert_eq(_ga_try("a[[:space:]]b text\n", "a b", 0, GA_TEXT), GAV_SET, "a POSIX class");
+    assert_eq(_ga_try("[^a] text\n", "b", 0, GA_TEXT), GAV_SET, "`^` negates");
+    assert_eq(_ga_try("[^a] text\n", "a", 0, GA_TEXT), GAV_UNSPEC, "`^` negates, the other way");
+    assert_eq(_ga_try("\xEF\xBB\xBF* text\n", "a", 0, GA_TEXT), GAV_SET, "a BOM");
+    # States.
+    assert_eq(_ga_try("* -text\n", "a", 0, GA_TEXT), GAV_UNSET, "unset");
+    assert_eq(_ga_try("* text !text\n", "a", 0, GA_TEXT), GAV_UNSPEC, "unspecified");
+    assert_eq(_ga_try("* text=auto\n", "a", 0, GA_TEXT), GAV_AUTO, "a value");
+    assert_eq(_ga_try("* eol=crlf\n", "a", 0, GA_EOL), GAV_CRLF, "eol");
+    assert_eq(_ga_try("* text\n* -text\n", "a", 0, GA_TEXT), GAV_UNSET, "the last line wins");
+    assert_eq(_ga_try("* binary\n", "a", 0, GA_TEXT), GAV_UNSET, "the binary macro");
+    assert_eq(_ga_try("* -binary\n", "a", 0, GA_TEXT), GAV_UNSPEC, "a macro only expands when set");
+    assert_eq(_ga_try("[attr]m text\n* m\n", "a", 0, GA_TEXT), GAV_SET, "a defined macro");
+    assert_eq(_ga_try("* m\n[attr]m text\n", "a", 0, GA_TEXT), GAV_SET, "defined after its use");
+    assert_eq(_ga_try("[attr]m -text\na m\n* -m\n", "a", 0, GA_TEXT), GAV_UNSPEC, "unset later, it never expands");
+    assert_eq(_ga_try("[attr]m -text\n* -m\na m\n", "a", 0, GA_TEXT), GAV_UNSET, "set later, it does");
+    assert_eq(_ga_try("[attr]m text\n* -text\na m\n", "a", 0, GA_TEXT), GAV_SET, "a later macro wins");
+    assert_eq(_ga_try("[attr]m text\na m\n* -text\n", "a", 0, GA_TEXT), GAV_UNSET, "an earlier one loses");
+    assert_eq(_ga_try("[attr]a b\n[attr]b a\n* a\n", "z", 0, GA_TEXT), GAV_UNSPEC, "a macro cycle ends");
+    assert_eq(_ga_try("[attr]binary text\n* binary\n", "a", 0, GA_TEXT), GAV_SET, "binary can be redefined");
+    assert_eq(_ga_try("* text bad!name\n", "a", 0, GA_TEXT), GAV_UNSPEC, "one bad name drops the line");
+    assert_eq(_ga_try("* text -\n", "a", 0, GA_TEXT), GAV_UNSPEC, "an empty name drops it too");
+    assert_eq(_ga_try("* builtin_x text\n", "a", 0, GA_TEXT), GAV_UNSPEC, "as a reserved one does");
+    assert_eq(_ga_try("* filter=lfs\n", "a", 0, GA_FILTER), GAV_OTHER, "a filter");
+    assert_eq(_ga_value("UTF-8", 5), GAV_UTF8, "UTF-8 is no encoding");
+    assert_eq(_ga_value("utf8", 4), GAV_UTF8, "however it is spelled");
+    assert_eq(_ga_value("UTF-16", 6), GAV_OTHER, "UTF-16 is one");
+    # A line of git's limit is skipped, whatever it says.
+    var bigl = alloc(2200);
+    memset(bigl, 32, 2100);
+    memcpy(bigl + 2100, "* text\n", 8);
+    assert_eq(_ga_try(bigl, "a", 0, GA_TEXT), GAV_UNSPEC, "an over-long line is skipped");
+    # Conversions.
+    var b = alloc(32);
+    memcpy(b, "a\r\nb\rc\r\n\r", 9);
+    assert_eq(_ga_strip_cr(b, 9), 7, "CR before LF goes, a lone CR stays");
+    assert_eq(memeq(b, "a\nb\rc\n\r", 7), 1, "and the bytes are right");
+    var cr[8];
+    assert_eq(_ga_is_binary("a\r\nb\r\n", 6, &cr), 0, "text");
+    assert_eq(load64(&cr), 2, "with its CRLFs counted");
+    assert_eq(_ga_is_binary("a\rb\n", 4, &cr), 1, "a lone CR is binary to auto");
+    assert_eq(_ga_is_binary("a\x00b\r\n", 5, &cr), 1, "a NUL is");
+    assert_eq(_ga_is_binary("\x01\x02\n", 3, &cr), 1, "mostly control bytes are");
+    assert_eq(_ga_is_binary("a\x1A", 2, &cr), 0, "a trailing ^Z is not counted");
+    assert_eq(_wildmatch_exact("a", 1, "a/b", 3), 0, "the exact match stops at the end");
+    assert_eq(_wildmatch("a", 1, "a/b", 3), 1, "ignore rules keep directory exclusion");
+    assert_eq(_wildmatch("a\\*b", 4, "a*b", 3), 1, "an escaped star");
+    assert_eq(_wildmatch("a\\*b", 4, "axb", 3), 0, "is a star");
+    assert_eq(_wildmatch("[[:digit:]]", 11, "7", 1), 1, "[:digit:]");
+    assert_eq(_wildmatch("[[:bogus:]]", 11, "7", 1), 0, "an unknown class matches nothing");
+    assert_eq(_wildmatch("[[:alpha:]0]", 12, "0", 1), 1, "a class beside a member");
+    return 0;
+}
+
+# 1.13.2: what a failed object read records, for the read API's results.
+fn test_1132_obj_fail() {
+    test_group("1.13.2 read failure reasons");
+    obj_fail_clear();
+    assert_eq(_obj_fail, 0, "cleared");
+    obj_fail_note(OBJ_TOO_BIG, 100);
+    obj_fail_note(OBJ_CORRUPT, 0 - 1);
+    assert_eq(_obj_fail, OBJ_TOO_BIG, "the first reason stands");
+    assert_eq(_obj_fail_size, 100, "and a known size survives a later note");
+    obj_fail_clear();
+    assert_eq(_obj_fail_size, 0 - 1, "cleared too");
+    assert_eq(_obj_frame_size("blob 12345\x00", 11), 12345, "a frame's content size");
+    assert_eq(_obj_frame_size("nonsense", 8), 0 - 1, "not a frame");
+    return 0;
+}
+
 # 1.13.0: revision syntax — the pure parts (rev_resolve's walk is exercised
 # against git in the integration suite, section 45).
 fn test_1130_revisions() {
@@ -2387,6 +2502,8 @@ fn main() {
     test_1122_closeout();
     test_1130_revisions();
     test_1131_link_text();
+    test_1132_gitattr();
+    test_1132_obj_fail();
     return assert_summary();
 }
 

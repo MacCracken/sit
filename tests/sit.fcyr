@@ -1251,6 +1251,59 @@ fn fuzz_serve_repo_paths(rounds) {
     return 0;
 }
 
+# Attribute files: any bytes parse, nothing reads past the text, and the macro
+# table holds. What a line means is the differential's job (gitattr_diff.py).
+fn fuzz_gitattr(rounds) {
+    var alpha = "*?[]!-=\"\\/ \t\r\n#:^atxe[attr]text crlf eol=auto";
+    var alen = strlen(alpha);
+    var buf = alloc(4096);
+    var st = alloc(48);
+    var wb = alloc(256);
+    var seed = 0x11320;
+    var i = 0;
+    while (i < rounds) {
+        var n = (seed >> 9) % 400;
+        var k = 0;
+        while (k < n) {
+            var c = load8(alpha + ((seed >> 17) & 0xFFFF) % alen);
+            if (((seed >> 3) & 63) == 0) { c = (seed >> 23) & 0xFF; }
+            store8(buf + k, c);
+            seed = seed * 6364136223846793005 + 1442695040888963407;
+            k = k + 1;
+        }
+        _ga_macros_begin();
+        _ga_macros_in(buf, n);
+        if (_ga_nmacros > _GA_MACRO_MAX) { println("fuzz: the macro table overflowed"); return 1; }
+        _ga_state_begin(st);
+        _ga_scan(buf, n, 0, "a/b.txt", 7, 2, st);
+        _ga_state_end(st);
+        var si = 0;
+        while (si < 6) {
+            var v = load64(st + si * 8);
+            if (v < 0) { println("fuzz: a state out of range"); return 1; }
+            if (v > GAV_OTHER) { println("fuzz: a state out of range"); return 1; }
+            si = si + 1;
+        }
+        # Stripping: never longer, and no CRLF left that was not made by the strip.
+        var wn = (seed >> 11) % 200;
+        var w = 0;
+        while (w < wn) {
+            var b = 10 + ((seed >> 5) & 3);
+            store8(wb + w, b);
+            seed = seed * 6364136223846793005 + 1442695040888963407;
+            w = w + 1;
+        }
+        var got = _ga_strip_cr(wb, wn);
+        if (got > wn) { println("fuzz: the strip grew"); return 1; }
+        if (got < 0) { println("fuzz: the strip went negative"); return 1; }
+        var nop = _ga_strip_cr(wb, got);
+        if (nop > got) { println("fuzz: a second strip grew"); return 1; }
+        seed = seed * 6364136223846793005 + 1442695040888963407;
+        i = i + 1;
+    }
+    return 0;
+}
+
 # 1.13.1: link_text_stays_below, the test that keeps a linked `.sit` / `.git` in
 # the directory sit stands in. Accepted text is checked by a second reading of
 # it: never absolute, and "/<text>/" holds no "/../".
@@ -1476,6 +1529,8 @@ fn main() {
     if (fuzz_rev_syntax(300000) != 0) { return 1; }
     println("fuzz: link_text (300000 rounds)");
     if (fuzz_link_text(300000) != 0) { return 1; }
+    println("fuzz: gitattr (200000 rounds)");
+    if (fuzz_gitattr(200000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

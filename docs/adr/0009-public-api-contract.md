@@ -108,3 +108,21 @@ No signature changed. `sit_repo_status` is now `compute_status_records` (`diff.c
 - It is mode-aware. A symlink is compared by its target. A file replaced by a symlink or a directory is modified. In a `.git/` repository a flipped executable bit counts too.
 - A gitlink (submodule) is skipped, its directory is not walked, and an untracked nested repository is one `dir/` record.
 - In a `.git/` repository, executables, symlinks, submodule contents, NTFS-reserved names and the files of a `git clone --shared` clone no longer come back as untracked: ADR 0011's 1.12.0 amendment.
+
+## Amendment (1.13.2) — a call can say it has no answer
+
+`sit_diff_path` had one success shape, so "could not read HEAD" came back as every line added and "too big to diff" as no changes, and a viewer could tell neither from the truth. `sit_repo_status` called a file it could not read modified. Neither return value changes shape. A call that has no answer returns what it always returned for "nothing to report" (0, an empty vec), and says why through a new accessor:
+
+| identifier | location | shape |
+|---|---|---|
+| `sit_last_result()` | api.cyr | a `SIT_*` result for the last `sit_diff_path` / `sit_repo_status`; `SIT_OK` means the answer is the truth |
+| `sit_set_store_wait(ms)` | api.cyr | how long a call waits for the store lock: 0 not at all, -1 no limit, default 60 s; past it, `SIT_BUSY` |
+| `sit_set_diff_limit(max_bytes, max_lines)` | api.cyr | the largest file `sit_diff_path` takes on, either side; 0 for no limit of the caller's |
+| `SIT_OK`, `SIT_BUSY`, `SIT_HEAD_TOO_BIG`, `SIT_HEAD_MISSING`, `SIT_HEAD_CORRUPT`, `SIT_WORK_TOO_BIG`, `SIT_WORK_UNREADABLE`, `SIT_DIFF_TOO_BIG`, `SIT_NOT_COMPARABLE`, `SIT_TREE_TOO_BIG` | api.cyr, `enum SitResult` | the results |
+
+- **The contract's naming rule grows by one:** an upper-case `SIT_` member of `enum SitResult` is public, and stable as a `sit_` name is. A new result is additive. A consumer that ignores `sit_last_result` sees what it always saw, so this is not a return-value change under the semver rules above.
+- **`sit_status_kind` gains 4, not compared.** The file is tracked and sit cannot tell whether it changed: its blob is over the 16 MiB ceiling at the same size as the file, the blob or the file cannot be read, or a `filter`, `ident` or `working-tree-encoding` applies. A consumer's switch on the kinds needs a default arm. thoth's has one.
+- **Behaviours a consumer can see.** A HEAD side that cannot be read now returns 0 with a result, not an all-added diff. A worktree file that cannot be read returns 0 with a result, not an all-deleted diff. A symlink's worktree side is its target, never the file it points at. `sit_repo_status` with an unreadable HEAD tree returns an empty vec with a result, not every file as new. The default wait on the store lock is 60 s, where it had no limit. Each of these is the bug fix the rules above call a patch.
+- **In a `.git/` repository** both calls compare the worktree as git compares it, after `.gitattributes`: ADR 0011's 1.13.2 amendment.
+
+These are new `sit_*` names, which this ADR and the roadmap's tiers put in a minor. They shipped in 1.13.2 because that is the number the release was cut under. No existing name, signature or return shape changed, so a consumer on 1.13.1's API builds and behaves as the list above says.

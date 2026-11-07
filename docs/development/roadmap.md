@@ -26,12 +26,6 @@ Each item ships under the usual test / fuzz / poison / bench gates.
 
 Gaps every git user hits on day one, verified at 1.12.0. 1.13.0 shipped the syntax (revisions, path-limited log, directory adds); the patches finish the arc.
 
-### 1.13.2 — the remaining read commands on `.git/`
-
-`sit blame`, `sit describe` and `sit merge-base` are read-only but still refuse a `.git/` repository (rc 1, verified at 1.12.0). Open them through `cli_read_repo` as 1.12.0 opened status / log / diff. They need the 1.12.0 width fixes (`_id_dup`) on their own paths, plus a differential against `git blame --porcelain`, `git describe` and `git merge-base` in both object formats. 1.13.0's resolver already reads git's revisions on both backends, so they take `HEAD~3` the moment they open.
-
-`blame` finds its one path by flattening each commit's whole tree (`_blame_content_at` → `commit_tree_entries`), which is O(files) per commit. 1.13.0's `tree_path_find` reads one tree per path component and is what `log -- <path>` uses; move blame onto it while the command is open, and measure it on a large tree.
-
 ### 1.13.3 — hardening carried from the 1.12.2 audit
 
 What [the 1.12.2 audit](../audit/2026-10-20-1.12.2-audit.md) left partly fixed:
@@ -39,7 +33,6 @@ What [the 1.12.2 audit](../audit/2026-10-20-1.12.2-audit.md) left partly fixed:
 - **A connectivity check before a served ref moves (X2c).** `serve_handle_put_ref` checks only that the new tip exists and is a commit. A push spans requests, and a `fsck --prune` between them can delete objects that arrived but that no ref named yet. Walk the new tip's commits and trees down to what the old tip (or any ref) reaches, as git's `check_connected` does, and refuse a hole with a 409. Bound the walk as the fast-forward check is bounded (60 s, then 503).
 - **Reflogs past 64 MiB (L5).** `read_file_heap`'s cap makes such a log unreadable to `sit reflog`, `@{…}` and `reflog expire`, which is the command that would shrink it. `fsck --prune` refuses while one exists (1.12.2). Read and rewrite logs in chunks.
 - **`patra_init` once per process (S5, sit's part).** `object_db_open` and `index_db_open` call `patra_init()` on every open, against patra's README ("once, before use"). Each repeat keeps 4,112 B of bump heap and re-creates patra's mutexes, page-cache and SQL state. That is nearly all of the ~4.4 KB a `--repos` server keeps per evicting request, and the read API pays it twice per `sit_repo_open`. Call it once, behind a flag of sit's own: `patra_initialized()` needs patra ≥ 1.16.1, newer than owl's toolchain. Measured 2026-10-20: a repeat `patra_init` 4,112 B, `sf_patra_open` + close 351 B, `CREATE TABLE` on an existing table 0.
-- **Tree expansion on the status path (G4).** A 124 KB repository whose HEAD tree is a 16-way, 5-level DAG expands to about a million paths: 8 s and 824 MB for `sit status`, and 3.3 GB over three API calls. It is bounded (2M nodes) and fails closed. Give status and diff a lower ceiling, or stop expanding the HEAD tree there once 1.14.0's DIRC reader lands.
 
 What 1.13.1's refusal left open ([ADR 0003](../adr/0003-no-upward-repo-discovery.md)'s amendment):
 - **Links below a real store.** A `.git/` directory with `refs` and `objects` linked out reads the other repository, and `sit status` lists its tracked paths as `deleted:`, as git does (verified at 1.13.1). The name on `On branch` stays the directory's own, so a prompt shows nothing of it but a dirty marker. `git-new-workdir` makes this shape and `objects/info/alternates` reaches as far on purpose (ADR 0011), so this needs a decision before a refusal.
@@ -107,7 +100,7 @@ Every history walk reads each commit object afresh, about 75 µs apiece. That ma
 
 ### 1.16.2 — an arena per public-API call (R1, rest)
 
-`sit_repo_status` frees every blob and file it compares. What it still keeps, ~94 KB per call on 200 files, is the flattened HEAD tree, the worktree listing and the result records, all on the bump heap. Running each call on an arena rewound at entry, as `sit serve` does per request, would close it. But the returned vec is the caller's, so the records must be copied out or the contract changed (ADR 0009). Measure with `tests/integration/api_heap_probe.cyr`.
+`sit_repo_status` frees every blob and file it compares. What it still keeps, ~94 KB per call on 200 files and ~50 MB on 100,000, is the flattened HEAD tree, the worktree listing and the result records, all on the bump heap. 1.13.2 bounded one walk at 256 MiB and stopped re-walking a tree over it, which closes the hostile case, audit G4. A real tree still pays per call, and that is this item. Running each call on an arena rewound at entry, as `sit serve` does per request, would close it. But the returned vec is the caller's, so the records must be copied out or the contract changed (ADR 0009). Measure with `tests/integration/api_heap_probe.cyr`.
 
 ### 1.16.3 — closeout P(-1) over 1.16.x
 

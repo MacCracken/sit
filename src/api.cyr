@@ -15,6 +15,10 @@
 #   - ann_kind / ann_line / ann_old / ann_new — accessors on the
 #                                 annotated-op records returned by
 #                                 sit_diff_path (defined in diff.cyr)
+#   - sit_last_result()         — why the last call's answer is not the truth
+#                                 (1.13.2; the SIT_* results below)
+#   - sit_set_store_wait(ms)    — how long a call waits for the store lock
+#   - sit_set_diff_limit(b, l)  — the largest file a diff will take on
 #
 # Identifier convention: any name `_`-prefixed is internal and may
 # change without notice. Public names use the `sit_` / `ann_` prefix.
@@ -62,6 +66,7 @@ fn sit_repo_open(cwd) {
     # read through them. Mappings are keyed by resolved path, so they stay.
     store_repo_reset();
     index_db_reset();
+    if (_api_big_head != 0) { store8(_api_big_head, 0); }     # 1.13.2: per repository
     sit_set_repo_root(cwd);
     _git_pack_forget_last();          # 1.7.6: per repo (see _git_pack_locate)
     if (_detect_repo_backend() < 0) {
@@ -78,17 +83,68 @@ fn sit_repo_close(repo) {
     return 0;
 }
 
+# What the last sit_diff_path or sit_repo_status could not do (1.13.2, ADR 0009).
+# sit_diff_path returns 0 for each of these, and sit_repo_status an empty vec: a
+# caller that asks can tell "no changes" from "no answer", and one that does not
+# sees what it always saw. SIT_OK means the answer is the truth. The HEAD results
+# are about any object on the way to the file, a tree or the commit too.
+enum SitResult {
+    SIT_OK = 0,
+    SIT_BUSY = 1,               # another process held the store past the wait
+    SIT_HEAD_TOO_BIG = 2,       # over 16 MiB, or sit_set_diff_limit
+    SIT_HEAD_MISSING = 3,       # HEAD names an object that is not here
+    SIT_HEAD_CORRUPT = 4,       # here, but it does not read
+    SIT_WORK_TOO_BIG = 5,       # over 64 MiB, or sit_set_diff_limit
+    SIT_WORK_UNREADABLE = 6,    # the file is there and cannot be read
+    SIT_DIFF_TOO_BIG = 7,       # the edit distance is past the diff's budget
+    SIT_NOT_COMPARABLE = 8,     # a filter, ident or encoding sit does not apply
+    SIT_TREE_TOO_BIG = 9        # sit_repo_status: HEAD's tree is past the walk's budget
+}
+
+var _api_result = 0;
+var _api_big_head = 0;          # see _sit_repo_status_in
+var _api_wait_ms = 60000;       # sit_set_store_wait
+var _api_max_bytes = 0;         # sit_set_diff_limit; 0 = sit's own ceilings only
+var _api_max_lines = 0;
+
+# Why the last sit_diff_path or sit_repo_status has no answer: a SIT_* value.
+fn sit_last_result() {
+    return _api_result;
+}
+
+# How long a call waits when another process holds the object store, in ms: 0
+# not at all, -1 without limit. Past it the call returns SIT_BUSY. The default is
+# 60 s. Through 1.13.1 there was no limit, and a viewer hung with no output for as
+# long as anyone who could read `.sit/objects.flock` held it. Applies to `.sit/`
+# repositories; a `.git/` repository has no sit store lock.
+fn sit_set_store_wait(ms) {
+    _api_wait_ms = ms;
+    if (ms < 0) { _api_wait_ms = 0 - 1; }
+    return 0;
+}
+
+# The largest file sit_diff_path takes on, either side, in bytes and in lines; 0
+# for no limit of the caller's. A diff keeps about 160 bytes a line, so 16 MiB of
+# newlines is 2.6 GB. Past a limit the call returns SIT_HEAD_TOO_BIG or
+# SIT_WORK_TOO_BIG, having read at most sit's 16 MiB of blob.
+fn sit_set_diff_limit(max_bytes, max_lines) {
+    _api_max_bytes = max_bytes;
+    _api_max_lines = max_lines;
+    return 0;
+}
+
 # Compute the diff between `path`'s HEAD blob and its working-tree contents.
 # Returns a vec of annotated-op records (use `ann_kind` / `ann_line` /
 # `ann_old` / `ann_new` to inspect each), or 0 if the file is either
-# unchanged, absent from both HEAD and the working tree, or the LCS table
-# exceeds its cap (16M cells; see diff.cyr P-15).
+# unchanged or absent from both HEAD and the working tree, or when there is no
+# answer: sit_last_result says which (1.13.2). In a `.git/` repository the worktree
+# side is compared as git compares it, after `.gitattributes`.
 #
 # Shape: ops are line-level (one per old + new line, per LCS edit script).
 # `kind` is 0 = keep / 1 = delete (was in HEAD, removed from working) /
 # 2 = add (in working, not in HEAD). Caller owns the returned vec.
 fn sit_diff_path(repo, path) {
-    _api_enter();
+    if (_api_enter() != 0) { return 0; }
     var ops = _sit_diff_path_in(path);
     _api_leave();
     return ops;
@@ -97,53 +153,172 @@ fn sit_diff_path(repo, path) {
 # 1.11.0: a consumer calls the API for as long as it runs, so the store lock is
 # taken per call (a store session, object_db.cyr), not held from the first read
 # to exit — `sit gc` can run between calls, and the next call reads what it left.
-# A .git/ repository has no sit store lock.
+# A .git/ repository has no sit store lock. 1.13.2: the wait is the caller's, the
+# call's -1 is SIT_BUSY, and a view never creates the lock file.
 fn _api_enter() {
-    if (_repo_backend == 0) { store_enter(); }
+    _api_result = SIT_OK;
+    if (_repo_backend == 0) {
+        _store_session_wait_ms = _api_wait_ms;
+        _store_lock_create = 0;
+        if (store_enter() != 0) {
+            _store_lock_create = 1;
+            _api_result = SIT_BUSY;
+            return 0 - 1;
+        }
+    }
     return 0;
 }
 
 # The end of an API call: give the store lock back.
 fn _api_leave() {
-    if (_repo_backend == 0) { store_leave(); }
+    if (_repo_backend == 0) {
+        store_leave();
+        _store_lock_create = 1;
+    }
     return 0;
+}
+
+# The result for an object that would not read, from what the read said.
+fn _api_head_result() {
+    if (_obj_fail == OBJ_TOO_BIG) { return SIT_HEAD_TOO_BIG; }
+    if (_obj_fail == OBJ_CORRUPT) { return SIT_HEAD_CORRUPT; }
+    return SIT_HEAD_MISSING;
+}
+
+# The lines in `len` bytes at `buf`: one per LF, and one for a last line without.
+fn _api_lines(buf, len) {
+    var n = 0;
+    var i = 0;
+    while (i < len) {
+        if ((load8(buf + i) & 0xFF) == 10) { n = n + 1; }
+        i = i + 1;
+    }
+    if (len > 0) {
+        if ((load8(buf + len - 1) & 0xFF) != 10) { n = n + 1; }
+    }
+    return n;
+}
+
+# 1 when a side of a diff is past the caller's line limit.
+fn _api_over_lines(buf, len) {
+    if (_api_max_lines <= 0) { return 0; }
+    if (len <= _api_max_lines) { return 0; }         # no more lines than bytes
+    if (_api_lines(buf, len) > _api_max_lines) { return 1; }
+    return 0;
+}
+
+# HEAD's side of `path`, found by reading one tree per path component: 1 with the
+# blob at obj24 (and whether it is a symlink at link8), 0 when HEAD has no file
+# there, -1 with the result set. 1.13.2: flatten_tree expanded all of HEAD to find
+# one path, ~34 MB per file viewed in a 100,000-file repository, kept for good, and
+# gigabytes from a 200 KB tree that repeats a subtree (issue 2026-10-31).
+fn _api_head_side(path, obj24, link8) {
+    store64(link8, 0);
+    var head = read_head_ref();
+    if (head == 0) { return 0; }
+    obj_fail_clear();
+    var tree = commit_tree_hex(head);
+    if (tree == 0) { _api_result = _api_head_result(); return 0 - 1; }
+    var hex[72];
+    var k = tree_path_find(tree, path, strlen(path), &hex);
+    if (k < 0) { _api_result = _api_head_result(); return 0 - 1; }
+    if (k != 1) { return 0; }                        # nothing there, or a directory
+    if (_tree_found_kind == 2) { return 0; }         # a gitlink: another repository's
+    if (_tree_found_kind == 1) { store64(link8, 1); }
+    if (read_object(&hex, obj24) != 0) { _api_result = _api_head_result(); return 0 - 1; }
+    var blen = load64(obj24 + 8) - load64(obj24 + 16);
+    var over = 0;
+    if (_api_max_bytes > 0) {
+        if (blen > _api_max_bytes) { over = 1; }
+    }
+    if (over == 0) { over = _api_over_lines(load64(obj24) + load64(obj24 + 16), blen); }
+    if (over == 1) {
+        fl_free(load64(obj24));
+        _api_result = SIT_HEAD_TOO_BIG;
+        return 0 - 1;
+    }
+    return 1;
+}
+
+# The worktree's side of `path`: 1 with {ptr, len} at out16 (and whether it is a
+# symlink at link8), 0 when there is no file there, -1 with the result set.
+# 1.13.2: one that cannot be read is not a deletion: a file behind a lost
+# permission came back with every line removed. Nor is a symlink a file: its side
+# is its target, as git stores it, and the file it points at, which can be anywhere,
+# is not read. Below a symlinked directory is nothing (wt_readable, audit G1).
+fn _api_work_side(path, out16, link8) {
+    store64(link8, 0);
+    if (_sf_parent_symlink(path) == 1) { return 0; }
+    var ab[4352];
+    var ap = sit_abs_into(path, &ab, 4352);
+    if (ap == 0) { _api_result = SIT_WORK_UNREADABLE; return 0 - 1; }
+    var kind = path_lstat_kind(ap);
+    if (kind < 0) {
+        if (path_is_absent(ap) == 1) { return 0; }
+        _api_result = SIT_WORK_UNREADABLE;
+        return 0 - 1;
+    }
+    if (kind == 0xA000) {
+        var lb = fl_alloc(4096);
+        if (lb == 0) { _api_result = SIT_WORK_UNREADABLE; return 0 - 1; }
+        var n = xreadlink(ap, lb, 4096);
+        if (n < 0) {
+            fl_free(lb);
+            _api_result = SIT_WORK_UNREADABLE;
+            return 0 - 1;
+        }
+        store64(link8, 1);
+        store64(out16, lb);
+        store64(out16 + 8, n);
+        return 1;
+    }
+    if (kind != 0x8000) { return 0; }                # a directory: the file is gone
+    if (_api_max_bytes > 0) {
+        if (path_size(ap) > _api_max_bytes) { _api_result = SIT_WORK_TOO_BIG; return 0 - 1; }
+    }
+    var rc = read_file_fl(path, out16);
+    if (rc == 0 - 4) { _api_result = SIT_WORK_TOO_BIG; return 0 - 1; }
+    if (rc != 0) { _api_result = SIT_WORK_UNREADABLE; return 0 - 1; }
+    if (_api_over_lines(load64(out16), load64(out16 + 8)) == 1) {
+        fl_free(load64(out16));
+        _api_result = SIT_WORK_TOO_BIG;
+        return 0 - 1;
+    }
+    return 1;
 }
 
 # sit_diff_path's body, inside a store session.
 fn _sit_diff_path_in(path) {
     if (path == 0) { return 0; }
 
-    # Resolve HEAD's blob hash for `path`. Treat "no HEAD" / "path absent
-    # from HEAD" the same as "old buffer is empty" so an all-added file
-    # still yields useful annotations.
-    var head_entries = read_head_tree_entries();
+    # "No HEAD" and "path absent from HEAD" are an empty old side, so an
+    # all-added file still yields useful annotations.
+    var obj[24];
+    var head_link[8];
+    var hs = _api_head_side(path, &obj, &head_link);
+    if (hs < 0) { return 0; }
     var old_buf = 0;
     var old_len = 0;
     var old_base = 0;
-    var obj[24];
-    if (head_entries != 0) {
-        var he = tree_find(head_entries, path);
-        if (he != 0) {
-            var head_hex = tree_entry_hash(he);
-            if (read_object(head_hex, &obj) == 0) {
-                old_base = load64(&obj);
-                old_buf = old_base + load64(&obj + 16);
-                old_len = load64(&obj + 8) - load64(&obj + 16);
-            }
-        }
-        tree_find_release(head_entries);    # 1.7.6 (R1)
+    if (hs == 1) {
+        old_base = load64(&obj);
+        old_buf = old_base + load64(&obj + 16);
+        old_len = load64(&obj + 8) - load64(&obj + 16);
     }
 
-    # Resolve working-tree contents. Path missing from disk → empty new
-    # buffer (yields an all-delete diff against HEAD).
+    # A path gone from the worktree is an empty new side, an all-delete diff.
     var new_buf = 0;
     var new_len = 0;
     var wp[16];
-    if (wt_readable(path) == 1) {
-        if (read_file_fl(path, &wp) == 0) {
-            new_buf = load64(&wp);
-            new_len = load64(&wp + 8);
-        }
+    var work_link[8];
+    var ws = _api_work_side(path, &wp, &work_link);
+    if (ws < 0) {
+        if (old_base != 0) { fl_free(old_base); }
+        return 0;
+    }
+    if (ws == 1) {
+        new_buf = load64(&wp);
+        new_len = load64(&wp + 8);
     }
 
     # Nothing on either side: no diff to report.
@@ -155,12 +330,31 @@ fn _sit_diff_path_in(path) {
     # compressed) cost 2.6 GB in the caller's process. Both buffers are freed.
     if (old_buf != 0) {
         if (new_buf != 0) {
-            if (old_len == new_len) {
-                if (memeq(old_buf, new_buf, old_len) == 1) {
-                    fl_free(new_buf);
-                    fl_free(old_base);
-                    return 0;
+            var same = 0;
+            if (old_len == new_len) { same = memeq(old_buf, new_buf, old_len); }
+            # 1.13.2: bytes that differ may still be what git calls unchanged.
+            if (same == 0) {
+                if (_repo_backend == 1) {
+                    if (load64(&head_link) == 0) {
+                        if (load64(&work_link) == 0) {
+                            var cl = gitattr_clean(path, new_buf, new_len, old_buf, old_len);
+                            gitattr_reset();
+                            if (cl < 0) {
+                                fl_free(new_buf);
+                                fl_free(old_base);
+                                _api_result = SIT_NOT_COMPARABLE;
+                                return 0;
+                            }
+                            new_len = cl;
+                            if (old_len == new_len) { same = memeq(old_buf, new_buf, old_len); }
+                        }
+                    }
                 }
+            }
+            if (same == 1) {
+                fl_free(new_buf);
+                fl_free(old_base);
+                return 0;
             }
         }
     }
@@ -171,6 +365,7 @@ fn _sit_diff_path_in(path) {
     if (ops == 0) {
         if (new_buf != 0) { fl_free(new_buf); }
         if (old_base != 0) { fl_free(old_base); }
+        _api_result = SIT_DIFF_TOO_BIG;
     }
     return ops;
 }
@@ -192,14 +387,16 @@ fn sit_repo_branch(repo) {
 
 # Per-file HEAD-vs-working-tree status for the open repo. Returns a vec of
 # opaque status records — read each with sit_status_path / sit_status_kind.
-# Kinds: 1 = modified, 2 = new (untracked), 3 = deleted. Unmodified files are
-# omitted. Backend-aware (roadmap 1.2.0): works on sit-native and existing git
+# Kinds: 1 = modified, 2 = new (untracked), 3 = deleted, 4 = not compared (sit
+# cannot tell: 1.13.2, _status_blob_differs). Unmodified files are omitted. When
+# there is no answer at all the vec is empty, and sit_last_result says why.
+# Backend-aware (roadmap 1.2.0): works on sit-native and existing git
 # repos. v1 scope is HEAD-vs-worktree only — no staging-index (git .git/index /
 # sit patra index) staged/unstaged split, and untracked honours the top-level
 # ignore file (.gitignore in git mode). New public surface (ADR 0009): additive,
 # SemVer-minor. Caller owns the returned vec.
 fn sit_repo_status(repo) {
-    _api_enter();
+    if (_api_enter() != 0) { return vec_new(); }
     var out = _sit_repo_status_in();
     _api_leave();
     return out;
@@ -207,11 +404,35 @@ fn sit_repo_status(repo) {
 
 # sit_repo_status's body, inside a store session: the records `sit status`
 # prints for a `.git/` repository (compute_status_records, diff.cyr, 1.12.0).
+#
+# 1.13.2: a walk keeps what it built on the heap, up to the 256 MiB budget, and a
+# consumer asks on every refresh, so 3.3 GB went in three calls on a hostile tree
+# (audit G4). A commit whose tree went over is remembered and not walked again.
 fn _sit_repo_status_in() {
-    return compute_status_records();
+    var head = read_head_ref();
+    if (head != 0) {
+        if (_api_big_head != 0) {
+            if (streq(head, _api_big_head) == 1) {
+                _api_result = SIT_TREE_TOO_BIG;
+                return vec_new();
+            }
+        }
+    }
+    var recs = compute_status_records();
+    if (_status_tree_failed == 1) {
+        if (_tree_walk_fail == 1) {
+            _api_result = SIT_TREE_TOO_BIG;
+            if (_api_big_head == 0) { _api_big_head = alloc_or_die(72); }
+            var hl = _id_hexlen();
+            memcpy(_api_big_head, head, hl);
+            store8(_api_big_head + hl, 0);
+        }
+        else { _api_result = _api_head_result(); }
+    }
+    return recs;
 }
 
 # Accessors on a status record (mirror the ann_* pattern; opaque layout).
 fn sit_status_path(rec) { return load64(rec); }
-# Status kind of a record: 1 = modified, 2 = new (untracked), 3 = deleted.
+# Status kind of a record: 1 = modified, 2 = new (untracked), 3 = deleted, 4 = not compared.
 fn sit_status_kind(rec) { return load64(rec + 8); }

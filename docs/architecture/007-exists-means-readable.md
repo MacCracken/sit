@@ -36,3 +36,7 @@ The reverse case matters as much. A worktree path under a symlinked directory ex
 - **To ask "is there something here", use `path_lstat_kind(sit_abs(p)) >= 0`** (or `_sf_special` / `path_is_regular` for the kind). Use `sf_exists` only where "absent" and "unreadable" may safely be treated the same — usually because the next step is a read that would fail anyway.
 - **Before opening a file only to read it, check it is a regular file.** `read_file_heap`, `read_file_fl`, read-only `sf_open` and the git readers do this since 1.7.6; `sf_exists` itself refuses to open anything but a regular file or a directory.
 - An absent file and an unreadable one are different errors. Say which.
+
+## A failed `lstat` is not an answer either (1.13.2)
+
+`path_lstat_kind` returns -1 for "not there" and for "cannot look", and a file behind a directory that lost its `x` bit gives the second. `sit_diff_path` read that as deleted and marked every line removed. Where a read answers a consumer, ask `path_is_absent`, which is 1 only for `ENOENT` / `ENOTDIR`. Anything else is an error to report (`SIT_WORK_UNREADABLE`), not an absence.

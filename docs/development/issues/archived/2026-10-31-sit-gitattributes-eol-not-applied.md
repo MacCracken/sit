@@ -1,4 +1,6 @@
-# `.gitattributes` eol / text / filter rules are not applied in git read mode — OPEN
+# `.gitattributes` eol / text / filter rules are not applied in git read mode — RESOLVED
+
+**Resolution:** Closed in sit 1.13.2: `src/git_attr.cyr`. `filter`, `ident` and `working-tree-encoding` are `SIT_NOT_COMPARABLE`. `core.autocrlf` and the global attribute files are not read. See ADR 0011's amendment.
 
 **Discovered:** 2026-10-31 during owl's P(−1) audit (1.5.3, INFO-007), VCS-path review.
 **Severity:** Low. Wrong change markers for files git considers clean; no crash, no data risk.

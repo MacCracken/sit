@@ -57,3 +57,25 @@ R2, reading trees as git wrote them:
 - In a `.git/` repository `parse_tree` keeps every mode git writes (100644, 100755, 100664, 120000, 160000, 40000). It drops only names no reader can use (empty, `.`, `..`, `.git` in any case, a `/`), so the checkout-safety rules (NTFS names, `:`, trailing dots) no longer apply to a repository sit never checks out. sit's own trees keep the strict rules.
 - Status compares a symlink by its target. A file replaced by a symlink or a directory counts as modified, and in a `.git/` repository so does a flipped executable bit (git's `core.fileMode`). A gitlink is neither compared nor walked into, and an untracked directory holding a `.git` is listed once, as `dir/`.
 - `objects/info/alternates` is followed for loose objects, packs and short ids, chained as git chains them, up to 6 directories. A listed directory that does not exist is reported once and skipped. Like git, sit reads objects from wherever the repository points.
+
+## Amendment (1.13.2) — the last read commands, and `.gitattributes`
+
+**`blame`, `describe` and `merge-base` open a `.git/` repository**, through `cli_read_repo`, at the repository's id width.
+
+- `blame` walks the first parent, so it is `git blame --first-parent`. It finds its path through `tree_path_find` and skips a commit whose blob id matches its parent's, 4,187 ms → 36 ms on a 10,000-file tree of 41 commits.
+- `describe` reads tags of both kinds, loose and from `packed-refs`, so it is `git describe --tags`. It names the tag with the fewest commits in `<tag>..<commit>`. That is not always what git prints: git sorts candidates on interim depths and finishes the count only for the winner, so it can print `v8-11` with `rel/v6` at 7. Its short id stays a fixed 12 hex, and a tie goes to sit's rule (annotated, then the smaller name), not to git's commit date.
+- `merge-base` prints one base. On a criss-cross it is one of `git merge-base --all`.
+- `.git/shallow` is not read. A parent that is not there ends the walk, as it does in git.
+
+**`status`, `diff`, `sit_diff_path` and `sit_repo_status` compare a file as git compares it** (`src/git_attr.cyr`). git stores a `text` file with LF and cleans the worktree side before comparing, so a CRLF working copy of an LF blob is clean. Byte-for-byte, every line of it read as changed.
+
+- Only bytes that differ reach this. A file identical to its blob is clean whatever its attributes say, which is also what git's stat cache answers after a checkout, so a clean tree reads no attribute file.
+- Rules are read from the root `.gitattributes`, each directory's on the way to the file, and `.git/info/attributes`, resolved as `attr.c` resolves them: highest precedence first, lines and states last to first, the first value an attribute meets stands, and a macro expands only at the assignment that wins. A forward last-rule-wins reading gives wrong answers on real files: after `x mine` and a later `* -mine`, `mine` never expands for `x`.
+- `text`, `crlf`, `eol` and `text=auto` follow `convert.c`, including `auto`'s two refusals: a file that looks binary, and a blob that already holds CRLF.
+- `filter`, `ident` and `working-tree-encoding` are conversions sit does not run. Such a file reads as *not compared* when its bytes differ, never as changed. Running a filter would execute a command named by the repository, which is exactly what a read-only view of a repository from anywhere must not do.
+
+Not read: the global and system attribute files, and `core.autocrlf` / `core.eol`, which sit does not take from a user's home. A repository relying on those still shows CRLF working copies as changed. `.gitattributes` from the index is not read either (git falls back to it when the worktree copy is gone).
+
+A `.gitattributes` that is not a regular file is not read, as in git since 2.32. One over 1 MiB is passed over, where git's limit is 100 MiB. A pattern over `_wildmatch`'s 256 bytes matches nothing.
+
+`_wildmatch` gained git's `[:class:]`, `^` and `\\` escapes for this, since `[[:space:]]` is how an attribute pattern spells a space, and ignore rules get them too.

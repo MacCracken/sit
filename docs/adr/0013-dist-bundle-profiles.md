@@ -32,7 +32,7 @@ Membership rules:
 
 - **Positive** — report-only consumers compile sit with no shims and no wire warnings, and carry no signing or network code.
 - **Positive** — both profiles expose the same public API (`sit_repo_open` / `_branch` / `_status` / `_diff_path`, `ann_*`, `sit_status_*`), so a consumer can move between them without code changes.
-- **Negative** — two bundles to keep in sync. CI's dist-sync step and the integration suite's library probe guard the full bundle.
+- **Negative** — two bundles to keep in sync. CI's dist-sync step and the integration suite's library probes guard both, and integration section 49 fails on any unresolved symbol outside the list below (1.13.2).
 - **Negative** — a few symbols are deliberately left unresolved in each bundle because they sit on paths the profile never executes. In the read bundle these are `load_signing_seed`, `sign_commit_body` and `verify_commit_body`, reachable only from commit's signing path. In the full bundle they are the SSH / HTTPS transport entry points. This is safe only while those paths stay unreachable from consumer code; the compiler refuses a reachable undefined call.
 - **Neutral** — owl is a candidate to move onto the read profile alongside thoth.
 

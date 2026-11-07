@@ -4,6 +4,94 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.13.2] — 2026-11-06 — the read API says why, `.gitattributes`, and the last read commands on `.git/`
+
+Closes the five issues owl's P(-1) audit filed against sit on 1.13.0, and the roadmap's 1.13.2 slot. Nothing changes in the on-disk format or the wire protocol, and no existing public signature or return shape changes. The toolchain stays at cyrius 6.7.18. New: `src/git_attr.cyr`. ADR 0009 and ADR 0011 gain amendments, and [the audit note](docs/audit/2026-11-06-1.13.2-audit.md) records the findings.
+
+### Added — the read API can say it has no answer
+
+`sit_diff_path` had one success shape, so a consumer could not tell "no changes" from "no answer". Three additive names in `api.cyr` ([ADR 0009](docs/adr/0009-public-api-contract.md)'s amendment):
+
+- **`sit_last_result()`**: why the last `sit_diff_path` or `sit_repo_status` has no answer. `SIT_OK`, `SIT_BUSY`, `SIT_HEAD_TOO_BIG`, `SIT_HEAD_MISSING`, `SIT_HEAD_CORRUPT`, `SIT_WORK_TOO_BIG`, `SIT_WORK_UNREADABLE`, `SIT_DIFF_TOO_BIG`, `SIT_NOT_COMPARABLE`, `SIT_TREE_TOO_BIG`. The calls still return 0, or an empty vec, so a consumer that does not ask sees what it always saw.
+- **`sit_set_store_wait(ms)`**: how long a call waits for the store lock. 0 not at all, -1 no limit, 60 s by default.
+- **`sit_set_diff_limit(max_bytes, max_lines)`**: the largest file `sit_diff_path` takes on, either side. A diff keeps about 160 bytes a line, so 16 MiB of newlines is 2.6 GB.
+- **`sit_status_kind` gains 4, not compared**: a tracked file sit cannot tell about. `sit status` lists these under `Not compared`, and `sit diff` names them on stderr.
+
+These are `sit_*` additions, which ADR 0009 and the roadmap's tiers put in a minor. They ship in this patch because it was cut as one. ADR 0009's amendment says so.
+
+### Added — `blame`, `describe` and `merge-base` on a `.git/` repository
+
+The last read-only commands that refused one. They open through `cli_read_repo`, at the repository's id width, in both object formats. [ADR 0011](docs/adr/0011-git-read-mode.md)'s amendment gives the detail.
+
+- **`blame`** is `git blame --first-parent`. It finds its path through `tree_path_find` and skips a commit whose blob id matches its parent's.
+- **`describe`** is `git describe --tags`: loose and packed tags of both kinds, a loose tag shadowing a packed one. It names the tag with the fewest commits in `<tag>..<commit>`, which git does not always do: git sorts candidates on interim depths and finishes the count only for the winner, so it printed `v8-11` here with `rel/v6` at 7.
+- **`merge-base`** prints one base, on a criss-cross one of `git merge-base --all`.
+
+### Added — `.gitattributes` in git read mode (`src/git_attr.cyr`)
+
+`status`, `diff`, `sit_diff_path` and `sit_repo_status` compare a file as git does. git stores a `text` file with LF and cleans the worktree side first, so a CRLF working copy of an LF blob is clean; byte for byte, every line of it read as changed. Rules come from the root `.gitattributes`, each directory's on the way to the file, and `.git/info/attributes`. They resolve as `attr.c` resolves them: precedence, last line, macros and all. `text`, `crlf`, `eol` and `text=auto` follow `convert.c`, including `auto`'s refusal of a file that looks binary and of a blob already holding CRLF.
+
+- Only bytes that differ reach it, so a clean tree reads no attribute file.
+- **`filter`, `ident` and `working-tree-encoding` are not run.** Such a file is *not compared* when its bytes differ. A filter is a command the repository names, and a read-only view of a repository from anywhere does not execute one.
+- Not read: the global and system attribute files, and `core.autocrlf` / `core.eol`.
+- `_wildmatch` gains git's `[:class:]`, `^` and `\` escapes, since `[[:space:]]` is how an attribute pattern spells a space. Ignore rules get them too.
+
+### Security
+
+- **A small repository could exhaust a viewer's memory (HIGH).** To diff one path, `sit_diff_path` flattened all of HEAD on a never-freed heap, and a tree repeating one subtree costs almost nothing to store. A 200 KB `.git` took owl to 1.7 GB, and at the 2M-entry cap to out of memory, just by viewing a file in it. It now reads one tree per path component (`tree_path_find`).
+- **`flatten_tree` is bounded in bytes.** `_TREE_MAX_NODES` bounded entries, not bytes, and a path can be 65 KB. The walk now also stops at 256 MiB, inside a tree as well as between trees (`_TREE_MAX_BYTES`), which is about a million real files, and frees each tree it reads. `sit_repo_status` fails closed with `SIT_TREE_TOO_BIG`, and `sit status` exits 1, where every file came back as new. A commit whose tree went over is remembered, so a consumer polling status pays once (audit G4).
+- **A read-only view could be hung, and wrote to the repository it viewed (MEDIUM).** The read API waited without limit on the store lock, and `flock` needs only read access, so anyone who could read a shared repository could hang every viewer of it. The wait now ends, and a read-only view no longer creates `.sit/objects.flock`.
+- **`sit_diff_path` followed a tracked symlink (MEDIUM).** A link retargeted in a worktree read the file it pointed at, wherever that was, into the caller's diff. A symlink's side is now its target, as git stores it.
+- **`sit blame` printed an author's bytes raw.** An escape sequence in a `.git/` author reached the terminal. It goes through `write_sanitized` now, as `log` and `show` do.
+
+### Fixed
+
+- **"Could not read it" is no longer an answer (MEDIUM).** Each of these came back as if it were the truth:
+  - A HEAD blob over 16 MiB, missing or corrupt read as absent, so `sit_diff_path` marked every line of an unchanged 23 MB file as added. It is now `SIT_HEAD_TOO_BIG`, `_MISSING` or `_CORRUPT`, and the reason is recorded where it is known (`obj_fail_note`).
+  - A diff past its budget returned 0, the same as no changes. It is now `SIT_DIFF_TOO_BIG`.
+  - A worktree file that could not be read was deleted, with every line removed. It is now `SIT_WORK_UNREADABLE`, and `SIT_WORK_TOO_BIG` over 64 MiB. A closed parent directory counts too: `path_is_absent` is 1 only for `ENOENT` / `ENOTDIR`.
+  - `sit status` called a file it could not compare modified. An unchanged file over 16 MiB is now *not compared*. A different size is still modified, read from the object's header without inflating it, through a delta chain included. A sit repository hashes the file and has an exact answer at any size.
+- **A pack directory past about 10,000 entries read every packed object as missing.** Its listing buffers grew one at a time on a shared count of tries. They now double together. A pack entry over the 16 MiB ceiling is also refused before its buffer is allocated.
+- **`dist/sit-read.cyr` referenced `commit_tree_hex`, which it did not define** (1.7.6 to 1.13.1). The function moved to `commit.cyr`, so every consumer build is back to the three documented warnings.
+- **`sit blame` printed a last line with no newline as empty.** It took the length word of a `split_lines` record raw, with its no-EOL flag.
+- `commit_tree_hex`, `commit_parents_of` and `_blame_author_of` free the commit they read, and `commit_tree_entries` now shares `commit_tree_hex`'s parse.
+
+### Performance
+
+Measured on the release binary and the `read_result_probe` / `api_heap_probe` builds of the read bundle.
+
+| | 1.13.1 | 1.13.2 |
+|---|---:|---:|
+| `sit_diff_path`, tree bomb N = 100 (200 KB `.git`), peak RSS | 1,731 MB (owl) | 5.2 MB |
+| `sit_diff_path`, tree bomb N = 2,000, peak RSS | out of memory | 5.2 MB |
+| `sit_diff_path`, real 100,000-file tree, heap kept per call | 31,955,208 B | 200 B |
+| the same, RSS grown over 3 calls | 108 MB | 0 |
+| `sit status`, tree bomb N = 100 | 42.7 s | 0.8 s, refused |
+| three `sit_repo_status` calls on a bomb, peak RSS | 3.3 GB (audit G4) | 267 MB |
+| `sit blame`, 10,000-file tree, 41 commits (identical output) | 4,187 ms | 36 ms |
+| `sit status`, real 100,000-file tree | 2,333 ms | 2,324 ms |
+| `is_ignored`, 10 / 50 patterns, paired runs | 8.66 / 43.0 µs | 8.55 / 42.6 µs |
+
+### Changed
+
+- The default wait on the store lock through the read API is 60 s, where it had no limit. Set it with `sit_set_store_wait`.
+- A file in `.git/` read mode whose bytes differ only by what `.gitattributes` normalizes is clean. It was modified.
+- **The roadmap.** The 1.13.2 slot is done and deleted, as is G4 from 1.13.3. What a real tree keeps per status call, ~50 MB at 100,000 files, stays with 1.16.2's arena.
+
+### Not closed
+
+- `core.autocrlf`, `core.eol` and the global attribute files are not read, so a repository relying on those still shows a CRLF working copy as changed.
+- A file over 16 MiB of unchanged size cannot be told from a same-size edit in a `.git/` repository: sit computes no SHA-1 (ADR 0011). It reads as not compared until 1.14.0's DIRC reader gives status git's stat data.
+- `describe`'s tie between two candidates at one count goes to sit's rule, not git's commit date, and two annotated tags on one commit go by name, not tagger date.
+
+### Tests
+
+- **Integration sections 49–52**, 108 assertions. 49 compares what every probe build leaves undefined against architecture 006's table, per bundle. 50 runs the issues' repros through `read_result_probe.cyr`, a new probe against the shipped read bundle. 51 covers `.gitattributes`, hostile files included (a symlink, a FIFO, one past its size). 52 covers the three commands, and that a `.git/` repository is byte-identical afterwards.
+- **`gitattr_diff.py`**: random rules, blobs and working copies, with git's `status` as the expected answer. 4,000 rounds, 36,469 files, 2,852 of them differing only until cleaned, 0 mismatches. It found the macro-precedence bug on the way, and 1.13.1 fails it within a dozen rounds.
+- **`readcmd_diff.py`**: random histories of merges and tags, in SHA-1 and SHA-256, loose and packed, against `git blame --first-parent --porcelain`, `git merge-base --all` and `git rev-list`. 1,200 rounds, 13,990 checks, 0 mismatches.
+- **`test_1132_gitattr`, `test_1132_obj_fail`** (70 assertions) and **`fuzz_gitattr`** (200,000 rounds).
+- 816 unit / 1215 integration / 27 fuzz, and unit plus fuzz under poisoned allocators, A/B identical. owl and thoth build against the new bundle with one warning fewer and no symbol collision.
+
 ## [1.13.1] — 2026-11-06 — a repository stays where sit stands
 
 A security patch, from a review of commandress on 1.13.0. commandress's `vcs` segment runs `sit status` in whatever directory a prompt is in and sees only its stdout, so the rule has to be sit's. Nothing changes in the on-disk format, the wire protocol or the public API's signatures. The toolchain stays at cyrius 6.7.18. [ADR 0003](docs/adr/0003-no-upward-repo-discovery.md) gains an amendment.

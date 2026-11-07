@@ -229,8 +229,8 @@ fn list_working_files() {
 #
 # The records sit_repo_status returns for either backend, and `sit status`
 # prints for a `.git/` repository (whose index sit does not read): {path, kind},
-# kind 1 modified, 2 new (untracked), 3 deleted. Shared so the library and the
-# command can never disagree.
+# kind 1 modified, 2 new (untracked), 3 deleted, 4 not compared (1.13.2: see
+# _status_blob_differs). Shared so the library and the command can never disagree.
 #
 # Mode-aware (R2): a symlink (120000) is compared by its target, as git stores
 # it; a regular file whose place holds a symlink or a directory is modified; on
@@ -247,37 +247,91 @@ fn _status_push(vec, path, kind) {
     return 0;
 }
 
-# Byte-compare a HEAD blob (named by id `hex`) against working file `path`.
-# Returns 1 if they differ (or either can't be read), 0 if identical. Uses a
-# content compare rather than a re-hash so it needs no hash primitive — which
-# is what lets it work on a git SHA-1 repo without a first-party SHA-1.
+# A status record's kind for a file sit could not compare with HEAD (1.13.2).
+enum StatusKind { STATUS_NOT_COMPARED = 4 }
+
+# Set when compute_status_records could not read HEAD's tree: it then returned
+# no records, and `_tree_walk_fail` / `_obj_fail` say why.
+var _status_tree_failed = 0;
+
+# How a blob sit could not read (obj_fail_note says why) compares with the
+# working file `path`, as _status_blob_differs reports it. Past the 16 MiB read
+# ceiling a sit id is a hash sit can compute. A `.git/` id is SHA-1, which sit does
+# not compute (ADR 0011), so there the object's own size is all it has: a different
+# size is a change, unless a conversion could explain it, and the same size says
+# nothing either way.
+fn _status_unread_blob(hex, path) {
+    if (_obj_fail != OBJ_TOO_BIG) { return STATUS_NOT_COMPARED; }
+    if (_repo_backend == 0) {
+        var wh = hash_file_as_blob(path);
+        if (wh == 0) { return STATUS_NOT_COMPARED; }
+        if (streq(wh, hex) == 1) { return 0; }
+        return 1;
+    }
+    var size = _obj_fail_size;
+    if (size < 0) { return STATUS_NOT_COMPARED; }
+    var ab[4352];
+    var ap = sit_abs_into(path, &ab, 4352);
+    if (ap == 0) { return STATUS_NOT_COMPARED; }
+    if (path_size(ap) == size) { return STATUS_NOT_COMPARED; }
+    if (gitattr_action(path) != GC_NONE) { return STATUS_NOT_COMPARED; }
+    return 1;
+}
+
+# Compare a HEAD blob (named by id `hex`) with working file `path`: 0 identical,
+# 1 different, STATUS_NOT_COMPARED when sit cannot tell. Uses a content compare
+# rather than a re-hash so it needs no hash primitive — which is what lets it
+# work on a git SHA-1 repo without a first-party SHA-1.
 #
 # 1.7.6 (R1): both buffers are freed before returning. The blob (a freelist
 # buffer from either backend) and a heap copy of the worktree file were kept
 # per file per call — about 10 MB per sit_repo_status on 200 files of 50 KB, in
 # the consumer's process, for as long as it ran.
+#
+# 1.13.2: "either cannot be read" is no longer "different": an unchanged 23 MB
+# tracked file came back modified, because its blob is past the read ceiling.
+# And in a `.git/` repository the bytes that differ are compared as git compares
+# them, after the conversion `.gitattributes` asks for (git_attr.cyr).
 fn _status_blob_differs(hex, path) {
     var obj[24];
-    if (read_object(hex, &obj) != 0) { return 1; }
+    obj_fail_clear();
+    if (read_object(hex, &obj) != 0) { return _status_unread_blob(hex, path); }
     var ob = load64(&obj) + load64(&obj + 16);
     var ol = load64(&obj + 8) - load64(&obj + 16);
     var wp[16];
-    if (read_file_fl(path, &wp) != 0) { fl_free(load64(&obj)); return 1; }
+    var wr = read_file_fl(path, &wp);
+    if (wr != 0) {
+        fl_free(load64(&obj));
+        if (wr == 0 - 4) { return 1; }                    # past 64 MiB; no blob reads past 16
+        return STATUS_NOT_COMPARED;
+    }
     var nb = load64(&wp);
     var nl = load64(&wp + 8);
     var differ = 0;
     if (ol != nl) { differ = 1; }
     else { if (memeq(ob, nb, ol) == 0) { differ = 1; } }
+    if (differ == 1) {
+        if (_repo_backend == 1) {
+            var cl = gitattr_clean(path, nb, nl, ob, ol);
+            if (cl < 0) { differ = STATUS_NOT_COMPARED; }
+            else {
+                if (cl == ol) {
+                    if (memeq(ob, nb, ol) == 1) { differ = 0; }
+                }
+            }
+        }
+    }
     fl_free(nb);
     fl_free(load64(&obj));
     return differ;
 }
 
 # 1 when the symlink at the resolved path `ap` points somewhere other than the
-# blob `hex` says (git stores a link's target as its blob), or either is unreadable.
+# blob `hex` says (git stores a link's target as its blob), or the link cannot be
+# read; STATUS_NOT_COMPARED when the blob cannot.
 fn _status_link_differs(hex, ap) {
     var obj[24];
-    if (read_object(hex, &obj) != 0) { return 1; }
+    if (read_object(hex, &obj) != 0) { return STATUS_NOT_COMPARED; }
     var ob = load64(&obj) + load64(&obj + 16);
     var ol = load64(&obj + 8) - load64(&obj + 16);
     var lb[4096];
@@ -293,7 +347,7 @@ fn _status_link_differs(hex, ap) {
 }
 
 # How the worktree compares with HEAD's entry `e` at `path`: 0 unchanged,
-# 1 modified, 3 deleted.
+# 1 modified, 3 deleted, STATUS_NOT_COMPARED when sit cannot tell.
 fn _status_entry_state(e, path) {
     if (_sf_parent_symlink(path) == 1) { return 3; }    # 1.12.2 (G1): not through a link
     var ab[4352];
@@ -319,9 +373,20 @@ fn _status_entry_state(e, path) {
 }
 
 # HEAD-against-worktree status records for the open repository (see above).
+# 1.13.2: a HEAD whose tree cannot be read gives no records and sets
+# `_status_tree_failed`. It was taken for "nothing tracked", the safe reading for
+# a dirty check but not for a status: every file came back as new.
 fn compute_status_records() {
+    _status_tree_failed = 0;
     var out = vec_new();
+    obj_fail_clear();
     var head_entries = read_head_tree_entries();
+    if (head_entries == 0) {
+        if (read_head_ref() != 0) {
+            _status_tree_failed = 1;
+            return out;
+        }
+    }
     var gitlinks = 0;
     if (head_entries != 0) {
         var hn = vec_len(head_entries);
@@ -355,6 +420,7 @@ fn compute_status_records() {
         j = j + 1;
     }
     if (head_entries != 0) { tree_find_release(head_entries); }   # 1.7.6 (R1)
+    gitattr_reset();
     return out;
 }
 
@@ -375,9 +441,18 @@ fn _diff_worktree_side(path, out16) {
     return read_file_heap(path, out16);
 }
 
+# `path`, said on stderr as a file `sit diff` left out because sit cannot compare it.
+fn _diff_say_not_compared(path) {
+    syscall(SYS_WRITE, STDERR, "sit: not compared: ", 19);
+    write_sanitized(STDERR, path, strlen(path));
+    syscall(SYS_WRITE, STDERR, "\n", 1);
+    return 0;
+}
+
 # `sit diff [<commit>]` on a `.git/` repository: each file of `entries` (a
 # flattened tree) the worktree changed or deleted, against its blob. Gitlinks
-# are another repository's.
+# are another repository's. 1.13.2: the worktree side as git compares it, after
+# what `.gitattributes` asks for, and a file sit cannot compare is said, not diffed.
 fn _diff_worktree_git(entries, ctx) {
     var n = vec_len(entries);
     var i = 0;
@@ -386,15 +461,28 @@ fn _diff_worktree_git(entries, ctx) {
         var path = tree_entry_name(e);
         if (streq(tree_entry_mode(e), "160000") == 0) {
             var st = _status_entry_state(e, path);
-            if (st != 0) {
-                var hp[16];
-                if (read_blob_content(tree_entry_hash(e), &hp) == 0) {
-                    if (st == 3) { print_file_diff(path, load64(&hp), load64(&hp + 8), 0, 0, ctx); }
-                    else {
-                        var wp[16];
-                        if (_diff_worktree_side(path, &wp) == 0) {
-                            print_file_diff(path, load64(&hp), load64(&hp + 8),
-                              load64(&wp), load64(&wp + 8), ctx);
+            if (st == STATUS_NOT_COMPARED) { _diff_say_not_compared(path); }
+            else {
+                if (st != 0) {
+                    var hp[16];
+                    if (read_blob_content(tree_entry_hash(e), &hp) == 0) {
+                        if (st == 3) { print_file_diff(path, load64(&hp), load64(&hp + 8), 0, 0, ctx); }
+                        else {
+                            var wp[16];
+                            if (_diff_worktree_side(path, &wp) == 0) {
+                                var wl = load64(&wp + 8);
+                                var ab[4352];
+                                var ap = sit_abs_into(path, &ab, 4352);
+                                if (ap != 0) {
+                                    if (path_lstat_kind(ap) == 0x8000) {
+                                        var cl = gitattr_clean(path, load64(&wp), wl,
+                                          load64(&hp), load64(&hp + 8));
+                                        if (cl >= 0) { wl = cl; }
+                                    }
+                                }
+                                print_file_diff(path, load64(&hp), load64(&hp + 8),
+                                  load64(&wp), wl, ctx);
+                            }
                         }
                     }
                 }
@@ -402,6 +490,7 @@ fn _diff_worktree_git(entries, ctx) {
         }
         i = i + 1;
     }
+    gitattr_reset();
     return 0;
 }
 
@@ -409,6 +498,7 @@ fn _diff_worktree_git(entries, ctx) {
 # git's index is not read, so a change staged with `git add` shows as a change.
 fn _cmd_status_git() {
     var recs = compute_status_records();
+    if (_status_tree_failed == 1) { return 1; }           # said by the read
     var branch = current_branch_name();
     stdout_write("On branch ", 10);
     if (branch != 0) { write_sanitized(STDOUT, branch, strlen(branch)); }
@@ -419,6 +509,7 @@ fn _cmd_status_git() {
     stdout_write(note, strlen(note));
     var changed = vec_new();
     var untracked = vec_new();
+    var unknown = vec_new();
     var i = 0;
     while (i < vec_len(recs)) {
         var r = vec_get(recs, i);
@@ -426,10 +517,12 @@ fn _cmd_status_git() {
         if (k == 1) { push_status_item(changed, "modified:  ", load64(r)); }
         if (k == 3) { push_status_item(changed, "deleted:   ", load64(r)); }
         if (k == 2) { vec_push(untracked, load64(r)); }
+        if (k == STATUS_NOT_COMPARED) { vec_push(unknown, load64(r)); }
         i = i + 1;
     }
     var any = 0;
     if (print_labeled_section("Changes since HEAD:", 19, changed) == 1) { any = 1; }
+    if (print_name_section("Not compared (too large, unreadable, or filtered):", 50, unknown) == 1) { any = 1; }
     if (print_name_section("Untracked files:", 16, untracked) == 1) { any = 1; }
     if (any == 0) {
         stdout_write("\nnothing to commit, working tree clean\n", 39);

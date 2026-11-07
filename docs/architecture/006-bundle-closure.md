@@ -31,8 +31,12 @@ The read profile was unaffected: it carries neither `wire_http` nor `serve`.
 
 These names print as `warning: undefined function` in a consumer build. That is expected. A `(reachable call site)` suffix is not: it means a new root or a moved call has pulled a transport or signing path into the bundle.
 
+A name on neither list is a hole, reachable or not. `commit_tree_hex`, defined in `history.cyr` and called by `cmd_show` in the read bundle, dangled from 1.7.6 to 1.13.1, because an unreachable undefined call only warns. 1.13.2 moved it to `commit.cyr`. When a `[lib.read]` module calls a function, the function belongs in a `[lib.read]` module.
+
 ## How it is guarded
 
 `tests/integration/run.sh` compiles `tests/integration/git_probe.cyr` against the **shipped** `dist/sit.cyr`, then asserts `sit_repo_branch` / `sit_repo_status` against a real `.git/` repo. If `cyrius` is on `PATH` and the probe does not compile, that is a **FAIL**, not a skip. (Through 1.6.2 a compile failure was reported as "toolchain not found", which is how this breakage could have passed CI.)
 
-When adding a callback (`&fn`) or a new call from a `[lib]` module into `wire_ssh` / `wire_https`, move the callee into the bundle or keep the caller unreachable, then run the integration suite.
+Integration section 49 (1.13.2) compares what every probe build leaves undefined against the table above, per bundle, and fails on any difference in either direction. A new unresolved name fails there before a consumer sees the warning.
+
+When adding a callback (`&fn`) or a new call from a `[lib]` module into `wire_ssh` / `wire_https`, move the callee into the bundle or keep the caller unreachable, then run the integration suite. A name that is meant to dangle goes in the table and in section 49 together.

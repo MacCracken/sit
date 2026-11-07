@@ -1,4 +1,6 @@
-# `sit_diff_path` flattens the whole HEAD tree on every call: a 200 KB `.git` costs gigabytes to diff one file — OPEN
+# `sit_diff_path` flattens the whole HEAD tree on every call: a 200 KB `.git` costs gigabytes to diff one file — RESOLVED
+
+**Resolution:** Closed in sit 1.13.2: `sit_diff_path` reads one tree per path component through `tree_path_find`, and `flatten_tree` is bounded at 256 MiB with `SIT_TREE_TOO_BIG`. Peak on the repro, N = 100 and N = 2,000 alike: 5.2 MB. See the CHANGELOG's 1.13.2 entry.
 
 **Discovered:** 2026-10-31 during owl's P(−1) audit (1.5.2 → 1.5.3, INFO-004), VCS-path review.
 **Severity:** High. A repository is hostile input to a viewer: a 200 KB crafted `.git` makes any in-process

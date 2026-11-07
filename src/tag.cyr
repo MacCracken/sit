@@ -360,9 +360,11 @@ fn cmd_verify_tag() {
 # `<tag>-<n>-g<short>` where n is the number of commits since the tag.
 #
 # Both tag kinds are honoured: a lightweight tag names its commit directly, an
-# annotated tag is peeled first, so `describe` does not care which was used.
+# annotated tag is peeled first, so `describe` does not care which was used. On a
+# `.git/` repository that is `git describe --tags` (1.13.2, ADR 0011), and a loose
+# tag shadows a packed one of the same name, as in git.
 fn cmd_describe() {
-    if (cli_sit_repo() != 1) { return 1; }
+    if (cli_read_repo() < 0) { return 1; }
 
     var start = 0;
     if (argc() >= 3) {
@@ -371,9 +373,7 @@ fn cmd_describe() {
             eprintln("sit: cannot resolve commit");
             return 1;
         }
-        start = alloc(65);
-        memcpy(start, &hex, 64);
-        store8(start + 64, 0);
+        start = _id_dup(&hex);
     }
     else {
         start = read_head_ref();
@@ -385,45 +385,58 @@ fn cmd_describe() {
     # whole refs/tags tree (release/v1 was invisible), and two tags on one
     # commit resolve the same way every run: annotated over lightweight (as
     # git prefers), then the smaller name (the listing is sorted).
-    if (sf_exists(".sit/refs/tags") != 1) {
-        eprintln("sit: no tags found to describe");
-        return 1;
-    }
-    var names = ref_names_under(".sit/refs/tags");
-    var tagmap = map_new();
-    var tag_ann = map_new();
+    var hl = _id_hexlen();
+    var tags_dir = alloc(15);
+    memcpy(tags_dir, _repo_dir(), 5);
+    memcpy(tags_dir + 5, "refs/tags", 10);
+    var names = ref_names_under(tags_dir);
+    var tag_ids = map_new();
     var ti = 0;
     while (ti < vec_len(names)) {
         var nm = vec_get(names, ti);
         var nl = strlen(nm);
         var tpath = alloc(15 + nl + 1);
-        memcpy(tpath, ".sit/refs/tags/", 15);
+        memcpy(tpath, tags_dir, 14);
+        store8(tpath + 14, 47);
         memcpy(tpath + 15, nm, nl);
         store8(tpath + 15 + nl, 0);
         var pair[16];
         if (read_file_heap(tpath, &pair) == 0) {
             var rb = load64(&pair);
-            var rl = load64(&pair + 8);
-            if (rl >= 64) {
-                if (hex_prefix_valid(rb, 64) == 1) {
-                    var oid = alloc(65);
-                    memcpy(oid, rb, 64);
-                    store8(oid + 64, 0);
-                    var peeled = peel_tag(oid);
-                    if (peeled != 0) {
-                        var annotated = 0;
-                        if (streq(peeled, oid) == 0) { annotated = 1; }
-                        if (map_has(tagmap, peeled) == 0) {
+            if (load64(&pair + 8) >= hl) {
+                if (hex_prefix_valid(rb, hl) == 1) { map_set(tag_ids, nm, _id_dup(rb)); }
+            }
+        }
+        ti = ti + 1;
+    }
+    if (_repo_backend == 1) {
+        _git_packed_tags(names, tag_ids);
+        sort_cstrings(names);
+    }
+    if (vec_len(names) == 0) {
+        eprintln("sit: no tags found to describe");
+        return 1;
+    }
+    var tagmap = map_new();
+    var tag_ann = map_new();
+    ti = 0;
+    while (ti < vec_len(names)) {
+        var nm = vec_get(names, ti);
+        if (map_has(tag_ids, nm) == 1) {
+            var oid = map_get(tag_ids, nm);
+            var peeled = peel_tag(oid);
+            if (peeled != 0) {
+                var annotated = 0;
+                if (streq(peeled, oid) == 0) { annotated = 1; }
+                if (map_has(tagmap, peeled) == 0) {
+                    map_set(tagmap, peeled, nm);
+                    map_set(tag_ann, peeled, annotated);
+                }
+                else {
+                    if (annotated == 1) {
+                        if (map_get(tag_ann, peeled) == 0) {
                             map_set(tagmap, peeled, nm);
-                            map_set(tag_ann, peeled, annotated);
-                        }
-                        else {
-                            if (annotated == 1) {
-                                if (map_get(tag_ann, peeled) == 0) {
-                                    map_set(tagmap, peeled, nm);
-                                    map_set(tag_ann, peeled, 1);
-                                }
-                            }
+                            map_set(tag_ann, peeled, 1);
                         }
                     }
                 }

@@ -1,4 +1,6 @@
-# `dist/sit-read.cyr` references `commit_tree_hex`, which the read profile does not define — OPEN
+# `dist/sit-read.cyr` references `commit_tree_hex`, which the read profile does not define — RESOLVED
+
+**Resolution:** Closed in sit 1.13.2: `commit_tree_hex` moved to `commit.cyr`, and integration section 49 fails on any unresolved symbol outside architecture 006's table.
 
 **Discovered:** 2026-10-31 during owl's 1.5.1 dependency bump (cyrius 6.7.18, sit 1.13.0); recorded as the
 audit's INFO-008.

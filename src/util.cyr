@@ -221,6 +221,29 @@ fn path_lstat_mode(path) {
     #endif
 }
 
+# The size in bytes of the file at the resolved path `ap`, or -1.
+fn path_size(ap) {
+    var st[256];
+    if (xstat(ap, &st) != 0) { return 0 - 1; }
+    return load64(&st + STAT_SIZE);
+}
+
+# 1 when an lstat of `ap` failed because nothing is there, 0 when something is,
+# or when it could not be asked: EACCES on a parent says nothing about the file.
+# 1.13.2: "cannot look" read as "deleted" (architecture 007).
+fn path_is_absent(ap) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    if (path_lstat_kind(ap) < 0) { return 1; }
+    return 0;
+    #else
+    var stbuf[144];
+    var rc = syscall(262, VAL_AT_FDCWD, ap, &stbuf, VAL_AT_SYMLINK_NOFOLLOW);
+    if (rc == 0 - 2) { return 1; }                   # ENOENT
+    if (rc == 0 - 20) { return 1; }                  # ENOTDIR
+    return 0;
+    #endif
+}
+
 # ----------------------------------------------------------------
 # sit-owned FS wrappers (sf_*). Every repo FS access funnels through
 # one of these so the prefixing lives in a single place. The inner

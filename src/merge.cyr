@@ -373,16 +373,13 @@ fn _merge_commit_ts(hex) {
 #      base(s); return the newest by author timestamp for determinism.
 #
 # Criss-cross histories can have several equally-valid bases; sit returns one
-# (git would do a recursive merge). Returns a 64-char NUL-terminated hex, or
-# 0 if the two commits share no ancestor.
+# (git would do a recursive merge). Returns a NUL-terminated id, or 0 if the two
+# commits share no ancestor.
 fn find_merge_base(a_hex, b_hex) {
     # Phase 1: ancestors of a (full DAG).
     var anc_a = map_new();
     var q = vec_new();
-    var sa = alloc_or_die(65);
-    memcpy(sa, a_hex, 64);
-    store8(sa + 64, 0);
-    vec_push(q, sa);
+    vec_push(q, _id_dup(a_hex));
     while (vec_len(q) > 0) {
         var cur = vec_get(q, vec_len(q) - 1);
         vec_pop(q);
@@ -404,10 +401,7 @@ fn find_merge_base(a_hex, b_hex) {
     var candidates = vec_new();
     var seen_b = map_new();
     var q2 = vec_new();
-    var sb = alloc_or_die(65);
-    memcpy(sb, b_hex, 64);
-    store8(sb + 64, 0);
-    vec_push(q2, sb);
+    vec_push(q2, _id_dup(b_hex));
     while (vec_len(q2) > 0) {
         var cur = vec_get(q2, vec_len(q2) - 1);
         vec_pop(q2);
@@ -470,8 +464,9 @@ fn find_merge_base(a_hex, b_hex) {
 # full-DAG lowest common ancestor — git's `git merge-base` shape. Both args
 # are resolved through resolve_hash (branch / tag / hex-prefix). Exposes the
 # LCA so the merge base is testable independent of a full `sit merge`.
+# 1.13.2: a `.git/` repository too, read-only (ADR 0011).
 fn cmd_merge_base() {
-    if (cli_sit_repo() != 1) { return 1; }
+    if (cli_read_repo() < 0) { return 1; }
     if (argc() < 4) {
         eprintln("usage: sit merge-base <commit> <commit>");
         return 1;
@@ -484,9 +479,7 @@ fn cmd_merge_base() {
         syscall(SYS_WRITE, STDERR, "'\n", 2);
         return 1;
     }
-    var ha = alloc_or_die(65);
-    memcpy(ha, &resa, 64);
-    store8(ha + 64, 0);
+    var ha = _id_dup(&resa);
 
     var resb[72];
     if (resolve_commit_hash(argv(3), &resb) != 1) {
@@ -495,16 +488,14 @@ fn cmd_merge_base() {
         syscall(SYS_WRITE, STDERR, "'\n", 2);
         return 1;
     }
-    var hb = alloc_or_die(65);
-    memcpy(hb, &resb, 64);
-    store8(hb + 64, 0);
+    var hb = _id_dup(&resb);
 
     var base = find_merge_base(ha, hb);
     if (base == 0) {
         eprintln("sit: no common ancestor");
         return 1;
     }
-    stdout_write(base, 64);
+    stdout_write(base, _id_hexlen());
     stdout_write("\n", 1);
     return 0;
 }

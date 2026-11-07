@@ -511,7 +511,10 @@ fn _git_delta_header(base_len, delta, delta_len, cur) {
     # 1.6.4 (D5): held to the same 16 MiB object ceiling as every other read.
     # The 256 MiB pack-entry cap let a small hostile delta make an in-process
     # consumer allocate and fill 256 MiB per chain level.
-    if (result_size > _DELTA_MAX_RESULT) { return 0 - 1; }
+    if (result_size > _DELTA_MAX_RESULT) {
+        obj_fail_note(OBJ_TOO_BIG, result_size);
+        return 0 - 1;
+    }
     return result_size;
 }
 
@@ -668,10 +671,27 @@ fn _pack_inflate(pdata, plen, body, size, out_len) {
     # file — `__init__.py`, `.gitkeep` — packs to exactly that), and was read
     # as a failure, so every empty blob in a gc'd repo was unreadable. git
     # requires the result to be the size the header declared; so does this.
-    if (got < 0) { fl_free(buf); return 0; }
-    if (got != size) { fl_free(buf); return 0; }
+    if (got < 0) { _obj_fail_inflate(got, size); fl_free(buf); return 0; }
+    if (got != size) { obj_fail_note(OBJ_CORRUPT, 0 - 1); fl_free(buf); return 0; }
     store64(out_len, got);
     return buf;
+}
+
+# The size the delta of `link` (a _PACK_LINK record) reconstructs, or -1. Its
+# header is the first bytes of the stream, and the inflate writes in order, so a
+# short buffer holds it: the reader wants the size of an object it will not build.
+fn _pack_link_result(link) {
+    var lp = load64(link);
+    var plen = load64(link + 8);
+    var body = load64(link + 16);
+    if (body >= plen) { return 0 - 1; }
+    var head[32];
+    memset(&head, 0, 32);
+    zlib_decompress_with_ratio_cap(lp + body, plen - body, &head, 32, SIT_MAX_INFLATE_RATIO);
+    var cur[8];
+    store64(&cur, 0);
+    if (_delta_varint(&head, &cur, 32) < 0) { return 0 - 1; }
+    return _delta_varint(&head, &cur, 32);
 }
 
 fn _git_pack_obj(pdata, plen, offset, out24) {
@@ -731,6 +751,14 @@ fn _pack_obj_ex(pdata, plen, offset, out24, type_out, allow_ref) {
             if (size < 0) { rc = 0 - 10; }
             if (size > _PACK_MAX_OBJ) { rc = 0 - 10; }
             type = load64(&type_slot);
+            # 1.13.2: past sankoch's ceiling the inflate cannot succeed, so the
+            # entry is refused before its buffer is allocated.
+            if (rc == 0) {
+                if (size > _OBJ_INFLATE_MAX) {
+                    obj_fail_note(OBJ_TOO_BIG, size);
+                    rc = 0 - 12;
+                }
+            }
         }
         if (rc == 0) {
             if (reading == 1) {
@@ -917,6 +945,14 @@ fn _pack_obj_ex(pdata, plen, offset, out24, type_out, allow_ref) {
     if (dbuf != 0) { fl_free(dbuf); }
     if (other != 0) { fl_free(other); }
     if (loose_buf != 0) { fl_free(loose_buf); }      # never `base` by now (R5)
+    if (rc != 0) {
+        # 1.13.2: the size asked about is the object's, the outermost delta's
+        # result, not that of whichever link stopped the read.
+        obj_fail_note(OBJ_CORRUPT, 0 - 1);
+        if (_obj_fail == OBJ_TOO_BIG) {
+            if (nlinks > 0) { _obj_fail_size = _pack_link_result(links); }
+        }
+    }
     fl_free(links);
     if (rc != 0) {
         if (base_owned == 1) { fl_free(base); }
@@ -953,6 +989,9 @@ fn _pack_obj_ex(pdata, plen, offset, out24, type_out, allow_ref) {
 
 # dir_list_into's name and offset buffers for the pack directory, doubled and
 # listed again when a directory does not fit, up to _GIT_PACKDIR_TRIES times.
+# 1.13.2: both double together. The tries were shared, one buffer at a time, so
+# a directory past about 10,000 entries ran out of them: every packed object
+# read as missing, and an unchanged file as entirely new.
 var _GIT_PACKDIR_NAMES = 4096;
 var _GIT_PACKDIR_ENTRIES = 64;
 var _GIT_PACKDIR_TRIES = 16;
@@ -1052,12 +1091,14 @@ fn _git_pack_locate_in(objdir, hex, out24) {
         listing = 0;
         tries = tries + 1;
         if (tries < _GIT_PACKDIR_TRIES) {
-            if (n == 0 - 3) { names_cap = names_cap * 2; listing = 1; }
-            if (n == 0 - 4) { max_entries = max_entries * 2; listing = 1; }
+            if (n == 0 - 3) { listing = 1; }
+            if (n == 0 - 4) { listing = 1; }
         }
         if (listing == 1) {
             fl_free(names);
             fl_free(offs);
+            names_cap = names_cap * 2;
+            max_entries = max_entries * 2;
         }
     }
     var rc = 0 - 3;

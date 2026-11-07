@@ -494,6 +494,9 @@ Simplification vs git (documented in `src/index.cyr`): a non-segment `**` (e.g. 
 
   Trees are read as git wrote them: executables, symlinks (compared by target) and submodules (skipped) count as git counts them, as do names like `aux.c` or `a:b.txt` that sit refuses to *write*. `objects/info/alternates` is followed, so a `git clone --shared` reads fine.
 
+  - `sit blame` (first parent, so `git blame --first-parent`), `sit describe` (`git describe --tags`, naming the tag with the fewest commits in `<tag>..<commit>`) and `sit merge-base` (1.13.2).
+  - **`.gitattributes` (1.13.2).** `status`, `diff` and the read API compare a file as git does: `text`, `eol`, `crlf` and `text=auto` are applied before comparing, so a CRLF working copy of an LF blob is clean. A file under a `filter`, `ident` or `working-tree-encoding`, which sit does not run, is listed under *Not compared* when its bytes differ, as is a file too large to read or one sit cannot open. `core.autocrlf` and the global attribute files are not read.
+
   Read-only: commands that write (`add`, `commit`, `branch`, `gc`, `reflog expire`, …) refuse a `.git/` repository, and sit stays `.sit/`-native for its own repos. Modules `src/git_read.cyr` + `src/git_pack.cyr`; see [ADR 0011](../adr/0011-git-read-mode.md).
 
 ## What doesn't yet

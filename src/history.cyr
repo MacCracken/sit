@@ -43,18 +43,6 @@ fn _parent_tree_entries(commit_hex) {
     return e;
 }
 
-# A commit's tree oid as a heap cstring, or 0.
-fn commit_tree_hex(commit_hex) {
-    var obj[24];
-    if (read_object(commit_hex, &obj) != 0) { return 0; }
-    var buf = load64(&obj);
-    var blen = load64(&obj + 8);
-    var coff = load64(&obj + 16);
-    var info[56];
-    if (parse_commit_body(buf + coff, blen - coff, &info) != 0) { return 0; }
-    return load64(&info);
-}
-
 # Read a commit's message as a heap cstring, or 0.
 fn commit_message_of(commit_hex) {
     var obj[24];

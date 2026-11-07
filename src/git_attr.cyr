@@ -1,0 +1,732 @@
+# git_attr.cyr — what `.gitattributes` does to a file before git compares it (1.13.2).
+#
+# git stores a `text` file with LF and compares with the conversion applied, so
+# a CRLF working copy of an LF blob is clean. Read mode compared the two byte for
+# byte, so every line of such a file came back changed, in `sit status`, `sit
+# diff`, and the markers owl draws from sit_diff_path. This is the worktree-to-blob
+# half of git's convert.c, and the reader of attr.c it needs. See ADR 0011's 1.13.2
+# amendment. Only a `.git/` repository reaches it: sit's own repositories store
+# bytes as they are.
+#
+# Looked up only when the bytes differ. A file that matches its blob is clean
+# whatever its attributes say, which is also git's answer for a blob holding CRLF
+# under `text` (git's stat cache never looks at it). So a clean tree reads no
+# attribute file at all.
+#
+# Read, lowest precedence first, as git reads them: the root `.gitattributes`,
+# each directory's on the way to the file, then `.git/info/attributes`. Not read:
+# the global and system files, and `core.autocrlf` / `core.eol`, which live in
+# configuration sit does not take from the user's home.
+#
+# A repository is hostile input, so: a `.gitattributes` that is not a regular file
+# is not read (git since 2.32 refuses a symlink); one over _GA_FILE_MAX is passed
+# over; a line of _GA_LINE_MAX or more is skipped, as git skips it. All memory is
+# freelist memory, returned by gitattr_reset, because the read API looks attributes
+# up once per call for as long as a consumer runs.
+#
+# Resolved the way git resolves them, not last-rule-wins read forwards: from the
+# highest precedence down, each file's lines last to first and each line's states
+# last to first, the first value an attribute meets is its value, and a macro
+# expands only at the assignment that wins. It decides real cases: after
+# `x mine` and a later `* -mine`, the macro `mine` never expands for `x`, and a
+# forward reading could not take the expansion back. It also ends any macro
+# cycle, since a macro expands at most once per lookup.
+
+# The attributes that change bytes, as slots of a state.
+enum GitAttr { GA_TEXT = 0, GA_CRLF = 1, GA_EOL = 2, GA_FILTER = 3, GA_IDENT = 4, GA_WTE = 5 }
+# An attribute's state: unspecified, `name`, `-name`, then `name=value` by value.
+# GAV_OPEN is a slot no line has reached yet, in a lookup only.
+enum GitAttrVal {
+    GAV_OPEN = 0 - 1, GAV_UNSPEC = 0, GAV_SET = 1, GAV_UNSET = 2,
+    GAV_AUTO = 3, GAV_INPUT = 4, GAV_LF = 5, GAV_CRLF = 6, GAV_UTF8 = 7, GAV_OTHER = 8
+}
+# What the worktree file needs before it is compared: nothing; CR-before-LF
+# removed; the same under git's `auto` rules; or a conversion sit does not do.
+enum GitConv { GC_NONE = 0, GC_TEXT = 1, GC_AUTO = 2, GC_CANNOT = 3, GC_UNDEF = 4 }
+
+var _GA_STATE = 48;             # bytes: one word per attribute
+var _GA_LINE_MAX = 2048;        # git's ATTR_MAX_LINE_LENGTH
+var _GA_FILE_MAX = 1048576;     # git's limit is 100 MiB; no real file comes near this
+var _GA_FILES_MAX = 256;        # files kept per call; past it the table starts over
+var _GA_MACRO_MAX = 64;
+var _GA_FILE_REC = 32;          # {path, path length, text, text length}
+var _GA_MACRO_REC = 40;         # {name, name length, states, end, assigned this lookup}
+
+var _ga_files = 0;              # _GA_FILES_MAX records, on the freelist
+var _ga_nfiles = 0;
+var _ga_macros = 0;             # _GA_MACRO_MAX records, pointing into the files' text
+var _ga_nmacros = 0;
+var _ga_macros_read = 0;        # 1 once the macros of this call are collected
+
+# Give back everything read for the last lookups, and forget it: attributes can
+# change between calls. Macros point into the files' text, so they go too.
+fn gitattr_reset() {
+    var i = 0;
+    while (i < _ga_nfiles) {
+        var rec = _ga_files + i * _GA_FILE_REC;
+        fl_free(load64(rec));
+        if (load64(rec + 16) != 0) { fl_free(load64(rec + 16)); }
+        i = i + 1;
+    }
+    _ga_nfiles = 0;
+    _ga_nmacros = 0;
+    _ga_macros_read = 0;
+    return 0;
+}
+
+# 1 for git's field separators in an attribute line.
+fn _ga_blank(c) {
+    if (c == 32) { return 1; }
+    if (c == 9) { return 1; }
+    if (c == 13) { return 1; }
+    if (c == 10) { return 1; }
+    return 0;
+}
+
+# The first address in [p, e) that is not blank.
+fn _ga_skip(p, e) {
+    var q = p;
+    var going = 1;
+    while (going == 1) {
+        if (q >= e) { going = 0; }
+        else {
+            if (_ga_blank(load8(q) & 0xFF) == 0) { going = 0; }
+            else { q = q + 1; }
+        }
+    }
+    return q;
+}
+
+# The end of the token starting at `p`.
+fn _ga_tok_end(p, e) {
+    var q = p;
+    var going = 1;
+    while (going == 1) {
+        if (q >= e) { going = 0; }
+        else {
+            if (_ga_blank(load8(q) & 0xFF) == 1) { going = 0; }
+            else { q = q + 1; }
+        }
+    }
+    return q;
+}
+
+# 1 when n bytes at p are the literal `lit`.
+fn _ga_is(p, n, lit) {
+    if (n != strlen(lit)) { return 0; }
+    return memeq(p, lit, n);
+}
+
+# git's attr_name_valid and attr_name_reserved: [-A-Za-z0-9_.], no leading '-',
+# no `builtin_` prefix.
+fn _ga_name_ok(n, nl) {
+    if (nl <= 0) { return 0; }
+    if ((load8(n) & 0xFF) == 45) { return 0; }
+    if (nl >= 8) { if (memeq(n, "builtin_", 8) == 1) { return 0; } }
+    var i = 0;
+    var ok = 1;
+    while (i < nl) {
+        var c = load8(n + i) & 0xFF;
+        var good = 0;
+        if (c == 45) { good = 1; }
+        if (c == 46) { good = 1; }
+        if (c == 95) { good = 1; }
+        if (c >= 48) { if (c <= 57) { good = 1; } }
+        if (c >= 65) { if (c <= 90) { good = 1; } }
+        if (c >= 97) { if (c <= 122) { good = 1; } }
+        if (good == 0) { ok = 0; }
+        i = i + 1;
+    }
+    return ok;
+}
+
+# The address of the first '=' in [p, t), or 0.
+fn _ga_equals(p, t) {
+    var q = p;
+    while (q < t) {
+        if ((load8(q) & 0xFF) == 61) { return q; }
+        q = q + 1;
+    }
+    return 0;
+}
+
+# 1 when every state in [p, e) names an attribute git accepts. One bad name
+# drops the whole line, in git as here.
+fn _ga_states_ok(p, e) {
+    var cur = _ga_skip(p, e);
+    while (cur < e) {
+        var t = _ga_tok_end(cur, e);
+        var n = cur;
+        var c = load8(cur) & 0xFF;
+        if (c == 45) { n = cur + 1; }
+        if (c == 33) { n = cur + 1; }
+        var eq = _ga_equals(cur, t);
+        var ne = t;
+        if (eq != 0) { ne = eq; }
+        if (_ga_name_ok(n, ne - n) == 0) { return 0; }
+        cur = _ga_skip(t, e);
+    }
+    return 1;
+}
+
+# The slot of the attribute named n[0..nl), or -1 for one that changes no bytes.
+fn _ga_slot(n, nl) {
+    if (_ga_is(n, nl, "text") == 1) { return GA_TEXT; }
+    if (_ga_is(n, nl, "crlf") == 1) { return GA_CRLF; }
+    if (_ga_is(n, nl, "eol") == 1) { return GA_EOL; }
+    if (_ga_is(n, nl, "filter") == 1) { return GA_FILTER; }
+    if (_ga_is(n, nl, "ident") == 1) { return GA_IDENT; }
+    if (_ga_is(n, nl, "working-tree-encoding") == 1) { return GA_WTE; }
+    return 0 - 1;
+}
+
+# A `name=value`'s value as a state. git compares these byte for byte, except
+# that an encoding spelled UTF-8 or UTF8, in any case, is no encoding at all.
+fn _ga_value(v, vl) {
+    if (_ga_is(v, vl, "auto") == 1) { return GAV_AUTO; }
+    if (_ga_is(v, vl, "input") == 1) { return GAV_INPUT; }
+    if (_ga_is(v, vl, "lf") == 1) { return GAV_LF; }
+    if (_ga_is(v, vl, "crlf") == 1) { return GAV_CRLF; }
+    if (vl == 5) { if (_git_ieq(v, 0, vl, "utf-8", 5) == 1) { return GAV_UTF8; } }
+    if (vl == 4) { if (_git_ieq(v, 0, vl, "utf8", 4) == 1) { return GAV_UTF8; } }
+    return GAV_OTHER;
+}
+
+# The latest macro named n[0..nl) from this call's table, or -1.
+fn _ga_macro_find(n, nl) {
+    var i = _ga_nmacros - 1;
+    while (i >= 0) {
+        var m = _ga_macros + i * _GA_MACRO_REC;
+        if (load64(m + 8) == nl) {
+            if (memeq(load64(m), n, nl) == 1) { return i; }
+        }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+# Give the attribute at n[0..nl) the value `val` unless a line of higher
+# precedence already has, expanding a macro that this assignment sets. A slot and
+# a macro can share a name.
+fn _ga_assign(n, nl, val, st) {
+    var first = 0;
+    var slot = _ga_slot(n, nl);
+    if (slot >= 0) {
+        if (load64(st + slot * 8) == GAV_OPEN) {
+            store64(st + slot * 8, val);
+            first = 1;
+        }
+    }
+    var mi = _ga_macro_find(n, nl);
+    if (mi >= 0) {
+        var m = _ga_macros + mi * _GA_MACRO_REC;
+        if (load64(m + 32) == 0) {
+            store64(m + 32, 1);
+            first = 1;
+        }
+        if (first == 1) {
+            if (val == GAV_SET) { _ga_apply(load64(m + 16), load64(m + 24), st); }
+        }
+    }
+    return 0;
+}
+
+# Apply the states in [p, e) to `st`, the last one first.
+fn _ga_apply(p, e, st) {
+    var end = e;
+    while (end > p) {
+        var trimming = 1;
+        while (trimming == 1) {
+            if (end <= p) { trimming = 0; }
+            else {
+                if (_ga_blank(load8(end - 1) & 0xFF) == 0) { trimming = 0; }
+                else { end = end - 1; }
+            }
+        }
+        if (end > p) {
+            var cur = end;
+            var finding = 1;
+            while (finding == 1) {
+                if (cur <= p) { finding = 0; }
+                else {
+                    if (_ga_blank(load8(cur - 1) & 0xFF) == 1) { finding = 0; }
+                    else { cur = cur - 1; }
+                }
+            }
+            var c = load8(cur) & 0xFF;
+            var n = cur;
+            var val = GAV_SET;
+            var eq = _ga_equals(cur, end);
+            var ne = end;
+            if (eq != 0) { ne = eq; }
+            if (c == 45) { n = cur + 1; val = GAV_UNSET; }
+            else {
+                if (c == 33) { n = cur + 1; val = GAV_UNSPEC; }
+                else {
+                    if (eq != 0) { val = _ga_value(eq + 1, end - eq - 1); }
+                }
+            }
+            _ga_assign(n, ne - n, val, st);
+            end = cur;
+        }
+    }
+    return 0;
+}
+
+# Decode the C-quoted pattern at `c` into `out`, as git's unquote_c_style does.
+# Returns its length with the address past the closing quote at rest8, or -1
+# when it is not one, and the line then treats the quote as a plain byte.
+fn _ga_unquote(c, e, out, rest8) {
+    var p = c + 1;
+    var n = 0;
+    while (p < e) {
+        var b = load8(p) & 0xFF;
+        if (b == 34) {
+            store64(rest8, p + 1);
+            return n;
+        }
+        if (b != 92) {
+            store8(out + n, b);
+            n = n + 1;
+            p = p + 1;
+        }
+        else {
+            if (p + 1 >= e) { return 0 - 1; }
+            var d = load8(p + 1) & 0xFF;
+            var v = 0 - 1;
+            if (d == 34) { v = 34; }
+            if (d == 92) { v = 92; }
+            if (d == 97) { v = 7; }
+            if (d == 98) { v = 8; }
+            if (d == 102) { v = 12; }
+            if (d == 110) { v = 10; }
+            if (d == 114) { v = 13; }
+            if (d == 116) { v = 9; }
+            if (d == 118) { v = 11; }
+            if (v >= 0) { p = p + 2; }
+            else {
+                # \ooo, the first digit 0 to 3.
+                if (d < 48) { return 0 - 1; }
+                if (d > 51) { return 0 - 1; }
+                if (p + 3 >= e) { return 0 - 1; }
+                var o1 = (load8(p + 2) & 0xFF) - 48;
+                var o2 = (load8(p + 3) & 0xFF) - 48;
+                if (o1 < 0) { return 0 - 1; }
+                if (o1 > 7) { return 0 - 1; }
+                if (o2 < 0) { return 0 - 1; }
+                if (o2 > 7) { return 0 - 1; }
+                v = (d - 48) * 64 + o1 * 8 + o2;
+                p = p + 4;
+            }
+            store8(out + n, v);
+            n = n + 1;
+        }
+    }
+    return 0 - 1;
+}
+
+# 1 when the pattern matches the file `path`. `blen` is the length of the
+# directory the pattern's file is in, a prefix of `path` (0 at the root), and `bn`
+# where the basename starts. git's path_matches: a pattern ending in '/' names a
+# directory, and attributes do not apply to what is below one, so it never
+# matches here; a pattern with no '/' matches the basename, at any depth; any
+# other is relative to its file's directory, a leading '/' dropped.
+fn _ga_match(pat, pl, blen, path, plen, bn) {
+    if (pl <= 0) { return 0; }
+    if ((load8(pat + pl - 1) & 0xFF) == 47) { return 0; }
+    var slash = 0;
+    var i = 0;
+    while (i < pl) {
+        if ((load8(pat + i) & 0xFF) == 47) { slash = 1; }
+        i = i + 1;
+    }
+    if (slash == 0) { return _wildmatch_exact(pat, pl, path + bn, plen - bn); }
+    var off = 0;
+    if (blen > 0) { off = blen + 1; }
+    var p2 = pat;
+    var l2 = pl;
+    if ((load8(pat) & 0xFF) == 47) { p2 = pat + 1; l2 = pl - 1; }
+    return _wildmatch_exact(p2, l2, path + off, plen - off);
+}
+
+# One line of an attribute file at [p, p + n): its states are applied to `st`
+# when its pattern matches `path`. Comments, macro lines and `!` patterns (which
+# git refuses) do nothing here.
+fn _ga_line(p, n, blen, path, plen, bn, st) {
+    if (n >= _GA_LINE_MAX) { return 0; }
+    var e = p + n;
+    var c = _ga_skip(p, e);
+    if (c >= e) { return 0; }
+    if ((load8(c) & 0xFF) == 35) { return 0; }
+    var qbuf[2048];
+    var rest8[8];
+    var pat = c;
+    var pl = 0 - 1;
+    if ((load8(c) & 0xFF) == 34) {
+        pl = _ga_unquote(c, e, &qbuf, &rest8);
+        if (pl >= 0) { pat = &qbuf; }
+    }
+    if (pl < 0) {
+        var t = _ga_tok_end(c, e);
+        pl = t - c;
+        store64(&rest8, t);
+    }
+    if (pl > 6) { if (memeq(pat, "[attr]", 6) == 1) { return 0; } }
+    if (pl <= 0) { return 0; }
+    if ((load8(pat) & 0xFF) == 33) { return 0; }
+    var rest = load64(&rest8);
+    if (_ga_states_ok(rest, e) == 0) { return 0; }
+    if (_ga_match(pat, pl, blen, path, plen, bn) == 1) { _ga_apply(rest, e, st); }
+    return 0;
+}
+
+# The end of the line starting at `pos`.
+fn _ga_eol(buf, pos, len) {
+    var le = pos;
+    var going = 1;
+    while (going == 1) {
+        if (le >= len) { going = 0; }
+        else {
+            if ((load8(buf + le) & 0xFF) == 10) { going = 0; }
+            else { le = le + 1; }
+        }
+    }
+    return le;
+}
+
+# Where the text of an attribute file starts: past a UTF-8 BOM, as git skips one.
+fn _ga_start(buf, len) {
+    if (len >= 3) {
+        if ((load8(buf) & 0xFF) == 0xEF) {
+            if ((load8(buf + 1) & 0xFF) == 0xBB) {
+                if ((load8(buf + 2) & 0xFF) == 0xBF) { return 3; }
+            }
+        }
+    }
+    return 0;
+}
+
+# Apply every line of one file's text, the last one first (see _ga_line).
+fn _ga_scan(buf, len, blen, path, plen, bn, st) {
+    var start = _ga_start(buf, len);
+    var e = len;
+    while (e > start) {
+        var end = e;
+        if ((load8(buf + end - 1) & 0xFF) == 10) { end = end - 1; }
+        var ls = end;
+        var finding = 1;
+        while (finding == 1) {
+            if (ls <= start) { finding = 0; }
+            else {
+                if ((load8(buf + ls - 1) & 0xFF) == 10) { finding = 0; }
+                else { ls = ls - 1; }
+            }
+        }
+        _ga_line(buf + ls, end - ls, blen, path, plen, bn, st);
+        e = ls;
+    }
+    return 0;
+}
+
+# The text of the repo-relative file `rel` at out16 {text, length}, both 0 when
+# it is not there. Read once per call: status can ask once per changed file.
+fn _ga_text(rel, rlen, out16) {
+    store64(out16, 0);
+    store64(out16 + 8, 0);
+    var i = 0;
+    while (i < _ga_nfiles) {
+        var rec = _ga_files + i * _GA_FILE_REC;
+        if (load64(rec + 8) == rlen) {
+            if (memeq(load64(rec), rel, rlen) == 1) {
+                store64(out16, load64(rec + 16));
+                store64(out16 + 8, load64(rec + 24));
+                return 0;
+            }
+        }
+        i = i + 1;
+    }
+    if (_ga_files == 0) {
+        _ga_files = fl_alloc(_GA_FILES_MAX * _GA_FILE_REC);
+        if (_ga_files == 0) { return 0 - 1; }
+    }
+    # The table is full only on a walk through hundreds of directories. Starting
+    # over costs rereads, nothing else, except that macros point into the root's
+    # text and so are collected again.
+    if (_ga_nfiles >= _GA_FILES_MAX) {
+        gitattr_reset();
+        _ga_macros_load();
+    }
+    var abuf[4352];
+    var ap = sit_abs_into(rel, &abuf, 4352);
+    if (ap != 0) {
+        if (path_lstat_kind(ap) == 0x8000) {
+            if (path_size(ap) <= _GA_FILE_MAX) {
+                if (read_file_fl(rel, out16) != 0) {
+                    store64(out16, 0);
+                    store64(out16 + 8, 0);
+                }
+            }
+        }
+    }
+    var key = fl_alloc(rlen + 1);
+    if (key == 0) {
+        if (load64(out16) != 0) { fl_free(load64(out16)); }
+        store64(out16, 0);
+        store64(out16 + 8, 0);
+        return 0 - 1;
+    }
+    memcpy(key, rel, rlen);
+    store8(key + rlen, 0);
+    var r = _ga_files + _ga_nfiles * _GA_FILE_REC;
+    store64(r, key);
+    store64(r + 8, rlen);
+    store64(r + 16, load64(out16));
+    store64(r + 24, load64(out16 + 8));
+    _ga_nfiles = _ga_nfiles + 1;
+    return 0;
+}
+
+# Add a macro. The latest of a name wins (_ga_macro_find).
+fn _ga_macro_add(n, nl, states, end) {
+    if (_ga_nmacros >= _GA_MACRO_MAX) { return 0; }
+    var m = _ga_macros + _ga_nmacros * _GA_MACRO_REC;
+    store64(m, n);
+    store64(m + 8, nl);
+    store64(m + 16, states);
+    store64(m + 24, end);
+    store64(m + 32, 0);
+    _ga_nmacros = _ga_nmacros + 1;
+    return 0;
+}
+
+# An empty macro table but for git's one built-in: `binary`, which a repository
+# can redefine. 0, or -1 without the memory.
+fn _ga_macros_begin() {
+    if (_ga_macros == 0) {
+        _ga_macros = fl_alloc(_GA_MACRO_MAX * _GA_MACRO_REC);
+        if (_ga_macros == 0) { return 0 - 1; }
+    }
+    _ga_nmacros = 0;
+    var states = "-diff -merge -text";
+    _ga_macro_add("binary", 6, states, states + 18);
+    return 0;
+}
+
+# Collect the `[attr]name states` lines of one file's text.
+fn _ga_macros_in(buf, len) {
+    var pos = _ga_start(buf, len);
+    while (pos < len) {
+        var le = _ga_eol(buf, pos, len);
+        var e = buf + le;
+        if (le - pos < _GA_LINE_MAX) {
+            var c = _ga_skip(buf + pos, e);
+            var t = _ga_tok_end(c, e);
+            if (t - c > 6) {
+                if (memeq(c, "[attr]", 6) == 1) {
+                    if (_ga_name_ok(c + 6, t - c - 6) == 1) {
+                        if (_ga_states_ok(t, e) == 1) {
+                            _ga_macro_add(c + 6, t - c - 6, t, e);
+                        }
+                    }
+                }
+            }
+        }
+        pos = le + 1;
+    }
+    return 0;
+}
+
+# This call's macros: only the top-level files may define one. Before any rule
+# is applied, since a line can use a macro defined after it.
+fn _ga_macros_load() {
+    _ga_macros_read = 1;
+    if (_ga_macros_begin() != 0) { return 0 - 1; }
+    var t[16];
+    _ga_text(".gitattributes", 14, &t);
+    if (load64(&t) != 0) { _ga_macros_in(load64(&t), load64(&t + 8)); }
+    _ga_text(".git/info/attributes", 20, &t);
+    if (load64(&t) != 0) { _ga_macros_in(load64(&t), load64(&t + 8)); }
+    return 0;
+}
+
+# Open every slot and every macro for a new lookup.
+fn _ga_state_begin(st) {
+    var i = 0;
+    while (i < 6) {
+        store64(st + i * 8, GAV_OPEN);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < _ga_nmacros) {
+        store64(_ga_macros + i * _GA_MACRO_REC + 32, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# A slot no line reached is an unspecified attribute.
+fn _ga_state_end(st) {
+    var i = 0;
+    while (i < 6) {
+        if (load64(st + i * 8) == GAV_OPEN) { store64(st + i * 8, GAV_UNSPEC); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The attributes of the file `path` into `st` (_GA_STATE bytes).
+fn gitattr_lookup(path, st) {
+    if (_ga_macros_read == 0) { _ga_macros_load(); }
+    _ga_state_begin(st);
+    var plen = strlen(path);
+    if (plen >= 4096) { _ga_state_end(st); return 0; }
+    var bn = 0;
+    var i = 0;
+    while (i < plen) {
+        if ((load8(path + i) & 0xFF) == 47) { bn = i + 1; }
+        i = i + 1;
+    }
+    var t[16];
+    _ga_text(".git/info/attributes", 20, &t);
+    if (load64(&t) != 0) { _ga_scan(load64(&t), load64(&t + 8), 0, path, plen, bn, st); }
+    var rel[4128];
+    i = plen - 1;
+    while (i > 0) {
+        if ((load8(path + i) & 0xFF) == 47) {
+            memcpy(&rel, path, i);
+            memcpy(&rel + i, "/.gitattributes", 16);
+            _ga_text(&rel, i + 15, &t);
+            if (load64(&t) != 0) { _ga_scan(load64(&t), load64(&t + 8), i, path, plen, bn, st); }
+        }
+        i = i - 1;
+    }
+    _ga_text(".gitattributes", 14, &t);
+    if (load64(&t) != 0) { _ga_scan(load64(&t), load64(&t + 8), 0, path, plen, bn, st); }
+    _ga_state_end(st);
+    return 0;
+}
+
+# convert.c's git_path_check_crlf: an attribute's state as an action.
+fn _ga_crlf_action(v) {
+    if (v == GAV_SET) { return GC_TEXT; }
+    if (v == GAV_INPUT) { return GC_TEXT; }
+    if (v == GAV_AUTO) { return GC_AUTO; }
+    if (v == GAV_UNSET) { return GC_NONE; }
+    return GC_UNDEF;
+}
+
+# What `path` needs before it can be compared with its blob (convert.c's
+# convert_attrs, the clean direction only: eol= decides what a checkout writes,
+# and anything cleaned ends in LF). An `ident`, a `filter` driver and a working-tree
+# encoding are conversions sit does not run, so such a file cannot be compared.
+fn gitattr_action(path) {
+    var st[48];
+    gitattr_lookup(path, &st);
+    if (load64(&st + GA_FILTER * 8) >= GAV_AUTO) { return GC_CANNOT; }
+    if (load64(&st + GA_IDENT * 8) == GAV_SET) { return GC_CANNOT; }
+    var w = load64(&st + GA_WTE * 8);
+    if (w >= GAV_AUTO) {
+        if (w != GAV_UTF8) { return GC_CANNOT; }
+    }
+    var act = _ga_crlf_action(load64(&st + GA_TEXT * 8));
+    if (act == GC_UNDEF) { act = _ga_crlf_action(load64(&st + GA_CRLF * 8)); }
+    if (act == GC_NONE) { return GC_NONE; }
+    var eol = load64(&st + GA_EOL * 8);
+    if (act == GC_UNDEF) {
+        if (eol == GAV_LF) { return GC_TEXT; }
+        if (eol == GAV_CRLF) { return GC_TEXT; }
+        return GC_NONE;
+    }
+    return act;
+}
+
+# git's gather_stats + convert_is_binary: 1 when `auto` leaves these bytes alone
+# as binary. Writes whether they hold a CRLF at crlf8.
+fn _ga_is_binary(buf, len, crlf8) {
+    var crlf = 0;
+    var lonecr = 0;
+    var nul = 0;
+    var printable = 0;
+    var nonprintable = 0;
+    var i = 0;
+    while (i < len) {
+        var c = load8(buf + i) & 0xFF;
+        if (c == 13) {
+            var pair = 0;
+            if (i + 1 < len) { if ((load8(buf + i + 1) & 0xFF) == 10) { pair = 1; } }
+            if (pair == 1) { crlf = crlf + 1; i = i + 1; }
+            else { lonecr = lonecr + 1; }
+        }
+        else {
+            if (c != 10) {
+                if (c == 127) { nonprintable = nonprintable + 1; }
+                else {
+                    if (c < 32) {
+                        var soft = 0;
+                        if (c == 8) { soft = 1; }
+                        if (c == 9) { soft = 1; }
+                        if (c == 12) { soft = 1; }
+                        if (c == 27) { soft = 1; }
+                        if (soft == 1) { printable = printable + 1; }
+                        else {
+                            if (c == 0) { nul = nul + 1; }
+                            nonprintable = nonprintable + 1;
+                        }
+                    }
+                    else { printable = printable + 1; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (len >= 1) {
+        if ((load8(buf + len - 1) & 0xFF) == 26) { nonprintable = nonprintable - 1; }
+    }
+    store64(crlf8, crlf);
+    if (lonecr != 0) { return 1; }
+    if (nul != 0) { return 1; }
+    if ((printable / 128) < nonprintable) { return 1; }
+    return 0;
+}
+
+# Remove each CR that comes before an LF, in place. Returns the new length.
+fn _ga_strip_cr(buf, len) {
+    var r = 0;
+    var w = 0;
+    while (r < len) {
+        var c = load8(buf + r) & 0xFF;
+        var drop = 0;
+        if (c == 13) {
+            if (r + 1 < len) {
+                if ((load8(buf + r + 1) & 0xFF) == 10) { drop = 1; }
+            }
+        }
+        if (drop == 0) {
+            store8(buf + w, c);
+            w = w + 1;
+        }
+        r = r + 1;
+    }
+    return w;
+}
+
+# The worktree bytes of `path` as git would compare them with its blob `blob`.
+# Rewrites `wbuf` in place, which only ever shortens it, and returns the length to
+# use, or -1 when sit cannot make that comparison (gitattr_action). git's `auto`
+# stands off a file that looks binary and, since 2.10, one whose blob already
+# holds CRLF: normalizing that would show every line as changed.
+fn gitattr_clean(path, wbuf, wlen, blob, blen) {
+    var act = gitattr_action(path);
+    if (act == GC_CANNOT) { return 0 - 1; }
+    if (act == GC_NONE) { return wlen; }
+    if (act == GC_AUTO) {
+        var crlf[8];
+        if (_ga_is_binary(wbuf, wlen, &crlf) == 1) { return wlen; }
+        if (load64(&crlf) == 0) { return wlen; }
+        var bcrlf[8];
+        if (_ga_is_binary(blob, blen, &bcrlf) == 0) {
+            if (load64(&bcrlf) != 0) { return wlen; }
+        }
+    }
+    return _ga_strip_cr(wbuf, wlen);
+}

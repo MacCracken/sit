@@ -7,8 +7,8 @@ str
 fs
 freelist
 chrono
-mmap
 hashmap
+mmap
 sigil
 process
 sandhi

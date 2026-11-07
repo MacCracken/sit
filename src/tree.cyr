@@ -304,6 +304,10 @@ fn parse_tree(body, body_len) {
 # strictly ascending git order), and nothing is allocated. The id is written by
 # git_pack.cyr's _hex_into.
 
+# What the last entry found was, past "not a tree" (1.13.2): 0 a file, 1 a
+# symlink, 2 a gitlink, which names a commit of another repository.
+var _tree_found_kind = 0;
+
 # The entry named name[0..nlen) in a tree body, if parse_tree would keep it.
 # Writes its id + NUL to hex_out; 2 for a tree, 1 for another entry, 0 for none.
 # Only the first entry of a name can be kept (a later one is out of order), so
@@ -329,6 +333,7 @@ fn _tree_body_find(body, body_len, name, nlen, hex_out) {
         if (nu + 1 + rawlen > body_len) { pos = body_len; }
         else {
             var ml = sp - pos;
+            var pos0 = pos;
             var en = body + sp + 1;            # NUL-terminated in the body
             var el = nu - sp - 1;
             var is_tree = 0;
@@ -368,6 +373,11 @@ fn _tree_body_find(body, body_len, name, nlen, hex_out) {
                     if (keep == 1) {
                         _hex_into(body + nu + 1, rawlen, hex_out);
                         found = 1 + is_tree;
+                        _tree_found_kind = 0;
+                        if (ml == 6) {
+                            if (memeq(body + pos0, "120000", 6) == 1) { _tree_found_kind = 1; }
+                            if (memeq(body + pos0, "160000", 6) == 1) { _tree_found_kind = 2; }
+                        }
                     }
                 }
             }
@@ -403,7 +413,10 @@ fn tree_path_find(tree_hex, path, plen, hex_out) {
             var k = read_object_kind(&cur, &obj);
             if (k < 0) { kind = 0 - 1; }
             else {
-                if (k != 2) { kind = 0 - 1; }
+                if (k != 2) {
+                    obj_fail_note(OBJ_CORRUPT, 0 - 1);
+                    kind = 0 - 1;
+                }
                 else {
                     var coff = load64(&obj + 16);
                     kind = _tree_body_find(load64(&obj) + coff, load64(&obj + 8) - coff, path + p, q - p, &cur);
@@ -456,35 +469,66 @@ var _tree_walk_depth = 0;
 var _TREE_MAX_NODES = 2000000;
 var _tree_walk_nodes = 0;
 
+# 1.13.2: entries are not the only dimension either. A path can be 256 levels of
+# 255-byte names, so 2M entries could still be gigabytes on the heap from a
+# 200 KB repository (issue 2026-10-31, audit G4). The byte budget charges each
+# entry what the walk keeps for it: its path, its name again (parse_tree's copy)
+# and about 150 bytes of records and id. A real tree costs ~250 bytes a file, so
+# this is about a million files; the Linux kernel is 80,000.
+var _TREE_MAX_BYTES = 268435456;   # 256 MiB
+var _tree_walk_bytes = 0;
+
+# Why the last walk stopped: 0 it did not, 1 over a budget, 2 a tree did not read.
+var _tree_walk_fail = 0;
+var _tree_walk_said = 0;           # the budget refusal is said once per process
+
 # Reset the per-walk budgets. Every EXTERNAL entry into flatten_tree must call
 # this first; the recursion itself must not.
 fn flatten_tree_reset() {
     _tree_walk_depth = 0;
     _tree_walk_nodes = 0;
+    _tree_walk_bytes = 0;
+    _tree_walk_fail = 0;
     return 0;
 }
 
-# Push one {mode, full path, hash} entry per file under `tree_hex`; depth- and node-capped.
+# A budget refused the walk: say so once (the read API walks per call), and
+# fail it. Returns flatten_tree's -2.
+fn _tree_walk_refuse(msg) {
+    _tree_walk_fail = 1;
+    if (_tree_walk_said == 0) {
+        eprintln(msg);
+        _tree_walk_said = 1;
+    }
+    return 0 - 2;
+}
+
+# Push one {mode, full path, hash} entry per file under `tree_hex`; capped in depth, entries and bytes.
 fn flatten_tree(tree_hex, prefix, out) {
     if (_tree_walk_depth >= _TREE_MAX_DEPTH) {
-        eprintln("sit: tree depth exceeds 256 — refusing to walk further");
-        return 0 - 2;
+        return _tree_walk_refuse("sit: tree depth exceeds 256 — refusing to walk further");
     }
     if (_tree_walk_nodes >= _TREE_MAX_NODES) {
-        eprintln("sit: tree entry count exceeds the walk limit (malformed or hostile repo?)");
-        return 0 - 2;
+        return _tree_walk_refuse("sit: tree entry count exceeds the walk limit (malformed or hostile repo?)");
+    }
+    if (_tree_walk_bytes >= _TREE_MAX_BYTES) {
+        return _tree_walk_refuse("sit: tree paths exceed the walk limit (malformed or hostile repo?)");
     }
     _tree_walk_depth = _tree_walk_depth + 1;
     var obj[24];
     if (read_object(tree_hex, &obj) != 0) {
         _tree_walk_depth = _tree_walk_depth - 1;
+        _tree_walk_fail = 2;
         return 0 - 1;
     }
     var buf = load64(&obj);
     var blen = load64(&obj + 8);
     var coff = load64(&obj + 16);
 
+    # parse_tree copies what it keeps, so the object's buffer goes back here. It
+    # was kept per visit, and a tree that repeats one subtree revisits it.
     var entries = parse_tree(buf + coff, blen - coff);
+    fl_free(buf);
     var n = vec_len(entries);
     var i = 0;
     while (i < n) {
@@ -496,6 +540,12 @@ fn flatten_tree(tree_hex, prefix, out) {
 
         var prefix_len = strlen(prefix);
         var name_len = strlen(name);
+        _tree_walk_bytes = _tree_walk_bytes + prefix_len + 2 * name_len + 150;
+        # One tree can hold 600,000 entries, each with the whole prefix.
+        if (_tree_walk_bytes >= _TREE_MAX_BYTES) {
+            _tree_walk_depth = _tree_walk_depth - 1;
+            return _tree_walk_refuse("sit: tree paths exceed the walk limit (malformed or hostile repo?)");
+        }
 
         if (streq(mode, "40000") == 1) {
             var sub_prefix = alloc_or_die(prefix_len + name_len + 2);
@@ -547,7 +597,10 @@ fn read_head_tree_entries() {
     var out = commit_tree_entries(head_commit);
     if (out == 0) {
         if (_head_tree_warned == 0) {
-            eprintln("sit: HEAD's tree cannot be read (missing or corrupt objects) — run 'sit fsck'");
+            # A budget refusal has said so already, and fsck would not help.
+            if (_tree_walk_fail != 1) {
+                eprintln("sit: HEAD's tree cannot be read (missing or corrupt objects) — run 'sit fsck'");
+            }
             _head_tree_warned = 1;
         }
     }

@@ -115,6 +115,51 @@ fn resolve_hash(prefix, out_buf) {
 # past the ratio / 16 MiB caps), -4 no framing NUL.
 var _OBJ_INFLATE_MAX = 16777216;
 
+# Why the last object read failed (1.13.2): 0 nothing was said, so the object is
+# not here; OBJ_TOO_BIG past the inflate ceilings; OBJ_CORRUPT here, but it does
+# not read. `_obj_fail_size` is a too-big object's own size when it declared one,
+# else -1. The read API and status need the difference: a blob read as absent
+# marked every line of an unchanged 23 MB file as new. The return codes below
+# differ per backend and per layer, so the reason is recorded where it is known.
+# obj_fail_clear goes before the read being asked about.
+enum ObjFail { OBJ_TOO_BIG = 1, OBJ_CORRUPT = 2 }
+var _obj_fail = 0;
+var _obj_fail_size = 0 - 1;
+
+# Forget the last failure, before a read whose outcome will be asked about.
+fn obj_fail_clear() {
+    _obj_fail = 0;
+    _obj_fail_size = 0 - 1;
+    return 0;
+}
+
+# Record why a read failed. The first reason stands, so a too-big delta base is
+# not overwritten by the chain it stopped; a known size is kept either way.
+fn obj_fail_note(why, size) {
+    if (_obj_fail == 0) { _obj_fail = why; }
+    if (size >= 0) { _obj_fail_size = size; }
+    return 0;
+}
+
+# An inflate's negative result, recorded: over a ceiling, or not a stream.
+fn _obj_fail_inflate(rc, size) {
+    if (rc == 0 - ERR_OUTPUT_LIMIT) { return obj_fail_note(OBJ_TOO_BIG, size); }
+    if (rc == 0 - ERR_BUFFER_TOO_SMALL) { return obj_fail_note(OBJ_TOO_BIG, size); }
+    return obj_fail_note(OBJ_CORRUPT, 0 - 1);
+}
+
+# The content size a framed header at `buf` declares ("<type> <n>\0"), or -1.
+fn _obj_frame_size(buf, avail) {
+    var want = obj_frame_total(buf, avail);
+    if (want < 0) { return 0 - 1; }
+    var nul = 0;
+    while (nul < avail) {
+        if (load8(buf + nul) == 0) { return want - nul - 1; }
+        nul = nul + 1;
+    }
+    return 0 - 1;
+}
+
 # Inflate stored object bytes into a freelist buffer sized for them (see above).
 fn obj_inflate_fl(compressed, clen, out24) {
     var dec_cap = clen * 4;
@@ -129,7 +174,11 @@ fn obj_inflate_fl(compressed, clen, out24) {
         if (dec_cap < _OBJ_INFLATE_MAX) {
             # The output is written in order, so the header is in `buf`.
             var want = obj_frame_total(buf, 32);
-            if (want > _OBJ_INFLATE_MAX) { fl_free(buf); return 0 - 3; }
+            if (want > _OBJ_INFLATE_MAX) {
+                obj_fail_note(OBJ_TOO_BIG, _obj_frame_size(buf, 32));
+                fl_free(buf);
+                return 0 - 3;
+            }
             var cap2 = want + 16;
             if (want <= dec_cap) { cap2 = _OBJ_INFLATE_MAX; }   # header unreadable or lying
             if (cap2 > _OBJ_INFLATE_MAX) { cap2 = _OBJ_INFLATE_MAX; }
@@ -139,7 +188,11 @@ fn obj_inflate_fl(compressed, clen, out24) {
             dlen = zlib_decompress_with_ratio_cap(compressed, clen, buf, cap2, SIT_MAX_INFLATE_RATIO);
         }
     }
-    if (dlen <= 0) { fl_free(buf); return 0 - 3; }
+    if (dlen <= 0) {
+        _obj_fail_inflate(dlen, _obj_frame_size(buf, 32));
+        fl_free(buf);
+        return 0 - 3;
+    }
     var nul = 0;
     var scanning = 1;
     while (scanning == 1) {
@@ -149,7 +202,11 @@ fn obj_inflate_fl(compressed, clen, out24) {
             else { nul = nul + 1; }
         }
     }
-    if (nul >= dlen) { fl_free(buf); return 0 - 4; }
+    if (nul >= dlen) {
+        obj_fail_note(OBJ_CORRUPT, 0 - 1);
+        fl_free(buf);
+        return 0 - 4;
+    }
     store64(out24, buf);
     store64(out24 + 8, dlen);
     store64(out24 + 16, nul + 1);
@@ -693,7 +750,7 @@ fn db_row_read(db, hex, out) {
 
     var rs = patra_query(db, sql);
     fl_free(sql);
-    if (rs == 0) { return 0 - 2; }
+    if (rs == 0) { obj_fail_note(OBJ_CORRUPT, 0 - 1); return 0 - 2; }
     if (patra_result_count(rs) == 0) {
         patra_result_free(rs);
         return 0 - 3;
@@ -701,6 +758,7 @@ fn db_row_read(db, hex, out) {
 
     var blen = patra_result_get_bytes_len(rs, 0, 0);
     if (blen <= 0) {
+        obj_fail_note(OBJ_CORRUPT, 0 - 1);
         patra_result_free(rs);
         return 0 - 4;
     }
@@ -711,6 +769,7 @@ fn db_row_read(db, hex, out) {
         return 0 - 6;
     }
     if (patra_result_read_bytes(db, rs, 0, 0, compressed) != 0) {
+        obj_fail_note(OBJ_CORRUPT, 0 - 1);
         fl_free(compressed);
         patra_result_free(rs);
         return 0 - 5;
@@ -1086,9 +1145,17 @@ var _object_db_cached = 0;
 # in that process can write it, and gc cannot run there either. agnos has only
 # non-blocking flock, so there a command does not wait for gc (accepted, as for
 # its other locks).
+#
+# 1.13.2: the read API never creates it (`_store_lock_create`). A consumer only
+# views the repository, and a missing lock file means no writer has run here
+# since it was made, so there is nothing to wait for and the store opens
+# unlocked, as a read-only repository's does. A gc that starts during such a call
+# makes the file and locks it; the worst it does to the reader is one read that
+# fails and says so.
 
 var _store_lock_fd = 0 - 1;     # this repository's lock file, once opened
 var _store_lock_held = 0;       # 0 not held, 1 shared, 2 exclusive (gc)
+var _store_lock_create = 1;     # 0 while the read API is in a call
 # The device and inode of the objects.patra the cached handle has open
 # (1.11.0): a store session that finds another file there knows a gc replaced it.
 var _store_id_a = 0;
@@ -1116,14 +1183,15 @@ fn _store_lock_nonblock() {
     #endif
 }
 
-# Open, creating if needed, the lock file at the resolved path `ap`: an fd, or
-# -1 when it cannot be opened or is not a regular file. 1.12.2 (P5): opened
-# without blocking and checked on the fd, so a FIFO swapped in after the lstat
-# (in a file:// remote another user can write) is refused instead of hanging
-# the open.
+# Open, creating if needed (and allowed, see above), the lock file at the
+# resolved path `ap`: an fd, or -1 when it cannot be opened or is not a regular
+# file. 1.12.2 (P5): opened without blocking and checked on the fd, so a FIFO
+# swapped in after the lstat (in a file:// remote another user can write) is
+# refused instead of hanging the open.
 fn _store_lock_open(ap) {
     var kind = path_lstat_kind(ap);
     if (kind < 0) {
+        if (_store_lock_create == 0) { return 0 - 1; }
         var cfd = file_open(ap, O_RDONLY | O_CREAT | O_EXCL | _store_lock_cloexec(), 0x1A4);
         if (cfd >= 0) { return cfd; }
         kind = path_lstat_kind(ap);               # another process created it meanwhile
@@ -1142,9 +1210,10 @@ fn _store_lock_open(ap) {
 }
 
 # How long this process waits for its own repository's shared lock while a gc
-# holds it, in ms: -1 for as long as the gc runs (a command, the read API, a
-# one-repository server), 0 not at all (`sit serve --repos`, whose requests
-# answer 503 instead: one repository's gc stalled the whole server, 1.12.2 X6).
+# holds it, in ms: -1 for as long as the gc runs (a command, a one-repository
+# server), 0 not at all (`sit serve --repos`, whose requests answer 503 instead:
+# one repository's gc stalled the whole server, 1.12.2 X6). The read API sets it
+# per call (sit_set_store_wait, 1.13.2).
 var _store_session_wait_ms = 0 - 1;
 
 # How long a file:// remote's lock is waited for, in ms (1.12.2, P5): anyone who

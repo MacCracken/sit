@@ -1,0 +1,133 @@
+# read_result_probe.cyr — what the read API answers, and why (1.13.2).
+#
+# Built by tests/integration/run.sh against the SHIPPED read bundle
+# (dist/sit-read.cyr, what owl and thoth link), then run inside a repo:
+#
+#   read_result_probe diff <path> [wait_ms] [max_bytes] [max_lines]
+#   read_result_probe status [wait_ms]
+#   read_result_probe repeat             three status calls; the first and last result
+#
+# Prints one line, then peak resident KB:
+#
+#   DIFF <result> <ops, -1 for a 0 return> <adds> <dels>
+#   STATUS <result> <records>       followed by one `R <kind> <path>` per record
+#   PEAK <KB>
+#
+# A wait of -1 is no limit. Not part of the product; lives with the tests.
+include "dist/sit-read.cyr"
+
+fn _put_num(label, v) {
+    var nb[24];
+    stdout_write(label, strlen(label));
+    if (v < 0) {
+        stdout_write("-", 1);
+        v = 0 - v;
+    }
+    var k = write_decimal(&nb, v);
+    stdout_write(&nb, k);
+    return 0;
+}
+
+# A decimal argument, a leading '-' allowed.
+fn _arg_num(i) {
+    var s = argv_heap(i);
+    var neg = 0;
+    var ci = 0;
+    if (load8(s) == 45) { neg = 1; ci = 1; }
+    var v = 0;
+    while (load8(s + ci) != 0) { v = v * 10 + (load8(s + ci) - 48); ci = ci + 1; }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+
+# Peak resident KB, VmHWM of /proc/self/status.
+fn _peak_kb() {
+    var fd = file_open("/proc/self/status", 0, 0);
+    if (fd < 0) { return 0; }
+    var buf = alloc(8192);
+    var n = file_read(fd, buf, 8191);
+    file_close(fd);
+    var i = 0;
+    while (i + 6 < n) {
+        if (memeq(buf + i, "VmHWM:", 6) == 1) {
+            var p = i + 6;
+            var v = 0;
+            while (p < n) {
+                var d = load8(buf + p);
+                if (d >= 48) { if (d <= 57) { v = v * 10 + (d - 48); } }
+                if (d == 10) { p = n; }
+                p = p + 1;
+            }
+            return v;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    args_init();
+    if (sit_repo_open(".") == 0) { eprintln("PROBE-FAIL-OPEN"); return 1; }
+    var cmd = argv_heap(1);
+    var ac = argc();
+    if (streq(cmd, "repeat") == 1) {
+        sit_repo_status(0);
+        var first = sit_last_result();
+        sit_repo_status(0);
+        sit_repo_status(0);
+        _put_num("REPEAT ", first);
+        _put_num(" ", sit_last_result());
+        stdout_write("\n", 1);
+    }
+    elif (streq(cmd, "status") == 1) {
+        if (ac > 2) { sit_set_store_wait(_arg_num(2)); }
+        var st = sit_repo_status(0);
+        var sn = 0 - 1;
+        if (st != 0) { sn = vec_len(st); }
+        _put_num("STATUS ", sit_last_result());
+        _put_num(" ", sn);
+        stdout_write("\n", 1);
+        var i = 0;
+        while (i < sn) {
+            var rec = vec_get(st, i);
+            _put_num("R ", sit_status_kind(rec));
+            stdout_write(" ", 1);
+            var p = sit_status_path(rec);
+            stdout_write(p, strlen(p));
+            stdout_write("\n", 1);
+            i = i + 1;
+        }
+    }
+    else {
+        var path = argv_heap(2);
+        if (ac > 3) { sit_set_store_wait(_arg_num(3)); }
+        if (ac > 5) { sit_set_diff_limit(_arg_num(4), _arg_num(5)); }
+        var ops = sit_diff_path(0, path);
+        var n = 0 - 1;
+        var adds = 0;
+        var dels = 0;
+        if (ops != 0) {
+            n = vec_len(ops);
+            var j = 0;
+            while (j < n) {
+                var k = ann_kind(vec_get(ops, j));
+                if (k == 2) { adds = adds + 1; }
+                if (k == 1) { dels = dels + 1; }
+                j = j + 1;
+            }
+        }
+        _put_num("DIFF ", sit_last_result());
+        _put_num(" ", n);
+        _put_num(" ", adds);
+        _put_num(" ", dels);
+        stdout_write("\n", 1);
+    }
+    _put_num("PEAK ", _peak_kb());
+    stdout_write("\n", 1);
+    stdout_flush();
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

@@ -1,4 +1,6 @@
-# The read API waits forever on a held store lock, and creates `.sit/objects.flock` from a read-only view — OPEN
+# The read API waits forever on a held store lock, and creates `.sit/objects.flock` from a read-only view — RESOLVED
+
+**Resolution:** Closed in sit 1.13.2: `sit_set_store_wait` (60 s by default, `SIT_BUSY` past it), and a read-only view no longer creates the lock file. See architecture 008.
 
 **Discovered:** 2026-10-31 during owl's P(−1) audit (1.5.3, INFO-005), VCS-path review.
 **Severity:** Medium. A viewer hangs with no output for as long as another process holds the lock, and a

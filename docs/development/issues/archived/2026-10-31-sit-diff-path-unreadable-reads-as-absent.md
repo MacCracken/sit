@@ -1,4 +1,6 @@
-# `sit_diff_path` reports "unreadable" as "absent" and "too big to diff" as "unchanged" — OPEN
+# `sit_diff_path` reports "unreadable" as "absent" and "too big to diff" as "unchanged" — RESOLVED
+
+**Resolution:** Closed in sit 1.13.2: `sit_last_result` tells them apart, and `sit_set_diff_limit` is the caller's budget. `sit status` no longer calls an unreadable file modified, and the 10,000-entry pack directory reads. See the CHANGELOG's 1.13.2 entry and ADR 0009's amendment.
 
 **Discovered:** 2026-10-31 during owl's P(−1) audit (1.5.3, INFO-006), VCS-path review.
 **Severity:** Medium. Silent wrong answers in both directions: a consumer marks an unchanged file entirely

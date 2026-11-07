@@ -110,7 +110,7 @@ fn build_commit_object(tree_hex, parents, message, seed) {
 
 # Read a commit's parent hexes — the out+48 vec from parse_commit_body, or 0
 # if the object is unreadable / not a parseable commit. The returned vec holds
-# heap-owned 64-char NUL-terminated hex copies (safe to retain across calls).
+# heap-owned NUL-terminated hex copies (safe to retain across calls).
 # Consolidates the read_object → parse_commit_body → load64(out+48) boilerplate
 # shared by the pure parent-graph walks (is_ancestor, find_merge_base). [v0.9.0]
 fn commit_parents_of(hex) {
@@ -120,7 +120,9 @@ fn commit_parents_of(hex) {
     var blen = load64(&obj + 8);
     var coff = load64(&obj + 16);
     var info[56];
-    if (parse_commit_body(buf + coff, blen - coff, &info) != 0) { return 0; }
+    var pr = parse_commit_body(buf + coff, blen - coff, &info);
+    fl_free(buf);
+    if (pr != 0) { return 0; }
     return load64(&info + 48);
 }
 
@@ -1432,20 +1434,31 @@ fn cmd_log() {
     return 0;
 }
 
-# Hash arbitrary content with "blob <len>\0" framing without writing.
-# Returns 64-char null-terminated hex C-string (matches `sit add`'s hash).
-fn commit_tree_entries(commit_hex) {
+# A commit's tree id as a heap cstring, or 0. 1.13.2: here, not in history.cyr,
+# because `sit show` (diff.cyr, in the read bundle) calls it and history.cyr is
+# not in `[lib.read]`: every consumer build printed it as a fourth undefined
+# function (architecture 006). The commit's buffer is freed, since the read API
+# reaches this once per call.
+fn commit_tree_hex(commit_hex) {
     var obj[24];
     if (read_object(commit_hex, &obj) != 0) { return 0; }
     var buf = load64(&obj);
     var blen = load64(&obj + 8);
     var coff = load64(&obj + 16);
-    var body = buf + coff;
-    var body_len = blen - coff;
-
     var info[56];
-    if (parse_commit_body(body, body_len, &info) != 0) { return 0; }
-    var tree_hex = load64(&info);
+    var pr = parse_commit_body(buf + coff, blen - coff, &info);
+    fl_free(buf);
+    if (pr != 0) {
+        obj_fail_note(OBJ_CORRUPT, 0 - 1);
+        return 0;
+    }
+    return load64(&info);
+}
+
+# Every file of a commit's tree, flattened: a vec of {mode, path, hash}, or 0
+# when the commit or a tree in it cannot be read.
+fn commit_tree_entries(commit_hex) {
+    var tree_hex = commit_tree_hex(commit_hex);
     if (tree_hex == 0) { return 0; }
 
     var out = vec_new();

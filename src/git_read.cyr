@@ -201,7 +201,11 @@ fn _git_read_loose_in(objdir, hex, out) {
     var size = syscall(SYS_LSEEK, fd, 0, SEEK_END);
     syscall(SYS_LSEEK, fd, 0, SEEK_SET);
     if (size < 0) { file_close(fd); return 0 - 1; }
-    if (size > _GIT_LOOSE_MAX) { file_close(fd); return 0 - 1; }
+    if (size > _GIT_LOOSE_MAX) {
+        obj_fail_note(OBJ_TOO_BIG, 0 - 1);
+        file_close(fd);
+        return 0 - 1;
+    }
     var compressed = fl_alloc(size + 1);
     if (compressed == 0) { file_close(fd); return 0 - 1; }
     var blen = 0;
@@ -215,7 +219,11 @@ fn _git_read_loose_in(objdir, hex, out) {
         }
     }
     file_close(fd);
-    if (blen <= 0) { fl_free(compressed); return 0 - 2; }
+    if (blen <= 0) {
+        obj_fail_note(OBJ_CORRUPT, 0 - 1);
+        fl_free(compressed);
+        return 0 - 2;
+    }
 
     # 1.7.6 (R10): the shared inflate, sized from the object's header.
     var ir = obj_inflate_fl(compressed, blen, out);
@@ -551,6 +559,51 @@ fn _git_packed_ref_scan(buf, len, refname, out_buf) {
         }
     }
     return result;
+}
+
+# Every `refs/tags/` entry of .git/packed-refs not already in `seen` (a map of
+# names), onto `names` and into `seen` as name -> id, both heap cstrings. `^` lines
+# are peeled ids and are passed over: peel_tag reads the tag object itself.
+fn _git_packed_tags(names, seen) {
+    var pair[16];
+    if (read_file_fl(".git/packed-refs", &pair) != 0) { return 0; }
+    var buf = load64(&pair);
+    var len = load64(&pair + 8);
+    var hl = _id_hexlen();
+    var pos = 0;
+    while (pos < len) {
+        var le = pos;
+        var going = 1;
+        while (going == 1) {
+            if (le >= len) { going = 0; }
+            else {
+                if (load8(buf + le) == 10) { going = 0; }
+                else { le = le + 1; }
+            }
+        }
+        var e = le;
+        if (e > pos) { if (load8(buf + e - 1) == 13) { e = e - 1; } }
+        # "<id> refs/tags/<name>"
+        var ns = pos + hl + 1 + 10;
+        if (ns < e) {
+            if (hex_prefix_valid(buf + pos, hl) == 1) {
+                if (load8(buf + pos + hl) == 32) {
+                    if (memeq(buf + pos + hl + 1, "refs/tags/", 10) == 1) {
+                        var name = alloc_or_die(e - ns + 1);
+                        memcpy(name, buf + ns, e - ns);
+                        store8(name + e - ns, 0);
+                        if (map_has(seen, name) == 0) {
+                            map_set(seen, name, _id_dup(buf + pos));
+                            vec_push(names, name);
+                        }
+                    }
+                }
+            }
+        }
+        pos = le + 1;
+    }
+    fl_free(buf);
+    return 0;
 }
 
 # Look up a full refname (e.g. "refs/heads/main") in .git/packed-refs. Writes

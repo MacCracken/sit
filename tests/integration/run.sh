@@ -75,6 +75,17 @@ if command -v cyrius >/dev/null 2>&1; then
   fi
 fi
 
+# 1.13.2: what the read API answers, and why, against the shipped read bundle.
+RESULT_PROBE=""
+RESULT_PROBE_BROKEN=0
+if command -v cyrius >/dev/null 2>&1; then
+  if ( cd "$ROOT" && cyrius build tests/integration/read_result_probe.cyr "$WORK/read_result_probe" ) >"$WORK/read_result_probe.log" 2>&1; then
+    RESULT_PROBE="$WORK/read_result_probe"
+  else
+    RESULT_PROBE_BROKEN=1
+  fi
+fi
+
 export HOME="$WORK/home"; mkdir -p "$HOME"
 export SIT_AUTHOR_NAME="Integration Test"
 export SIT_AUTHOR_EMAIL="itest@sit.local"
@@ -3158,6 +3169,309 @@ if command -v git >/dev/null 2>&1; then
   mkdir gf; printf 'gitdir: ../victim/.git\n' > gf/.git; nosit48 gf "a hostile gitdir: file"
 else
   printf '  SKIP: git not installed — section 48 skipped\n'
+fi
+
+# ── 49. a consumer build leaves nothing unresolved it should not ───
+# cyrius refuses a REACHABLE undefined call, but an unreachable one only warns, so
+# `commit_tree_hex` dangled in the read bundle from 1.7.6 to 1.13.1 with no test
+# noticing (issue 2026-10-31). architecture 006 lists what may dangle, and why.
+hr "bundle closure"
+unresolved() { grep -ho "undefined function '[^']*'" "$@" 2>/dev/null | sed "s/.*'\(.*\)'/\1/" | sort -u | tr '\n' ' '; }
+if [ -n "$RESULT_PROBE" ] && [ -n "$GIT_PROBE" ]; then
+  assert_eq "$(unresolved "$WORK/read_result_probe.log" "$WORK/api_heap_probe.log" "$WORK/repo_switch_probe.log" "$WORK/read_heap_probe.log")" \
+    "load_signing_seed sign_commit_body verify_commit_body " "49: dist/sit-read.cyr leaves only the documented symbols"
+  assert_eq "$(unresolved "$WORK/git_probe.log" "$WORK/serve_push_probe.log")" \
+    "_ssh_set_auth_token _url_is_http_family _wire_https_connect ssh_remote_push_object ssh_remote_push_ref ssh_remote_read_both ssh_remote_read_raw ssh_remote_resolve_branch wire_ssh_close wire_ssh_open " \
+    "49: dist/sit.cyr leaves only the documented symbols"
+  case "$(cat "$WORK"/*_probe.log)" in *"reachable call site"*) bad "49: a probe has a reachable undefined call";; *) ok;; esac
+elif [ "$RESULT_PROBE_BROKEN" = 1 ]; then
+  bad "49: read_result_probe.cyr does not compile against dist/sit-read.cyr (see $WORK/read_result_probe.log)"
+else
+  echo "  (skipped 49: needs cyrius)"
+fi
+
+# ── 50. the read API says why it has no answer ─────────────────────
+# Through 1.13.1 sit_diff_path had one success shape, so "could not read HEAD" came
+# back as every line added and "too big to diff" as no changes, and flattening all
+# of HEAD to find one path made a 200 KB repository a gigabyte problem.
+hr "read API results"
+if [ -n "$RESULT_PROBE" ] && command -v git >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  G() { git -c user.name=t -c user.email=t@t "$@"; }
+  peak() { sed -n 's/^PEAK //p'; }
+  Y="$WORK/rr132"; mkdir -p "$Y"; cd "$Y"
+
+  # 50a. A tree bomb. N = 100 cost 1.7 GB to view a 12-byte file through owl.
+  BOMB="$ROOT/docs/development/issues/archived/repros/2026-10-31-sit-tree-bomb.py"
+  python3 -I "$BOMB" tb 20 100 1000 255 >/dev/null
+  python3 -I "$BOMB" tc 20 2000 1000 255 >/dev/null
+  OUT=$(cd tb && "$RESULT_PROBE" diff README)
+  assert_eq "$(echo "$OUT" | head -1)" "DIFF 0 -1 0 0" "50a: a clean file in a tree bomb is clean"
+  [ "$(echo "$OUT" | peak)" -lt 32768 ] && ok || bad "50a: one path cost $(echo "$OUT" | peak) KB (bound 32 MB; 1.13.1 1.7 GB)"
+  OUT=$(cd tc && "$RESULT_PROBE" diff README)
+  assert_eq "$(echo "$OUT" | head -1)" "DIFF 0 -1 0 0" "50a: at the 2M-entry scale too (1.13.1: out of memory)"
+  [ "$(echo "$OUT" | peak)" -lt 32768 ] && ok || bad "50a: one path at 2M entries cost $(echo "$OUT" | peak) KB"
+  OUT=$(cd tb && "$RESULT_PROBE" status 2>/dev/null)
+  assert_eq "$(echo "$OUT" | head -1)" "STATUS 9 0" "50a: status fails closed, and says so"
+  [ "$(echo "$OUT" | peak)" -lt 409600 ] && ok || bad "50a: status cost $(echo "$OUT" | peak) KB (bound 400 MB)"
+  OUT=$(cd tb && "$RESULT_PROBE" repeat 2>/dev/null)
+  assert_eq "$(echo "$OUT" | head -1)" "REPEAT 9 9" "50a: a repeat says the same"
+  [ "$(echo "$OUT" | peak)" -lt 409600 ] && ok || bad "50a: a repeat walked again ($(echo "$OUT" | peak) KB; 1.13.1 3.3 GB in three calls)"
+  OUT=$(cd tb && "$SIT" status 2>&1); RC=$?
+  assert_eq "$RC" "1" "50a: sit status refuses it"
+  assert_contains "$OUT" "walk limit" "50a: and says why"
+  case "$OUT" in *Untracked*) bad "50a: an unread tree listed files as untracked";; *) ok;; esac
+
+  # 50b. A blob past the read ceiling: not absent, and not modified.
+  mkdir b; ( cd b; git init -q .
+    python3 -I -c "
+open('big.txt','w').write(''.join(f'line {i}\n' for i in range(2000000)))
+open('alt.txt','w').write(''.join(f'v{i}\n' for i in range(8000)))
+open('ok.txt','w').write('a\nb\n')"
+    git add -A; G commit -qm base )
+  big50() {
+    assert_eq "$(cd b && "$RESULT_PROBE" diff big.txt | head -1)" "DIFF 2 -1 0 0" "50b: $1: too big, not all added"
+    assert_contains "$(cd b && "$RESULT_PROBE" status)" "R 4 big.txt" "50b: $1: not compared"
+    assert_contains "$(cd b && "$SIT" status)" "Not compared" "50b: $1: sit status says so"
+    case "$(cd b && "$SIT" status)" in *"modified:  big.txt"*) bad "50b: $1: an unchanged file came back modified";; *) ok;; esac
+  }
+  big50 "loose"
+  ( cd b; git gc -q ); big50 "packed"
+  # A size that changed is a change, known without reading the blob.
+  cp b/big.txt big.save; printf 'line 0\nCHANGED\n' > b/big.txt
+  assert_contains "$(cd b && "$RESULT_PROBE" status)" "R 1 big.txt" "50b: a different size is modified"
+  assert_eq "$(cd b && "$RESULT_PROBE" diff big.txt | head -1)" "DIFF 2 -1 0 0" "50b: and has no diff, said"
+  python3 -I -c "
+b = open('big.save','rb').read(); open('b/big.txt','wb').write(b[:5] + (b'9' if b[5:6] != b'9' else b'8') + b[6:])"
+  assert_contains "$(cd b && "$RESULT_PROBE" status)" "R 4 big.txt" "50b: the same size cannot be told"
+  cp big.save b/big.txt
+  # A delta chain's object: the size asked about is the object's, not its base's.
+  mkdir bd; ( cd bd; git init -q .
+    python3 -I -c "open('big.txt','w').write(''.join(f'line {i}\n' for i in range(2000000)))"
+    git add -A; G commit -qm one; echo extra >> big.txt; git add -A; G commit -qm two
+    git repack -adfq --depth=50 --window=50 )
+  assert_contains "$(cd bd && "$RESULT_PROBE" status)" "R 4 big.txt" "50b: a delta's size is the object's"
+  echo more >> bd/big.txt
+  assert_contains "$(cd bd && "$RESULT_PROBE" status)" "R 1 big.txt" "50b: a delta's change of size is seen"
+
+  # 50c. A diff past its budget is not "no changes".
+  python3 -I -c "
+L=[f'v{i}\n' for i in range(8000)]
+for i in range(0,8000,2): L[i]=f'w{i}\n'
+open('b/alt.txt','w').write(''.join(L))"
+  assert_eq "$(cd b && "$RESULT_PROBE" diff alt.txt | head -1)" "DIFF 7 -1 0 0" "50c: too big to diff, said"
+  assert_contains "$(cd b && "$RESULT_PROBE" status)" "R 1 alt.txt" "50c: and status still calls it modified"
+
+  # 50d. The caller's budget.
+  printf 'a\nb\nc\nd\ne\n' > b/ok.txt
+  assert_eq "$(cd b && "$RESULT_PROBE" diff ok.txt 0 0 0 | head -1)" "DIFF 0 5 3 0" "50d: no limit of the caller's"
+  assert_eq "$(cd b && "$RESULT_PROBE" diff ok.txt 0 5 0 | head -1)" "DIFF 5 -1 0 0" "50d: the worktree over its bytes"
+  assert_eq "$(cd b && "$RESULT_PROBE" diff ok.txt 0 0 4 | head -1)" "DIFF 5 -1 0 0" "50d: over its lines"
+  assert_eq "$(cd b && "$RESULT_PROBE" diff ok.txt 0 0 5 | head -1)" "DIFF 0 5 3 0" "50d: at its lines"
+  printf 'a\n' > b/ok.txt
+  assert_eq "$(cd b && "$RESULT_PROBE" diff ok.txt 0 3 0 | head -1)" "DIFF 2 -1 0 0" "50d: the HEAD side over its bytes"
+  assert_eq "$(cd b && "$RESULT_PROBE" diff ok.txt 0 0 1 | head -1)" "DIFF 2 -1 0 0" "50d: over its lines"
+  printf 'a\nb\n' > b/ok.txt
+
+  # 50e. Missing and corrupt are told apart, in a blob and in a tree on the way.
+  mkdir e; ( cd e; git init -q .; mkdir d; echo one > d/f.txt; echo two > g.txt; git add -A; G commit -qm c )
+  BH=$(cd e && git rev-parse HEAD:g.txt); TH=$(cd e && git rev-parse HEAD:d)
+  op() { printf '%s' "e/.git/objects/$(printf %s "$1" | cut -c1-2)/$(printf %s "$1" | cut -c3-)"; }
+  chmod u+w "$(op "$BH")"; printf 'not zlib' > "$(op "$BH")"
+  assert_eq "$(cd e && "$RESULT_PROBE" diff g.txt | head -1)" "DIFF 4 -1 0 0" "50e: a corrupt blob"
+  assert_contains "$(cd e && "$RESULT_PROBE" status)" "R 4 g.txt" "50e: is not compared"
+  rm -f "$(op "$BH")"
+  assert_eq "$(cd e && "$RESULT_PROBE" diff g.txt | head -1)" "DIFF 3 -1 0 0" "50e: a missing blob"
+  chmod u+w "$(op "$TH")"; rm -f "$(op "$TH")"
+  assert_eq "$(cd e && "$RESULT_PROBE" diff d/f.txt | head -1)" "DIFF 3 -1 0 0" "50e: a missing tree on the way"
+  OUT=$(cd e && "$RESULT_PROBE" status 2>/dev/null)
+  assert_eq "$(echo "$OUT" | head -1)" "STATUS 3 0" "50e: status has no answer, and says why"
+  rm -f "$(op "$(cd e && git rev-parse HEAD)")"
+  assert_eq "$(cd e && "$RESULT_PROBE" diff g.txt | head -1)" "DIFF 3 -1 0 0" "50e: a missing commit"
+
+  # 50f. The worktree side: unreadable is not deleted, a link is its target.
+  mkdir f; ( cd f; git init -q .; mkdir d; echo one > a.txt; echo two > d/b.txt; ln -s a.txt l; git add -A; G commit -qm c )
+  if [ "$(id -u)" != 0 ]; then
+    chmod 000 f/a.txt
+    assert_eq "$(cd f && "$RESULT_PROBE" diff a.txt | head -1)" "DIFF 6 -1 0 0" "50f: an unreadable file is no deletion"
+    assert_contains "$(cd f && "$RESULT_PROBE" status)" "R 4 a.txt" "50f: and is not compared"
+    chmod 644 f/a.txt
+    chmod 000 f/d
+    assert_eq "$(cd f && "$RESULT_PROBE" diff d/b.txt | head -1)" "DIFF 6 -1 0 0" "50f: nor is one behind a closed directory"
+    chmod 755 f/d
+  fi
+  mv f/a.txt f/gone; assert_eq "$(cd f && "$RESULT_PROBE" diff a.txt | head -1)" "DIFF 0 1 0 1" "50f: a real deletion still is one"
+  mv f/gone f/a.txt
+  printf 'secret-outside-the-tree\n' > outside.txt; rm f/l; ln -s ../outside.txt f/l
+  assert_eq "$(cd f && "$RESULT_PROBE" diff l | head -1)" "DIFF 0 2 1 1" "50f: a retargeted link is one line changed"
+  rm f/l; ln -s a.txt f/l
+  assert_eq "$(cd f && "$RESULT_PROBE" diff l | head -1)" "DIFF 0 -1 0 0" "50f: an unchanged link is unchanged"
+
+  # 50g. A pack directory past 10,000 entries read every packed object as missing.
+  mkdir g; ( cd g; git init -q .; printf 'a\nb\n' > a.txt; git add -A; G commit -qm c; git gc -q
+    python3 -I -c "
+for i in range(12000): open('.git/objects/pack/tmp_%05d' % i, 'w').close()" )
+  assert_eq "$(cd g && "$RESULT_PROBE" diff a.txt | head -1)" "DIFF 0 -1 0 0" "50g: a crowded pack directory still reads"
+
+  # 50h. The store lock: a chosen wait, a distinct answer, and a view creates nothing.
+  mkdir h; ( cd h; "$SIT" init >/dev/null; printf 'a\nb\n' > a.txt; "$SIT" add a.txt >/dev/null
+             "$SIT" commit -m c >/dev/null; printf 'a\nc\n' > a.txt )
+  if command -v flock >/dev/null 2>&1; then
+    ( cd h; flock -x .sit/objects.flock sleep 3 ) & LP=$!
+    sleep 0.4
+    T0=$(date +%s%N)
+    assert_eq "$(cd h && timeout 2 "$RESULT_PROBE" diff a.txt 0 | head -1)" "DIFF 1 -1 0 0" "50h: wait 0 answers busy"
+    assert_eq "$(cd h && timeout 2 "$RESULT_PROBE" status 0 | head -1)" "STATUS 1 0" "50h: status too"
+    assert_eq "$(cd h && timeout 2 "$RESULT_PROBE" diff a.txt 300 2>/dev/null | head -1)" "DIFF 1 -1 0 0" "50h: a bounded wait ends"
+    [ $(( ($(date +%s%N) - T0) / 1000000 )) -lt 2000 ] && ok || bad "50h: the waits took too long"
+    wait "$LP"
+  fi
+  assert_eq "$(cd h && "$RESULT_PROBE" diff a.txt 0 | head -1)" "DIFF 0 3 1 1" "50h: the lock free, the answer returns"
+  rm h/.sit/objects.flock
+  ( cd h; find .sit -type f | sort | xargs sha256sum ) > h.before
+  assert_eq "$(cd h && "$RESULT_PROBE" diff a.txt 0 | head -1)" "DIFF 0 3 1 1" "50h: no lock file, nothing to wait for"
+  assert_eq "$(cd h && "$RESULT_PROBE" status 0 | head -1)" "STATUS 0 1" "50h: status too"
+  ( cd h; find .sit -type f | sort | xargs sha256sum ) > h.after
+  [ -e h/.sit/objects.flock ] && bad "50h: a read-only view created the lock file" || ok
+  assert_eq "$(cmp h.before h.after && echo same)" "same" "50h: a view leaves the store as it found it"
+  ( cd h; "$SIT" status >/dev/null ); [ -e h/.sit/objects.flock ] && ok || bad "50h: a command still makes the lock file"
+  ( cd h; "$SIT" gc >/dev/null 2>&1 ); assert_eq "$?" "0" "50h: gc runs"
+  assert_eq "$(cd h && "$RESULT_PROBE" diff a.txt 0 | head -1)" "DIFF 0 3 1 1" "50h: and a view reads what it left"
+
+  # 50i. sit status on a real tree is the same answer it was.
+  mkdir i; ( cd i; git init -q .; mkdir -p x/y; echo a > x/y/z; echo b > k; git add -A; G commit -qm c; echo c >> k; echo d > n )
+  assert_eq "$(cd i && "$RESULT_PROBE" status | grep -c '^R')" "2" "50i: an ordinary status is unchanged"
+elif [ "$RESULT_PROBE_BROKEN" = 1 ]; then
+  bad "50: read_result_probe.cyr does not compile against dist/sit-read.cyr (see $WORK/read_result_probe.log)"
+else
+  echo "  (skipped 50: needs cyrius, git and python3)"
+fi
+
+# ── 51. .gitattributes in git read mode ────────────────────────────
+hr ".gitattributes"
+if [ -n "$RESULT_PROBE" ] && command -v git >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  G() { git -c user.name=t -c user.email=t@t "$@"; }
+  Y="$WORK/ga132"; mkdir -p "$Y"; cd "$Y"
+
+  # 51a. The report's repro: clean to git, every line changed to sit.
+  mkdir a; ( cd a; git init -q .; printf '*.bat text eol=crlf\n' > .gitattributes
+             printf 'echo one\r\necho two\r\necho three\r\n' > run.bat; git add -A; G commit -qm c )
+  assert_eq "$(cd a && git status --short)" "" "51a: git calls it clean"
+  assert_contains "$(cd a && "$SIT" status)" "nothing to commit" "51a: so does sit"
+  assert_eq "$(cd a && "$RESULT_PROBE" diff run.bat | head -1)" "DIFF 0 -1 0 0" "51a: and the read API"
+  assert_eq "$(cd a && "$SIT" diff)" "" "51a: and sit diff"
+  printf 'echo one\r\nCHANGED\r\necho three\r\n' > a/run.bat
+  assert_eq "$(cd a && "$RESULT_PROBE" diff run.bat | head -1)" "DIFF 0 4 1 1" "51a: one changed line is one"
+  assert_eq "$(cd a && "$SIT" diff | grep -c '^[-+][^-+]')" "$(cd a && git diff | grep -c '^[-+][^-+]')" "51a: sit diff agrees with git"
+  assert_contains "$(cd a && "$SIT" status)" "modified:  run.bat" "51a: and status"
+
+  # 51b. What sit does not run is not compared, and not called changed.
+  mkdir b; ( cd b; git init -q .; printf '*.bin filter=lfs -text\n*.id ident\n*.u16 working-tree-encoding=UTF-16\n*.u8 working-tree-encoding=UTF-8\n' > .gitattributes
+             echo pointer > a.bin; echo '$Id$' > a.id; printf 'wide\n' | iconv -t UTF-16 > a.u16; echo fine > a.u8; git add -A; G commit -qm c
+             echo real-content > a.bin; echo '$Id: abc $' > a.id; echo wider > a.u16; echo edited > a.u8 )
+  assert_eq "$(cd b && "$RESULT_PROBE" diff a.bin | head -1)" "DIFF 8 -1 0 0" "51b: a filter cannot be compared"
+  assert_eq "$(cd b && "$RESULT_PROBE" diff a.id | head -1)" "DIFF 8 -1 0 0" "51b: nor ident"
+  assert_eq "$(cd b && "$RESULT_PROBE" diff a.u16 | head -1)" "DIFF 8 -1 0 0" "51b: nor an encoding"
+  assert_eq "$(cd b && "$RESULT_PROBE" diff a.u8 | head -1)" "DIFF 0 2 1 1" "51b: UTF-8 is no encoding"
+  OUT=$(cd b && "$SIT" status)
+  assert_contains "$OUT" "Not compared" "51b: sit status says so"
+  case "$OUT" in *"modified:  a.bin"*) bad "51b: a filtered file came back modified";; *) ok;; esac
+  assert_contains "$(cd b && "$SIT" diff 2>&1)" "not compared: a.bin" "51b: sit diff says so"
+  git -C b show HEAD:a.bin > b/a.bin
+  assert_eq "$(cd b && "$RESULT_PROBE" diff a.bin | head -1)" "DIFF 0 -1 0 0" "51b: matching bytes need no filter"
+
+  # 51c. A hostile attribute file: a symlink is not followed, a FIFO does not hang.
+  mkdir c; ( cd c; git init -q .; printf 'a\n' > a.txt; printf 'b\n' > b.txt; git add -A; G commit -qm c
+             printf 'a\r\n' > a.txt
+             printf '* text\n' > ../outside.attr; ln -s ../outside.attr .gitattributes )
+  assert_contains "$(cd c && timeout 5 "$SIT" status)" "modified:  a.txt" "51c: a symlinked .gitattributes is not read"
+  rm c/.gitattributes; mkfifo c/.gitattributes
+  assert_contains "$(cd c && timeout 5 "$SIT" status)" "modified:  a.txt" "51c: nor a FIFO"
+  rm c/.gitattributes; python3 -I -c "open('c/.gitattributes','w').write('* text\n' + '#' * 2000000)"
+  assert_contains "$(cd c && timeout 5 "$SIT" status)" "modified:  a.txt" "51c: nor one past its size"
+
+  # 51d. sit's own repositories never apply them: bytes are bytes there.
+  mkdir d; ( cd d; "$SIT" init >/dev/null; printf '* text\n' > .gitattributes; printf 'a\n' > a.txt
+             "$SIT" add a.txt .gitattributes >/dev/null; "$SIT" commit -m c >/dev/null; printf 'a\r\n' > a.txt )
+  assert_contains "$(cd d && "$SIT" status)" "modified" "51d: a sit repository compares bytes"
+  assert_eq "$(cd d && "$RESULT_PROBE" diff a.txt | head -1)" "DIFF 0 2 1 1" "51d: and through the API"
+
+  # 51e. git's own answer, over random rules (the long form ran 4,000 rounds).
+  mkdir e
+  OUT=$(python3 -I "$ROOT/tests/integration/gitattr_diff.py" "$SIT" "$Y/e" 132 40 2>&1); RC=$?
+  assert_eq "$RC" "0" "51e: the attribute differential agrees with git ($(echo "$OUT" | tail -1))"
+  assert_contains "$OUT" " 0 mismatches" "51e: with no mismatches"
+elif [ "$RESULT_PROBE_BROKEN" = 1 ]; then
+  bad "51: read_result_probe.cyr does not compile against dist/sit-read.cyr (see $WORK/read_result_probe.log)"
+else
+  echo "  (skipped 51: needs cyrius, git and python3)"
+fi
+
+# ── 52. blame, describe and merge-base on a .git/ repository ───────
+hr "the remaining read commands on .git/"
+if command -v git >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  G() { git -c user.name=Ann -c user.email=a@a "$@"; }
+  Y="$WORK/rc132"; mkdir -p "$Y"; cd "$Y"
+  git init -q -b main a; ( cd a; printf 'one\ntwo\n' > f.txt; mkdir d; echo x > d/g.txt; git add -A; G commit -qm c1
+    git tag lw; printf 'one\nTWO\nthree' > f.txt; git add -A; G commit -qm c2; G tag -a -m t ann
+    git checkout -q -b side HEAD~1; echo s > s.txt; git add -A; G commit -qm side
+    git checkout -q main; echo m > m.txt; git add -A; G commit -qm mainline; git pack-refs --all )
+  C1=$(cd a && git rev-parse lw); C2=$(cd a && git rev-parse ann^{commit}); SIDE=$(cd a && git rev-parse side)
+  SV=$(cd a && git status --porcelain=v2 --branch; git for-each-ref; find .git -type f | sort | xargs sha256sum)
+
+  assert_eq "$(cd a && "$SIT" merge-base main side)" "$(cd a && git merge-base main side)" "52: merge-base names git's base"
+  assert_eq "$(cd a && "$SIT" merge-base HEAD~1 side)" "$C1" "52: and takes git's revisions"
+  OUT=$(cd a && "$SIT" merge-base main no-such-ref 2>&1); assert_eq "$?" "1" "52: an unknown revision fails"
+  assert_eq "$(cd a && "$SIT" describe "$C2")" "ann" "52: describe on a tagged commit, a packed annotated tag"
+  assert_eq "$(cd a && "$SIT" describe "$C1")" "lw" "52: a packed lightweight tag"
+  assert_eq "$(cd a && "$SIT" describe | sed 's/-g.*//')" "$(cd a && git describe --tags | sed 's/-g.*//')" "52: a distance, as git counts it"
+  assert_eq "$(cd a && "$SIT" describe side | sed 's/-g.*//')" "$(cd a && git describe --tags side | sed 's/-g.*//')" "52: on a branch"
+  git init -q notags; ( cd notags; echo a > a; git add -A; G commit -qm c )
+  OUT=$(cd notags && "$SIT" describe 2>&1); RC=$?
+  assert_eq "$RC" "1" "52: no tags fails"
+  assert_contains "$OUT" "no tags found" "52: and says so"
+
+  OUT=$(cd a && "$SIT" blame f.txt)
+  assert_eq "$(echo "$OUT" | wc -l | tr -d ' ')" "3" "52: blame has a line for every line"
+  assert_contains "$(echo "$OUT" | sed -n 1p)" "$(echo "$C1" | cut -c1-12) (Ann <a@a> 1) one" "52: an old line, and its commit"
+  assert_contains "$(echo "$OUT" | sed -n 2p)" "$(echo "$C2" | cut -c1-12) (Ann <a@a> 2) TWO" "52: a changed line"
+  assert_contains "$(echo "$OUT" | sed -n 3p)" "three" "52: a last line with no newline is printed"
+  assert_contains "$(cd a && "$SIT" blame nosuch.txt 2>&1)" "not tracked" "52: an untracked path"
+  assert_contains "$(cd a && "$SIT" blame d 2>&1)" "not tracked" "52: a directory"
+  git init -q sm; ( cd sm; git -c protocol.file.allow=always submodule --quiet add ../a sub 2>/dev/null; G commit -qm s )
+  assert_contains "$(cd sm && "$SIT" blame sub 2>&1)" "not tracked" "52: a gitlink"
+
+  # Nothing written.
+  assert_eq "$(cd a && git status --porcelain=v2 --branch; git for-each-ref; find .git -type f | sort | xargs sha256sum)" "$SV" "52: the repository is untouched"
+  [ -e a/.sit ] && bad "52: a .sit appeared" || ok
+
+  # A loose tag beside the packed ones, and shadowing one: a loose ref wins in git.
+  ( cd a; G tag beside "$SIDE"; G tag -f lw "$C2" >/dev/null 2>&1 )
+  assert_eq "$(cd a && "$SIT" describe "$SIDE")" "beside" "52: a loose tag beside the packed ones"
+  ( cd a; "$SIT" describe "$C1" >/dev/null 2>&1 ); assert_eq "$?" "1" "52: a moved tag no longer names its old commit, read at its loose value"
+
+  # An escape in an author reaches blame as it reaches everything else.
+  git init -q e; ( cd e; printf 'a\n' > f; git add -A
+    git -c user.name="$(printf 'x\033[31my')" -c user.email=a@a commit -qm c )
+  case "$(cd e && "$SIT" blame f | od -c)" in *033*) bad "52: an escape reached the terminal";; *) ok;; esac
+
+  # Hostile repository shapes: a tag file that is no id, and a packed-refs of noise.
+  mkdir -p h; git init -q h; ( cd h; echo a > a; git add -A; G commit -qm c; G tag good
+    printf 'garbage\n' > .git/refs/tags/bad; printf 'zz refs/tags/x\nnoise\n\n^abc\n' >> .git/packed-refs )
+  assert_eq "$(cd h && "$SIT" describe 2>/dev/null)" "good" "52: noise among the tags is passed over"
+
+  # A native repository, the same as ever, and the no-EOL fix there too.
+  mkdir n; ( cd n; "$SIT" init >/dev/null; printf 'a\nb' > f; "$SIT" add f >/dev/null; "$SIT" commit -m one >/dev/null )
+  assert_contains "$(cd n && "$SIT" blame f | sed -n 2p)" ") b" "52: a sit repository keeps its last line too"
+
+  # git's own answers over random histories, both object formats (the long form
+  # ran 1,200 rounds).
+  mkdir d1 d2
+  OUT=$(python3 -I "$ROOT/tests/integration/readcmd_diff.py" "$SIT" "$Y/d1" 132 12 sha1 2>&1); RC=$?
+  assert_eq "$RC" "0" "52: the differential agrees with git, SHA-1 ($(echo "$OUT" | tail -1))"
+  OUT=$(python3 -I "$ROOT/tests/integration/readcmd_diff.py" "$SIT" "$Y/d2" 133 12 sha256 2>&1); RC=$?
+  assert_eq "$RC" "0" "52: and SHA-256 ($(echo "$OUT" | tail -1))"
+else
+  echo "  (skipped 52: needs git and python3)"
 fi
 
 # ── summary ────────────────────────────────────────────────────────
