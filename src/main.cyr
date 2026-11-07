@@ -8,6 +8,7 @@ fn cmd_init() {
     # init always runs in the target repo directory; make that explicit.
     # On Linux a "." root is a sit_abs no-op → byte-identical behavior.
     sit_set_repo_root(".");
+    if (cli_store_refused() == 1) { return 1; }
     var reinit = sf_exists(".sit/HEAD");
 
     if (ensure_dir(".sit") != 0) {

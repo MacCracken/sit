@@ -304,10 +304,7 @@ fn cmd_key() {
 
 # `sit verify-commit [<hash>]` — verify a commit's sitsig signature (defaults to HEAD).
 fn cmd_verify_commit() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     var hex[72];
     if (argc() < 3) {
         var head = read_head_ref();

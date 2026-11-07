@@ -32,4 +32,4 @@
 
 ## When this changes
 
-Both 1 and 2 are listed as upstream asks on sit's roadmap. When patra's `DELETE` uses the index, the `OR` batching is no longer needed, though it is still correct. When its WAL syncs once per transaction rather than per page, a large add's index update falls from seconds toward one sync.
+Both 1 and 2 are filed on patra as consumer requests (`docs/development/requests/2026-10-30-sit-delete-update-by-index.md` and `…-sit-transaction-syncs-per-page.md`), and listed under sit's roadmap's upstream asks. When patra's `DELETE` uses the index, the `OR` batching is no longer needed, though it is still correct. When its WAL syncs once per transaction rather than per page, a large add's index update falls from seconds toward one sync.

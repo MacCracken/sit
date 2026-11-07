@@ -2267,6 +2267,28 @@ fn test_1122_closeout() {
     return 0;
 }
 
+# 1.13.1: what a symlink's text says about where it leads (the walk over real
+# links is integration section 48).
+fn test_1131_link_text() {
+    test_group("1.13.1 link text");
+    assert_eq(link_text_stays_below("meta/git", 8), 1, "a path below the link");
+    assert_eq(link_text_stays_below("./meta", 6), 1, "a leading ./");
+    assert_eq(link_text_stays_below(".git.real", 9), 1, "a name that starts with dots");
+    assert_eq(link_text_stays_below("..git", 5), 1, "two dots that are not a component");
+    assert_eq(link_text_stays_below("a/..b/c", 7), 1, "nor in the middle");
+    assert_eq(link_text_stays_below("a/b..", 5), 1, "nor at the end");
+    assert_eq(link_text_stays_below("", 0), 0, "an empty link");
+    assert_eq(link_text_stays_below("/etc/x", 6), 0, "an absolute link");
+    assert_eq(link_text_stays_below("..", 2), 0, "the parent");
+    assert_eq(link_text_stays_below("../victim/.git", 14), 0, "a leading ..");
+    assert_eq(link_text_stays_below("a/../../b", 9), 0, "a .. in the middle");
+    assert_eq(link_text_stays_below("a/..", 4), 0, "a .. at the end");
+    assert_eq(link_text_stays_below("a//../b", 7), 0, "a .. after an empty component");
+    # The length decides, not a NUL: readlink's bytes are not terminated.
+    assert_eq(link_text_stays_below("ab/../c", 2), 1, "only `n` bytes are read");
+    return 0;
+}
+
 # Run every test group; exit status is the failure count.
 # 1.13.0: revision syntax — the pure parts (rev_resolve's walk is exercised
 # against git in the integration suite, section 45).
@@ -2364,6 +2386,7 @@ fn main() {
     test_1120_git_parity();
     test_1122_closeout();
     test_1130_revisions();
+    test_1131_link_text();
     return assert_summary();
 }
 

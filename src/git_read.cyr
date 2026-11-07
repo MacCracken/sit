@@ -355,19 +355,61 @@ fn _git_alt_load(objdir, v) {
 # --- Backend detection -------------------------------------------------------
 # Probe order: .sit/ wins over .git/ so a repo that is somehow both stays
 # sit-native (sit never writes .git/). Sets the process-globals and returns the
-# selected backend id, or -1 if neither store is present.
+# selected backend id, -1 if neither store is present, or -2 if one here leads
+# out of this directory through a symlink (_store_leaves).
 fn _detect_repo_backend() {
+    if (_store_leaves(".sit", ".sit/HEAD") == 1) { return 0 - 2; }
     if (sf_exists(".sit/HEAD") == 1) {
         _repo_backend = 0;
         _git_hash_algo = 0;
         return 0;
     }
+    if (_store_leaves(".git", ".git/HEAD") == 1) { return 0 - 2; }
     if (sf_exists(".git/HEAD") == 1) {
         _repo_backend = 1;
         _git_hash_algo = _git_detect_hash_algo();
         return 1;
     }
     return 0 - 1;
+}
+
+# 1.13.1: sit acts on the repository at the cwd (ADR 0003), and a symlink is not
+# a way around that. `sit status` runs in whatever directory a prompt is in, so
+# `.git -> ../victim/.git`, or a HEAD linked to that one, showed the branch of a
+# repository the directory could only name a path to.
+#
+# 1 when the store `dir` (".sit", ".git") or its `head` leads out of it. The link
+# is what is judged, not where it lands, so an absolute link is refused even if
+# it lands here: on AGNOS sit cannot ask where "here" is. A `.git` FILE is not a
+# link and not read: sit has no `gitdir:` reader, so worktrees and submodules are
+# "not a sit repository". Such a file is as hostile as a link, so a reader must
+# hold it to this rule, and git's own back-link check, before following it.
+fn _store_leaves(dir, head) {
+    if (_store_link_leaves(dir) == 1) { return 1; }
+    # A symlinked HEAD is a ref name or nothing (_head_ref_at), as git has it.
+    var ab[4352];
+    if (path_is_symlink(_sf_abs(head, &ab)) == 1) {
+        if (_head_ref_at(head, 0) == 0) { return 1; }
+    }
+    return 0;
+}
+
+# 1 when the store `dir` is a symlink that does not stay in this directory: its
+# text may not climb, and no component of it may be a further link, which is
+# what a chain or `.git -> hop/.git` with `hop` linked out comes to. On AGNOS
+# path_is_symlink cannot see a link, so this is the accepted no-op it is there.
+fn _store_link_leaves(dir) {
+    var ab[4352];
+    var ap = _sf_abs(dir, &ab);
+    if (path_is_symlink(ap) != 1) { return 0; }
+    var t[4096];
+    var n = xreadlink(ap, &t, 4096);
+    if (n >= 4096) { return 1; }
+    if (link_text_stays_below(&t, n) == 0) { return 1; }
+    store8(&t + n, 0);
+    if (_sf_parent_symlink(&t) == 1) { return 1; }
+    if (path_is_symlink(_sf_abs(&t, &ab)) == 1) { return 1; }
+    return 0;
 }
 
 # A heap copy of the object id at `hex`, as many hex digits as the open
@@ -383,12 +425,42 @@ fn _id_dup(hex) {
 
 # The repository a read-only command works on (1.12.0, `.git/` CLI parity):
 # `.sit/` as ever, else an existing `.git/` repository read through this seam.
-# 0 (sit) or 1 (git); -1 when there is neither, which is said. Commands that
-# write keep their `.sit/HEAD` gate — sit never writes a `.git/` repository.
+# 0 (sit) or 1 (git); negative when there is neither or the one here is refused,
+# which is said. A command that writes asks cli_sit_repo instead — sit never
+# writes a `.git/` repository.
 fn cli_read_repo() {
     var b = _detect_repo_backend();
-    if (b < 0) { eprintln("sit: not a sit repository (run 'sit init')"); }
+    if (b == 0 - 2) { _store_refused_say(); }
+    else {
+        if (b < 0) { eprintln("sit: not a sit repository (run 'sit init')"); }
+    }
     return b;
+}
+
+# 1 when there is a `.sit/` repository here for a command to work on; 0 when not,
+# which is said. 1.13.1: every command's gate, in place of asking
+# sf_exists(".sit/HEAD"), which follows a link: through `.sit -> ../victim/.sit`,
+# `sit add` staged into that repository and `sit remote list` printed its URLs.
+# A new command starts here or at cli_read_repo.
+fn cli_sit_repo() {
+    if (cli_store_refused() == 1) { return 0; }
+    if (sf_exists(".sit/HEAD") == 1) { return 1; }
+    eprintln("sit: not a sit repository (run 'sit init')");
+    return 0;
+}
+
+# 1, said, when the `.sit` here leads out of the repository. For the commands
+# that have something of their own to do when there is no repository: `init`,
+# `remote`, `gc`, `serve`.
+fn cli_store_refused() {
+    if (_store_leaves(".sit", ".sit/HEAD") == 0) { return 0; }
+    _store_refused_say();
+    return 1;
+}
+
+fn _store_refused_say() {
+    eprintln("sit: refusing to follow a symlink out of this repository (.sit, .git or HEAD)");
+    return 0;
 }
 
 # --- Ref backend -------------------------------------------------------------

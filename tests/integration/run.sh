@@ -3035,6 +3035,131 @@ if command -v git >/dev/null 2>&1; then
   fi
 fi
 
+# ── 48. sit acts on the repository it stands in (ADR 0003, 1.13.1) ──
+# `sit status` runs in whatever directory a shell prompt is in (commandress's vcs
+# segment), so a directory could show the branch of a repository it can only
+# name a path to. Reproduced on 1.13.0: the `.git` and HEAD links below printed
+# "On branch private-secret-branch-name".
+hr "48. a symlinked repository or HEAD does not lead out of the repository"
+if command -v git >/dev/null 2>&1; then
+  Y="$WORK/y48"; rm -rf "$Y"; mkdir -p "$Y"; cd "$Y"
+  git -c init.defaultBranch=private-secret-branch-name init -q victim
+  ( cd victim; echo a > a.txt; git add a.txt; git -c user.name=t -c user.email=t@t commit -qm one )
+  mkdir sv; ( cd sv; "$SIT" init >/dev/null; echo a > a.txt; "$SIT" add a.txt >/dev/null; "$SIT" commit -m one >/dev/null
+              "$SIT" branch private-secret-branch-name >/dev/null; "$SIT" checkout private-secret-branch-name >/dev/null )
+
+  # Refused: exit 1, the reason said, nothing of the other repository shown.
+  refused48() {
+    OUT=$(cd "$Y/$1" && "$SIT" status 2>&1); RC=$?
+    assert_eq "$RC" "1" "48: $2: refused"
+    assert_contains "$OUT" "symlink" "48: $2: says why"
+    case "$OUT" in *private-secret*) bad "48: $2: showed another repository's branch";; *) ok;; esac
+  }
+  mkdir a; ln -s ../victim/.git a/.git;                   refused48 a ".git -> ../victim/.git"
+  mkdir b; ln -s "$Y/victim/.git" b/.git;                 refused48 b ".git as an absolute link"
+  mkdir c; ln -s ../sv/.sit c/.sit;                       refused48 c ".sit -> ../sv/.sit"
+  mkdir -p d/.sit; ln -s ../../victim/.git/HEAD d/.sit/HEAD; refused48 d ".sit/HEAD out"
+  git init -q e; rm e/.git/HEAD; ln -s ../../victim/.git/HEAD e/.git/HEAD; refused48 e ".git/HEAD out"
+  mkdir f; ln -s hop f/.git; ln -s ../victim/.git f/hop;  refused48 f "a link to a link out"
+  mkdir g; ln -s hop/.git g/.git; ln -s ../victim g/hop;  refused48 g "a link through a linked directory"
+  mkdir -p h/.sit; ln -s refs/../../../victim/.git/HEAD h/.sit/HEAD; refused48 h "HEAD spelling refs/ and climbing out"
+  mkdir i; ln -s .. i/.git;                               refused48 i ".git -> .."
+
+  # The gate is the shared one: the other read commands, and the API.
+  cd "$Y/a"
+  for c in "log --oneline" "diff" "show" "reflog" "cat-file HEAD"; do
+    OUT=$("$SIT" $c 2>&1); RC=$?
+    assert_eq "$RC" "1" "48: $c refuses too"
+    assert_contains "$OUT" "symlink" "48: $c says why"
+  done
+  if [ -n "$GIT_PROBE" ]; then
+    assert_contains "$("$GIT_PROBE" 2>&1)" "PROBE-FAIL-OPEN" "48: sit_repo_open refuses a linked .git"
+    cd "$Y/d"
+    assert_contains "$("$GIT_PROBE" 2>&1)" "PROBE-FAIL-OPEN" "48: and a linked HEAD"
+  fi
+  cd "$Y"
+
+  # Every command refuses, not only the read ones. Through the first cut of this
+  # fix `sit add` here still staged into the other repository, and `remote list`
+  # printed its URLs, credentials included. The list comes from the usage table,
+  # so a new command is covered, or named as exempt, on the day it lands.
+  sv48() { ( cd "$Y/sv" && find .sit -type f -exec cksum {} + | sort ); }
+  SV48=$(sv48)
+  ( cd sv; "$SIT" remote add origin 'http://user:private-secret-token@example.invalid/x' ); SV48=$(sv48)
+  for d in c d; do
+    cd "$Y/$d"; echo b > b.txt
+    for v in $("$SIT" --help | sed -n 's/^  \([a-z][a-z-]*\).*/\1/p' | sort -u); do
+      case "$v" in
+        clone|key|completions) continue ;;              # no repository here
+        serve) continue ;;                              # names its own, below
+        gc|init) ARGS="" ;;
+        remote) ARGS="list" ;;
+        commit) ARGS="-m x" ;;
+        *) ARGS="x y" ;;
+      esac
+      OUT=$(timeout 20 "$SIT" "$v" $ARGS 2>&1 </dev/null); RC=$?
+      assert_eq "$RC" "1" "48: $v refuses in $d"
+      assert_contains "$OUT" "symlink" "48: $v says why in $d"
+      case "$OUT" in *private-secret*) bad "48: $v showed another repository's data in $d";; *) ok;; esac
+    done
+  done
+  cd "$Y"
+  assert_eq "$(sv48)" "$SV48" "48: and the other repository is untouched"
+  OUT=$(timeout 5 "$SIT" serve "$Y/c" 2>&1); RC=$?
+  assert_eq "$RC" "1" "48: serve refuses a linked store"
+  assert_contains "$OUT" "symlink" "48: and says why"
+  # `remote` had no gate and needs none in an empty directory, where it lists nothing.
+  mkdir none; OUT=$(cd none && "$SIT" remote list 2>&1); RC=$?
+  assert_eq "$RC:$OUT" "0:" "48: remote list stays quiet outside a repository"
+
+  # A symlinked HEAD is a ref name, and is not followed even when it is one: the
+  # name printed is the link's, never what is reached through it.
+  mkdir -p j/.sit/refs/heads; ln -s refs/heads/x j/.sit/HEAD
+  ln -s ../../../../victim/.git/HEAD j/.sit/refs/heads/x
+  OUT=$(cd j && "$SIT" status 2>&1); RC=$?
+  assert_eq "$RC" "0" "48: a HEAD that spells a ref is read"
+  assert_contains "$OUT" "On branch x" "48: as the ref it spells"
+  case "$OUT" in *private-secret*) bad "48: a ref link showed another repository's branch";; *) ok;; esac
+
+  # What must keep working.
+  # A symlinked working directory: the link is above the repository, not in it.
+  ln -s victim wd
+  assert_contains "$(cd wd && "$SIT" status 2>&1)" "On branch private-secret-branch-name" "48: a symlinked working directory reads"
+  if [ -n "$REPO_PROBE" ]; then
+    assert_eq "$("$REPO_PROBE" "$Y/wd" 2>&1)" "$Y/wd 0 0 0" "48: and through the API by its linked path"
+  fi
+  # A link that stays inside the directory, on either backend.
+  git init -q -b inner k; ( cd k; echo a > a.txt; git add a.txt; git -c user.name=t -c user.email=t@t commit -qm one
+                            mkdir meta; mv .git meta/git; ln -s meta/git .git )
+  assert_contains "$(cd k && "$SIT" status 2>&1)" "On branch inner" "48: a .git link inside the directory reads"
+  mkdir m; ( cd m; "$SIT" init >/dev/null; mkdir meta; mv .sit meta/store; ln -s meta/store .sit )
+  assert_contains "$(cd m && "$SIT" status 2>&1)" "On branch main" "48: a .sit link inside the directory reads"
+  # git's own symlinked HEAD (core.preferSymlinkRefs) reads as the branch it is.
+  git init -q -b trunk n; ( cd n; echo a > a.txt; git add a.txt; git -c user.name=t -c user.email=t@t commit -qm one
+                            rm .git/HEAD; ln -s refs/heads/trunk .git/HEAD )
+  assert_eq "$(cd n && "$SIT" status 2>&1 | head -1)" "$(cd n && git status | head -1)" "48: a symref link reads as git reads it"
+  assert_contains "$(cd n && "$SIT" status 2>&1)" "nothing to commit" "48: and resolves to its commit"
+
+  # `gitdir:` files. sit reads none, so these stay what they were: not a sit
+  # repository. A hostile one leads nowhere; a reader added later must keep that.
+  nosit48() {
+    OUT=$(cd "$Y/$1" && "$SIT" status 2>&1); RC=$?
+    assert_eq "$RC" "1" "48: $2: not read"
+    assert_contains "$OUT" "not a sit repository" "48: $2: said as before"
+    case "$OUT" in *private-secret*) bad "48: $2: showed another repository's branch";; *) ok;; esac
+  }
+  git -C victim worktree add -q ../wt -b wt-branch 2>/dev/null; nosit48 wt "a linked worktree"
+  mkdir super; ( cd super; git init -q -b main
+                 git -c protocol.file.allow=always submodule --quiet add ../victim sub 2>/dev/null
+                 git -c user.name=t -c user.email=t@t commit -qm s )
+  nosit48 super/sub "a submodule"
+  assert_contains "$(cd super && "$SIT" status 2>&1)" "On branch main" "48: its superproject reads"
+  git init -q --separate-git-dir=sep.git sepw; nosit48 sepw "a --separate-git-dir worktree"
+  mkdir gf; printf 'gitdir: ../victim/.git\n' > gf/.git; nosit48 gf "a hostile gitdir: file"
+else
+  printf '  SKIP: git not installed — section 48 skipped\n'
+fi
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

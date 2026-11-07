@@ -47,10 +47,7 @@ fn _blame_author_of(commit_hex) {
 
 # `sit blame <path>` — the commit that last touched each line of <path>.
 fn cmd_blame() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 3) {
         eprintln("usage: sit blame <path>");
         return 1;

@@ -1501,10 +1501,7 @@ fn cmd_commit() {
         }
     }
 
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
 
     var seed = 0;
     if (sign == 1) {

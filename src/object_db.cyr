@@ -848,10 +848,7 @@ fn resolve_and_read(obj_out, hex_out) {
     # Backend detection (roadmap 1.2.0): read verbs work on a native .sit/ or an
     # existing .git/ repo; sets the process-global backend that read_object /
     # resolve_hash dispatch on. Non-repos still error as before.
-    if (_detect_repo_backend() < 0) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_read_repo() < 0) { return 1; }
 
     var prefix = argv_heap(2);
     var rr = resolve_hash(prefix, hex_out);
@@ -2101,10 +2098,7 @@ fn _fsck_commit_author_ts(body, len) {
 
 # `sit fsck [--prune|--prune-now]` — verify object integrity and reachability; --prune removes dangling objects.
 fn cmd_fsck() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
 
     # `--prune` removes dangling (unreachable) objects this walk identifies.
     # v1.1.0 added two grace mechanisms vs the old unconditional --prune=now:

@@ -1107,6 +1107,7 @@ fn cmd_gc() {
         eprintln("usage: sit gc");
         return 1;
     }
+    if (cli_store_refused() == 1) { return 1; }
     if (sf_exists(".sit/HEAD") != 1) {
         if (sf_exists(".git/HEAD") == 1) {
             eprintln("sit: gc packs a .sit/ store; for a .git/ repository use `git gc`");

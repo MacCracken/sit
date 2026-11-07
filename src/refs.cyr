@@ -423,7 +423,7 @@ fn read_head_ref_path() {
     return read_head_ref_path_a(0);
 }
 
-# How much of HEAD read_head_ref_path_a reads. Past "ref: " and a name of
+# How much of HEAD _head_ref_at reads. Past "ref: " and a name of
 # VAL_REFNAME_MAX bytes nothing can validate, so a longer HEAD is refused here
 # exactly as reading it all would refuse it.
 var HEAD_READ_MAX = 1024;
@@ -439,31 +439,52 @@ fn read_head_ref_path_a(a) {
     memcpy(&hp, _repo_dir(), 5);
     memcpy(&hp + 5, "HEAD", 4);
     store8(&hp + 9, 0);
+    return _head_ref_at(&hp, a);
+}
+
+# The ref name in the HEAD at `hp` (".sit/HEAD", ".git/HEAD"), drawn from `a`, or
+# 0 when it holds none. 1.13.1: a symlinked HEAD is never followed. Its TEXT is
+# the name, as git reads one (core.preferSymlinkRefs, validate_headref), and it
+# passes the checks below as a `ref: ` line does. Following it showed whatever
+# `ref: ` line the link reached, even from a link spelled `refs/heads/x`.
+fn _head_ref_at(hp, a) {
     var abuf[4352];
-    var ap = sit_abs_into(&hp, &abuf, 4352);
+    var ap = sit_abs_into(hp, &abuf, 4352);
     if (ap == 0) { return 0; }
-    if (_sf_special(ap) == 1) { return 0; }          # 1.7.6 (R11): not a FIFO
-    var fd = file_open(ap, 0, 0);
-    if (fd < 0) { return 0; }
     var hbuf[1032];                                # HEAD_READ_MAX bytes are read at most
     var buf = &hbuf;
     var len = 0;
-    var reading = 1;
-    while (reading == 1) {
-        if (len >= HEAD_READ_MAX) { reading = 0; }
-        else {
-            var got = file_read(fd, buf + len, HEAD_READ_MAX - len);
-            if (got <= 0) { reading = 0; }
-            else { len = len + got; }
-        }
+    var name_at = 5;                               # past "ref: ", or 0 in a link's text
+    if (path_is_symlink(ap) == 1) {
+        len = xreadlink(ap, buf, HEAD_READ_MAX);
+        if (len <= 0) { return 0; }
+        name_at = 0;
     }
-    file_close(fd);
+    else {
+        if (_sf_special(ap) == 1) { return 0; }      # 1.7.6 (R11): not a FIFO
+        var fd = file_open(ap, 0, 0);
+        if (fd < 0) { return 0; }
+        var reading = 1;
+        while (reading == 1) {
+            if (len >= HEAD_READ_MAX) { reading = 0; }
+            else {
+                var got = file_read(fd, buf + len, HEAD_READ_MAX - len);
+                if (got <= 0) { reading = 0; }
+                else { len = len + got; }
+            }
+        }
+        file_close(fd);
 
-    if (len < 5) { return 0; }
-    if (memeq(buf, "ref: ", 5) == 0) { return 0; }
+        if (len < 5) { return 0; }
+        if (memeq(buf, "ref: ", 5) == 0) { return 0; }
+    }
 
-    var stop = 5;
+    var stop = name_at;
     var scanning = 1;
+    if (name_at == 0) {                            # a link has no line to end: all of it
+        stop = len;
+        scanning = 0;
+    }
     while (scanning == 1) {
         if (stop >= len) { scanning = 0; }
         else {
@@ -476,7 +497,7 @@ fn read_head_ref_path_a(a) {
         }
     }
 
-    var ref_len = stop - 5;
+    var ref_len = stop - name_at;
     if (ref_len == 0) { return 0; }
     if (ref_len > VAL_REFNAME_MAX) { return 0; }   # refname_valid's verdict, before the copy
 
@@ -484,7 +505,7 @@ fn read_head_ref_path_a(a) {
     if (a == 0) { ref = alloc(ref_len + 1); }
     else { ref = alloc_via(a, ref_len + 1); }
     if (ref == 0) { return 0; }
-    memcpy(ref, buf + 5, ref_len);
+    memcpy(ref, buf + name_at, ref_len);
     store8(ref + ref_len, 0);
     # S-25: validate the symref TARGET before anyone builds a path out of it.
     #
@@ -712,10 +733,7 @@ fn ref_name_is_option(name) {
 
 # `sit tag [-a|-s] [-d <name> | <name> [-m <msg>] [<commit>]]` — list, create or delete tags.
 fn cmd_tag() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
 
     if (argc() < 3) {
         if (sf_exists(".sit/refs/tags") != 1) { return 0; }
@@ -888,10 +906,7 @@ fn cmd_tag() {
 
 # `sit branch [-d <name> | <name>]` — list, create or delete a branch.
 fn cmd_branch() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
 
     if (argc() < 3) {
         if (sf_exists(".sit/refs/heads") != 1) { return 0; }
@@ -1022,10 +1037,7 @@ fn cmd_branch() {
 # True if there are any staged or unstaged changes vs HEAD. Untracked files
 # are not considered dirty (they don't block checkout unless they collide).
 fn cmd_checkout() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 3) {
         eprintln("usage: sit checkout [-b] <branch>");
         return 1;

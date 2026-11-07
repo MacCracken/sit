@@ -2059,6 +2059,7 @@ fn cmd_serve() {
     }
     else {
         sit_set_repo_root(repo_path);
+        if (cli_store_refused() == 1) { return 1; }
         if (sf_exists(".sit/HEAD") != 1) {
             eprintln("sit: not a sit repository at given path");
             return 1;

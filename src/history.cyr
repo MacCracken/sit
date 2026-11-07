@@ -220,10 +220,7 @@ fn _apply_one_commit(target_hex, invert, marker_path, verb, verb_len) {
 
 # `sit cherry-pick <commit>` — apply <commit>'s change onto HEAD as a new commit.
 fn cmd_cherry_pick() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 3) {
         eprintln("usage: sit cherry-pick <commit>");
         return 1;
@@ -238,10 +235,7 @@ fn cmd_cherry_pick() {
 
 # `sit revert <commit>` — apply the inverse of <commit> as a new commit.
 fn cmd_revert() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 3) {
         eprintln("usage: sit revert <commit>");
         return 1;
@@ -607,10 +601,7 @@ fn _stash_apply_three_way(top, base, head) {
 
 # `sit stash [push|list|pop|drop]` — save or restore working-tree changes (default push).
 fn cmd_stash() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 3) { return _stash_push(); }
     var sub = argv(2);
     if (streq(sub, "push") == 1) { return _stash_push(); }

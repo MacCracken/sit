@@ -471,10 +471,7 @@ fn find_merge_base(a_hex, b_hex) {
 # are resolved through resolve_hash (branch / tag / hex-prefix). Exposes the
 # LCA so the merge base is testable independent of a full `sit merge`.
 fn cmd_merge_base() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 4) {
         eprintln("usage: sit merge-base <commit> <commit>");
         return 1;
@@ -653,10 +650,7 @@ fn three_way_merge_entries(base_entries, ours_entries, theirs_entries, merged, c
 
 # `sit merge <branch> [<branch> ...]` — fast-forward, three-way or (2+ branches) octopus merge into HEAD.
 fn cmd_merge() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 3) {
         eprintln("usage: sit merge [-S] [-m <msg>] <branch> [<branch> ...] | sit merge --abort");
         return 1;

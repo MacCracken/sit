@@ -22,9 +22,10 @@
 
 # Open the sit/git repository at the process's CURRENT WORKING DIRECTORY.
 # Returns 1 on success, 0 if the cwd holds neither a `.sit/` nor a `.git/`
-# store (or `cwd` is null). `cwd` is retained for API compatibility but is
-# now ADVISORY — pass `"."`; the reads are cwd-relative and this call no
-# longer chdirs.
+# store, or one that leads out of it through a symlink (1.13.1,
+# _detect_repo_backend), or `cwd` is null. `cwd` is retained for API
+# compatibility but is now ADVISORY — pass `"."`; the reads are cwd-relative and
+# this call no longer chdirs.
 #
 # v1.3.1: dropped the `syscall(SYS_CHDIR, cwd)`. It was portability-hostile —
 # AGNOS's frozen syscall floor has no chdir (nor openat/getcwd), so the raw

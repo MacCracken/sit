@@ -1370,6 +1370,7 @@ fn cmd_remote_remove() {
 
 # `sit remote add | list | remove` — dispatch the remote sub-commands (default list).
 fn cmd_remote() {
+    if (cli_store_refused() == 1) { return 1; }     # 1.13.1: it reads `.sit/config`
     if (argc() < 3) { return cmd_remote_list(); }
     var sub = argv(2);
     if (streq(sub, "add")    == 1) { return cmd_remote_add(); }
@@ -1515,10 +1516,7 @@ fn do_fetch(name, branch) {
 
 # `sit fetch <remote> [<ref>]` — copy objects and the remote-tracking ref, without merging.
 fn cmd_fetch() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 3) {
         eprintln("usage: sit fetch <remote> [<branch>]");
         return 1;
@@ -1534,10 +1532,7 @@ fn cmd_fetch() {
 # `sit merge` manually rather than attempting an automatic 3-way here — keeps
 # the semantics narrow and predictable.
 fn cmd_pull() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 3) {
         eprintln("usage: sit pull <remote> [<branch>]");
         return 1;
@@ -2063,10 +2058,7 @@ fn cmd_clone() {
 
 # `sit push <remote> [<ref>]` — push HEAD's branch to a remote (fast-forward only).
 fn cmd_push() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 3) {
         eprintln("usage: sit push <remote> [<branch>]");
         return 1;

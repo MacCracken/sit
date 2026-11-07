@@ -252,10 +252,7 @@ fn resolve_commit_hash(prefix, out_buf) {
 # object (and would report "no signature" on a perfectly good signed tag whose
 # commit happens to be unsigned).
 fn cmd_verify_tag() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 3) {
         eprintln("usage: sit verify-tag <tag>");
         return 1;
@@ -365,10 +362,7 @@ fn cmd_verify_tag() {
 # Both tag kinds are honoured: a lightweight tag names its commit directly, an
 # annotated tag is peeled first, so `describe` does not care which was used.
 fn cmd_describe() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
 
     var start = 0;
     if (argc() >= 3) {

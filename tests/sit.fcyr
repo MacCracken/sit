@@ -1251,6 +1251,43 @@ fn fuzz_serve_repo_paths(rounds) {
     return 0;
 }
 
+# 1.13.1: link_text_stays_below, the test that keeps a linked `.sit` / `.git` in
+# the directory sit stands in. Accepted text is checked by a second reading of
+# it: never absolute, and "/<text>/" holds no "/../".
+fn fuzz_link_text(rounds) {
+    var alpha = "..//ag";
+    var buf = alloc(80);
+    var seed = 0x1131D;
+    var i = 0;
+    while (i < rounds) {
+        var n = (seed >> 7) % 32;
+        var k = 0;
+        store8(buf, 47);
+        while (k < n) {
+            store8(buf + 1 + k, load8(alpha + ((seed >> (k % 11)) & 0xFFFF) % 6));
+            seed = seed * 6364136223846793005 + 1442695040888963407;
+            k = k + 1;
+        }
+        store8(buf + 1 + n, 47);
+        store8(buf + 2 + n, 0);
+        if (link_text_stays_below(buf + 1, n) == 1) {
+            if (n == 0) { println("fuzz: an empty link was accepted"); return 1; }
+            if (load8(buf + 1) == 47) { println("fuzz: an absolute link was accepted"); return 1; }
+            if (strstr(buf, "/../") >= 0) { println("fuzz: a .. component was accepted"); return 1; }
+        }
+        else {
+            if (n > 0) {
+                if (load8(buf + 1) != 47) {
+                    if (strstr(buf, "/../") < 0) { println("fuzz: a link below was refused"); return 1; }
+                }
+            }
+        }
+        seed = seed * 6364136223846793005 + 1442695040888963407;
+        i = i + 1;
+    }
+    return 0;
+}
+
 # 1.12.2: the directory a clone names itself after, from any path. Whatever
 # comes back is a non-empty segment with no '/', and never `.`, `..`, nor a
 # spelling of `.git` / `.sit` / `.ssh`; a reserved target is refused whatever
@@ -1437,6 +1474,8 @@ fn main() {
     if (fuzz_clone_names(300000) != 0) { return 1; }
     println("fuzz: rev_syntax (300000 rounds)");
     if (fuzz_rev_syntax(300000) != 0) { return 1; }
+    println("fuzz: link_text (300000 rounds)");
+    if (fuzz_link_text(300000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

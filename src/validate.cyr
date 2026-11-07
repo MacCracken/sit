@@ -411,6 +411,32 @@ fn tree_entry_name_valid(name) {
     return 1;
 }
 
+# 1 when the `n` bytes of symlink text at `t` stay below the directory holding
+# the link, as far as their spelling can say: relative, with no `..` component.
+# What each component is on disk is the caller's to check. `n` decides, not a
+# NUL: readlink's bytes are not terminated.
+fn link_text_stays_below(t, n) {
+    if (n <= 0) { return 0; }
+    if (load8(t) == 47) { return 0; }
+    var comp = 0;
+    var i = 0;
+    while (i <= n) {
+        var end = 0;
+        if (i == n) { end = 1; }
+        else { if (load8(t + i) == 47) { end = 1; } }
+        if (end == 1) {
+            if (i - comp == 2) {
+                if (load8(t + comp) == 46) {
+                    if (load8(t + comp + 1) == 46) { return 0; }
+                }
+            }
+            comp = i + 1;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
 # 1 if the `len` bytes at `name` name, or on some filesystem resolve to, one of
 # the dot-directories sit guards: `.git`, `.sit`, `.ssh`. Shared by tree entry
 # names and by the directory `sit clone` creates (1.12.2: a clone of a URL

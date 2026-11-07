@@ -45,10 +45,7 @@ fn cmd_add() {
         eprintln("usage: sit add [-f] <path>...");
         return 1;
     }
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     var paths = vec_new();
     var removed = vec_new();
     var seen = map_new();
@@ -1087,10 +1084,7 @@ fn dedupe_entries(entries) {
 #   8..16:  name ptr (heap, null-term; leaf name only)
 #   16..24: hash bytes ptr (heap, 32 raw bytes)
 fn cmd_reset() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 3) {
         eprintln("usage: sit reset <path> | sit reset --hard <ref>");
         return 1;
@@ -1201,10 +1195,7 @@ fn cmd_rm() {
         eprintln("usage: sit rm [--cached] <path>");
         return 1;
     }
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
 
     var cached = 0;
     var arg_idx = 2;
@@ -1897,10 +1888,7 @@ fn sf_rename(old, new) {
 # add. Doing both together keeps the staged content identical and only the path
 # changes — which is what makes a rename readable in history.
 fn cmd_mv() {
-    if (sf_exists(".sit/HEAD") != 1) {
-        eprintln("sit: not a sit repository (run 'sit init')");
-        return 1;
-    }
+    if (cli_sit_repo() != 1) { return 1; }
     if (argc() < 4) {
         eprintln("usage: sit mv <src> <dst>");
         return 1;

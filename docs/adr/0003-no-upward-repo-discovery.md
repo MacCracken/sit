@@ -43,3 +43,28 @@ Candidate for the in-tree integration suite ([`tests/integration/run.sh`](../../
 - [CVE-2022-24765 — NVD](https://nvd.nist.gov/vuln/detail/cve-2022-24765)
 - [git-scm blog: "Git security vulnerabilities announced" (2022)](https://github.blog/2022-04-12-git-security-vulnerability-announced/)
 - [docs/audit/2026-04-24-audit.md § S-29](../audit/2026-04-24-audit.md)
+
+## Amendment (1.13.1) — a symlink is not a way out of `$PWD`
+
+"sit acts on the repo at `$PWD`" held for the search and not for what it found. Nothing looked at what `.sit`, `.git` or HEAD were, so `.git -> ../victim/.git`, or a `.sit/HEAD` linked to `../../victim/.git/HEAD`, made `sit status` print `On branch <the other repository's branch>`. A symlink is a `GIT_DIR` that the directory sets for itself, which this ADR rejected. It matters because status runs unasked: commandress's `vcs` segment runs it in whatever directory a prompt is in, and sees only its stdout, so the rule has to be sit's. Found by a review of commandress on 1.13.0.
+
+**Every command that opens a repository now asks one test, `_store_leaves`.** The read commands and `sit_repo_open` reach it through `_detect_repo_backend` (`cli_read_repo`), and the rest through `cli_sit_repo`. `init`, `remote`, `gc` and `serve`, which each have something of their own to do when there is no repository, ask `cli_store_refused`. Writes refused a link already at the ref (`_sf_parent_symlink`), but that was the last step, and not every step went there: through `.sit -> ../victim/.sit`, `sit add` staged into the other repository, `sit remote list` printed its URLs, credentials included, and `sit init` reinitialized it. `sf_exists` follows a link, so it cannot be a command's gate.
+
+- **`.sit` or `.git` as a symlink** is accepted only if it stays in the directory: relative, no `..` component, and no further link on the way. The link is judged, not where it lands, so this needs no `realpath` and no cwd, which AGNOS does not have.
+- **A symlinked HEAD is never followed.** Its text is the ref name, under the checks a `ref: ` line passes (`refname_valid`, under `refs/`). Anything else is refused. This is git's own rule (`validate_headref`, `core.preferSymlinkRefs`). Not following matters: `HEAD -> refs/heads/x`, with `x` linked to another HEAD, passes on spelling alone.
+
+A refused command exits 1 and says why, and `sit_repo_open` returns 0. `sit clone`, `sit key` and `sit completions` open no repository here, and `sit serve --repos` already required `.sit` to be a directory and HEAD a file (`_serve_repo_check`).
+
+| Layout | Through 1.13.0 | Since 1.13.1 |
+|---|---|---|
+| A symlinked working directory (`cd link`, or `sit_repo_open` by a linked path) | reads | reads: only the last component is looked at |
+| Linked worktree, submodule, `--separate-git-dir` (a `.git` file, `gitdir: ...`) | not a sit repository | the same: sit has no `gitdir:` reader |
+| `.git/HEAD -> refs/heads/main` | reads, as `(detached)` | reads, as `main`, as git does |
+| `.git -> meta/git`, a link that stays inside | reads | reads |
+| `.git -> ../anything`, or an absolute link | reads | refused |
+
+sit is stricter than git here. git follows a `.git` symlink, and a `gitdir:` file, wherever it leads. A `gitdir:` file is as hostile as a link: `gitdir: ../victim/.git` shows the victim's branch under git, and reads as no repository under sit only because sit has no reader. A reader added later goes through this gate, and needs git's back-link check as well.
+
+**What this costs.** A store linked from outside the directory stops reading, and its shape cannot be told from the attack. That includes Android `repo` checkouts (`.git -> ../../.repo/projects/...`) and a store moved by hand. There is no allow-list, since this ADR rejected `safe.directory`. Move the store into the directory, or link it from there.
+
+**What this does not close**, on the [roadmap](../development/roadmap.md): links below a real store. A `.git/` directory whose `refs` and `objects` link out reads the other repository, and `sit status` lists its tracked paths as `deleted:`, as git does. `git-new-workdir` makes this shape, so a refusal needs its own decision, and `objects/info/alternates` reaches as far on purpose ([ADR 0011](0011-git-read-mode.md)).

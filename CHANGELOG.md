@@ -4,6 +4,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.13.1] — 2026-11-06 — a repository stays where sit stands
+
+A security patch, from a review of commandress on 1.13.0. commandress's `vcs` segment runs `sit status` in whatever directory a prompt is in and sees only its stdout, so the rule has to be sit's. Nothing changes in the on-disk format, the wire protocol or the public API's signatures. The toolchain stays at cyrius 6.7.18. [ADR 0003](docs/adr/0003-no-upward-repo-discovery.md) gains an amendment.
+
+### Security
+
+- **`sit status` showed the branch of another repository (LOW).** `.git -> ../victim/.git`, or a `.sit/HEAD` linked to `../../victim/.git/HEAD`, printed `On branch <the other repository's branch>` in any directory, and so in a prompt, for any repository the directory could name a path to. A file with no `ref: refs/...` line showed `(detached)`, so what leaked was a ref name, not file content.
+- **Every other command reached through a linked `.sit` too (MEDIUM).** Each gated on `sf_exists(".sit/HEAD")`, which follows a link, and `sit remote` had no gate at all. So `sit remote list` printed the other repository's URLs, credentials included, `sit add` staged into it, `sit init` reinitialized it, and `sit serve` served it. A ref write refused (`_sf_parent_symlink`), so `commit` stopped there, after writing its objects.
+- **The refusal.** Every command that opens a repository now refuses, through `cli_read_repo` or the new `cli_sit_repo` / `cli_store_refused`, as does `sit_repo_open`:
+  - a `.sit` or `.git` symlink that does not stay in the directory: absolute, with a `..` component, or through a further link (`link_text_stays_below`, `_store_link_leaves`);
+  - a symlinked HEAD whose text is not a ref name.
+
+  A refused command exits 1 and says why, and `sit_repo_open` returns 0.
+- **A symlinked HEAD is never followed** (`_head_ref_at`). Its text is the ref name, under the checks a `ref: ` line passes, which is how git reads one (`validate_headref`). `HEAD -> refs/heads/x`, with `x` linked to another repository's HEAD, showed that repository's branch while looking like a ref.
+
+### Breaking
+
+- **A `.sit` or `.git` symlink that leaves the directory no longer reads.** That includes Android `repo` checkouts (`.git -> ../../.repo/projects/...`): the shape cannot be told from the attack, and there is no allow-list (ADR 0003 rejected `safe.directory`). To migrate, move the store into the directory, or link it from inside. A symlinked working directory is unaffected, as is a link that stays inside the directory.
+
+### Fixed
+
+- **`.git/HEAD -> refs/heads/main` read as `(detached)`.** git's `core.preferSymlinkRefs` form now reads as the branch it names, as git reads it.
+
+### Not closed
+
+- **Links below a real store.** A `.git/` directory with `refs` and `objects` linked out reads the other repository, and `sit status` lists its tracked paths as `deleted:`, as git does. `git-new-workdir` makes this shape, so a refusal needs its own decision. It is on the roadmap (1.13.3), and ADR 0003's amendment gives the detail.
+
+### Changed
+
+- `sit fetch`, `pull` and `push` say `not a sit repository (run 'sit init')`, as every other command does. They left off the hint.
+- **The roadmap's slots shift.** This fix takes 1.13.1: the `.git/` read commands are 1.13.2, the audit hardening 1.13.3 and the closeout 1.13.4.
+
+### Tests
+
+- **Integration section 48**, 263 assertions. Nine ways out are refused, each checked for its exit status, its reason and no leaked name. Every command in the usage table then refuses a linked store and a linked HEAD, so a new command is covered the day it lands, and the other repository is compared byte for byte afterwards. `sit_repo_open` and `sit serve` refuse too. What must keep reading is pinned as well: a symlinked working directory (through the API by its linked path as well), a link inside the directory on both backends, a symref link compared with git, and the `gitdir:` forms. 122 of the 263 fail on a build of 1.13.0.
+- **`test_1131_link_text`** (14 assertions) and **`fuzz_link_text`** (300,000 rounds), which checks each verdict against a second reading of the text.
+- 746 unit / 1107 integration / 26 fuzz. Replayed through a real `cmdrs` prompt: no branch in a refused directory, and the branch as before through a symlinked working directory.
+
 ## [1.13.0] — 2026-10-30 — git's revisions, `log -- <path>`, and `sit add .`
 
 The 1.13.0 minor: the gaps a git user hits on day one. Each new form is checked against git itself, in SHA-1 and SHA-256 repositories, loose and packed. The toolchain stays at cyrius 6.7.18. New: [ADR 0018](docs/adr/0018-object-writes-in-batches.md) and [architecture 009](docs/architecture/009-patra-delete-scans-wal-syncs-per-page.md).
@@ -78,7 +116,7 @@ An ignored directory is refused (`-f` overrides). A symlink, a name sit cannot t
   Up to 24 paths are deleted in one statement and reinserted without reading the index, which keeps the one-file add as fast as before.
 - **A stored object is not compressed again** (`write_typed_object`). The existence test ran after the compression, so every object write, an unchanged file's included, compressed its bytes only to discard them.
 
-The rest of a large add is patra's: inside the index transaction its WAL syncs once per page touched (about 1,660 for 10,000 rows), 3.7 s of a 6.3 s add under load 17. That cost and the scanning `DELETE` are listed as upstream asks, not yet filed on patra.
+The rest of a large add is patra's: inside the index transaction its WAL syncs once per page touched (about 1,660 for 10,000 rows), 3.7 s of a 6.3 s add under load 17. That cost and the scanning `DELETE` are filed on patra as consumer requests.
 
 ### Fixed
 
@@ -130,7 +168,7 @@ The rest of a large add is patra's: inside the index transaction its WAL syncs o
   - The 1.13.0 slot is gone.
   - 1.13.1 notes that `blame` should move onto `tree_path_find` (it flattens a whole tree per commit).
   - "On request" lists the revision forms left out.
-  - Two upstream asks are added on patra, not yet filed there: the scanning `DELETE` / `UPDATE`, and the per-page WAL sync.
+  - Two upstream asks on patra, filed there as consumer requests (`docs/development/requests/2026-10-30-sit-*`): the scanning `DELETE` / `UPDATE`, and the per-page WAL sync.
   - Its line pins are re-checked.
 
 ### Performance
