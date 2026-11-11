@@ -3500,6 +3500,124 @@ case "$AGNOS_BUILT" in
   *) echo "  (skipped 53's build: needs cyrius)" ;;
 esac
 
+# ── 54. 1.13.4 a served ref never moves onto a hole (X2c) ──────────
+# A push spans requests and the ref moves in the last, so a `fsck --prune`
+# between them deleted objects that had arrived but that no ref named yet, and
+# the server then moved the ref onto the hole: through 1.13.3 54f landed with
+# `missing <tree>` in the store. A client that never sent a tree or a blob did
+# the same (54a, 54b, 54d). The served repository has an annotated tag, so every
+# update here also peels a tag among the tips.
+hr "1.13.4 connectivity before a served ref moves"
+if command -v python3 >/dev/null 2>&1; then
+  R="$WORK/cn1134"; mkdir -p "$R"; cd "$R"
+  HO="$ROOT/tests/integration/serve_holes.py"
+  mkdir srv && (cd srv && "$SIT" init >/dev/null && echo base > base.txt && "$SIT" add base.txt >/dev/null \
+    && "$SIT" commit -m base >/dev/null && "$SIT" tag -a v0 -m v0 >/dev/null)
+  "$SIT" serve "$R/srv" --listen 127.0.0.1:18820 > /dev/null 2>&1 & CNP=$!
+  waitport 18820
+  hpush() { python3 -I "$HO" push 18820 "$@" > /dev/null; }
+  href()  { python3 -I "$HO" ref 18820 "$@"; }
+  hpush commit1
+  assert_eq "$(href refs/heads/a commit1)" "ref 409 hole" "54a: a commit whose tree never arrived is refused"
+  hpush tree1
+  assert_eq "$(href refs/heads/a commit1)" "ref 409 hole" "54b: and one whose blob never arrived"
+  hpush blob1
+  assert_eq "$(href refs/heads/a commit1)" "ref 200" "54c: complete, the ref moves"
+  hpush blob2 tree2 commit2
+  assert_eq "$(href refs/heads/a commit2)" "ref 409 hole" "54d: a subtree missing under a commit whose parent a ref reaches"
+  hpush subtree1
+  assert_eq "$(href refs/heads/a commit2)" "ref 200" "54e: sent, the fast-forward lands"
+  hpush blob3 tree3
+  (cd srv && "$SIT" fsck --prune-now > /dev/null 2>&1)
+  hpush commit3
+  assert_eq "$(href refs/heads/b commit3)" "ref 409 hole" "54f: a tree and blob pruned between the requests of a push"
+  assert_eq "$(cd srv && "$SIT" fsck 2>&1 | grep -c '^missing')" "0" "54f: and no ref names a hole"
+  hpush blob3 tree3 commit3
+  assert_eq "$(href refs/heads/b commit3)" "ref 200" "54g: pushed again, it lands"
+  assert_eq "$(href refs/heads/c commit4)" "ref 409 hole" "54h: a tip that never arrived is a hole too, not a bad request"
+  kill $CNP 2>/dev/null; wait $CNP 2>/dev/null
+  CFS=$(cd srv && "$SIT" fsck 2>&1 | tail -1)
+  assert_contains "$CFS" ", 0 bad" "54: the served store is whole"
+else
+  echo "  (skipped 54: python3 not available)"
+fi
+
+# ── 55. 1.13.4 reflogs past 64 MiB (L5) ────────────────────────────
+# Every reflog reader took the whole log through read_file_heap, whose 64 MiB
+# cap made a longer log unreadable: through 1.13.3 `sit reflog` printed
+# nothing, `HEAD@{1}` was "no object matches", `reflog expire` expired 0, the
+# one command that would have shrunk it, and `fsck --prune` refused for as long
+# as the log existed. 1.13.4 reads every log a chunk at a time.
+hr "1.13.4 reflogs past 64 MiB"
+if command -v python3 >/dev/null 2>&1; then
+  R="$WORK/rl1134"; mkdir -p "$R"; cd "$R"
+  "$SIT" init >/dev/null
+  echo a > a; "$SIT" add a >/dev/null; "$SIT" commit -m one >/dev/null
+  echo b > a; "$SIT" add a >/dev/null; "$SIT" commit -m two >/dev/null
+  RC1=$("$SIT" log | awk '/^commit /{n++; if (n==2) {print $2; exit}}')
+  RC2=$(tr -d '\n' < .sit/refs/heads/main)
+  # 65 MiB of entries from 2001 ahead of the two real ones.
+  python3 -I - "$RC1" "$RC2" .sit/logs/HEAD <<'PY'
+import os, sys
+c1, c2, path = sys.argv[1:4]
+tail = open(path).read()
+size, n = 0, 0
+with open(path + ".new", "w") as f:
+    while size < 65 * 1024 * 1024:
+        a, b = (c1, c2) if n % 2 == 0 else (c2, c1)
+        line = "%s %s t <t@t> %d +0000\tpad: %d\n" % (a, b, 1000000000 + n, n)
+        f.write(line)
+        size += len(line)
+        n += 1
+    f.write(tail)
+os.rename(path + ".new", path)
+PY
+  assert_eq "$("$SIT" reflog -n 1)" "${RC2:0:12} HEAD@{0}: commit: two" "55a: sit reflog lists a log past 64 MiB"
+  assert_eq "$("$SIT" show 'HEAD@{1}' 2>&1 | head -1)" "commit $RC1" "55b: HEAD@{1} resolves in it"
+  assert_eq "$("$SIT" show 'HEAD@{2001-09-10}' 2>&1 | head -1)" "commit $RC2" "55b: and HEAD@{<date>}, 80,000 entries back"
+  echo dangling > d.txt; "$SIT" add d.txt >/dev/null; "$SIT" rm --cached d.txt >/dev/null 2>&1; rm -f d.txt
+  PO=$("$SIT" fsck --prune-now 2>&1); PRC=$?
+  assert_eq "$PRC" "0" "55c: fsck --prune runs beside it (1.12.2-1.13.3: refused)"
+  assert_contains "$PO" "pruned 1 objects" "55c: and prunes what nothing reaches"
+  EO=$("$SIT" reflog expire --expire=2010-01-01 HEAD 2>&1)
+  case "$EO" in "expired 0 "*) bad "55d: reflog expire expired nothing";; "expired "*) ok;; *) bad "55d: reflog expire said '$EO'";; esac
+  [ "$(wc -c < .sit/logs/HEAD)" -lt 4096 ] && ok || bad "55d: to the two real entries ($(wc -c < .sit/logs/HEAD) bytes left)"
+  assert_eq "$("$SIT" reflog | wc -l | tr -d ' ')" "2" "55d: which still list"
+  [ -e .sit/logs/HEAD.lock ] && bad "55d: the rewrite left its lock file" || ok
+else
+  echo "  (skipped 55: python3 not available)"
+fi
+
+# ── 56. 1.13.4 a --repos request is pinned to its repository (S3) ──
+# 1.12.2 checked a kept repository's path on every request, but the store, the
+# lock and the refs were then opened by path, so a swap in between still
+# reached outside <dir>: through 1.13.3 swap_race.py's 300 rounds here showed
+# the outside repository's tip in ~120 refs answers and wrote ~35 branches into
+# it. 1.13.4 walks the name with openat(O_NOFOLLOW) and serves the request
+# through the descriptors it found. Linux only: the race uses renameat2.
+hr "1.13.4 --repos pinned to descriptors"
+if [ "$(uname -s)" = "Linux" ] && command -v python3 >/dev/null 2>&1; then
+  R="$WORK/pin1134"; mkdir -p "$R/served/team" "$R/outside"; cd "$R"
+  (cd outside && "$SIT" init >/dev/null && echo SECRET > f && "$SIT" add f >/dev/null && "$SIT" commit -m secret >/dev/null)
+  (cd served/team && "$SIT" init >/dev/null && echo t > f && "$SIT" add f >/dev/null && "$SIT" commit -m t >/dev/null)
+  SEC=$(tr -d '\n' < outside/.sit/refs/heads/main)
+  TTIP=$(tr -d '\n' < served/team/.sit/refs/heads/main)
+  # The outside store holds the team tip too, so a push that reached it would land.
+  (cd outside && "$SIT" fetch "$R/served/team" main >/dev/null 2>&1)
+  "$SIT" serve "$R/served" --repos --listen 127.0.0.1:18821 > "$R/serve.out" 2>&1 & PNP=$!
+  waitport 18821
+  case "$(cat "$R/serve.out")" in *"cannot hold a repository open"*) bad "56: --repos did not pin on Linux";; *) ok;; esac
+  RACE=$(python3 -I "$ROOT/tests/integration/swap_race.py" 18821 "$R/served" team "$R/outside" "$SEC" "$TTIP" 300)
+  assert_eq "$RACE" "leaked 0 wrote 0 of 300" "56: a swap during requests never reaches the outside repository"
+  [ -d "$R/served/team" ] && [ ! -L "$R/served/team" ] && ok || bad "56: the race put the served repository back"
+  NR=$(ls "$R/served/team/.sit/refs/heads" | grep -c '^race')
+  [ "$NR" -gt 0 ] && ok || bad "56: no push in the race reached the served repository itself"
+  kill $PNP 2>/dev/null; wait $PNP 2>/dev/null
+  assert_contains "$(cd served/team && "$SIT" fsck 2>&1 | tail -1)" ", 0 bad" "56: whose store is whole"
+else
+  echo "  (skipped 56: needs Linux and python3)"
+fi
+
 # ── summary ────────────────────────────────────────────────────────
 printf '\n=== integration: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

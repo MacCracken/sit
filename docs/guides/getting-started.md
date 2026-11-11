@@ -225,7 +225,7 @@ sit push origin main
 # pushed main -> origin at 859d7b43afef (3 new objects)
 ```
 
-Push is fast-forward-only: if the remote has commits your local branch doesn't contain, the push aborts with `non-fast-forward push rejected (remote has diverged)`. Fetch, merge, and re-push is the resolution path.
+Push is fast-forward-only: if the remote has commits your local branch doesn't contain, the push aborts with `non-fast-forward push rejected (remote has diverged)`. Fetch, merge, and re-push is the resolution path. Since 1.13.4 a `sit serve` also refuses a ref update while it lacks an object the pushed history reaches (a `sit fsck --prune` ran on it in the middle of the push): the client says `it lacks objects this history reaches; push again`, and pushing again resends them.
 
 ### Pull and clone
 
@@ -289,7 +289,7 @@ sit clone http://127.0.0.1:8484/demo           # → ./demo, from /srv/repos/dem
 sit clone http://127.0.0.1:8484/team/beta      # → ./beta, from /srv/repos/team/beta
 ```
 
-A name is letters, digits, `.`, `_` and `-` per segment, never starting with `.`; a symlink, a directory without `.sit/`, or anything else answers 404, and the client says "the server has no sit repository at that URL". A URL's path works the same against any server that routes by it, such as a reverse proxy in front of `--repos`. Since 1.11.0 a server holds a repository's store only while it answers a request, so `sit gc` runs on a served repository between requests, and the next request reads what gc left. While a gc (or `fsck --prune`) holds one repository's store, that repository's requests answer **503** at once and the others are served as usual (1.12.2); try again when it is done. A repository is checked again on every request, so one replaced by a symlink after it was first served is a 404 from then on. One server's `--require-auth` token authorizes pushes to **every** repository it serves: repositories that need different push rights belong behind different servers, or a proxy that authorizes by path.
+A name is letters, digits, `.`, `_` and `-` per segment, never starting with `.`; a symlink, a directory without `.sit/`, or anything else answers 404, and the client says "the server has no sit repository at that URL". A URL's path works the same against any server that routes by it, such as a reverse proxy in front of `--repos`. Since 1.11.0 a server holds a repository's store only while it answers a request, so `sit gc` runs on a served repository between requests, and the next request reads what gc left. While a gc (or `fsck --prune`) holds one repository's store, that repository's requests answer **503** at once and the others are served as usual (1.12.2); try again when it is done. A repository is checked again on every request, so one replaced by a symlink after it was first served is a 404 from then on. Since 1.13.4 the request is then served through the directories that check opened, so a swap while it runs changes nothing. That needs Linux with `/proc` mounted; elsewhere `--repos` says at start that it cannot, and a swap during a request still races. One server's `--require-auth` token authorizes pushes to **every** repository it serves: repositories that need different push rights belong behind different servers, or a proxy that authorizes by path.
 
 Bearer-token auth (`--require-auth`, `~/.sit/serve.token`) gates writes over HTTP/HTTPS and ssh; reads stay anonymous. Pushing to a remote's currently-checked-out branch is refused (`denyCurrentBranch`), matching git.
 

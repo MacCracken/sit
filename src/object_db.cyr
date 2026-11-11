@@ -1109,10 +1109,27 @@ fn _ensure_object_index(db) {
     return 0;
 }
 
+# patra_init, once per process (1.13.4, audit S5). patra's README says "once,
+# before use", and each repeat is not free: it installs a fresh TLS block
+# (4,112 B of bump heap that is never returned) and re-creates patra's mutexes
+# and SQL scratch. Every store and index open called it, so a `--repos` server
+# kept ~4.4 KB per evicting request and the read API paid it twice per
+# sit_repo_open. A flag of sit's own rather than patra_initialized(), which
+# needs patra >= 1.16.1: a consumer may pin an older toolchain. A refusal leaves
+# the flag clear, so the next open retries, as patra_init allows.
+var _store_patra_ready = 0;
+
+fn store_patra_init() {
+    if (_store_patra_ready == 1) { return PATRA_OK; }
+    # 1.7.2: patra_init reports a refused allocation since patra 1.16.1.
+    if (patra_init() != PATRA_OK) { return PATRA_ERR_IO; }
+    _store_patra_ready = 1;
+    return PATRA_OK;
+}
+
 # Open (creating if needed) .sit/objects.patra with its objects table and hash index.
 fn object_db_open() {
-    # 1.7.2: patra_init reports a refused allocation since patra 1.16.1.
-    if (patra_init() != PATRA_OK) { return 0; }
+    if (store_patra_init() != PATRA_OK) { return 0; }
     var db = sf_patra_open(".sit/objects.patra");
     if (db == 0) { return 0; }
     patra_exec(db, "CREATE TABLE objects (hash STR, ty INT, content BYTES)");
@@ -1727,11 +1744,16 @@ fn fsck_collect_reflog_roots(roots) {
     var i = 0;
     while (i < vec_len(files)) {
         var fc = vec_get(files, i);
-        var pair[16];
-        if (read_file_heap(fc, &pair) == 0) {
-            _reflog_collect_oids(load64(&pair), load64(&pair + 8), roots);
+        # 1.13.4 (L5): a chunk at a time, so a log of any size is read; through
+        # 1.13.3 one past read_file_heap's 64 MiB was counted unread here, and
+        # `--prune` refused for as long as it existed.
+        var rd[56];
+        var ok = 0;
+        if (_rlog_open(fc, &rd) == 0) {
+            if (_reflog_collect_rd(&rd, roots) == 0) { ok = 1; }
+            _rlog_close(&rd);
         }
-        else { _fsck_unread(fc); }      # unreadable, or past read_file_heap's 64 MiB (L5)
+        if (ok == 0) { _fsck_unread(fc); }      # unreadable, or a line past RLOG_LINE_MAX
         i = i + 1;
     }
     return 0;

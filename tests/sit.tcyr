@@ -1695,6 +1695,17 @@ fn test_serve_request_arena() {
     assert_eq(memeq(body, "{\"refs\":[{", 10), 1, "the body opens the list");
     assert_eq(memeq(body + strlen(body) - 3, "}]}", 3), 1, "and closes it");
     assert(strstr(body, "},{") >= 0, "entries are comma-separated");
+    # 1.13.4 (X2c): the connectivity check's tips come from the same walk.
+    var tips = serve_ref_tips(a);
+    assert(tips != 0, "the ref tips are listed");
+    assert_eq(vec_len(tips), 4, "every ref the body lists, and no other (main, feature/x, alias, v1)");
+    var tgood = 1;
+    var tii = 0;
+    while (tii < vec_len(tips)) {
+        if (memeq(vec_get(tips, tii), _srv_hex, 64) == 0) { tgood = 0; }
+        tii = tii + 1;
+    }
+    assert_eq(tgood, 1, "each a ref file's 64 hex");
 
     # Bounded: after one warm-up (the arena, the object-store handle), more
     # requests leave the global heap exactly where it was.
@@ -1875,12 +1886,19 @@ fn test_176_pure() {
     assert_eq(_wire_http_parse_refs(rb, strlen(rb), pairs), 0 - 1,
       "N7: a hash with no closing quote in bounds is refused");
 
-    # R7: one-pass reflog line starts.
+    # R7: one pass over the lines (1.13.4: the chunked reader).
     var lb = "a\nbb\nccc\n";
-    var st = _reflog_line_starts(lb, 9);
-    assert_eq(vec_len(st), 3, "R7: three LF-terminated lines");
-    assert_eq(vec_get(st, 2), 5, "R7: the third starts at byte 5");
-    assert_eq(vec_len(_reflog_line_starts("no newline", 10)), 0, "R7: an unterminated line is not counted");
+    var lrd[56];
+    _rlog_mem(&lrd, lb, 9);
+    assert_eq(_reflog_count_rd(&lrd), 3, "R7: three LF-terminated lines");
+    _rlog_mem(&lrd, lb, 9);
+    var lln[16];
+    _rlog_next(&lrd, &lln);
+    _rlog_next(&lrd, &lln);
+    _rlog_next(&lrd, &lln);
+    assert_eq(load64(&lln) - lb, 5, "R7: the third starts at byte 5");
+    _rlog_mem(&lrd, "no newline", 10);
+    assert_eq(_reflog_count_rd(&lrd), 0, "R7: an unterminated line is not counted");
 
     # R4: the word-wise copy, every tail length.
     var src = alloc(40);
@@ -2289,6 +2307,421 @@ fn test_1131_link_text() {
     return 0;
 }
 
+# A tree body of `n` entries {mode, name, id byte} in `out`; returns its length.
+fn _cn_tree_body(out, modes, names, ids, n) {
+    var pos = 0;
+    var i = 0;
+    while (i < n) {
+        var m = vec_get(modes, i);
+        var nm = vec_get(names, i);
+        memcpy(out + pos, m, strlen(m));
+        pos = pos + strlen(m);
+        store8(out + pos, 32);
+        pos = pos + 1;
+        memcpy(out + pos, nm, strlen(nm) + 1);
+        pos = pos + strlen(nm) + 1;
+        var k = 0;
+        while (k < 32) { store8(out + pos + k, vec_get(ids, i)); k = k + 1; }
+        pos = pos + 32;
+        i = i + 1;
+    }
+    return pos;
+}
+
+# A fake repository for the --repos resolver: `<base>/<name>/.sit/HEAD`.
+fn _s3_repo(base, name) {
+    var p = alloc(512);
+    var bl = strlen(base);
+    var nl = strlen(name);
+    memcpy(p, base, bl);
+    store8(p + bl, 47);
+    memcpy(p + bl + 1, name, nl + 1);
+    sit_mkdir(p, 493);
+    memcpy(p + bl + 1 + nl, "/.sit", 6);
+    sit_mkdir(p, 493);
+    memcpy(p + bl + 1 + nl, "/.sit/HEAD", 11);
+    file_write_all(p, "ref: refs/heads/main\n", 21);
+    store8(p + bl + 1 + nl, 0);
+    return p;
+}
+
+# Remove what _s3_repo made at `<base>/<name>` (and a link there), if anything.
+fn _s3_rm(base, name) {
+    var p = alloc(512);
+    var bl = strlen(base);
+    var nl = strlen(name);
+    memcpy(p, base, bl);
+    store8(p + bl, 47);
+    memcpy(p + bl + 1, name, nl + 1);
+    if (path_lstat_kind(p) == 0xA000) { sys_unlink(p); return 0; }
+    memcpy(p + bl + 1 + nl, "/.sit/HEAD", 11);
+    sys_unlink(p);
+    store8(p + bl + 1 + nl + 5, 0);
+    if (path_lstat_kind(p) == 0xA000) { sys_unlink(p); }
+    else { sit_rmdir(p); }
+    store8(p + bl + 1 + nl, 0);
+    sit_rmdir(p);
+    return 0;
+}
+
+# The resolver fixture, gone (a run that stopped part-way left it behind).
+fn _s3_clean() {
+    var base = "/tmp/sit-tcyr-s3";
+    _s3_rm(base, "alpha");
+    _s3_rm(base, "alpha.real");
+    _s3_rm(base, "alpha.new");
+    _s3_rm(base, "gamma");
+    _s3_rm(base, "team/beta");
+    _s3_rm(base, "team");
+    sit_rmdir(base);
+    _s3_rm("/tmp", "sit-tcyr-s3-out");
+    return 0;
+}
+
+# 1.13.4 (S3): --repos resolution, by path and through descriptors.
+fn test_1134_repos() {
+    test_group("1.13.4 --repos resolution through descriptors (S3)");
+    # The `.sit` pin in sit_abs: `.sit` and `.sit/…` only.
+    sit_set_repo_root("/r");
+    sit_set_repo_dotdir("/proc/self/fd/9");
+    assert_streq(sit_abs(".sit"), "/proc/self/fd/9", ".sit is the pin");
+    assert_streq(sit_abs(".sit/refs/heads/x"), "/proc/self/fd/9/refs/heads/x", ".sit/… resolves below it");
+    assert_streq(sit_abs(".sitx"), "/r/.sitx", "a longer name is not .sit");
+    assert_streq(sit_abs(".si"), "/r/.si", "nor a shorter one");
+    assert_streq(sit_abs("a/.sit"), "/r/a/.sit", "nor a .sit below the root");
+    assert_streq(sit_abs("/abs"), "/abs", "an absolute path is used as given");
+    var ib[64];
+    assert_streq(sit_abs_into(".sit/HEAD", &ib, 64), "/proc/self/fd/9/HEAD", "sit_abs_into maps it too");
+    assert_eq(sit_abs_into(".sit/HEAD", &ib, 19), 0, "and refuses a buffer it does not fit");
+    assert_streq(str_cstr(sit_abs_str(str_from(".sit/packs"))), "/proc/self/fd/9/packs", "and sit_abs_str");
+    sit_set_repo_dotdir(0);
+    assert_streq(sit_abs(".sit/HEAD"), "/r/.sit/HEAD", "with no pin, the root join");
+    sit_set_repo_root(0);
+
+    _s3_clean();
+    var base = "/tmp/sit-tcyr-s3";
+    sit_mkdir(base, 493);
+    var outside = "/tmp/sit-tcyr-s3-out";
+    _s3_repo("/tmp", "sit-tcyr-s3-out");
+    var alpha = _s3_repo(base, "alpha");
+    sit_mkdir("/tmp/sit-tcyr-s3/team", 493);
+    _s3_repo(base, "team/beta");
+    var sub[8];
+    _serve_repos_dir = base;
+    _serve_repos = 0;
+
+    # By path (no /proc, or not Linux): checked per request.
+    _serve_repos_pin = 0;
+    var c1 = _serve_repo_for("/alpha/sit/v1/refs", &sub);
+    assert(c1 != 0, "by path: a repository resolves");
+    assert_streq(load64(c1), alpha, "by path: at <dir>/<name>");
+    assert_streq(load64(&sub), "/sit/v1/refs", "the path past the name");
+    assert_eq(_serve_repo_for("/alpha/sit/v1/refs", &sub), c1, "by path: kept for the next request");
+    sys_rename(alpha, "/tmp/sit-tcyr-s3/alpha.real");
+    xsymlink(outside, alpha);
+    assert_eq(_serve_repo_for("/alpha/sit/v1/refs", &sub), 0, "by path: swapped for a link, refused");
+    sys_unlink(alpha);
+    sys_rename("/tmp/sit-tcyr-s3/alpha.real", alpha);
+    _serve_repos = 0;
+
+    # Through descriptors.
+    assert_eq(_serve_repos_open_dir(base), 1, "pinned: <dir> opens and /proc/self/fd reaches it");
+    _serve_repos_pin = 1;
+    var c2 = _serve_repo_for("/alpha/sit/v1/refs", &sub);
+    assert(c2 != 0, "pinned: a repository resolves");
+    assert_eq(memeq(load64(c2), "/proc/self/fd/", 14), 1, "pinned: its root is its descriptor");
+    assert(_repo_dotdir != 0, "pinned: and .sit is pinned for the request");
+    store_ctx_load(c2);
+    assert_eq(path_lstat_kind(sit_abs(".sit/HEAD")), 0x8000, "pinned: .sit/HEAD reads through the pin");
+    assert_eq(_sf_parent_symlink(".sit/refs/heads/x"), 0, "pinned: the pin is not taken for a planted link");
+    var cell = map_get(_serve_repos, "alpha");
+    var kfd = load64(cell + 48);
+    assert_eq(_serve_repo_for("/alpha/sit/v1/refs", &sub), c2, "pinned: kept for the next request");
+    assert_eq(load64(cell + 48), kfd, "pinned: on the descriptors it kept");
+    # Swapped for a link to a repository outside <dir>: refused, and closed.
+    sys_rename(alpha, "/tmp/sit-tcyr-s3/alpha.real");
+    xsymlink(outside, alpha);
+    assert_eq(_serve_repo_for("/alpha/sit/v1/refs", &sub), 0, "pinned: swapped for a link, refused");
+    assert_eq(map_get(_serve_repos, "alpha"), 0, "pinned: and the kept one is closed");
+    var probe[256];
+    assert(sys_fstat(kfd, &probe) != 0, "pinned: its descriptors with it");
+    sys_unlink(alpha);
+    # Replaced by another real repository: served afresh, never through the old.
+    sit_mkdir(alpha, 493);
+    _s3_repo(base, "alpha");
+    var c3 = _serve_repo_for("/alpha/sit/v1/refs", &sub);
+    assert(c3 != 0, "pinned: a repository at the name again resolves");
+    var c4 = _serve_repo_for("/alpha/sit/v1/refs", &sub);
+    assert_eq(c4, c3, "pinned: and is kept");
+    sys_rename(alpha, "/tmp/sit-tcyr-s3/alpha.new");
+    sys_rename("/tmp/sit-tcyr-s3/alpha.real", alpha);
+    var c5 = _serve_repo_for("/alpha/sit/v1/refs", &sub);
+    assert(c5 != 0, "pinned: the original put back resolves");
+    assert(c5 != c3, "pinned: as a new store state, not the replaced one's");
+    # A nested name, and the shapes the walk refuses.
+    assert(_serve_repo_for("/team/beta/sit/v1/refs", &sub) != 0, "pinned: a nested name resolves");
+    xsymlink("/tmp/sit-tcyr-s3-out/.sit", "/tmp/sit-tcyr-s3/team/.sit");
+    assert_eq(_serve_repo_for("/team/sit/v1/refs", &sub), 0, "pinned: a .sit that is a link is refused");
+    sys_unlink("/tmp/sit-tcyr-s3/team/.sit");
+    _s3_repo(base, "gamma");
+    sys_unlink("/tmp/sit-tcyr-s3/gamma/.sit/HEAD");
+    xsymlink("/tmp/sit-tcyr-s3-out/.sit/HEAD", "/tmp/sit-tcyr-s3/gamma/.sit/HEAD");
+    assert_eq(_serve_repo_for("/gamma/sit/v1/refs", &sub), 0, "pinned: a .sit/HEAD that is a link is refused");
+    assert_eq(_serve_repo_for("/nope/sit/v1/refs", &sub), 0, "pinned: an absent name is refused");
+
+    sit_set_repo_dotdir(0);
+    sit_set_repo_root(0);
+    file_close(_serve_repos_dirfd);
+    _serve_repos_dirfd = 0 - 1;
+    _serve_repos_pin = 0;
+    _serve_repos_dir = 0;
+    _serve_repos = 0;
+    _s3_clean();
+    assert_eq(path_lstat_kind("/tmp/sit-tcyr-s3"), 0 - 1, "the fixture is cleaned up");
+    return 0;
+}
+
+# 1.13.4: the connectivity check's pieces (X2c), and patra_init once (S5).
+fn test_1134_hardening() {
+    test_group("1.13.4 connectivity before a served ref moves; patra_init once");
+    # The client tells a hole from a non-fast-forward 409 by its body.
+    assert_eq(wire_ref_refused_hole(409, "missing objects: x\n", 18), 1, "a 409 that says missing objects");
+    assert_eq(wire_ref_refused_hole(409, 0, 0), 0, "a 409 with no body is non-fast-forward");
+    assert_eq(wire_ref_refused_hole(409, "missing", 7), 0, "a short body is not it");
+    assert_eq(wire_ref_refused_hole(200, "missing objects", 15), 0, "nor any other status");
+    assert_eq(wire_ref_refused_hole(423, "missing objects", 15), 0, "denyCurrentBranch is not it");
+
+    # The walk orders by committer date; with none, the fallback.
+    var a = arena_allocator_growable(4096);
+    var cb = "tree aa\nauthor A <a@x> 100 +0000\ncommitter C <c@x> 200 +0000\n\nm\n";
+    assert_eq(_cn_committer_ts(a, cb, strlen(cb), 7), 200, "the committer's date, not the author's");
+    var cb2 = "tree aa\nauthor A <a@x> 100 +0000\n\ncommitter C <c@x> 200 +0000\n";
+    assert_eq(_cn_committer_ts(a, cb2, strlen(cb2), 7), 7, "a committer line past the headers is message text");
+    var cb3 = "tree aa\ncommitter C <c@x> 99999999999999 +0000\n\n";
+    assert_eq(_cn_committer_ts(a, cb3, strlen(cb3), 7), SIT_TS_MAX, "clamped as every commit date is");
+
+    # The heap pops newest first, and only nodes no tip reaches count as live.
+    var heap = vec_new_a(a);
+    var tsv = vec_new();
+    vec_push(tsv, 5); vec_push(tsv, 1); vec_push(tsv, 9); vec_push(tsv, 3);
+    vec_push(tsv, 7); vec_push(tsv, 9); vec_push(tsv, 0); vec_push(tsv, 4);
+    _cn_live = 0;
+    _cn_over = 0;
+    var i = 0;
+    while (i < vec_len(tsv)) {
+        var n = alloc_via(a, CN_NODE);
+        store64(n, 0);
+        store64(n + 8, vec_get(tsv, i));
+        store64(n + 16, CN_LOADED);
+        if (i == 2) { store64(n + 16, CN_LOADED | CN_DONE); }
+        _cn_push(a, heap, n);
+        i = i + 1;
+    }
+    assert_eq(_cn_live, 7, "seven queued, one of them painted complete");
+    var order_ok = 1;
+    var last = 99;
+    var popped = 0;
+    while (vec_len(heap) > 0) {
+        var pn = _cn_pop(heap);
+        if (load64(pn + 8) > last) { order_ok = 0; }
+        if ((load64(pn + 16) & CN_QUEUED) != 0) { order_ok = 0; }
+        last = load64(pn + 8);
+        popped = popped + 1;
+    }
+    assert_eq(order_ok, 1, "popped in descending date order, each unqueued");
+    assert_eq(popped, 8, "all eight");
+    assert_eq(_cn_live, 0, "and none is left live");
+    # Painting a queued node takes it out of the live count; an unqueued one is queued.
+    var q = alloc_via(a, CN_NODE);
+    store64(q + 8, 1);
+    store64(q + 16, CN_LOADED);
+    _cn_push(a, heap, q);
+    assert_eq(_cn_live, 1, "a new commit queued is live");
+    _cn_paint(a, heap, q);
+    assert_eq(_cn_live, 0, "painted while queued, it is not");
+    _cn_pop(heap);
+    var u = alloc_via(a, CN_NODE);
+    store64(u + 8, 2);
+    store64(u + 16, CN_LOADED | CN_NEW);
+    _cn_paint(a, heap, u);
+    assert_eq(vec_len(heap), 1, "a commit popped as new and painted later is queued again, to paint its parents");
+    assert_eq(_cn_live, 0, "without counting as live");
+    _cn_pop(heap);
+    var mi = alloc_via(a, CN_NODE);
+    store64(mi + 16, CN_LOADED | CN_MISSING);
+    _cn_paint(a, heap, mi);
+    assert_eq(vec_len(heap), 0, "a missing commit is painted but never queued");
+
+    # Same-path entries in a base, by one forward pass in git order: b.txt
+    # sorts before the tree b, which compares as "b/" ('.' < '/').
+    var bm = vec_new();
+    var bn = vec_new();
+    var bi = vec_new();
+    vec_push(bm, "100644"); vec_push(bn, "a");     vec_push(bi, 1);
+    vec_push(bm, "100644"); vec_push(bn, "b.txt"); vec_push(bi, 3);
+    vec_push(bm, "40000");  vec_push(bn, "b");     vec_push(bi, 2);
+    vec_push(bm, "100644"); vec_push(bn, "c");     vec_push(bi, 4);
+    var bbody = alloc(512);
+    var blen = _cn_tree_body(bbody, bm, bn, bi, 4);
+    var e = alloc_via(a, CN_BASE);
+    store64(e, 0); store64(e + 8, 0);
+    store64(e + 16, bbody); store64(e + 24, blen); store64(e + 32, 0);
+    var h = _cn_base_seek(e, "a", 1, 0);
+    assert(h != 0, "the first entry is found");
+    assert_eq(load8(h), 1, "with its id");
+    assert_eq(_cn_base_seek(e, "aa", 2, 0), 0, "a name the base lacks is not");
+    assert_eq(_cn_base_seek(e, "b", 1, 0), 0, "nor the tree b asked as a file");
+    var hb2 = _cn_base_seek(e, "b.txt", 5, 0);
+    assert(hb2 != 0, "a miss leaves the cursor in place: b.txt is still found");
+    assert_eq(load8(hb2), 3, "with its id");
+    var hb = _cn_base_seek(e, "b", 1, 1);
+    assert(hb != 0, "the tree b, asked as a tree, after b.txt");
+    assert_eq(load8(hb), 2, "with its id");
+    var hc = _cn_base_seek(e, "c", 1, 0);
+    assert(hc != 0, "and the scan goes on forward to c");
+    assert_eq(load8(hc), 4, "with its id");
+    assert_eq(_cn_base_seek(e, "a", 1, 0), 0, "the cursor never goes back");
+    store64(e + 16, 0);
+    assert_eq(_cn_base_seek(e, "a", 1, 0), 0, "a base that could not be read matches nothing");
+    store64(e + 16, bbody); store64(e + 24, blen - 5); store64(e + 32, 0);
+    _cn_base_seek(e, "z", 1, 0);
+    assert_eq(load64(e + 32), blen - 5, "a truncated base ends the scan");
+
+    # L5: the chunked log readers. A log file, read at every chunk size from 1
+    # byte up (so every refill and every grow path runs), gives the lines the
+    # in-memory reader gives, forward and backward, and the same @{n} / @{time}.
+    var lroot = "/tmp/sit-tcyr-l5";
+    sit_mkdir(lroot, 493);
+    sit_set_repo_root(lroot);
+    var A = "1111111111111111111111111111111111111111111111111111111111111111";
+    var B = "2222222222222222222222222222222222222222222222222222222222222222";
+    var lbuf = alloc(8192);
+    var lpos = 0;
+    var li = 0;
+    while (li < 12) {
+        var msg = "commit: x";
+        if (li == 5) {
+            # one line longer than every small chunk
+            msg = "commit: a much longer message that runs past the small chunk sizes many times over";
+        }
+        var nh = A;
+        if ((li & 1) == 1) { nh = B; }
+        lpos = lpos + reflog_format_line(lbuf + lpos, 0, nh, "n", "e", 1000 + li * 10, msg);
+        li = li + 1;
+    }
+    memcpy(lbuf + lpos, "trailing fragment", 17);
+    var lsize = lpos + 17;
+    file_write_all("/tmp/sit-tcyr-l5/log", lbuf, lsize);
+    var chunks = vec_new();
+    vec_push(chunks, 1); vec_push(chunks, 2); vec_push(chunks, 3); vec_push(chunks, 7);
+    vec_push(chunks, 64); vec_push(chunks, 150); vec_push(chunks, RLOG_CHUNK);
+    var fwd_bad = 0;
+    var back_bad = 0;
+    var nth_bad = 0;
+    var ci = 0;
+    while (ci < vec_len(chunks)) {
+        _rlog_chunk = vec_get(chunks, ci);
+        var frd[56];
+        var mrd[56];
+        var fl[16];
+        var ml[16];
+        if (_rlog_open("log", &frd) != 0) { fwd_bad = fwd_bad + 100; }
+        _rlog_mem(&mrd, lbuf, lsize);
+        var going = 1;
+        while (going == 1) {
+            var r1 = _rlog_next(&frd, &fl);
+            var r2 = _rlog_next(&mrd, &ml);
+            if (r1 != r2) { fwd_bad = fwd_bad + 1; going = 0; }
+            else {
+                if (r1 != 1) { going = 0; }
+                else {
+                    if (load64(&fl + 8) != load64(&ml + 8)) { fwd_bad = fwd_bad + 1; }
+                    else { if (memeq(load64(&fl), load64(&ml), load64(&ml + 8)) == 0) { fwd_bad = fwd_bad + 1; } }
+                }
+            }
+        }
+        _rlog_close(&frd);
+        var fbr[56];
+        var mbr[56];
+        if (_rlog_back_open("log", &fbr) != 0) { back_bad = back_bad + 100; }
+        _rlog_back_mem(&mbr, lbuf, lsize);
+        going = 1;
+        var nlines = 0;
+        while (going == 1) {
+            var b1 = _rlog_prev(&fbr, &fl);
+            var b2 = _rlog_prev(&mbr, &ml);
+            if (b1 != b2) { back_bad = back_bad + 1; going = 0; }
+            else {
+                if (b1 != 1) { going = 0; }
+                else {
+                    nlines = nlines + 1;
+                    if (load64(&fl + 8) != load64(&ml + 8)) { back_bad = back_bad + 1; }
+                    else { if (memeq(load64(&fl), load64(&ml), load64(&ml + 8)) == 0) { back_bad = back_bad + 1; } }
+                }
+            }
+        }
+        if (nlines != 12) { back_bad = back_bad + 1; }
+        _rlog_close(&fbr);
+        var nn = 0;
+        while (nn < 15) {
+            var o1[72];
+            var o2[72];
+            store8(&o1, 0);
+            store8(&o2, 0);
+            var g1 = 0;
+            if (_rlog_back_open("log", &fbr) == 0) {
+                g1 = _reflog_nth_rd(&fbr, nn, &o1);
+                _rlog_close(&fbr);
+            }
+            var g2 = _reflog_nth_in_buf(lbuf, lsize, nn, &o2);
+            if (g1 != g2) { nth_bad = nth_bad + 1; }
+            if (g1 == 1) { if (memeq(&o1, &o2, 64) == 0) { nth_bad = nth_bad + 1; } }
+            var t1 = 0;
+            if (_rlog_back_open("log", &fbr) == 0) {
+                t1 = _reflog_at_time_rd(&fbr, 995 + nn * 10, &o1);
+                _rlog_close(&fbr);
+            }
+            var t2 = _reflog_at_time_in_buf(lbuf, lsize, 995 + nn * 10, &o2);
+            if (t1 != t2) { nth_bad = nth_bad + 1; }
+            if (t1 == 1) { if (memeq(&o1, &o2, 64) == 0) { nth_bad = nth_bad + 1; } }
+            nn = nn + 1;
+        }
+        ci = ci + 1;
+    }
+    assert_eq(fwd_bad, 0, "L5: forward, a file read at every chunk size gives the in-memory lines");
+    assert_eq(back_bad, 0, "L5: and backward, newest first, the trailing fragment left out");
+    assert_eq(nth_bad, 0, "L5: @{n} and @{<time>} agree at every chunk size");
+    var o3[72];
+    assert_eq(_reflog_nth_in_buf(lbuf, lsize, 11, &o3), 1, "L5: @{11} is the oldest entry's new oid");
+    assert_eq(_reflog_nth_in_buf(lbuf, lsize, 12, &o3), 0, "L5: @{12}, its old oid, is the creation zeros");
+    assert_eq(_reflog_nth_in_buf(lbuf, lsize, 13, &o3), 0, "L5: @{13} is past it");
+    # The streamed rewrite: delete one line, then expire the older half, at a
+    # small chunk, against what is left.
+    _rlog_chunk = 7;
+    assert_eq(_reflog_rewrite("log", 1, 5), 1, "L5: a delete drops one line, the long one");
+    var crd[56];
+    _rlog_open("log", &crd);
+    assert_eq(_reflog_count_rd(&crd), 11, "L5: eleven are left");
+    _rlog_close(&crd);
+    assert_eq(_reflog_rewrite("log", 0, 1045), 5, "L5: expire drops the five made at or before the cutoff");
+    _rlog_open("log", &crd);
+    assert_eq(_reflog_count_rd(&crd), 6, "L5: six are left");
+    _rlog_close(&crd);
+    assert_eq(_reflog_rewrite("log", 0, 1045), 0, "L5: a second expire drops nothing");
+    assert_eq(path_lstat_kind("/tmp/sit-tcyr-l5/log.lock"), 0 - 1, "L5: and no lock file is left");
+    _rlog_chunk = RLOG_CHUNK;
+    sit_set_repo_root(0);
+    sys_unlink("/tmp/sit-tcyr-l5/log");
+
+    # patra_init runs once per process; a second open keeps nothing (S5).
+    assert_eq(store_patra_init(), PATRA_OK, "patra initializes");
+    assert_eq(_store_patra_ready, 1, "and sit remembers it did");
+    var u0 = alloc_used();
+    assert_eq(store_patra_init(), PATRA_OK, "a second call answers OK");
+    assert_eq(alloc_used() - u0, 0, "and allocates nothing (1.13.3: 4,112 B a call)");
+    return 0;
+}
+
 # Run every test group; exit status is the failure count.
 # A line of an attribute file against `path`: the state of `slot` afterwards.
 fn _ga_try(line, path, blen, slot) {
@@ -2504,6 +2937,8 @@ fn main() {
     test_1131_link_text();
     test_1132_gitattr();
     test_1132_obj_fail();
+    test_1134_hardening();
+    test_1134_repos();
     return assert_summary();
 }
 

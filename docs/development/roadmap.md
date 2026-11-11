@@ -26,17 +26,6 @@ Each item ships under the usual test / fuzz / poison / bench gates.
 
 Gaps every git user hits on day one, verified at 1.12.0. 1.13.0 shipped the syntax (revisions, path-limited log, directory adds); the patches finish the arc.
 
-### 1.13.4 — hardening carried from the 1.12.2 audit
-
-What [the 1.12.2 audit](../audit/2026-10-20-1.12.2-audit.md) left partly fixed:
-- **`--repos` resolution relative to a directory descriptor (S3).** Since 1.12.2 a kept repository is re-checked on every request, but a swap between that check and the opens still races: about 60 of 300 rounds in the reviewer's racer, when every request re-resolved. Open `<dir>` once, walk each name segment with `openat(…, O_NOFOLLOW | O_DIRECTORY)`, and open the store, the lock and the refs relative to the repository's descriptor. The stdlib's `openat` surface has to be checked against owl's toolchain first, since `serve.cyr` is in `[lib]`.
-- **A connectivity check before a served ref moves (X2c).** `serve_handle_put_ref` checks only that the new tip exists and is a commit. A push spans requests, and a `fsck --prune` between them can delete objects that arrived but that no ref named yet. Walk the new tip's commits and trees down to what the old tip (or any ref) reaches, as git's `check_connected` does, and refuse a hole with a 409. Bound the walk as the fast-forward check is bounded (60 s, then 503).
-- **Reflogs past 64 MiB (L5).** `read_file_heap`'s cap makes such a log unreadable to `sit reflog`, `@{…}` and `reflog expire`, which is the command that would shrink it. `fsck --prune` refuses while one exists (1.12.2). Read and rewrite logs in chunks.
-- **`patra_init` once per process (S5, sit's part).** `object_db_open` and `index_db_open` call `patra_init()` on every open, against patra's README ("once, before use"). Each repeat keeps 4,112 B of bump heap and re-creates patra's mutexes, page-cache and SQL state. That is nearly all of the ~4.4 KB a `--repos` server keeps per evicting request, and the read API pays it twice per `sit_repo_open`. Call it once, behind a flag of sit's own: `patra_initialized()` needs patra ≥ 1.16.1, newer than owl's toolchain. Measured 2026-10-20: a repeat `patra_init` 4,112 B, `sf_patra_open` + close 351 B, `CREATE TABLE` on an existing table 0.
-
-What 1.13.1's refusal left open ([ADR 0003](../adr/0003-no-upward-repo-discovery.md)'s amendment):
-- **Links below a real store.** A `.git/` directory with `refs` and `objects` linked out reads the other repository, and `sit status` lists its tracked paths as `deleted:`, as git does (verified at 1.13.1). The name on `On branch` stays the directory's own, so a prompt shows nothing of it but a dirty marker. `git-new-workdir` makes this shape and `objects/info/alternates` reaches as far on purpose (ADR 0011), so this needs a decision before a refusal.
-
 ### 1.13.5 — closeout P(-1) over 1.13.x
 
 ---
@@ -119,31 +108,31 @@ Wanted, but each waits for a consumer or a decision before it takes an arc.
   
     | flag | location |
     |---|---|
-        | `rm --cached` | `index.cyr:1211` |
-    | `reset --hard` | `index.cyr:1100` |
-    | `checkout -b` | `refs.cyr:1036` |
-    | `branch -d` | `refs.cyr:918` |
-    | `tag -d` / `-a` / `-s` | `refs.cyr:738,780,782` |
-    | `merge --abort` | `merge.cyr:666`; `-S` / `-m <msg>` are scanned anywhere (`cmd_merge`'s argument loop) |
-    | `rebase --abort` / `--continue` | `rebase.cyr:257,292` |
+        | `rm --cached` | `index.cyr:1202` |
+    | `reset --hard` | `index.cyr:1094` |
+    | `checkout -b` | `refs.cyr:1048` |
+    | `branch -d` | `refs.cyr:933` |
+    | `tag -d` / `-a` / `-s` | `refs.cyr:756,798,800` |
+    | `merge --abort` | `merge.cyr:651`; `-S` / `-m <msg>` are scanned anywhere (`cmd_merge`'s argument loop) |
+    | `rebase --abort` / `--continue` | `rebase.cyr:254,289` |
     | `config --global` | `config.cyr:360` |
   - **Option-shaped names are refused** where a name is created (`ref_name_is_option`, `refs.cyr`) and where `commit` takes a bare message (`commit.cyr`); a cmdit table must keep those refusals.
   - **Scanning loops:**
   
     | command | function | notes |
     |---|---|---|
-    | `log` | `cmd_log`, `commit.cyr:1176` | `--` and paths since 1.13.0 |
-    | `commit -S` / `-m` | `cmd_commit`, `commit.cyr:1460` | with no message, a merge's saved `-m` (`MERGE_MSG`) |
-    | `reflog -n` | `cmd_reflog`, `reflog.cyr:417` | a missing value is ignored; `show` / `expire` / `delete` sub-commands |
-    | `fsck --prune` / `--prune-now` | `cmd_fsck`, `object_db.cyr:2103` | everything else is ignored |
-    | `clone` | `cmd_clone`, `wire.cyr:1829` | |
-    | `serve` | `cmd_serve`, `serve.cyr:1874` | `<repo>` fixed at `argv(2)` |
-    | `diff` / `show` | `diff.cyr:1303,1610` | |
+    | `log` | `cmd_log`, `commit.cyr:1178` | `--` and paths since 1.13.0 |
+    | `commit -S` / `-m` | `cmd_commit`, `commit.cyr:1473` | with no message, a merge's saved `-m` (`MERGE_MSG`) |
+    | `reflog -n` | `cmd_reflog`, `reflog.cyr:654` | a missing value is ignored; `show` / `expire` / `delete` sub-commands |
+    | `fsck --prune` / `--prune-now` | `cmd_fsck`, `object_db.cyr:2191` | everything else is ignored |
+    | `clone` | `cmd_clone`, `wire.cyr:2403` | |
+    | `serve` | `cmd_serve`, `serve.cyr:2132` | `<repo>` fixed at `argv(2)` |
+    | `diff` / `show` | `diff.cyr:1396,1703` | |
   - **Sub-commands:**
-    - `stash push | list | pop | drop` (default push): `cmd_stash`, `history.cyr:609`.
+    - `stash push | list | pop | drop` (default push): `cmd_stash`, `history.cyr:591`.
     - `key generate | show`: `cmd_key`, `sign.cyr:293`.
-    - `remote add | list | remove` (default list): `cmd_remote`, `wire.cyr:1372`.
-    - `reflog [show] | expire | delete` (default show): `cmd_reflog`, `reflog.cyr:417`.
+    - `remote add | list | remove` (default list): `cmd_remote`, `wire.cyr:1951`.
+    - `reflog [show] | expire | delete` (default show): `cmd_reflog`, `reflog.cyr:654`.
     - The `getenv` reads (`SIT_AUTHOR_*`, `SIT_OWL`, `HOME`, …) are not flag fallbacks and stay.
 
   The plan:
@@ -158,11 +147,11 @@ Wanted, but each waits for a consumer or a decision before it takes an arc.
   
     stash, key, remote and reflog become nested re-entry (`cmdit_dispatch_argv` on `cmdit_verb_argc` / `_argv`), each keeping its own unknown-sub-command text.
   - **Gap, blocking diff/show only.** `-U<N>` is an *attached* short value, and cmdit rejects `-U3` as `CMDIT_ERR_BUNDLED`.
-    - It is pinned by `tests/integration/run.sh:486,491` (`show -U0`, `show -U4611686018427387904`) and CI's "diff -U<N>" smoke (`ci.yml:401`).
+    - It is pinned by `tests/integration/run.sh:507,512` (`show -U0`, `show -U4611686018427387904`) and CI's "diff -U<N>" smoke (`ci.yml:401`).
     - Keep diff/show hand-rolled, or strip `-U*` before `cmdit_parse_verb`.
     - cmdit's roadmap already records sit's `-U<N>` as demand for an opt-in "attached short value" (its won't-ship-without-cause list).
   - **Caller-side rules (not gaps):**
-    - serve's `--stdio` / `--listen` and `--tls` / `--stdio` exclusions, and `--tls` needing `--cert` / `--key` (`serve.cyr:1975-2022`)
+    - serve's `--stdio` / `--listen` and `--tls` / `--stdio` exclusions, and `--tls` needing `--cert` / `--key` (`serve.cyr:2230-2277`)
     - `merge` taking `-S` / `-m <msg>` before or after its branches, and `add` taking `-f` anywhere (1.12.1)
     - config's `--list` / `--unset` / `<key>` exclusivity
   - **Decide, don't drift:**
@@ -179,7 +168,7 @@ Blocked on another repo. Per [CLAUDE.md](../../CLAUDE.md), each belongs on the *
 
 - **sankoch — DEFLATE match-finder throughput.** Targets the `add-1MB` `zlib_compress` floor (~100 ms, about 6× git and the largest single cost in `sit add`). **On sankoch's roadmap** as its 2.9.1 item (checked at 2.8.9); it reaches sit with the cyrius release that folds that sankoch (1.15.2, above).
 - **patra — `page_write`'s return is ignored inside statements (L12).** `tbl_insert`, `tbl_delete`, `btree_insert` and `_bt_push_up` discard it, so in autocommit a page that never reached the disk is reported as `PATRA_OK` (reproduced with `RLIMIT_FSIZE` standing in for EIO / ENOSPC: `sit add` printed "added" and staged nothing). Inside a transaction the failure is reported, which is why sit writes the index only in transactions. **On patra's own roadmap** (its "Open — patra's own" list, found there at 1.16.2).
-- **patra — `patra_open` keeps its WAL path on the bump heap (S5, patra's part).** Each open keeps the path's length plus 5 bytes, which `patra_close` cannot return: 136 B per open for a 124-byte path, measured on the 1.16.5 fold. It is patra's own 2026-08-18 security review's S3 hygiene item, which was never tracked. **Filed on patra** as `docs/development/issues/2026-10-20-patra-open-keeps-its-wal-path.md`, indexed in its roadmap's open backlog (2026-10-20, checked at 1.16.6). The rest of S5 is sit's own (1.13.3, above).
+- **patra — `patra_open` keeps its WAL path on the bump heap (S5, patra's part).** Each open keeps the path's length plus 5 bytes, which `patra_close` cannot return: 136 B per open for a 124-byte path, measured on the 1.16.5 fold. It is patra's own 2026-08-18 security review's S3 hygiene item, which was never tracked. **Filed on patra** as `docs/development/issues/2026-10-20-patra-open-keeps-its-wal-path.md`, indexed in its roadmap's open backlog (2026-10-20, checked at 1.16.6). sit's own part of S5 (`patra_init` once per process) shipped in 1.13.4.
 - **patra — `DELETE` / `UPDATE … WHERE <indexed column> = <value>` scan the table.** `tbl_delete` walks every data page; the B-tree is maintained but not used to find the rows (its `SELECT` uses it). 4,000 single-row deletes over 4,000 rows: 2,084 ms, against 108 ms for the same `SELECT`s. sit batches its deletes 24 to a statement (`index_stage`, 1.13.0), so this bounds it rather than blocks it: an add of 10,000 modified files still spends seconds deleting. [Architecture 009](../architecture/009-patra-delete-scans-wal-syncs-per-page.md). **Filed on patra** as `docs/development/requests/2026-10-30-sit-delete-update-by-index.md`, indexed in its roadmap's open backlog (2026-10-30, checked at 1.16.6; its roadmap had only the related WAL-dedup and index-page reclamation items).
 - **patra — a transaction's WAL syncs once per page it touches.** `wal_log_page` `fdatasync`s every before-image as it writes it, a freshly allocated page's included, so a transaction costs about one sync per page: 10,000 index rows (1,660 pages of 256-byte `STR` columns) took 3.6 s of a 7.8 s `sit add .` on an SSD (git: 0.6 s). A transaction whose before-images are synced together, before the first data page reaches the disk, would make it one sync. [Architecture 009](../architecture/009-patra-delete-scans-wal-syncs-per-page.md). **Filed on patra** as `docs/development/requests/2026-10-30-sit-transaction-syncs-per-page.md`, indexed in its roadmap's open backlog (2026-10-30, checked at 1.16.6). It also meets the trigger of patra's deferred "WAL dedup scan is O(n²)" item.
 - **patra — open its files `O_CLOEXEC` (P7).** No patra open passes it, so children sit spawns (owl, ssh) inherit `objects.patra` read-write: `0500002` in their `/proc/self/fdinfo`, on the 1.12.2 build. **Filed on patra** as `docs/development/issues/2026-10-20-patra-descriptors-not-close-on-exec.md` (2026-10-20, checked at 1.16.6).
@@ -193,6 +182,7 @@ Dropping sandhi for a hand-rolled `net`-direct loopback HTTP/1.0 server (surface
 Closed by measurement. The reasoning lives where cited; they are listed here only so they are not re-opened blindly.
 
 - **`clone` has no algorithmic defect left** (1.4.9). Its cost is a fixture whose content is quadratic in commit count, which git's deltas collapse; 1.10.0's packs do that for storage (ADR 0016), and packs on the wire (the 1.15.x arc, above) would do it for transfer. Phase profile in the 1.4.9 CHANGELOG entry.
+- **Links below a real store are read, not refused** (1.13.4). A `.git/` whose `refs` and `objects` link into another repository is read as git reads it: `git-new-workdir` makes that shape, alternates reach as far by design, and sit only reads there. [ADR 0003](../adr/0003-no-upward-repo-discovery.md)'s 1.13.4 amendment.
 - **Memoizing `_wildmatch` is declined** (1.4.9). Both shapes cost 7–18% on `is_ignored` for a benign edge, since budget exhaustion shows a file rather than hiding it. Numbers at the call site in `src/index.cyr`.
 
 ---

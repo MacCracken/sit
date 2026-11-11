@@ -67,4 +67,17 @@ sit is stricter than git here. git follows a `.git` symlink, and a `gitdir:` fil
 
 **What this costs.** A store linked from outside the directory stops reading, and its shape cannot be told from the attack. That includes Android `repo` checkouts (`.git -> ../../.repo/projects/...`) and a store moved by hand. There is no allow-list, since this ADR rejected `safe.directory`. Move the store into the directory, or link it from there.
 
-**What this does not close**, on the [roadmap](../development/roadmap.md): links below a real store. A `.git/` directory whose `refs` and `objects` link out reads the other repository, and `sit status` lists its tracked paths as `deleted:`, as git does. `git-new-workdir` makes this shape, so a refusal needs its own decision, and `objects/info/alternates` reaches as far on purpose ([ADR 0011](0011-git-read-mode.md)).
+**What this does not close:** links below a real store, decided in 1.13.4 (below).
+
+## Amendment (1.13.4) — links below a real store are read as git reads them
+
+A `.git/` directory that is itself real, but whose `refs` and `objects` are links into another repository, reads that repository. `sit status` lists the other repository's tracked paths as `deleted:`, and `sit diff` prints their contents as removed lines, exactly as git does. The branch name stays the directory's own, so a prompt shows nothing of it but a dirty marker.
+
+**Decision: sit reads it, as git does, and refuses nothing.**
+
+- `git-new-workdir` makes exactly this shape: it links `refs`, `objects`, `logs/refs`, `packed-refs`, `config` and the rest into the original repository. A refusal cannot tell it from an attack, as the 1.13.1 amendment found for `.git` itself. But a `.git` link is a whole store chosen by the directory, and this is a working layout people use.
+- `objects/info/alternates` reaches another repository's objects on purpose ([ADR 0011](0011-git-read-mode.md)). Refusing linked `objects` and not alternates would close nothing. Refusing both would break `git clone --shared` and `--reference`.
+- sit only ever reads a `.git/` repository. What it can show is what the user running it can already read, and nothing is written there.
+- In a `.sit/` repository the shape does not read already: `.sit/objects.patra` linked out does not open (patra will not follow the link), and the `sf_*` wrappers refuse to write through a linked `.sit/refs`.
+
+1.13.1's refusal of a `.git` or `.sit` link that leaves the directory stands. If a consumer needs this shape refused (for example a prompt that runs in untrusted directories), the place for it is an opt-in check in the read API, not a default.

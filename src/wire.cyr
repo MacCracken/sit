@@ -75,7 +75,7 @@ fn remote_objects_path(repo_path) {
 # Blocks the CVE-2023-22490 shape where a malicious remote's .sit points at
 # /etc/shadow or similar.
 fn remote_objects_open(repo_path) {
-    if (patra_init() != PATRA_OK) { return 0; }       # 1.7.2: see object_db_open
+    if (store_patra_init() != PATRA_OK) { return 0; }   # 1.13.4: once per process
     var rl = strlen(repo_path);
     var sit_dir = alloc(rl + 6);
     memcpy(sit_dir, repo_path, rl);
@@ -1257,6 +1257,585 @@ fn _db_object_inflate_reuse(db, hex, cell, out16) {
     return 0;
 }
 
+# ── Connectivity before a served ref moves (1.13.4, audit X2c) ────────────────
+#
+# A push spans requests: its objects arrive one POST at a time and the ref moves
+# in the last. Until then no ref names them, so a `sit fsck --prune` between two
+# of those requests deleted them (since 1.12.2 it takes the store lock
+# exclusively, so it waits for a request, not for a push), and the server then
+# moved the ref onto the hole: every later clone of that branch failed. A client
+# that never sent a tree did the same. git refuses both in receive-pack
+# (`check_connected`: `rev-list --objects <new> --not --all`), and so does this.
+#
+# connected_in_db(db, new_hex, tips): what a tip in `tips` reaches is taken as
+# complete, as git takes it — every ref the server moves has passed this check,
+# and `fsck --prune` keeps whatever a ref reaches. From `new_hex` it walks the
+# commits no tip reaches, newest committer date first, painting what the tips
+# reach as it goes (git's limit_list): a branch forked from an old commit stops
+# where the tips' history meets it instead of running on to the root. A wrong or
+# skewed date costs time only, never a wrong answer — a commit is painted
+# complete only when a tip reaches it. Then it reads each new commit's tree,
+# oldest commit first, and skips every entry whose id the same path holds in a
+# complete parent's tree (a parent a tip reaches, or one already checked), so a
+# commit that changes one file reads one path of trees. Every other blob must be
+# present; blobs are not read, and gitlinks (160000) are not followed, as git's.
+#
+# Returns 1 when everything is present, 0 when an object is missing or is not
+# the type its referrer names it (a malformed tree included), -1 past
+# _wire_walk_deadline_ns or when the walk arena refuses. It shares that arena
+# and that deadline with is_ancestor_in_db, and like it is not re-entrant.
+
+enum ConnFlag { CN_LOADED = 1, CN_MISSING = 2, CN_DONE = 4, CN_QUEUED = 8, CN_NEW = 16 }
+
+# A commit of the walk: {hex, committer ts, flags, tree hex, parents vec}.
+var CN_NODE = 40;
+# A complete base tree while its same-path entries are matched:
+# {buffer, buffer cap, body, body len, cursor}.
+var CN_BASE = 40;
+
+var _cn_live = 0;           # queued commits no tip reaches yet; the walk ends at 0
+var _cn_visits = 0;
+var _cn_over = 0;           # 1 once the deadline passed or the arena refused
+
+# Count one object read; 1 (and _cn_over set) once the deadline has passed.
+fn _cn_tick() {
+    _cn_visits = _cn_visits + 1;
+    if (_wire_walk_deadline_ns == 0) { return 0; }
+    if ((_cn_visits & 63) != 0) { return 0; }
+    if (clock_now_ns() > _wire_walk_deadline_ns) {
+        _cn_over = 1;
+        return 1;
+    }
+    return 0;
+}
+
+# The node for `hex` (64 hex), made on first sight; 0 when the arena refused.
+fn _cn_node(a, nodes, hex) {
+    var n = map_get(nodes, hex);
+    if (n != 0) { return n; }
+    n = alloc_via(a, CN_NODE);
+    var h = alloc_via(a, 65);
+    if (n == 0) { _cn_over = 1; return 0; }
+    if (h == 0) { _cn_over = 1; return 0; }
+    memcpy(h, hex, 64);
+    store8(h + 64, 0);
+    store64(n, h);
+    store64(n + 8, 0);
+    store64(n + 16, 0);
+    store64(n + 24, 0);
+    store64(n + 32, 0);
+    if (map_set_a(a, nodes, h, n) < 0) { _cn_over = 1; return 0; }
+    return n;
+}
+
+# The committer timestamp of a commit body (git's walk order: a rebased commit
+# keeps its author date), else `fallback`.
+fn _cn_committer_ts(a, body, blen, fallback) {
+    var pos = 0;
+    while (pos < blen) {
+        var nl = pos;
+        var scanning = 1;
+        while (scanning == 1) {
+            if (nl >= blen) { scanning = 0; }
+            else {
+                if (load8(body + nl) == 10) { scanning = 0; }
+                else { nl = nl + 1; }
+            }
+        }
+        var ll = nl - pos;
+        if (ll == 0) { return fallback; }          # the headers end
+        if (ll > 10) {
+            if (memeq(body + pos, "committer ", 10) == 1) {
+                var ci[24];
+                if (parse_author_line_a(a, body + pos, ll, 10, &ci) == 0) {
+                    return commit_ts_clamp(load64(&ci + 8));
+                }
+                return fallback;
+            }
+        }
+        pos = nl + 1;
+    }
+    return fallback;
+}
+
+# Fill node `n` from a commit body already read; a body that is not a commit
+# sit can parse marks it missing.
+fn _cn_fill(a, n, framed, body, blen) {
+    var f = load64(n + 16) | CN_LOADED;
+    var ok = 0;
+    if (memeq(framed, "commit ", 7) == 1) {
+        var info[56];
+        if (parse_commit_body_a(a, body, blen, &info) == 0) {
+            store64(n + 8, _cn_committer_ts(a, body, blen, load64(&info + 24)));
+            store64(n + 24, load64(&info));
+            store64(n + 32, load64(&info + 48));
+            ok = 1;
+        }
+    }
+    if (ok == 0) { f = f | CN_MISSING; }
+    store64(n + 16, f);
+    return 0;
+}
+
+# Read node `n`'s commit once, through the reused buffer `cell`.
+fn _cn_load(db, a, n, cell) {
+    if ((load64(n + 16) & CN_LOADED) != 0) { return 0; }
+    _cn_tick();
+    var body[16];
+    if (_db_object_inflate_reuse(db, load64(n), cell, &body) != 0) {
+        store64(n + 16, load64(n + 16) | CN_LOADED | CN_MISSING);
+        return 0;
+    }
+    return _cn_fill(a, n, load64(cell), load64(&body), load64(&body + 8));
+}
+
+# Queue `n` in the max-heap on its timestamp. A queued node no tip reaches
+# counts toward _cn_live.
+fn _cn_push(a, heap, n) {
+    if (vec_push_a(a, heap, n) < 0) { _cn_over = 1; return 0 - 1; }
+    var f = load64(n + 16) | CN_QUEUED;
+    store64(n + 16, f);
+    if ((f & CN_DONE) == 0) { _cn_live = _cn_live + 1; }
+    var i = vec_len(heap) - 1;
+    var rising = 1;
+    while (rising == 1) {
+        if (i == 0) { rising = 0; }
+        else {
+            var p = (i - 1) / 2;
+            var pn = vec_get(heap, p);
+            if (load64(pn + 8) < load64(n + 8)) {
+                vec_set(heap, i, pn);
+                vec_set(heap, p, n);
+                i = p;
+            }
+            else { rising = 0; }
+        }
+    }
+    return 0;
+}
+
+# Take the newest node off the heap.
+fn _cn_pop(heap) {
+    var len = vec_len(heap);
+    var top = vec_get(heap, 0);
+    var last = vec_get(heap, len - 1);
+    vec_pop(heap);
+    len = len - 1;
+    if (len > 0) {
+        vec_set(heap, 0, last);
+        var i = 0;
+        var sinking = 1;
+        while (sinking == 1) {
+            var l = i * 2 + 1;
+            var r = l + 1;
+            var m = i;
+            if (l < len) { if (load64(vec_get(heap, l) + 8) > load64(vec_get(heap, m) + 8)) { m = l; } }
+            if (r < len) { if (load64(vec_get(heap, r) + 8) > load64(vec_get(heap, m) + 8)) { m = r; } }
+            if (m == i) { sinking = 0; }
+            else {
+                var t = vec_get(heap, m);
+                vec_set(heap, m, vec_get(heap, i));
+                vec_set(heap, i, t);
+                i = m;
+            }
+        }
+    }
+    var f = load64(top + 16);
+    store64(top + 16, f - CN_QUEUED);
+    if ((f & CN_DONE) == 0) { _cn_live = _cn_live - 1; }
+    return top;
+}
+
+# Paint `n` (loaded) as reached from a tip. A node not in the heap is queued, so
+# that its pop paints its parents in turn — one already popped as new included.
+fn _cn_paint(a, heap, n) {
+    var f = load64(n + 16);
+    if ((f & CN_DONE) != 0) { return 0; }
+    store64(n + 16, f | CN_DONE);
+    if ((f & CN_QUEUED) != 0) {
+        _cn_live = _cn_live - 1;
+        return 0;
+    }
+    if ((f & CN_MISSING) != 0) { return 0; }
+    return _cn_push(a, heap, n);
+}
+
+# Follow `hex` through annotated tags (TAG_PEEL_MAX links) to what they name.
+# Writes its id to out_hex (65 bytes) and, for a commit, its body {ptr, len} to
+# out_body (valid until `cell` is reused). Returns 2 commit, 1 tree, 0 blob, or
+# -1 when an object on the way is missing or malformed.
+fn _cn_peel(db, hex, cell, out_hex, out_body) {
+    var cur[72];
+    memcpy(&cur, hex, 64);
+    store8(&cur + 64, 0);
+    var links = 0;
+    while (links <= TAG_PEEL_MAX) {
+        _cn_tick();
+        var body[16];
+        if (_db_object_inflate_reuse(db, &cur, cell, &body) != 0) { return 0 - 1; }
+        var fb = load64(cell);
+        var b = load64(&body);
+        var bl = load64(&body + 8);
+        if (memeq(fb, "tag ", 4) == 0) {
+            memcpy(out_hex, &cur, 65);
+            store64(out_body, b);
+            store64(out_body + 8, bl);
+            if (memeq(fb, "commit ", 7) == 1) { return 2; }
+            if (memeq(fb, "tree ", 5) == 1) { return 1; }
+            if (memeq(fb, "blob ", 5) == 1) { return 0; }
+            return 0 - 1;
+        }
+        # A tag: "object <64 hex>\n" first (parse_tag_body's rule).
+        if (bl < 72) { return 0 - 1; }
+        if (memeq(b, "object ", 7) == 0) { return 0 - 1; }
+        if (hex_prefix_valid(b + 7, 64) == 0) { return 0 - 1; }
+        if (load8(b + 71) != 10) { return 0 - 1; }
+        memcpy(&cur, b + 7, 64);
+        links = links + 1;
+    }
+    return 0 - 1;
+}
+
+# Record `hex` as present and complete.
+fn _cn_ok(a, ok, hex) {
+    var hc = alloc_via(a, 65);
+    if (hc == 0) { _cn_over = 1; return 0 - 1; }
+    memcpy(hc, hex, 64);
+    store8(hc + 64, 0);
+    if (map_set_a(a, ok, hc, 1) < 0) { _cn_over = 1; return 0 - 1; }
+    return 0;
+}
+
+# Advance base `e`'s cursor to the entry named `name` (nl bytes, a tree or not)
+# and return a pointer to its 32-byte id, or 0 when the base has none. Both
+# trees are in git order, so one forward pass over the base serves the whole
+# scan of the new tree; a base out of order only finds fewer matches.
+fn _cn_base_seek(e, name, nl, is_tree) {
+    var body = load64(e + 16);
+    if (body == 0) { return 0; }
+    var blen = load64(e + 24);
+    var pos = load64(e + 32);
+    while (pos < blen) {
+        var sp = pos;
+        var scanning = 1;
+        while (scanning == 1) {
+            if (sp >= blen) { scanning = 0; }
+            else {
+                if (load8(body + sp) == 32) { scanning = 0; }
+                else { sp = sp + 1; }
+            }
+        }
+        var nu = sp + 1;
+        scanning = 1;
+        while (scanning == 1) {
+            if (nu >= blen) { scanning = 0; }
+            else {
+                if (load8(body + nu) == 0) { scanning = 0; }
+                else { nu = nu + 1; }
+            }
+        }
+        if (nu + 33 > blen) {
+            store64(e + 32, blen);
+            return 0;
+        }
+        var bt = 0;
+        if (sp - pos == 5) { if (memeq(body + pos, "40000", 5) == 1) { bt = 1; } }
+        var c = _tree_order_cmp(body + sp + 1, nu - sp - 1, bt, name, nl, is_tree);
+        if (c > 0) {
+            store64(e + 32, pos);
+            return 0;
+        }
+        pos = nu + 33;
+        if (c == 0) {
+            store64(e + 32, pos);
+            return body + nu + 1;
+        }
+    }
+    store64(e + 32, blen);
+    return 0;
+}
+
+# Check every entry of the tree body {body, blen} against the complete bases
+# `bv` (nb of CN_BASE). 1, 0 or -1 as connected_in_db.
+fn _cn_tree_entries(db, a, ok, body, blen, bv, nb, depth) {
+    var pos = 0;
+    while (pos < blen) {
+        var sp = pos;
+        var scanning = 1;
+        while (scanning == 1) {
+            if (sp >= blen) { scanning = 0; }
+            else {
+                if (load8(body + sp) == 32) { scanning = 0; }
+                else { sp = sp + 1; }
+            }
+        }
+        var nu = sp + 1;
+        scanning = 1;
+        while (scanning == 1) {
+            if (nu >= blen) { scanning = 0; }
+            else {
+                if (load8(body + nu) == 0) { scanning = 0; }
+                else { nu = nu + 1; }
+            }
+        }
+        if (nu + 33 > blen) { return 0; }          # a truncated entry: malformed
+        var ml = sp - pos;
+        var is_tree = 0;
+        var is_link = 0;
+        if (ml == 5) { if (memeq(body + pos, "40000", 5) == 1) { is_tree = 1; } }
+        if (ml == 6) { if (memeq(body + pos, "160000", 6) == 1) { is_link = 1; } }
+        var name = body + sp + 1;
+        var nl = nu - sp - 1;
+        var raw = body + nu + 1;
+        pos = nu + 33;
+        if (is_link == 0) {
+            var eh[72];
+            _hex_into(raw, 32, &eh);
+            var skip = map_has(ok, &eh);
+            var subs = 0;
+            var bi = 0;
+            while (bi < nb) {
+                var hit = _cn_base_seek(bv + bi * CN_BASE, name, nl, is_tree);
+                if (hit != 0) {
+                    if (memeq(hit, raw, 32) == 1) { skip = 1; }
+                    else {
+                        if (is_tree == 1) {
+                            if (subs == 0) {
+                                subs = vec_new_a(a);
+                                if (subs == 0) { _cn_over = 1; return 0 - 1; }
+                            }
+                            var sh = alloc_via(a, 65);
+                            if (sh == 0) { _cn_over = 1; return 0 - 1; }
+                            _hex_into(hit, 32, sh);
+                            if (vec_push_a(a, subs, sh) < 0) { _cn_over = 1; return 0 - 1; }
+                        }
+                    }
+                }
+                bi = bi + 1;
+            }
+            if (skip == 0) {
+                if (is_tree == 1) {
+                    var r = _cn_tree(db, a, ok, &eh, subs, depth + 1);
+                    if (r != 1) { return r; }
+                }
+                else {
+                    if (_cn_tick() == 1) { return 0 - 1; }
+                    if (db_object_has(db, &eh) == 0) { return 0; }
+                    if (_cn_ok(a, ok, &eh) < 0) { return 0 - 1; }
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+# Check the tree `hex` and everything below it, given `bases` (a vec of complete
+# tree ids at the same path, or 0). 1, 0 or -1 as connected_in_db.
+fn _cn_tree(db, a, ok, hex, bases, depth) {
+    if (map_has(ok, hex) == 1) { return 1; }
+    var nb = 0;
+    if (bases != 0) { nb = vec_len(bases); }
+    var bi = 0;
+    while (bi < nb) {
+        if (memeq(vec_get(bases, bi), hex, 64) == 1) { return 1; }
+        bi = bi + 1;
+    }
+    if (depth >= _TREE_MAX_DEPTH) { return 0; }
+    if (_cn_tick() == 1) { return 0 - 1; }
+    var cell[16];
+    store64(&cell, 0);
+    store64(&cell + 8, 0);
+    var body[16];
+    if (_db_object_inflate_reuse(db, hex, &cell, &body) != 0) {
+        if (load64(&cell) != 0) { fl_free(load64(&cell)); }
+        return 0;
+    }
+    if (memeq(load64(&cell), "tree ", 5) == 0) {
+        fl_free(load64(&cell));
+        return 0;
+    }
+    # Each base in its own buffer: the scan holds them all while it recurses.
+    var bv = 0;
+    if (nb > 0) {
+        bv = alloc_via(a, nb * CN_BASE);
+        if (bv == 0) {
+            fl_free(load64(&cell));
+            _cn_over = 1;
+            return 0 - 1;
+        }
+    }
+    bi = 0;
+    while (bi < nb) {
+        var e = bv + bi * CN_BASE;
+        store64(e, 0);
+        store64(e + 8, 0);
+        store64(e + 16, 0);
+        store64(e + 24, 0);
+        store64(e + 32, 0);
+        var bb[16];
+        if (_db_object_inflate_reuse(db, vec_get(bases, bi), e, &bb) == 0) {
+            if (memeq(load64(e), "tree ", 5) == 1) {
+                store64(e + 16, load64(&bb));
+                store64(e + 24, load64(&bb + 8));
+            }
+        }
+        bi = bi + 1;
+    }
+    var r = _cn_tree_entries(db, a, ok, load64(&body), load64(&body + 8), bv, nb, depth);
+    bi = 0;
+    while (bi < nb) {
+        var fe = bv + bi * CN_BASE;
+        if (load64(fe) != 0) { fl_free(load64(fe)); }
+        bi = bi + 1;
+    }
+    fl_free(load64(&cell));
+    if (r == 1) {
+        if (_cn_ok(a, ok, hex) < 0) { return 0 - 1; }
+    }
+    return r;
+}
+
+# The commit walk, then the tree checks. See connected_in_db.
+fn _cn_walk(db, a, new_hex, tips, nodes, ok, heap, newv, cell) {
+    var oh[72];
+    var obody[16];
+    # The tips: complete, and where the walk stops.
+    var ti = 0;
+    while (ti < vec_len(tips)) {
+        var tk = _cn_peel(db, vec_get(tips, ti), cell, &oh, &obody);
+        if (tk == 2) {
+            var tn = _cn_node(a, nodes, &oh);
+            if (tn == 0) { return 0 - 1; }
+            if ((load64(tn + 16) & CN_LOADED) == 0) {
+                _cn_fill(a, tn, load64(cell), load64(&obody), load64(&obody + 8));
+            }
+            if (_cn_paint(a, heap, tn) < 0) { return 0 - 1; }
+        }
+        if (tk == 1) { if (_cn_ok(a, ok, &oh) < 0) { return 0 - 1; } }
+        if (tk == 0) { if (_cn_ok(a, ok, &oh) < 0) { return 0 - 1; } }
+        if (_cn_over == 1) { return 0 - 1; }
+        ti = ti + 1;
+    }
+    # The new tip, through any tags.
+    var nh[72];
+    var nbody[16];
+    var nk = _cn_peel(db, new_hex, cell, &nh, &nbody);
+    if (nk < 0) { return 0; }
+    if (nk == 0) { return 1; }                     # a blob, and it was just read
+    if (nk == 1) { return _cn_tree(db, a, ok, &nh, 0, 0); }
+    var nn = _cn_node(a, nodes, &nh);
+    if (nn == 0) { return 0 - 1; }
+    if ((load64(nn + 16) & CN_LOADED) == 0) {
+        _cn_fill(a, nn, load64(cell), load64(&nbody), load64(&nbody + 8));
+    }
+    if ((load64(nn + 16) & CN_MISSING) != 0) { return 0; }
+    if ((load64(nn + 16) & CN_DONE) != 0) { return 1; }
+    if (_cn_push(a, heap, nn) < 0) { return 0 - 1; }
+
+    var walking = 1;
+    while (walking == 1) {
+        if (vec_len(heap) == 0) { walking = 0; }
+        else {
+            if (_cn_live <= 0) { walking = 0; }
+        }
+        if (walking == 1) {
+            if (_cn_tick() == 1) { return 0 - 1; }
+            var n = _cn_pop(heap);
+            var f = load64(n + 16);
+            var pv = load64(n + 32);
+            var np = 0;
+            if (pv != 0) { np = vec_len(pv); }
+            if ((f & CN_DONE) == 0) {
+                store64(n + 16, f | CN_NEW);
+                if (vec_push_a(a, newv, n) < 0) { _cn_over = 1; return 0 - 1; }
+            }
+            var pi = 0;
+            while (pi < np) {
+                var pn = _cn_node(a, nodes, vec_get(pv, pi));
+                if (pn == 0) { return 0 - 1; }
+                _cn_load(db, a, pn, cell);
+                var pf = load64(pn + 16);
+                if ((f & CN_DONE) != 0) {
+                    if (_cn_paint(a, heap, pn) < 0) { return 0 - 1; }
+                }
+                else {
+                    if ((pf & CN_MISSING) != 0) { return 0; }
+                    if ((pf & (CN_QUEUED | CN_DONE | CN_NEW)) == 0) {
+                        if (_cn_push(a, heap, pn) < 0) { return 0 - 1; }
+                    }
+                }
+                if (_cn_over == 1) { return 0 - 1; }
+                pi = pi + 1;
+            }
+        }
+    }
+
+    # The new commits' trees, oldest first, so that a parent's tree is checked
+    # before its child's and serves as the child's base.
+    var k = vec_len(newv);
+    while (k > 0) {
+        k = k - 1;
+        var c = vec_get(newv, k);
+        if ((load64(c + 16) & CN_DONE) == 0) {
+            var bases = 0;
+            var cpv = load64(c + 32);
+            var cnp = 0;
+            if (cpv != 0) { cnp = vec_len(cpv); }
+            var ci = 0;
+            while (ci < cnp) {
+                var pn2 = map_get(nodes, vec_get(cpv, ci));
+                if (pn2 != 0) {
+                    var pt = load64(pn2 + 24);
+                    var pf2 = load64(pn2 + 16);
+                    if (pt != 0) {
+                        if ((pf2 & CN_MISSING) == 0) {
+                            var complete = 0;
+                            if ((pf2 & CN_DONE) != 0) { complete = 1; }
+                            if (map_has(ok, pt) == 1) { complete = 1; }
+                            if (complete == 1) {
+                                if (bases == 0) {
+                                    bases = vec_new_a(a);
+                                    if (bases == 0) { _cn_over = 1; return 0 - 1; }
+                                }
+                                if (vec_push_a(a, bases, pt) < 0) { _cn_over = 1; return 0 - 1; }
+                            }
+                        }
+                    }
+                }
+                ci = ci + 1;
+            }
+            var r = _cn_tree(db, a, ok, load64(c + 24), bases, 0);
+            if (r != 1) { return r; }
+        }
+    }
+    return 1;
+}
+
+# Is everything `new_hex` reaches in `db`, given the server's ref tips `tips`
+# (a vec of 64-hex ids)? 1, 0 or -1 — see the section comment above.
+fn connected_in_db(db, new_hex, tips) {
+    var a = _wire_walk_alloc();
+    reset_via(a);                                   # the previous walk's memory
+    _cn_live = 0;
+    _cn_visits = 0;
+    _cn_over = 0;
+    var nodes = map_new_a(a);
+    var ok = map_new_a(a);
+    var heap = vec_new_a(a);
+    var newv = vec_new_a(a);
+    if (nodes == 0) { return 0 - 1; }
+    if (ok == 0) { return 0 - 1; }
+    if (heap == 0) { return 0 - 1; }
+    if (newv == 0) { return 0 - 1; }
+    var cell[16];                                   # the reused inflate buffer {ptr, cap}
+    store64(&cell, 0);
+    store64(&cell + 8, 0);
+    var rc = _cn_walk(db, a, new_hex, tips, nodes, ok, heap, newv, &cell);
+    if (load64(&cell) != 0) { fl_free(load64(&cell)); }
+    if (_cn_over == 1) { return 0 - 1; }
+    return rc;
+}
+
 # `sit remote add <name> <url>` — record a named remote after validating its URL.
 fn cmd_remote_add() {
     if (argc() < 5) {
@@ -2352,6 +2931,10 @@ fn _do_push_http(name, branch, url, src_db, local_tip) {
     store8(rname + 11 + bl, 0);
     var ref_rc = http_remote_push_ref(http, rname, local_tip);
     wire_http_close(http);
+    if (ref_rc == 3) {
+        eprintln("sit: server rejected ref update: it lacks objects this history reaches; push again");
+        return 1;
+    }
     if (ref_rc == 1) {
         eprintln("sit: server rejected ref update (non-fast-forward)");
         return 1;
@@ -2479,6 +3062,10 @@ fn _do_push_ssh(name, branch, url, src_db, local_tip) {
     store8(rname + 11 + bl, 0);
     var ref_rc = ssh_remote_push_ref(sh, rname, local_tip);
     wire_ssh_close(sh);
+    if (ref_rc == 3) {
+        eprintln("sit: server rejected ref update: it lacks objects this history reaches; push again");
+        return 1;
+    }
     if (ref_rc == 1) {
         eprintln("sit: server rejected ref update (non-fast-forward)");
         return 1;

@@ -391,11 +391,16 @@ fn _serve_ref_link_inside(path) {
 }
 
 # Append `{"name":…,"hash":…}` for the ref file at `path`, if the name is a valid
-# ref name and the file holds one.
+# ref name and the file holds one. With no builder (`sb` 0), push the hash onto
+# the vec at st+16 instead (serve_ref_tips).
 fn _serve_emit_ref(a, sb, rname, path, st) {
     if (refname_valid(rname) == 0) { return 0; }
     var hex = serve_read_ref_file(a, path);
     if (hex == 0) { return 0; }
+    if (sb == 0) {
+        if (vec_push_a(a, load64(st + 16), hex) < 0) { store64(st + 8, 1); }
+        return 0;
+    }
     var bad = 0;
     if (load64(st) == 0) { bad = bad | str_builder_add_cstr_a(a, sb, ","); }
     bad = bad | str_builder_add_cstr_a(a, sb, "{\"name\":\"");
@@ -412,9 +417,10 @@ fn _serve_emit_ref(a, sb, rname, path, st) {
 fn serve_build_refs(a) {
     var sb = str_builder_new_a(a);
     if (sb == 0) { return 0; }
-    var st[16];
+    var st[24];
     store64(&st, 1);
     store64(&st + 8, 0);
+    store64(&st + 16, 0);
     if (str_builder_add_cstr_a(a, sb, "{\"refs\":[") != 0) { return 0; }
     serve_emit_refs_subtree(a, sb, "refs/heads/", ".sit/refs/heads", &st);
     serve_emit_refs_subtree(a, sb, "refs/tags/",  ".sit/refs/tags",  &st);
@@ -423,6 +429,23 @@ fn serve_build_refs(a) {
     var built = str_builder_build_a(a, sb);
     if (built == 0) { return 0; }
     return str_data(built);
+}
+
+# The tips GET /sit/v1/refs advertises (heads and tags), as a vec of 64-hex ids
+# in `a`, or 0 when `a` refused. 1.13.4 (X2c): what connected_in_db takes as
+# complete, read through the same walk, so a linked refs directory or a ref link
+# that leaves the refs tree counts for nothing here either.
+fn serve_ref_tips(a) {
+    var v = vec_new_a(a);
+    if (v == 0) { return 0; }
+    var st[24];
+    store64(&st, 1);
+    store64(&st + 8, 0);
+    store64(&st + 16, v);
+    serve_emit_refs_subtree(a, 0, "refs/heads/", ".sit/refs/heads", &st);
+    serve_emit_refs_subtree(a, 0, "refs/tags/",  ".sit/refs/tags",  &st);
+    if (load64(&st + 8) != 0) { return 0; }
+    return v;
 }
 
 # ── TLS-aware response senders (bite 3) ──
@@ -936,6 +959,15 @@ fn serve_handle_put_object(cfd, path, buf, n) {
 var SIT_REF_PUT_PREFIX = "/sit/v1/refs/";
 var SIT_REF_PUT_PREFIX_LEN = 13;
 
+# 409 for a ref update whose new tip reaches an object this server does not have
+# (1.13.4, X2c). The body is what a 1.13.4 client tells apart from a
+# non-fast-forward 409 (wire_ref_refused_hole); an older one reads both alike.
+fn _serve_send_hole(cfd) {
+    var hole = "missing objects: the new tip reaches an object this server does not have\n";
+    _serve_send_response(cfd, 409, "Conflict", "text/plain", hole, strlen(hole), 0);
+    return 0;
+}
+
 # POST /sit/v1/refs/<name>: validate the ref name and hex, then update the ref.
 fn serve_handle_put_ref(cfd, path, buf, n) {
     var plen = strlen(path);
@@ -1055,14 +1087,17 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
     store8(new_hex + 64, 0);
 
     # The new tip must already be in objects.patra (pushed by the
-    # client via /sit/v1/objects before this call). No transitive
-    # check.
+    # client via /sit/v1/objects before this call), and since 1.13.4 so must
+    # everything it reaches (connected_in_db, below).
     var db = get_object_db();
     if (db == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
     # 1.7.6 (N4): and it must be something a ref can name — a commit for a
     # branch, a commit or an annotated tag for a tag. Existence alone let a push
     # point a branch at a blob.
     var nty = db_object_type(db, new_hex);
+    # 1.13.4: an absent tip is a hole like any other (a prune between requests
+    # took it, or the client never sent it), not a malformed request.
+    if (nty < 0) { return _serve_send_hole(cfd); }
     var ty_ok = 0;
     if (nty == 2) { ty_ok = 1; }
     if (is_tag == 1) { if (nty == 3) { ty_ok = 1; } }
@@ -1070,6 +1105,25 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
         _serve_send_status(cfd, 400, "Bad Request");
         return 0;
     }
+
+    # 1.13.4 (X2c): everything the new tip reaches must be here, down to what
+    # the server's refs already reach — git's check_connected. A push spans
+    # requests, so a `fsck --prune` between them could delete objects that had
+    # arrived but that no ref named yet, and a client could skip a tree: either
+    # way the ref moved onto a hole. Checked before the fast-forward walk, which
+    # would read a hole in the new history as divergence. Both walks share the
+    # request budget (60 s, then 503), as the fast-forward check alone had.
+    var tips = serve_ref_tips(a);
+    if (tips == 0) { _serve_send_status(cfd, 500, "Internal Server Error"); return 0; }
+    var walk_until = clock_now_ns() + SERVE_TLS_DEADLINE_NS;
+    _wire_walk_deadline_ns = walk_until;
+    var conn = connected_in_db(db, new_hex, tips);
+    _wire_walk_deadline_ns = 0;
+    if (conn < 0) {
+        _serve_send_status(cfd, 503, "Service Unavailable");
+        return 0;
+    }
+    if (conn == 0) { return _serve_send_hole(cfd); }
 
     # Existing tip? FF check via is_ancestor_in_db.
     #
@@ -1108,8 +1162,9 @@ fn serve_handle_put_ref(cfd, path, buf, n) {
             return 0;
         }
         # 1.7.6 (N4): the walk gets the request budget the TLS loop already
-        # gives a request (60 s); past it the push is answered 503.
-        _wire_walk_deadline_ns = clock_now_ns() + SERVE_TLS_DEADLINE_NS;
+        # gives a request (60 s); past it the push is answered 503. 1.13.4: what
+        # the connectivity check left of it.
+        _wire_walk_deadline_ns = walk_until;
         var anc = is_ancestor_in_db(db, cur, new_hex);
         _wire_walk_deadline_ns = 0;
         if (anc < 0) {
@@ -1179,12 +1234,14 @@ fn serve_handle_request(ctx, cfd, buf, n) {
     # wait stalled every request to every repository behind it.
     if (store_enter() != 0) {
         store_ctx_save(rctx);
+        sit_set_repo_dotdir(0);
         _serve_send_status(cfd, 503, "Service Unavailable");
         return 0;
     }
     rc = _serve_route(cfd, buf, n, method, load64(&subp));
     store_leave();
     store_ctx_save(rctx);
+    sit_set_repo_dotdir(0);
     return rc;
 }
 
@@ -1201,8 +1258,15 @@ fn serve_handle_request(ctx, cfd, buf, n) {
 # used one is closed.
 
 var _serve_repos_dir = 0;           # the <dir> of --repos, or 0: one repository
-var _serve_repos = 0;               # name -> {store state, last use}
+var _serve_repos = 0;               # name -> a cell (SERVE_REPO_CELL)
 var _serve_repos_tick = 0;
+var _serve_repos_dirfd = 0 - 1;     # 1.13.4: <dir>, opened once
+var _serve_repos_pin = 0;           # 1.13.4: 1 when each request is pinned to descriptors (below)
+
+# A kept repository: {store state, last use, repo dev, repo ino, .sit dev,
+# .sit ino, repo fd, .sit fd, the `.sit` pin path}. Without the pin the fds
+# are -1, the pin 0, and the `.sit` ids 0.
+var SERVE_REPO_CELL = 72;
 var SERVE_REPOS_OPEN = 64;
 var SERVE_REPO_NAME_MAX = 1024;
 var SERVE_REPO_SEGMENTS_MAX = 16;
@@ -1268,34 +1332,230 @@ fn _serve_repo_for(path, sub_out) {
     if (_serve_repos == 0) { _serve_repos = map_new(); }
     _serve_repos_tick = _serve_repos_tick + 1;
     var cell = map_get(_serve_repos, &name);
+    if (_serve_repos_pin == 1) { cell = _serve_repo_pinned(&name, nlen, cell); }
+    else { cell = _serve_repo_by_path(&name, nlen, cell); }
+    if (cell == 0) { return 0; }
+    store64(cell + 8, _serve_repos_tick);
+    store64(sub_out, path + k);
+    sit_set_repo_dotdir(load64(cell + 64));
+    return load64(cell);
+}
+
+# A new cell for `name` (a NUL-terminated copy is kept as its key), its store
+# state at `root`, made room for. Ids and descriptors are the caller's to fill.
+fn _serve_repo_cell_new(name, nlen, root) {
+    if (map_size(_serve_repos) >= SERVE_REPOS_OPEN) { _serve_repos_evict(); }
+    var cell = alloc_or_die(SERVE_REPO_CELL);
+    store64(cell, store_ctx_new(root));
+    store64(cell + 8, 0);
+    store64(cell + 16, 0);
+    store64(cell + 24, 0);
+    store64(cell + 32, 0);
+    store64(cell + 40, 0);
+    store64(cell + 48, 0 - 1);
+    store64(cell + 56, 0 - 1);
+    store64(cell + 64, 0);
+    var kc = alloc_or_die(nlen + 1);
+    memcpy(kc, name, nlen + 1);
+    map_set(_serve_repos, kc, cell);
+    return cell;
+}
+
+# Close a kept repository for good: its store state and its descriptors.
+fn _serve_repo_drop(name, cell) {
+    store_ctx_close(load64(cell));
+    if (load64(cell + 48) >= 0) { file_close(load64(cell + 48)); }
+    if (load64(cell + 56) >= 0) { file_close(load64(cell + 56)); }
+    store64(cell + 48, 0 - 1);
+    store64(cell + 56, 0 - 1);
+    map_delete(_serve_repos, name);
+    return 0;
+}
+
+# Through 1.13.3, and where nothing can be pinned (no /proc): the repository by
+# its path, checked again on every request (1.12.2, X3 / S3) — a kept one must
+# still pass _serve_repo_check and be the directory it was. The path was checked
+# once and then trusted, so a directory under <dir> swapped for a symlink
+# served, and took pushes into, a repository outside <dir> — through the old
+# lock descriptor, which a gc there did not see. A repository replaced by
+# another real directory (restored from a backup) was served through the old
+# one's store handle. A swap between this check and the request's opens still
+# races; _serve_repo_pinned closes that.
+fn _serve_repo_by_path(name, nlen, cell) {
     if (cell != 0) {
-        # 1.12.2 (X3 / S3): a kept repository is checked again on every request,
-        # and must still be the directory it was. The path was checked once and
-        # then trusted, so a directory under <dir> swapped for a symlink served,
-        # and took pushes into, a repository outside <dir> — through the old
-        # lock descriptor, which a gc there did not see. A repository replaced
-        # by another real directory (restored from a backup) was served through
-        # the old one's store handle.
         if (_serve_repo_kept(cell) == 0) {
-            store_ctx_close(load64(cell));
-            map_delete(_serve_repos, &name);
+            _serve_repo_drop(name, cell);
             cell = 0;
         }
     }
     if (cell == 0) {
-        var root = _serve_repo_resolve(&name, nlen);
+        var root = _serve_repo_resolve(name, nlen);
         if (root == 0) { return 0; }
-        if (map_size(_serve_repos) >= SERVE_REPOS_OPEN) { _serve_repos_evict(); }
-        cell = alloc_or_die(32);
-        store64(cell, store_ctx_new(root));
-        if (path_file_id(root, cell + 16) != 0) { return 0; }
-        var kc = alloc_or_die(nlen + 1);
-        memcpy(kc, &name, nlen + 1);
-        map_set(_serve_repos, kc, cell);
+        cell = _serve_repo_cell_new(name, nlen, root);
+        if (path_file_id(root, cell + 16) != 0) {
+            _serve_repo_drop(name, cell);
+            return 0;
+        }
     }
-    store64(cell + 8, _serve_repos_tick);
-    store64(sub_out, path + k);
-    return load64(cell);
+    return cell;
+}
+
+# 1.13.4 (S3): the repository through descriptors. Every request walks
+# `<dir>/<name>` from <dir>'s descriptor a segment at a time, then `.sit`, each
+# with openat(O_NOFOLLOW | O_DIRECTORY), so no link is followed on the way. A
+# kept repository must be the same two directories (device and inode) the walk
+# finds, or it is closed and opened afresh. The request then reads and writes
+# through `/proc/self/fd/<repo>` and `/proc/self/fd/<.sit>` (the repository root
+# and sit_set_repo_dotdir): a swap after the walk changes nothing, where through
+# 1.13.3 the store, the lock and the refs were opened by path afterwards, and a
+# racer reached the outside repository in ~60 of 300 rounds.
+fn _serve_repo_pinned(name, nlen, cell) {
+    var w[48];
+    var wr = _serve_repo_walk(name, nlen, &w);
+    if (cell != 0) {
+        var same = 0;
+        if (wr == 0) {
+            same = 1;
+            if (load64(&w + 16) != load64(cell + 16)) { same = 0; }
+            if (load64(&w + 24) != load64(cell + 24)) { same = 0; }
+            if (load64(&w + 32) != load64(cell + 32)) { same = 0; }
+            if (load64(&w + 40) != load64(cell + 40)) { same = 0; }
+        }
+        if (same == 0) {
+            _serve_repo_drop(name, cell);
+            cell = 0;
+        }
+    }
+    if (wr != 0) { return 0; }
+    if (cell != 0) {
+        # The kept descriptors name these same directories; the fresh pair goes.
+        file_close(load64(&w));
+        file_close(load64(&w + 8));
+        return cell;
+    }
+    cell = _serve_repo_cell_new(name, nlen, _serve_fd_path(load64(&w)));
+    store64(cell + 16, load64(&w + 16));
+    store64(cell + 24, load64(&w + 24));
+    store64(cell + 32, load64(&w + 32));
+    store64(cell + 40, load64(&w + 40));
+    store64(cell + 48, load64(&w));
+    store64(cell + 56, load64(&w + 8));
+    store64(cell + 64, _serve_fd_path(load64(&w + 8)));
+    return cell;
+}
+
+# "/proc/self/fd/<fd>" as a heap cstring.
+fn _serve_fd_path(fd) {
+    var p = alloc_or_die(40);
+    memcpy(p, "/proc/self/fd/", 14);
+    var k = write_decimal(p + 14, fd);
+    store8(p + 14 + k, 0);
+    return p;
+}
+
+# openat(dfd, name) of a directory, never through a link; the fd, or negative.
+# Linux only: agnos has no openat, and Darwin's /dev/fd does not reach below a
+# directory descriptor, so neither pins (_serve_repos_pin stays 0 there).
+fn _serve_open_dir_at(dfd, name) {
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifndef CYRIUS_TARGET_MACOS
+    return sys_openat(dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0);
+    #endif
+    #endif
+    return 0 - 38;                                 # ENOSYS
+}
+
+# {dev, ino} of the open `fd` into out16: 0, or -1.
+fn _serve_fd_id(fd, out16) {
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifndef CYRIUS_TARGET_MACOS
+    var st[256];
+    if (sys_fstat(fd, &st) != 0) { return 0 - 1; }
+    store64(out16, load64(&st));
+    store64(out16 + 8, load64(&st + 8));
+    return 0;
+    #endif
+    #endif
+    return 0 - 1;
+}
+
+# 1 when `.sit/HEAD` is a regular file in the `.sit` directory open as `sfd`,
+# not following a link.
+fn _serve_head_at(sfd) {
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifndef CYRIUS_TARGET_MACOS
+    var st[256];
+    if (sys_fstatat(sfd, "HEAD", &st, AT_SYMLINK_NOFOLLOW) != 0) { return 0; }
+    if ((load32(&st + STAT_MODE) & 0xF000) != 0x8000) { return 0; }
+    return 1;
+    #endif
+    #endif
+    return 0;
+}
+
+# Walk `<dir>/<name>` and its `.sit` from <dir>'s descriptor (see
+# _serve_repo_pinned). Fills `w` (48 bytes) {repo fd, .sit fd, repo dev, repo
+# ino, .sit dev, .sit ino} and returns 0, or -1 with nothing left open: a
+# segment that is a link, not a directory, or absent; no `.sit` directory; no
+# regular `.sit/HEAD`.
+fn _serve_repo_walk(name, nlen, w) {
+    var seg[264];
+    var fd = _serve_repos_dirfd;
+    var start = 0;
+    var i = 0;
+    var ok = 1;
+    while (i <= nlen) {
+        if (ok == 1) {
+            var c = 47;
+            if (i < nlen) { c = load8(name + i); }
+            if (c == 47) {
+                var sl = i - start;
+                memcpy(&seg, name + start, sl);    # a segment is at most 255 bytes
+                store8(&seg + sl, 0);
+                var nfd = _serve_open_dir_at(fd, &seg);
+                if (fd != _serve_repos_dirfd) { file_close(fd); }
+                fd = nfd;
+                if (nfd < 0) { ok = 0; }
+                start = i + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (ok == 0) { return 0 - 1; }
+    var sfd = _serve_open_dir_at(fd, ".sit");
+    if (sfd < 0) { file_close(fd); return 0 - 1; }
+    var good = _serve_head_at(sfd);
+    if (good == 1) { if (_serve_fd_id(fd, w + 16) != 0) { good = 0; } }
+    if (good == 1) { if (_serve_fd_id(sfd, w + 32) != 0) { good = 0; } }
+    if (good == 0) {
+        file_close(sfd);
+        file_close(fd);
+        return 0 - 1;
+    }
+    store64(w, fd);
+    store64(w + 8, sfd);
+    return 0;
+}
+
+# Open <dir> for --repos and decide whether requests can be pinned: 1 when
+# `/proc/self/fd/<fd>` reaches the directory the descriptor holds (Linux with
+# /proc mounted), else 0. -1 when <dir> cannot be opened.
+fn _serve_repos_open_dir(dir) {
+    var fd = 0 - 1;
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifndef CYRIUS_TARGET_MACOS
+    fd = file_open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    #endif
+    #endif
+    if (fd < 0) { return 0; }
+    var a[16];
+    var b[16];
+    if (_serve_fd_id(fd, &a) != 0) { file_close(fd); return 0; }
+    if (path_file_id(_serve_fd_path(fd), &b) != 0) { file_close(fd); return 0; }
+    if (load64(&a) != load64(&b)) { file_close(fd); return 0; }
+    if (load64(&a + 8) != load64(&b + 8)) { file_close(fd); return 0; }
+    _serve_repos_dirfd = fd;
+    return 1;
 }
 
 # `<dir>/<name>` as a heap cstring when it passes _serve_repo_check, else 0.
@@ -1343,8 +1603,8 @@ fn _serve_repo_check(root) {
     return 1;
 }
 
-# 1 when the repository a kept cell {store state, last use, dev, ino} names
-# still passes _serve_repo_check and is the same directory as when it was kept.
+# 1 when the repository a kept cell (SERVE_REPO_CELL) names still passes
+# _serve_repo_check and is the same directory as when it was kept.
 fn _serve_repo_kept(cell) {
     var root = load64(load64(cell));             # store_ctx_new keeps root first
     if (_serve_repo_check(root) == 0) { return 0; }
@@ -1372,9 +1632,7 @@ fn _serve_repos_evict() {
         i = i + 1;
     }
     if (best == 0) { return 0; }
-    var victim = map_get(_serve_repos, best);
-    store_ctx_close(load64(victim));
-    map_delete(_serve_repos, best);
+    _serve_repo_drop(best, map_get(_serve_repos, best));
     return 0;
 }
 
@@ -2056,6 +2314,12 @@ fn cmd_serve() {
         }
         _serve_repos_dir = repo_path;
         _store_session_wait_ms = 0;        # 1.12.2 (X6): 503, not a stalled server
+        # 1.13.4 (S3): pin each request to descriptors where the platform can.
+        _serve_repos_pin = _serve_repos_open_dir(repo_path);
+        if (_serve_repos_pin == 0) {
+            eprintln("sit: warning: --repos cannot hold a repository open for a request here (no /proc/self/fd);");
+            eprintln("sit:   each request checks its repository's path first, but a swap during a request races");
+        }
     }
     else {
         sit_set_repo_root(repo_path);

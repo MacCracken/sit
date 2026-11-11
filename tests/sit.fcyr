@@ -1475,6 +1475,159 @@ fn fuzz_rev_syntax(rounds) {
     return 0;
 }
 
+# 1.13.4 (L5): the chunked log readers over bytes dense in LFs. Forward, every
+# line lies in the buffer, ends in its only LF and starts where the last one
+# ended, and there are as many as there are LFs; backward gives the same lines
+# newest first. fsck's collector takes the same bytes without a crash.
+fn fuzz_rlog_readers(rounds) {
+    var cap = 2048;
+    var input = alloc(cap);
+    var starts = alloc(cap * 8);
+    var lens = alloc(cap * 8);
+    var alpha = "\n\n\na 0123456789abcdef\t+";
+    var seed = 0x51ed;
+    var i = 0;
+    while (i < rounds) {
+        var size = (seed & 0x7FF);                 # 0..2047
+        var k = 0;
+        while (k < size) {
+            seed = seed * 6364136223846793005 + 1442695040888963407;
+            store8(input + k, load8(alpha + ((seed >> 33) & 0x1F) % 23));
+            k = k + 1;
+        }
+        var lfs = 0;
+        var last = 0;
+        k = 0;
+        while (k < size) {
+            if (load8(input + k) == 10) { lfs = lfs + 1; last = k + 1; }
+            k = k + 1;
+        }
+        var rd[56];
+        var line[16];
+        _rlog_mem(&rd, input, size);
+        var n = 0;
+        var at = 0;
+        var going = 1;
+        while (going == 1) {
+            var r = _rlog_next(&rd, &line);
+            if (r != 1) { going = 0; }
+            else {
+                var lp = load64(&line);
+                var ll = load64(&line + 8);
+                if (lp != input + at) { println("fuzz: _rlog_next skipped bytes"); return 1; }
+                if (ll < 1) { println("fuzz: _rlog_next gave an empty line"); return 1; }
+                if (at + ll > size) { println("fuzz: _rlog_next ran past the buffer"); return 1; }
+                if (load8(lp + ll - 1) != 10) { println("fuzz: _rlog_next line without its LF"); return 1; }
+                var q = 0;
+                while (q < ll - 1) {
+                    if (load8(lp + q) == 10) { println("fuzz: _rlog_next line with two LFs"); return 1; }
+                    q = q + 1;
+                }
+                store64(starts + n * 8, at);
+                store64(lens + n * 8, ll);
+                at = at + ll;
+                n = n + 1;
+            }
+        }
+        if (n != lfs) { println("fuzz: _rlog_next line count is not the LF count"); return 1; }
+        if (at != last) { println("fuzz: _rlog_next stopped short of the last LF"); return 1; }
+        var br[56];
+        _rlog_back_mem(&br, input, size);
+        var b = n;
+        going = 1;
+        while (going == 1) {
+            var r2 = _rlog_prev(&br, &line);
+            if (r2 != 1) { going = 0; }
+            else {
+                b = b - 1;
+                if (b < 0) { println("fuzz: _rlog_prev gave more lines than forward"); return 1; }
+                if (load64(&line) != input + load64(starts + b * 8)) { println("fuzz: _rlog_prev line start differs"); return 1; }
+                if (load64(&line + 8) != load64(lens + b * 8)) { println("fuzz: _rlog_prev line length differs"); return 1; }
+            }
+        }
+        if (b != 0) { println("fuzz: _rlog_prev gave fewer lines than forward"); return 1; }
+        if ((i & 63) == 0) {
+            var roots = vec_new();
+            _reflog_collect_oids(input, size, roots);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# 1.13.4 (X2c): what the connectivity walk parses out of pushed objects. A
+# base-tree seek over random tree-shaped bytes answers inside the body (an id's
+# 32 bytes fit), and its cursor only moves forward, to at most the end. A
+# committer date is the fallback or a clamped time.
+fn fuzz_conn_scan(rounds) {
+    var cap = 1024;
+    var body = alloc(cap);
+    var name = alloc(64);
+    var alpha = "40000 100644 ab\0\0\0\n";
+    var nalpha = "ab.";
+    var ca = arena_allocator_growable(4096);
+    var seed = 0xc0ffee;
+    var i = 0;
+    while (i < rounds) {
+        var blen = (seed & 0x3FF);
+        var k = 0;
+        while (k < blen) {
+            seed = seed * 6364136223846793005 + 1442695040888963407;
+            store8(body + k, load8(alpha + ((seed >> 33) & 0x1F) % 20));
+            if (((seed >> 40) & 7) == 0) { store8(body + k, (seed >> 48) & 0xFF); }
+            k = k + 1;
+        }
+        var e[40];
+        store64(&e, 0);
+        store64(&e + 8, 0);
+        store64(&e + 16, body);
+        store64(&e + 24, blen);
+        store64(&e + 32, 0);
+        var j = 0;
+        var prev = 0;
+        while (j < 6) {
+            seed = seed * 6364136223846793005 + 1442695040888963407;
+            var nl = ((seed >> 35) & 3) + 1;
+            var q = 0;
+            while (q < nl) { store8(name + q, load8(nalpha + ((seed >> (20 + q * 3)) & 7) % 3)); q = q + 1; }
+            store8(name + nl, 0);
+            var hit = _cn_base_seek(&e, name, nl, (seed >> 50) & 1);
+            if (hit != 0) {
+                if (hit < body) { println("fuzz: _cn_base_seek hit before the body"); return 1; }
+                if (hit + 32 > body + blen) { println("fuzz: _cn_base_seek id past the body"); return 1; }
+            }
+            var cur = load64(&e + 32);
+            if (cur < prev) { println("fuzz: _cn_base_seek cursor went back"); return 1; }
+            if (cur > blen) { println("fuzz: _cn_base_seek cursor past the end"); return 1; }
+            prev = cur;
+            j = j + 1;
+        }
+        # Every other round, a committer line with random bytes after the ident.
+        if ((i & 1) == 0) {
+            var hdr = "tree x\ncommitter A <a@b> ";
+            var hl = strlen(hdr);
+            if (blen > hl + 2) {
+                memcpy(body, hdr, hl);
+                var dd = hl;
+                while (dd < blen) {
+                    seed = seed * 6364136223846793005 + 1442695040888963407;
+                    if (((seed >> 40) & 3) != 0) { store8(body + dd, 48 + ((seed >> 33) % 10)); }
+                    dd = dd + 1;
+                }
+                store8(body + hl + ((seed >> 20) % (blen - hl)), 10);
+            }
+        }
+        reset_via(ca);
+        var ts = _cn_committer_ts(ca, body, blen, 0 - 7);
+        if (ts != 0 - 7) {
+            if (ts < 0) { println("fuzz: _cn_committer_ts below 0"); return 1; }
+            if (ts > SIT_TS_MAX) { println("fuzz: _cn_committer_ts past SIT_TS_MAX"); return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn main() {
     alloc_init();
     println("fuzz: zlib_decompress (10000 rounds)");
@@ -1531,6 +1684,10 @@ fn main() {
     if (fuzz_link_text(300000) != 0) { return 1; }
     println("fuzz: gitattr (200000 rounds)");
     if (fuzz_gitattr(200000) != 0) { return 1; }
+    println("fuzz: rlog_readers (100000 rounds)");
+    if (fuzz_rlog_readers(100000) != 0) { return 1; }
+    println("fuzz: conn_scan (300000 rounds)");
+    if (fuzz_conn_scan(300000) != 0) { return 1; }
     println("fuzz: no crashes");
     return 0;
 }

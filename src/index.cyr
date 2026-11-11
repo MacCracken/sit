@@ -447,7 +447,7 @@ fn _ensure_entries_index(db) {
 
 # Open (creating if needed) .sit/index.patra with its entries table and path index.
 fn index_db_open() {
-    if (patra_init() != PATRA_OK) { return 0; }       # 1.7.2: see object_db_open
+    if (store_patra_init() != PATRA_OK) { return 0; }   # 1.13.4: once per process
     var db = sf_patra_open(".sit/index.patra");
     if (db == 0) { return 0; }
     # Idempotent — second call returns "already exists", which we ignore.

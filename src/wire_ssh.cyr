@@ -1013,6 +1013,7 @@ fn ssh_remote_push_object(h, hex, ty, compressed, clen) {
 #   0  — success (HTTP 200)
 #   1  — non-FF rejection (HTTP 409 Conflict)
 #   2  — denyCurrentBranch (HTTP 423 Locked) — v0.8.4
+#   3  — the server lacks an object the new tip reaches (409, "missing objects") — 1.13.4
 #   -1 — any other failure (400, 401, 5xx, transport)
 fn ssh_remote_push_ref(h, refname, hex) {
     if (refname_valid(refname) == 0) { return 0 - 1; }
@@ -1032,6 +1033,7 @@ fn ssh_remote_push_ref(h, refname, hex) {
     var status = _wire_ssh_post_xhdr(h, sub, body, 65, 0, &resp);
     if (status < 0) { return 0 - 1; }
     if (status == 200) { return 0; }
+    if (wire_ref_refused_hole(status, load64(&resp), load64(&resp + 8)) == 1) { return 3; }
     if (status == 409) { return 1; }
     if (status == 423) { return 2; }
     return 0 - 1;

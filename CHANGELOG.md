@@ -4,6 +4,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.13.4] — 2026-11-11 — what the 1.12.2 audit left partly fixed
+
+A security patch. It closes the four findings [the 1.12.2 audit](docs/audit/2026-10-20-1.12.2-audit.md) left partly fixed or deferred (S3, X2c, L5, and sit's part of S5), and records a decision on the roadmap's fifth 1.13.4 item. Nothing changes in the on-disk format, the wire protocol's requests or the public API. The toolchain stays at cyrius 6.7.18. [The audit note](docs/audit/2026-11-11-1.13.4-audit.md) has the review, and [architecture 010](docs/architecture/010-repos-requests-pinned-to-descriptors.md) the one non-obvious constraint the S3 fix adds.
+
+### Security
+
+- **`sit serve --repos` serves a request through the directory it checked (S3, MEDIUM).** Since 1.12.2 a kept repository's path was checked on every request, but the request then opened the store, the lock and the refs by path. So a symlink swapped in between still reached outside `<dir>`. A racer that exchanges `<dir>/team` with a link to another repository (`renameat2`, 300 rounds) saw that repository's tip in 119 refs answers and pushed 35 branches into it. Now each request walks `<name>` from `<dir>`'s descriptor a segment at a time with `openat(O_NOFOLLOW | O_DIRECTORY)`, then `.sit` the same way, and checks `.sit/HEAD` with `fstatat`. Every file the request touches is then reached through `/proc/self/fd/<n>` for those two directories. The same racer gets 0 and 0. A kept repository must still be the same two directories, by device and inode, or it is closed and opened afresh. Where `/proc/self/fd` cannot reach below a directory descriptor (no `/proc`, AGNOS, macOS), `--repos` says so at start and checks paths per request, as 1.12.2 did.
+- **A served ref never moves onto a hole (X2c, MEDIUM).** A push spans requests, and the ref moves in the last one. So a `sit fsck --prune` between two of them deleted objects that had arrived but that no ref named yet, and the server then moved the ref onto the hole. Every later clone of that branch failed. A client that never sent a tree or a blob did the same. `serve_handle_put_ref` now runs git's `check_connected`: everything the new tip reaches must be in the store, down to what the server's refs already reach (`connected_in_db`), or the update is refused with 409 and a `missing objects` body. The walk orders commits by committer date, as git's `limit_list` does, so a branch forked from old history stops where the refs' history meets it. A commit's tree is checked against its parents', so a commit that changes one file reads one path of trees. An absent tip is the same 409, not a 400. Connectivity is checked before the fast-forward walk, which would read a hole as divergence, and the two share its 60 s budget (then 503). A 1.13.4 client says `server rejected ref update: it lacks objects this history reaches; push again`. An older one reads the 409 as non-fast-forward.
+
+### Fixed
+
+- **Reflogs past 64 MiB (L5).** Every reflog reader took the whole log through `read_file_heap`, whose 64 MiB cap made a longer log unreadable. `sit reflog` printed nothing, `HEAD@{1}` was "no object matches", and `reflog expire` expired 0 entries, though it is the one command that would shrink such a log. `fsck --prune` refused while the log existed (1.12.2). Logs are now read a chunk at a time: forward to count, collect fsck's roots and rewrite, and backward, newest first, for `@{n}`, `@{<time>}` and `sit reflog`. `reflog expire` and `reflog delete` stream the kept lines through `<log>.lock`, fsync and a rename, and write nothing when nothing would go. A single line may be up to 64 MiB, past which the read fails rather than skipping it. The in-memory `_in_buf` functions the tests and the fuzz harness drive now run the same readers over a buffer.
+- **`patra_init` once per process (S5, sit's part).** Every store and index open called it. Each repeat bump-allocated a fresh 4,112-byte TLS block that is never returned, and re-created patra's mutexes and SQL scratch. `store_patra_init` calls it once, behind a flag of sit's own: `patra_initialized()` needs patra 1.16.1 or later. A `sit_repo_open` + `sit_repo_status` alternating between two repositories kept 7,872 B per call, and now keeps 3,504 B. patra's part (the WAL path `patra_open` keeps) stays filed on patra.
+
+### Decided
+
+- **Links below a real store are read as git reads them.** A `.git/` whose `refs` and `objects` are links into another repository is read, as git reads it. `git-new-workdir` makes that shape, `objects/info/alternates` reaches as far on purpose (ADR 0011), and sit only ever reads a `.git/` repository. A `.sit/objects.patra` linked out does not open already. Recorded in ADR 0003's 1.13.4 amendment, and listed under the roadmap's closed decisions.
+
+### Changed
+
+- `_write_replace` (util.cyr) is split into `_replace_open` and `_replace_close`, so a writer can stream into the lock file. `sf_write_atomic` behaves as before.
+- Removed: `_reflog_line_start`, `_reflog_line_starts`, `_reflog_write_kept`, which had no caller left.
+
+### Numbers
+
+| | 1.13.3 | 1.13.4 |
+|---|---:|---:|
+| `--repos` swap race, 300 rounds: refs answers with the outside tip, branches written outside | 119, 35 | 0, 0 |
+| `--repos` GET `/refs` on a three-segment name, 3,000 requests (three alternating runs) | 169.6 µs | 176.3 µs |
+| push over http, 300-commit fixture: first push, incremental, branch forked 290 commits back | 0.42, 0.375, 0.372 s | 0.54, 0.371, 0.376 s |
+| a 70 MiB reflog: `sit reflog`, `reflog delete`, `reflog expire`, `fsck --prune-now` | nothing / refused | 0.45, 0.71, 0.57, 0.60 s |
+| a 70 MiB reflog: `HEAD@{1}`, `reflog -n 1` (the tail only) | "no object matches" | ~1 ms |
+| read API, `sit_repo_open` + `sit_repo_status` over two repositories, bump heap kept per call | 7,872 B | 3,504 B |
+
+The first push's 0.12 s is the check of all 1,506 objects. Snapshot: [`docs/benchmarks/2026-11-11-v1.13.4.md`](docs/benchmarks/2026-11-11-v1.13.4.md).
+
+### Verified
+
+- **Unit:** 900 assertions (816 at 1.13.3). New: `test_1134_hardening` covers the client's hole test, the walk's date order and heap, the base-tree seek, the chunked readers against the in-memory ones at every chunk size from 1 byte up, the streamed rewrites, and `patra_init` once. `test_1134_repos` covers the `.sit` pin in `sit_abs` and both resolvers, by path and through descriptors.
+- **Integration:** sections 54 (a served ref onto a hole, including the prune between requests), 55 (a 65 MiB reflog through every reader and `fsck --prune`) and 56 (the swap race, `swap_race.py`). Against the 1.13.3 binary, 54 fails 6 of 10, 55 fails 8 of 9 and 56 fails its race.
+- **Fuzz:** `fuzz_rlog_readers` (the readers' line invariants, forward against backward) and `fuzz_conn_scan` (the base-tree seek and the committer date over random tree-shaped bytes).
+- **Builds:** x86_64, aarch64 and `--agnos`, DCE included. Not built for macOS here: this toolchain has no macOS target, and the new descriptor code is behind `#ifdef CYRIUS_TARGET_LINUX` / `#ifndef CYRIUS_TARGET_MACOS`.
+- **Downstream:** owl and thoth build against the new read bundle with the same three placeholder warnings as against 1.13.3's, and no bundled name added in 1.13.4 collides with either. owl's tests pass. thoth's pass except `a bundle matches its sum`, its checksum of the vendored copy, which fails for any new bundle.
+
 ## [1.13.3] — 2026-11-06 — sit sees a symlink on AGNOS and macOS
 
 A security patch, found by thoth's hostile pass on a real AGNOS guest and its suite on a real Mac. Nothing changes on Linux, in the on-disk format, the wire protocol or the public API. The toolchain stays at cyrius 6.7.18, and cmdit 1.5.0 is the latest.

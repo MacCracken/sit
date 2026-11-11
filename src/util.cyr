@@ -27,6 +27,34 @@ fn sit_set_repo_root(root) {
     return 0;
 }
 
+# 1.13.4 (audit S3): when set, what the path `.sit` stands for — a
+# `/proc/self/fd/<n>` path naming the `.sit` directory `sit serve --repos`
+# opened for a request without following a link — so every `.sit/…` path of
+# the open repository resolves through that descriptor, whatever is renamed or
+# linked into `.sit`'s place after it was opened. 0 everywhere else, and every
+# path then joins as below.
+var _repo_dotdir = 0;
+
+fn sit_set_repo_dotdir(p) {
+    _repo_dotdir = p;
+    return 0;
+}
+
+# The length of `rel` past its leading `.sit` when a `.sit` is pinned and `rel`
+# is `.sit` or starts `.sit/`; -1 otherwise.
+fn _sit_in_dotdir(rel) {
+    if (_repo_dotdir == 0) { return 0 - 1; }
+    # A byte at a time, so a shorter `rel` stops at its NUL.
+    if (load8(rel) != 46) { return 0 - 1; }
+    if (load8(rel + 1) != 115) { return 0 - 1; }
+    if (load8(rel + 2) != 105) { return 0 - 1; }
+    if (load8(rel + 3) != 116) { return 0 - 1; }
+    var c = load8(rel + 4);
+    if (c == 0) { return 0; }
+    if (c != 47) { return 0 - 1; }
+    return strlen(rel) - 4;
+}
+
 # The ONE prefix point. Rules, in order:
 #   (1) rel already absolute (byte 0 == '/') → return UNCHANGED.
 #       (cert/token/HOME paths pass straight through.)
@@ -72,6 +100,8 @@ fn sit_abs_into(rel, buf, cap) {
 fn _sit_abs_len(rel) {
     if (rel == 0) { return 0; }
     if (load8(rel) == 47) { return 0; }              # '/'
+    var dk = _sit_in_dotdir(rel);
+    if (dk >= 0) { return strlen(_repo_dotdir) + dk + 1; }
     if (_repo_root == 0) { return 0; }
     # A "." root means "current directory" — prefixing "./" is redundant
     # and would break Linux byte-for-byte parity. Treat it as no-prefix so
@@ -80,8 +110,17 @@ fn _sit_abs_len(rel) {
     return strlen(_repo_root) + 1 + strlen(rel) + 1;
 }
 
-# Write "<root>/<rel>" + NUL at `out`, sized by _sit_abs_len. Returns `out`.
+# Write "<root>/<rel>" + NUL at `out`, sized by _sit_abs_len (or, for a `.sit`
+# path with `.sit` pinned, "<pin><rest of rel>"). Returns `out`.
 fn _sit_abs_fill(out, rel) {
+    var dk = _sit_in_dotdir(rel);
+    if (dk >= 0) {
+        var dl = strlen(_repo_dotdir);
+        memcpy(out, _repo_dotdir, dl);
+        memcpy(out + dl, rel + 4, dk);
+        store8(out + dl + dk, 0);
+        return out;
+    }
     var rlen = strlen(_repo_root);
     var plen = strlen(rel);
     memcpy(out, _repo_root, rlen);
@@ -98,7 +137,7 @@ fn sit_abs_str(rel) {
     if (rel == 0) { return rel; }
     var data = str_data(rel);
     if (str_len(rel) > 0) { if (load8(data) == 47) { return rel; } }
-    if (_repo_root == 0) { return rel; }
+    if (_repo_root == 0) { if (_repo_dotdir == 0) { return rel; } }
     return str_from(sit_abs(str_cstr(rel)));
 }
 
@@ -314,7 +353,13 @@ fn _sf_parent_symlink(p) {
             if (i > 0) {
                 memcpy(pre, p, i);
                 store8(pre + i, 0);
-                if (path_is_symlink(_sf_abs(pre, &abuf)) == 1) { return 1; }
+                # 1.13.4: a pinned `.sit` is a descriptor's /proc link, opened
+                # without following one; it is not a link to ask about.
+                var pinned = 0;
+                if (i == 4) { if (_sit_in_dotdir(pre) == 0) { pinned = 1; } }
+                if (pinned == 0) {
+                    if (path_is_symlink(_sf_abs(pre, &abuf)) == 1) { return 1; }
+                }
             }
         }
         i = i + 1;
@@ -430,6 +475,22 @@ fn _write_replace(ap, buf, len) {
     var lbuf[4360];
     var lp = &lbuf;
     if (al + 6 > 4360) { lp = alloc_or_die(al + 6); }
+    var fd = _replace_open(ap, lp);
+    if (fd < 0) { return fd; }
+    var written = sit_write_full(fd, buf, len);
+    var rc = 0;
+    if (written != len) { rc = written; if (rc >= 0) { rc = 0 - 5; } }
+    rc = _replace_close(fd, ap, lp, rc);
+    if (rc != 0) { return rc; }
+    return len;
+}
+
+# The first half of _write_replace, for a writer that streams (1.13.4: `reflog
+# expire` over a log of any size): `<ap>.lock`, made O_EXCL with the permission
+# bits `ap` has, its path written to `lp` (strlen(ap) + 6 bytes). The fd, or a
+# negative errno.
+fn _replace_open(ap, lp) {
+    var al = strlen(ap);
     memcpy(lp, ap, al);
     memcpy(lp + al, ".lock", 5);
     store8(lp + al + 5, 0);
@@ -447,17 +508,20 @@ fn _write_replace(ap, buf, len) {
     var ost[256];
     if (xstat(ap, &ost) == 0) { syscall(SYS_FCHMOD, fd, load32(&ost + STAT_MODE) & 4095); }
     #endif
-    var written = sit_write_full(fd, buf, len);
-    var rc = 0;
-    if (written != len) { rc = written; if (rc >= 0) { rc = 0 - 5; } }
+    return fd;
+}
+
+# The second half: with `rc` 0, fsync `fd` and rename the lock `lp` over `ap`;
+# otherwise, or when either fails, remove the lock. 0, or a negative errno.
+fn _replace_close(fd, ap, lp, rc) {
     if (rc == 0) { if (xfsync(fd) != 0) { rc = 0 - 5; } }
     file_close(fd);
     if (rc == 0) {
         var rr = _sit_rename_raw(lp, ap);
         if (rr != 0) { rc = rr; }
     }
-    if (rc != 0) { xunlink(lp); return rc; }
-    return len;
+    if (rc != 0) { xunlink(lp); }
+    return rc;
 }
 
 # Atomically replace the file at `p` (repo-root-relative, or absolute) with

@@ -1390,6 +1390,7 @@ fn http_remote_push_object(h, hex, ty, compressed, clen) {
 # Returns:
 #   0  — success (200 OK)
 #   1  — non-FF (409 Conflict)
+#   3  — the server lacks an object the new tip reaches (409, "missing objects"; 1.13.4)
 #   -1 — any other failure (400, 401, network, etc.)
 
 # POST a ref update (validated name, 64-hex) to the remote.
@@ -1411,11 +1412,24 @@ fn http_remote_push_ref(h, refname, hex) {
     var rc = _wire_http_post(h, sub, body, 65, &quad);
     if (rc != 0) { return 0 - 1; }
     var status = load64(&quad + 16);
+    var hole = wire_ref_refused_hole(status, load64(&quad), load64(&quad + 8));
     _wire_http_response_free(&quad);
     if (status == 200) { return 0; }
+    if (hole == 1) { return 3; }                # 1.13.4: objects missing on the server
     if (status == 409) { return 1; }
     if (status == 423) { return 2; }            # v0.8.4 denyCurrentBranch
     return 0 - 1;
+}
+
+# 1 when a ref update's response is the server's connectivity refusal (1.13.4,
+# X2c): a 409 whose body starts "missing objects". A non-fast-forward 409 has no
+# body, and a server older than 1.13.4 never sends this one.
+fn wire_ref_refused_hole(status, body, blen) {
+    if (status != 409) { return 0; }
+    if (body == 0) { return 0; }
+    if (blen < 15) { return 0; }
+    if (memeq(body, "missing objects", 15) == 1) { return 1; }
+    return 0;
 }
 
 # Variant of `_wire_http_post` that also injects an extra request

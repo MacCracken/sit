@@ -120,52 +120,241 @@ fn _reflog_count_in_buf(buf, len) {
     return c;
 }
 
-# Byte offset where line `idx` (0-based) starts, or -1 if absent.
-fn _reflog_line_start(buf, len, idx) {
-    if (idx == 0) { return 0; }
-    var i = 0;
-    var seen = 0;
-    var found = 0 - 1;
-    var scanning = 1;
-    while (scanning == 1) {
-        if (i >= len) { scanning = 0; }
-        else {
-            if (load8(buf + i) == 10) {
-                seen = seen + 1;
-                if (seen == idx) { found = i + 1; scanning = 0; }
-            }
-            i = i + 1;
-        }
-    }
-    return found;
+# ── Chunked readers (1.13.4, audit L5) ────────────────────────────────
+#
+# Every reader before 1.13.4 took the whole log through read_file_heap, whose
+# 64 MiB cap made a longer log unreadable to `sit reflog`, `@{…}` and `reflog
+# expire` — the one command that would have shrunk it — and `fsck --prune`
+# refused while one existed (1.12.2). These read a log a chunk at a time. Each
+# runs over a file or over a buffer already in memory (the `_in_buf` functions,
+# which the unit tests and the fuzz harness drive), so both take one path.
+#
+# A line is LF-terminated; bytes after the last LF are not one, as every reader
+# before took them. A line may be up to RLOG_LINE_MAX (the old whole-file cap),
+# past which the read fails rather than skipping it: fsck must not lose a line's
+# oids in silence.
+#
+# Forward, `rd` (56 bytes): {fd (-1 over a buffer), buf, cap, lo, hi, eof,
+# scanned}: buf[lo, hi) is unread, buf[lo, scanned) holds no LF.
+# Backward, `br` (56 bytes): {fd, buf, cap, base, n, hi, -}: buf holds the
+# file's bytes [base, base + n), and hi is where the next line (newest first)
+# ends.
+
+var RLOG_CHUNK = 65536;
+var RLOG_LINE_MAX = 67108864;
+var _rlog_chunk = 65536;       # RLOG_CHUNK; a test makes it small to force every refill path
+
+# Open the log at `path` (repo-relative) into `rd`, positioned at its start.
+# 0, or -1 when it is not a regular file or cannot be opened or buffered.
+fn _rlog_open(path, rd) {
+    var abuf[4352];
+    var ap = sit_abs_into(path, &abuf, 4352);
+    if (ap == 0) { ap = sit_abs(path); }
+    if (path_is_regular(ap) == 0) { return 0 - 1; }
+    var fd = file_open(ap, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var buf = fl_alloc(_rlog_chunk);
+    if (buf == 0) { file_close(fd); return 0 - 1; }
+    store64(rd, fd);
+    store64(rd + 8, buf);
+    store64(rd + 16, _rlog_chunk);
+    store64(rd + 24, 0);
+    store64(rd + 32, 0);
+    store64(rd + 40, 0);
+    store64(rd + 48, 0);
+    return 0;
 }
 
-# Resolve <ref>@{n} within a log buffer: write the new-oid (field 2) of the
-# entry n moves ago into out (65 bytes, nul-terminated). n == 0 is the last
-# (current) entry. Returns 1 on success, 0 if n is out of range or the
-# target line is malformed. Never reads past `len`.
-#
-# 1.13.0 (G8): n equal to the number of entries is the OLDEST entry's old oid,
-# as git's read_ref_at gives it — what the ref held before the log began, which
-# `reflog expire` leaves behind — unless that is the creation zeros.
-fn _reflog_nth_in_buf(buf, len, n, out) {
-    if (n < 0) { return 0; }
-    var c = _reflog_count_in_buf(buf, len);
-    if (n > c) { return 0; }
-    if (c == 0) { return 0; }
-    var target = c - 1 - n;
-    var field = 1;                   # the new oid; the old one for n == c
-    if (n == c) { target = 0; field = 0; }
-    var s = _reflog_line_start(buf, len, target);
-    if (s < 0) { return 0; }
-    # Layout: old(H) SP new(H) SP ... — the new oid at [s+H+1, s+2H+1). H is the
-    # open backend's id width: 64, or 40 in a SHA-1 `.git/` (1.12.0).
+# Set `rd` up over the bytes buf[0, len): a reader that never refills.
+fn _rlog_mem(rd, buf, len) {
+    store64(rd, 0 - 1);
+    store64(rd + 8, buf);
+    store64(rd + 16, len);
+    store64(rd + 24, 0);
+    store64(rd + 32, len);
+    store64(rd + 40, 1);
+    store64(rd + 48, 0);
+    return 0;
+}
+
+# Release what _rlog_open / _rlog_back_open took (nothing over a buffer).
+fn _rlog_close(rd) {
+    if (load64(rd) >= 0) {
+        fl_free(load64(rd + 8));
+        file_close(load64(rd));
+    }
+    return 0;
+}
+
+# Read up to `want` bytes at `fd`'s position into `dst` (short only at the end).
+# The count, or -1.
+fn _rlog_fill(fd, dst, want) {
+    var got = 0;
+    var going = 1;
+    while (going == 1) {
+        if (got >= want) { going = 0; }
+        else {
+            var r = file_read(fd, dst + got, want - got);
+            if (r < 0) { return 0 - 1; }
+            if (r == 0) { going = 0; }
+            else { got = got + r; }
+        }
+    }
+    return got;
+}
+
+# The next line of `rd`: {ptr, len} (the LF included) into `out`, valid until
+# the next call. 1, 0 at the end, -1 on a read error or a line past
+# RLOG_LINE_MAX.
+fn _rlog_next(rd, out) {
+    var going = 1;
+    while (going == 1) {
+        var buf = load64(rd + 8);
+        var lo = load64(rd + 24);
+        var hi = load64(rd + 32);
+        var sc = load64(rd + 48);
+        if (sc < lo) { sc = lo; }
+        var lf = 0 - 1;
+        while (sc < hi) {
+            if (load8(buf + sc) == 10) { lf = sc; sc = hi; }
+            else { sc = sc + 1; }
+        }
+        if (lf >= 0) {
+            store64(out, buf + lo);
+            store64(out + 8, lf - lo + 1);
+            store64(rd + 24, lf + 1);
+            store64(rd + 48, lf + 1);
+            return 1;
+        }
+        store64(rd + 48, hi);
+        if (load64(rd + 40) == 1) { return 0; }
+        # Move the partial line to the front, grow for a long one, read on.
+        var keep = hi - lo;
+        var k = 0;
+        while (k < keep) {
+            store8(buf + k, load8(buf + lo + k));
+            k = k + 1;
+        }
+        var cap = load64(rd + 16);
+        if (keep == cap) {
+            if (cap >= RLOG_LINE_MAX) { return 0 - 1; }
+            var nb = fl_alloc(cap * 2);
+            if (nb == 0) { return 0 - 1; }
+            memcpy(nb, buf, keep);
+            fl_free(buf);
+            buf = nb;
+            cap = cap * 2;
+            store64(rd + 8, buf);
+            store64(rd + 16, cap);
+        }
+        var got = _rlog_fill(load64(rd), buf + keep, cap - keep);
+        if (got < 0) { return 0 - 1; }
+        if (got == 0) { store64(rd + 40, 1); }
+        store64(rd + 24, 0);
+        store64(rd + 32, keep + got);
+        store64(rd + 48, keep);
+    }
+    return 0 - 1;
+}
+
+# The file offset of the last LF before `limit` in `br`'s file, reading back
+# from `br`'s line end as needed; -1 when there is none, -2 on a read error or a
+# line past RLOG_LINE_MAX.
+fn _rlog_last_lf(br, limit) {
+    var going = 1;
+    while (going == 1) {
+        var buf = load64(br + 8);
+        var base = load64(br + 24);
+        var i = limit - 1;
+        while (i >= base) {
+            if (load8(buf + i - base) == 10) { return i; }
+            i = i - 1;
+        }
+        if (base == 0) { return 0 - 1; }
+        # Load the window that ends where the current line does.
+        var hi = load64(br + 40);
+        var cap = load64(br + 16);
+        if (hi - base >= cap) {
+            if (cap >= RLOG_LINE_MAX) { return 0 - 2; }
+            var nb = fl_alloc(cap * 2);
+            if (nb == 0) { return 0 - 2; }
+            fl_free(buf);
+            buf = nb;
+            cap = cap * 2;
+            store64(br + 8, buf);
+            store64(br + 16, cap);
+        }
+        var nbase = hi - cap;
+        if (nbase < 0) { nbase = 0; }
+        var fd = load64(br);
+        if (syscall(SYS_LSEEK, fd, nbase, SEEK_SET) != nbase) { return 0 - 2; }
+        if (_rlog_fill(fd, buf, hi - nbase) != hi - nbase) { return 0 - 2; }
+        store64(br + 24, nbase);
+        store64(br + 32, hi - nbase);
+    }
+    return 0 - 2;
+}
+
+# Place `br`'s first line end after the last LF (a trailing fragment is not a
+# line). 0, or -1 on a read error.
+fn _rlog_back_start(br) {
+    var p = _rlog_last_lf(br, load64(br + 40));
+    if (p == 0 - 2) { return 0 - 1; }
+    store64(br + 40, p + 1);
+    return 0;
+}
+
+# Open the log at `path` (repo-relative) into `br`, positioned at its end.
+# 0, or -1 as _rlog_open.
+fn _rlog_back_open(path, br) {
+    if (_rlog_open(path, br) != 0) { return 0 - 1; }
+    var size = syscall(SYS_LSEEK, load64(br), 0, SEEK_END);
+    if (size < 0) { _rlog_close(br); return 0 - 1; }
+    store64(br + 24, size);
+    store64(br + 32, 0);
+    store64(br + 40, size);
+    if (_rlog_back_start(br) != 0) { _rlog_close(br); return 0 - 1; }
+    return 0;
+}
+
+# Set `br` up over buf[0, len), positioned at its end.
+fn _rlog_back_mem(br, buf, len) {
+    store64(br, 0 - 1);
+    store64(br + 8, buf);
+    store64(br + 16, len);
+    store64(br + 24, 0);
+    store64(br + 32, len);
+    store64(br + 40, len);
+    store64(br + 48, 0);
+    return _rlog_back_start(br);
+}
+
+# The previous line of `br` (newest first): {ptr, len} into `out`, the LF
+# included. 1, 0 past the first line, -1 on a read error. The line stays valid
+# until the next call — after the call that returns 0 too, so the oldest line
+# is still readable once the walk has passed it.
+fn _rlog_prev(br, out) {
+    var hi = load64(br + 40);
+    if (hi <= 0) { return 0; }
+    var p = _rlog_last_lf(br, hi - 1);
+    if (p == 0 - 2) { return 0 - 1; }
+    var s = p + 1;
+    store64(out, load64(br + 8) + s - load64(br + 24));
+    store64(out + 8, hi - s);
+    store64(br + 40, s);
+    return 1;
+}
+
+# The oid in field `field` (0 old, 1 new) of one line, copied with a NUL to
+# `out`: 1, or 0 when the line is too short, malformed there, or — with
+# `nonzero` — the field is the creation zeros.
+fn _reflog_line_oid(line, llen, field, nonzero, out) {
     var h = _id_hexlen();
-    if (s + 2 * h + 1 > len) { return 0; }
-    if (load8(buf + s + h) != 32) { return 0; }
-    var at = buf + s + field * (h + 1);
+    if (llen < 2 * h + 1) { return 0; }
+    if (load8(line + h) != 32) { return 0; }
+    var at = line + field * (h + 1);
     if (hex_prefix_valid(at, h) == 0) { return 0; }
-    if (field == 0) {
+    if (nonzero == 1) {
         var zero = 1;
         var k = 0;
         while (k < h) {
@@ -176,6 +365,41 @@ fn _reflog_nth_in_buf(buf, len, n, out) {
     }
     memcpy(out, at, h);
     store8(out + h, 0);
+    return 1;
+}
+
+# Resolve <ref>@{n} from `br` (positioned at its end): the new oid of the entry
+# n moves ago into out (an id + NUL). n == 0 is the last (current) entry.
+# 1, 0 if n is out of range or the line is malformed, -1 on a read error.
+#
+# 1.13.0 (G8): n equal to the number of entries is the OLDEST entry's old oid,
+# as git's read_ref_at gives it — what the ref held before the log began, which
+# `reflog expire` leaves behind — unless that is the creation zeros.
+fn _reflog_nth_rd(br, n, out) {
+    if (n < 0) { return 0; }
+    var line[16];
+    var k = 0;
+    var going = 1;
+    while (going == 1) {
+        var r = _rlog_prev(br, &line);
+        if (r < 0) { return 0 - 1; }
+        if (r == 0) {
+            # Past the oldest line: n == the number of entries asks for its old oid.
+            if (k == 0) { return 0; }
+            if (k != n) { return 0; }
+            return _reflog_line_oid(load64(&line), load64(&line + 8), 0, 1, out);
+        }
+        if (k == n) { return _reflog_line_oid(load64(&line), load64(&line + 8), 1, 0, out); }
+        k = k + 1;
+    }
+    return 0;
+}
+
+# _reflog_nth_rd over a buffer. Never reads past `len`.
+fn _reflog_nth_in_buf(buf, len, n, out) {
+    var br[56];
+    if (_rlog_back_mem(&br, buf, len) != 0) { return 0; }
+    if (_reflog_nth_rd(&br, n, out) != 1) { return 0; }
     return 1;
 }
 
@@ -265,65 +489,76 @@ fn _reflog_spec_parse(name, out) {
     return 1;
 }
 
-# Push a 64-hex oid at `p` into the `roots` vec as a fresh 65-byte cstring,
-# unless it's invalid hex or the all-zeros creation sentinel. Used by fsck
-# to treat reflog entries as reachability roots (prune grace).
-fn _reflog_push_oid_if_valid(p, roots) {
+# Push the oid at `p` into the `roots` vec as a fresh cstring, unless it is
+# invalid hex, the all-zeros creation sentinel, or the id `last` (the one
+# pushed just before: an entry's old oid is usually the previous one's new).
+# Returns the pushed cstring, or `last`.
+fn _reflog_push_oid_if_valid(p, roots, last) {
     var h = _id_hexlen();
-    if (hex_prefix_valid(p, h) == 0) { return 0; }
+    if (hex_prefix_valid(p, h) == 0) { return last; }
     var allzero = 1;
     var k = 0;
     while (k < h) {
         if (load8(p + k) != 48) { allzero = 0; k = h; }
         else { k = k + 1; }
     }
-    if (allzero == 1) { return 0; }
+    if (allzero == 1) { return last; }
+    if (last != 0) { if (memeq(last, p, h) == 1) { return last; } }
     var hex = alloc(h + 1);
     memcpy(hex, p, h);
     store8(hex + h, 0);
     vec_push(roots, hex);
-    return 0;
+    return hex;
 }
 
-# Collect every old+new oid from a reflog buffer into `roots` (skipping the
-# all-zeros creation sentinel). Pure parse over one log file's bytes.
+# Collect every old+new oid from `rd` into `roots` (skipping the all-zeros
+# creation sentinel). 0, or -1 on a read error: the caller must then count the
+# log as unread, since its later lines' oids are missing.
 #
 # 1.7.6 (R7): one pass. Each line's start was found by rescanning from byte 0,
 # so N entries cost N²/2 line scans — 75 s of `sit fsck` at 20,000 entries,
 # and reflogs never expire. Same lines as before: every LF-terminated one.
-fn _reflog_collect_oids(buf, len, roots) {
+fn _reflog_collect_rd(rd, roots) {
     var h = _id_hexlen();
-    var s = 0;
-    var i = 0;
-    while (i < len) {
-        if (load8(buf + i) == 10) {
-            if (s + 2 * h + 1 <= len) {
-                if (load8(buf + s + h) == 32) {
-                    _reflog_push_oid_if_valid(buf + s, roots);          # old
-                    _reflog_push_oid_if_valid(buf + s + h + 1, roots);  # new
+    var last = 0;
+    var line[16];
+    var going = 1;
+    while (going == 1) {
+        var r = _rlog_next(rd, &line);
+        if (r < 0) { return 0 - 1; }
+        if (r == 0) { going = 0; }
+        else {
+            var lp = load64(&line);
+            if (load64(&line + 8) >= 2 * h + 1) {
+                if (load8(lp + h) == 32) {
+                    last = _reflog_push_oid_if_valid(lp, roots, last);          # old
+                    last = _reflog_push_oid_if_valid(lp + h + 1, roots, last);  # new
                 }
             }
-            s = i + 1;
         }
-        i = i + 1;
     }
     return 0;
 }
 
-# Start offsets of the LF-terminated lines in `buf`, in order, in one pass
-# (1.7.6, R7): line k starts at vec_get(result, k).
-fn _reflog_line_starts(buf, len) {
-    var starts = vec_new();
-    var s = 0;
-    var i = 0;
-    while (i < len) {
-        if (load8(buf + i) == 10) {
-            vec_push(starts, s);
-            s = i + 1;
-        }
-        i = i + 1;
+# _reflog_collect_rd over a buffer.
+fn _reflog_collect_oids(buf, len, roots) {
+    var rd[56];
+    _rlog_mem(&rd, buf, len);
+    return _reflog_collect_rd(&rd, roots);
+}
+
+# Count the entries (LF-terminated lines) of `rd`: the count, or -1 on a read error.
+fn _reflog_count_rd(rd) {
+    var line[16];
+    var c = 0;
+    var going = 1;
+    while (going == 1) {
+        var r = _rlog_next(rd, &line);
+        if (r < 0) { return 0 - 1; }
+        if (r == 0) { going = 0; }
+        else { c = c + 1; }
     }
-    return starts;
+    return c;
 }
 
 # ── File wrappers ──────────────
@@ -370,12 +605,12 @@ fn reflog_append(refpath, old_hex, new_hex, msg) {
 # Resolve <ref>@{n}: read .sit/logs/<refpath>, write the new-oid of entry n
 # into out (65 bytes). Returns 1 on success, 0 if no log / out of range.
 fn reflog_read_nth(refpath, n, out) {
-    var path = reflog_log_path(refpath);
-    var pair[16];
-    if (read_file_heap(path, &pair) != 0) { return 0; }
-    var buf = load64(&pair);
-    var len = load64(&pair + 8);
-    return _reflog_nth_in_buf(buf, len, n, out);
+    var br[56];
+    if (_rlog_back_open(reflog_log_path(refpath), &br) != 0) { return 0; }
+    var r = _reflog_nth_rd(&br, n, out);
+    _rlog_close(&br);
+    if (r != 1) { return 0; }
+    return 1;
 }
 
 # The number of entries in the log at refpath: 0 when there is no log, -1 when
@@ -383,9 +618,11 @@ fn reflog_read_nth(refpath, n, out) {
 fn reflog_entry_count(refpath) {
     var path = reflog_log_path(refpath);
     if (path_lstat_kind(sit_abs(path)) < 0) { return 0; }
-    var pair[16];
-    if (read_file_heap(path, &pair) != 0) { return 0 - 1; }
-    return _reflog_count_in_buf(load64(&pair), load64(&pair + 8));
+    var rd[56];
+    if (_rlog_open(path, &rd) != 0) { return 0 - 1; }
+    var c = _reflog_count_rd(&rd);
+    _rlog_close(&rd);
+    return c;
 }
 
 # ── `sit reflog` command ───────
@@ -461,34 +698,39 @@ fn cmd_reflog() {
         ai = ai + 1;
     }
 
-    var path = reflog_log_path(refpath);
-    var pair[16];
-    if (read_file_heap(path, &pair) != 0) { return 0; }
-    var buf = load64(&pair);
-    var len = load64(&pair + 8);
-    var starts = _reflog_line_starts(buf, len);       # 1.7.6 (R7): once
-    var count = vec_len(starts);
-    if (count == 0) { return 0; }
+    # 1.13.4 (L5): newest first, a chunk at a time — no size limit.
+    var br[56];
+    if (_rlog_back_open(reflog_log_path(refpath), &br) != 0) { return 0; }
 
     var label_len = strlen(ref_label);
     var shown = 0;
     var d = 0;
-    while (d < count) {
+    var rc = 0;
+    var line[16];
+    var going = 1;
+    while (going == 1) {
         var stop = 0;
         if (limit >= 0) { if (shown >= limit) { stop = 1; } }
-        if (stop == 1) { d = count; }       # terminate (no break with vars)
+        var r = 0;
+        if (stop == 0) { r = _rlog_prev(&br, &line); }
+        if (r < 0) {
+            eprintln("sit: cannot read the reflog");
+            rc = 1;
+        }
+        if (r != 1) { going = 0; }          # terminate (no break with vars)
         else {
-            var s = vec_get(starts, count - 1 - d);
+            var lp = load64(&line);
+            var ll = load64(&line + 8);
             var hw = _id_hexlen();
-            if (s >= 0) {
-                if (s + hw + 13 <= len) {
+            if (ll >= 0) {
+                if (hw + 13 <= ll) {
                     # Display sanitization: .sit/logs is on-disk data that
                     # could be corrupt or hand-crafted, so scrub control bytes
                     # (terminal-escape injection) out of the echoed oid + msg
                     # before they hit the terminal. Sanitize into a buffer so
                     # the buffered stdout ordering is preserved (S-21 class).
                     var oidbuf[16];
-                    _reflog_san_into(&oidbuf, buf + s + hw + 1, 12);
+                    _reflog_san_into(&oidbuf, lp + hw + 1, 12);
                     stdout_write(&oidbuf, 12);          # short new-oid
                     stdout_write(" ", 1);
                     stdout_write(ref_label, label_len);
@@ -498,7 +740,7 @@ fn cmd_reflog() {
                     stdout_write(&nb, nd);
                     stdout_write("}: ", 3);
                     var mp[16];
-                    if (_reflog_line_msg(buf + s, len - s, &mp) == 1) {
+                    if (_reflog_line_msg(lp, ll, &mp) == 1) {
                         var mlen = load64(&mp + 8);
                         var sanmsg = alloc(mlen + 1);
                         _reflog_san_into(sanmsg, load64(&mp), mlen);
@@ -511,8 +753,9 @@ fn cmd_reflog() {
             d = d + 1;
         }
     }
+    _rlog_close(&br);
     stdout_flush();
-    return 0;
+    return rc;
 }
 
 # ── Time specs (1.8.0): `<ref>@{<date>}` and `reflog expire --expire=<when>` ──
@@ -729,58 +972,60 @@ fn _reflog_line_ts(line, llen) {
     return v;
 }
 
-# Resolve `<ref>@{<time>}` within a log buffer: the value the ref had at time
-# `t` — the new oid of the newest entry made at or before `t`. Before the first
-# entry it is that entry's old oid, or — when the first entry created the ref —
-# its new oid, the oldest value known, as git does ("log only goes back to");
-# a warning says so. Writes 64 hex + NUL to out; 1 on success, 0 otherwise.
-fn _reflog_at_time_in_buf(buf, len, t, out) {
-    var starts = _reflog_line_starts(buf, len);
-    var n = vec_len(starts);
-    if (n == 0) { return 0; }
-    var found = 0 - 1;
-    var i = n - 1;
-    while (i >= 0) {
-        if (found < 0) {
-            var s = vec_get(starts, i);
-            var e = len;
-            if (i + 1 < n) { e = vec_get(starts, i + 1); }
-            var ts = _reflog_line_ts(buf + s, e - s);
-            if (ts >= 0) { if (ts <= t) { found = i; } }
+# Resolve `<ref>@{<time>}` from `br` (positioned at its end): the value the ref
+# had at time `t` — the new oid of the newest entry made at or before `t`.
+# Before the first entry it is that entry's old oid, or — when the first entry
+# created the ref — its new oid, the oldest value known, as git does ("log only
+# goes back to"); a warning says so. Writes an id + NUL to out; 1 on success,
+# 0 otherwise, -1 on a read error.
+fn _reflog_at_time_rd(br, t, out) {
+    var line[16];
+    var seen = 0;
+    var going = 1;
+    while (going == 1) {
+        var r = _rlog_prev(br, &line);
+        if (r < 0) { return 0 - 1; }
+        if (r == 0) { going = 0; }
+        else {
+            seen = 1;
+            var ts = _reflog_line_ts(load64(&line), load64(&line + 8));
+            if (ts >= 0) {
+                if (ts <= t) { return _reflog_line_oid(load64(&line), load64(&line + 8), 1, 0, out); }
+            }
         }
-        i = i - 1;
     }
-    var h = _id_hexlen();                           # 64, or 40 in a SHA-1 .git/
-    var off = h + 1;                                # the new oid
-    var at = 0;
-    if (found >= 0) { at = vec_get(starts, found); }
-    else { off = 0; }                               # before the log: the old oid
-    if (at + 2 * h + 1 > len) { return 0; }
-    if (load8(buf + at + h) != 32) { return 0; }
-    if (hex_prefix_valid(buf + at + off, h) == 0) { return 0; }
-    var zero = 1;
-    var z = 0;
-    while (z < h) {
-        if (load8(buf + at + off + z) != 48) { zero = 0; }
-        z = z + 1;
+    if (seen == 0) { return 0; }
+    # Before the log: the oldest line, which `line` still holds.
+    var lp = load64(&line);
+    var ll = load64(&line + 8);
+    var got = _reflog_line_oid(lp, ll, 0, 1, out);
+    if (got == 0) {
+        # The creation zeros (or a malformed old field): the oldest new oid, if
+        # the line is well formed there.
+        got = _reflog_line_oid(lp, ll, 1, 0, out);
     }
-    if (zero == 1) {
-        off = h + 1;
-        if (hex_prefix_valid(buf + at + off, h) == 0) { return 0; }
-    }
-    if (found < 0) {
+    if (got == 1) {
         eprintln("sit: warning: the reflog does not go back that far; using its oldest entry");
     }
-    memcpy(out, buf + at + off, h);
-    store8(out + h, 0);
+    return got;
+}
+
+# _reflog_at_time_rd over a buffer.
+fn _reflog_at_time_in_buf(buf, len, t, out) {
+    var br[56];
+    if (_rlog_back_mem(&br, buf, len) != 0) { return 0; }
+    if (_reflog_at_time_rd(&br, t, out) != 1) { return 0; }
     return 1;
 }
 
 # Resolve <ref>@{<time>} for the log at refpath; as reflog_read_nth.
 fn reflog_read_at_time(refpath, t, out) {
-    var pair[16];
-    if (read_file_heap(reflog_log_path(refpath), &pair) != 0) { return 0; }
-    return _reflog_at_time_in_buf(load64(&pair), load64(&pair + 8), t, out);
+    var br[56];
+    if (_rlog_back_open(reflog_log_path(refpath), &br) != 0) { return 0; }
+    var r = _reflog_at_time_rd(&br, t, out);
+    _rlog_close(&br);
+    if (r != 1) { return 0; }
+    return 1;
 }
 
 # Parse "<base>@{<time>}" (a time spec, not a bare ordinal). On success writes
@@ -824,27 +1069,74 @@ fn _reflog_date_spec_parse(name, now, out) {
 # the old log or the new one. An append that was waiting on the lock while the
 # rewrite ran lands on the replaced file and is lost: one line, never a ref.
 
-# Rewrite the log at `path` (repo-relative) to the lines `keep` marks (one byte
-# per line, 1 = keep). Returns the number of lines dropped, or -1.
-fn _reflog_write_kept(path, buf, len, starts, keep) {
-    var n = vec_len(starts);
-    var out = alloc_or_die(len + 1);
-    var o = 0;
-    var dropped = 0;
-    var i = 0;
-    while (i < n) {
-        var s = vec_get(starts, i);
-        var e = len;
-        if (i + 1 < n) { e = vec_get(starts, i + 1); }
-        if (load8(keep + i) == 1) {
-            memcpy(out + o, buf + s, e - s);
-            o = o + e - s;
-        }
-        else { dropped = dropped + 1; }
-        i = i + 1;
+# 1 when line `idx` of a log, {line, ll}, stays in a rewrite: `how` 0 drops
+# what `reflog expire` drops (an entry made at or before `arg`; one whose time
+# cannot be read is kept), `how` 1 drops the line at index `arg` (`delete`).
+fn _reflog_keeps(how, arg, idx, line, ll) {
+    if (how == 1) {
+        if (idx == arg) { return 0; }
+        return 1;
     }
-    if (dropped == 0) { return 0; }
-    if (sf_write_atomic(path, out, o) < 0) { return 0 - 1; }
+    var ts = _reflog_line_ts(line, ll);
+    if (ts >= 0) { if (ts <= arg) { return 0; } }
+    return 1;
+}
+
+# Rewrite the log at `path` (repo-relative) to the lines _reflog_keeps keeps,
+# through `<log>.lock`, fsync and a rename, as sf_write_atomic does, but a chunk
+# at a time (1.13.4, L5): a log past 64 MiB was unreadable, so `reflog expire`
+# could not shrink it. A first pass counts what would go, and with nothing to
+# drop nothing is written. The caller holds the log's flock, so nothing appends
+# between the passes. Returns the number of lines dropped, or -1.
+fn _reflog_rewrite(path, how, arg) {
+    var rd[56];
+    var line[16];
+    if (_rlog_open(path, &rd) != 0) { return 0 - 1; }
+    var drop = 0;
+    var idx = 0;
+    var r = 1;
+    while (r == 1) {
+        r = _rlog_next(&rd, &line);
+        if (r == 1) {
+            if (_reflog_keeps(how, arg, idx, load64(&line), load64(&line + 8)) == 0) { drop = drop + 1; }
+            idx = idx + 1;
+        }
+    }
+    _rlog_close(&rd);
+    if (r < 0) { return 0 - 1; }
+    if (drop == 0) { return 0; }
+
+    if (_sf_parent_symlink(path) == 1) { return 0 - 1; }
+    var abuf[4352];
+    var ap = _sf_abs(path, &abuf);
+    var lbuf[4360];
+    var lp = &lbuf;
+    if (strlen(ap) + 6 > 4360) { lp = alloc_or_die(strlen(ap) + 6); }
+    var wfd = _replace_open(ap, lp);
+    if (wfd < 0) { return 0 - 1; }
+    var rc = 0;
+    var dropped = 0;
+    if (_rlog_open(path, &rd) != 0) { rc = 0 - 5; }
+    else {
+        idx = 0;
+        r = 1;
+        while (r == 1) {
+            r = _rlog_next(&rd, &line);
+            if (r == 1) {
+                var ll = load64(&line + 8);
+                if (_reflog_keeps(how, arg, idx, load64(&line), ll) == 1) {
+                    if (rc == 0) {
+                        if (sit_write_full(wfd, load64(&line), ll) != ll) { rc = 0 - 5; }
+                    }
+                }
+                else { dropped = dropped + 1; }
+                idx = idx + 1;
+            }
+        }
+        if (r < 0) { rc = 0 - 5; }
+        _rlog_close(&rd);
+    }
+    if (_replace_close(wfd, ap, lp, rc) != 0) { return 0 - 1; }
     return dropped;
 }
 
@@ -876,26 +1168,7 @@ fn _reflog_expire_file(refpath, cutoff) {
     var path = reflog_log_path(refpath);
     var fd = _reflog_lock(path);
     if (fd < 0) { return 0; }                        # no log: nothing to expire
-    var pair[16];
-    var r = 0 - 1;
-    if (read_file_heap(path, &pair) == 0) {
-        var buf = load64(&pair);
-        var len = load64(&pair + 8);
-        var starts = _reflog_line_starts(buf, len);
-        var n = vec_len(starts);
-        var keep = alloc_or_die(n + 1);
-        var i = 0;
-        while (i < n) {
-            var s = vec_get(starts, i);
-            var e = len;
-            if (i + 1 < n) { e = vec_get(starts, i + 1); }
-            var ts = _reflog_line_ts(buf + s, e - s);
-            store8(keep + i, 1);
-            if (ts >= 0) { if (ts <= cutoff) { store8(keep + i, 0); } }
-            i = i + 1;
-        }
-        r = _reflog_write_kept(path, buf, len, starts, keep);
-    }
+    var r = _reflog_rewrite(path, 0, cutoff);
     file_unlock(fd);
     file_close(fd);
     return r;
@@ -1035,21 +1308,19 @@ fn _reflog_cmd_delete() {
         return 1;
     }
     var rc = 1;
-    var pair[16];
-    if (read_file_heap(path, &pair) == 0) {
-        var buf = load64(&pair);
-        var len = load64(&pair + 8);
-        var starts = _reflog_line_starts(buf, len);
-        var n = vec_len(starts);
+    var rd[56];
+    var n = 0 - 1;
+    if (_rlog_open(path, &rd) == 0) {
+        n = _reflog_count_rd(&rd);
+        _rlog_close(&rd);
+    }
+    if (n < 0) { eprintln("sit: cannot read the reflog"); }
+    else {
         if (num >= n) {
             eprint3("sit: '", spec_s, "' is past the end of the reflog\n");
         }
         else {
-            var keep = alloc_or_die(n + 1);
-            var i = 0;
-            while (i < n) { store8(keep + i, 1); i = i + 1; }
-            store8(keep + (n - 1 - num), 0);
-            if (_reflog_write_kept(path, buf, len, starts, keep) == 1) {
+            if (_reflog_rewrite(path, 1, n - 1 - num) == 1) {
                 stdout_write("deleted ", 8);
                 write_sanitized(STDOUT, spec_s, strlen(spec_s));
                 stdout_write("\n", 1);
